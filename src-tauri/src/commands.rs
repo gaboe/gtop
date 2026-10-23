@@ -39,6 +39,13 @@ pub async fn get_processes(
     include_environ: bool,
     state: State<'_, AppState>,
 ) -> Result<(Vec<ProcessInfo>, SystemStats), String> {
+    snapshot(&state, include_environ)
+}
+
+fn snapshot(
+    state: &AppState,
+    include_environ: bool,
+) -> Result<(Vec<ProcessInfo>, SystemStats), String> {
     let mut sys = state.sys.lock().map_err(|e| e.to_string())?;
     let mut disks = state.disks.lock().map_err(|e| e.to_string())?;
     let mut networks = state.networks.lock().map_err(|e| e.to_string())?;
@@ -100,4 +107,21 @@ pub async fn get_process_environ(
 pub async fn kill_process(pid: u32, state: State<'_, AppState>) -> Result<bool, String> {
     let sys = state.sys.lock().map_err(|e| e.to_string())?;
     Ok(ProcessMonitor::kill_process(&sys, pid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `NEOHTOP_PERF=1 cargo test --release tick_cost -- --ignored --nocapture`
+    /// logs the cost of 20 ticks without a window
+    #[test]
+    #[ignore]
+    fn tick_cost() {
+        let state = AppState::new();
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            snapshot(&state, false).unwrap();
+        }
+    }
 }
