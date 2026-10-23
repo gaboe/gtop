@@ -24,9 +24,12 @@ pub fn now() -> f64 {
         .unwrap_or_default()
         .as_secs_f64()
 }
-pub fn source(processes: &[ProcessInfo], cores: usize) -> Option<(String, f32)> {
+pub fn source<'a>(
+    processes: impl IntoIterator<Item = &'a ProcessInfo>,
+    cores: usize,
+) -> Option<(String, f32)> {
     let mut groups: BTreeMap<&str, (usize, f32)> = BTreeMap::new();
-    for p in processes.iter().filter(|p| p.cpu_usage > 100.) {
+    for p in processes.into_iter().filter(|p| p.cpu_usage > 100.) {
         let g = groups.entry(&p.name).or_default();
         g.0 += 1;
         g.1 += p.cpu_usage;
@@ -257,7 +260,7 @@ fn tape(view: &HistoryView, metric: Metric, height: f32, mem_total: u64, t: &Tok
         }))
 }
 impl Monitor {
-    fn tower(&self, t: &Tokens) -> Stateful<Div> {
+    fn tower(&self, t: &Tokens, cx: &App) -> Stateful<Div> {
         let mut tower = div()
             .relative()
             .id("tower")
@@ -304,7 +307,14 @@ impl Monitor {
         };
         let stats = &s.stats;
         let cores = stats.cpu_usage.len();
-        let src = source(&s.processes, cores);
+        let src = source(
+            self.table
+                .read(cx)
+                .order
+                .iter()
+                .filter_map(|i| s.processes.get(*i)),
+            cores,
+        );
         tower = tower.child(
             win(t)
                 .child(
@@ -596,12 +606,12 @@ impl Monitor {
                     let at = end - (h.columns.len().saturating_sub(1) as f64 * (1. - f)) as u64;
                     label(timestamp(at * 60, "%H:%M"), &t)
                 }));
-            right=right.child(win(&t).child(label(format!("TOTAL CPU · LAST {} H · RECORDED {} OF {} MIN · HATCHED: GTOP NOT RUNNING",[1,8,24][index],h.covered,[60,480,1440][index]),&t)).child(tape(h,Metric::Cpu,150.,mem,&t)).child(axis))
+            right=right.child(win(&t).child(label(format!("TOTAL CPU · LAST {} H · RECORDED {} OF {} MIN · HATCHED: GTOP CLOSED OR PAUSED",[1,8,24][index],h.covered,[60,480,1440][index]),&t)).child(tape(h,Metric::Cpu,150.,mem,&t)).child(axis))
                 .child(div().flex_1().min_h_0().flex().flex_col().border_1().border_color(rgb(t.rule)).child(div().h(px(29.)).px_2().flex().items_center().child(label("PROCESS                         CORE TIME        SHARE             OF ALL CPU      GPU TIME       PEAK MEMORY      PEAK CPU %",&t)))
-                .child(uniform_list("history-rows",h.rows.len(),cx.processor(move|this,range:std::ops::Range<usize>,_,_|{
+                .child(uniform_list("history-rows",h.rows.len(),cx.processor(move|this,range:std::ops::Range<usize>,_,cx|{
                     let h=&this.history[index];let t=this.draft.unwrap_or(this.settings.base()).tokens();
-                    range.filter_map(|row|{let (name,p)=h.rows.get(row)?;Some(div().h(px(22.)).flex().items_center().gap_3().px_2().border_b_1().border_color(rgb(t.row_rule)).text_color(rgb(if row<3{t.base.led}else{t.ink_row})).child(div().w(px(190.)).truncate().child(name.clone())).child(div().w(px(105.)).child(format!("{:.1} min",p.cpu_seconds/60.))).child(segments((p.cpu_seconds/h.rows.first().map(|r|r.1.cpu_seconds).unwrap_or(1.).max(0.001)*100.) as f32,30,&t).w(px(120.))).child(div().w(px(100.)).child(format!("{:.1}%",p.cpu_seconds/h.total_cpu.max(0.001)*100.))).child(div().w(px(100.)).child(format!("{:.1} min",p.gpu_seconds/60.))).child(div().w(px(110.)).child(bytes(p.peak_memory))).child(format!("{:.1}",p.peak_cpu))) }).collect::<Vec<_>>()
-                })).flex_1().min_h_0()));
+                    range.filter_map(|row|{let (name,p)=h.rows.get(row)?;let selected=this.history_selected.as_ref().map(|n|n==name).unwrap_or(row==0);let key=name.clone();Some(div().id(("history-row",row)).bg(rgb(if selected{t.plate2}else{t.base.ground})).on_click(cx.listener(move|this,_,_,cx|{this.history_selected=Some(key.clone());cx.notify();})).h(px(22.)).flex().items_center().gap_3().px_2().border_b_1().border_color(rgb(t.row_rule)).text_color(rgb(if row<3{t.base.led}else{t.ink_row})).child(div().w(px(190.)).truncate().child(name.clone())).child(div().w(px(105.)).child(format!("{:.1} min",p.cpu_seconds/60.))).child(segments((p.cpu_seconds/h.rows.first().map(|r|r.1.cpu_seconds).unwrap_or(1.).max(0.001)*100.) as f32,30,&t).w(px(120.))).child(div().w(px(100.)).child(format!("{:.1}%",p.cpu_seconds/h.total_cpu.max(0.001)*100.))).child(div().w(px(100.)).child(format!("{:.1} min",p.gpu_seconds/60.))).child(div().w(px(110.)).child(bytes(p.peak_memory))).child(format!("{:.1}",p.peak_cpu))) }).collect::<Vec<_>>()
+                })).track_scroll(&self.history_scroll).flex_1().min_h_0()));
         } else {
             let h = &self.history[0];
             let mut head = div()
@@ -681,7 +691,7 @@ impl Monitor {
             .text_color(rgb(t.base.silk))
             .font_family("JetBrains Mono")
             .text_size(px(12.))
-            .child(self.tower(&t))
+            .child(self.tower(&t, cx))
             .child(right);
         if self.settings_open {
             root = root.child(self.palette_panel(&t, cx));
@@ -821,18 +831,20 @@ impl Monitor {
                 }
             }
             "e" if self.details.is_some() => self.fetch_environment(window, cx),
-            "enter" | "x" => {
-                let key = self
-                    .details
-                    .as_ref()
-                    .map(|d| d.key)
-                    .or_else(|| self.table.read(cx).selected)
-                    .or_else(|| {
-                        self.table
-                            .read(cx)
-                            .process(0)
-                            .map(crate::model::ProcessKey::from)
-                    });
+            "enter" | "x" if self.view.is_none() => {
+                let key = crate::model::action_target(
+                    if k == "x" {
+                        crate::model::ProcessAction::Kill
+                    } else {
+                        crate::model::ProcessAction::Detail
+                    },
+                    self.details.as_ref().map(|d| d.key),
+                    self.table.read(cx).selected,
+                    self.table
+                        .read(cx)
+                        .process(0)
+                        .map(crate::model::ProcessKey::from),
+                );
                 if let Some(key) = key {
                     self.select(key, cx);
                     if k == "x" {
@@ -853,6 +865,24 @@ impl Monitor {
                     rows.reorder();
                     cx.notify();
                 });
+            }
+            "j" | "k" | "down" | "up" if self.view.is_some() => {
+                let h = &self.history[self.view.unwrap()];
+                let current = self
+                    .history_selected
+                    .as_ref()
+                    .and_then(|name| h.rows.iter().position(|r| &r.0 == name))
+                    .unwrap_or(0);
+                let next = if k == "j" || k == "down" {
+                    (current + 1).min(h.rows.len().saturating_sub(1))
+                } else {
+                    current.saturating_sub(1)
+                };
+                if let Some((name, _)) = h.rows.get(next) {
+                    self.history_selected = Some(name.clone());
+                    self.history_scroll
+                        .scroll_to_item(next, ScrollStrategy::Top);
+                }
             }
             "j" | "k" | "down" | "up" => {
                 self.table.update(cx, |table, cx| {

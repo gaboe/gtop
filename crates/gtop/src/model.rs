@@ -17,6 +17,24 @@ impl From<&ProcessInfo> for ProcessKey {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum ProcessAction {
+    Detail,
+    Kill,
+}
+
+pub fn action_target(
+    action: ProcessAction,
+    details: Option<ProcessKey>,
+    selected: Option<ProcessKey>,
+    first: Option<ProcessKey>,
+) -> Option<ProcessKey> {
+    match action {
+        ProcessAction::Detail => selected.or(first),
+        ProcessAction::Kill => details.or(selected).or(first),
+    }
+}
+
 pub enum SearchTerm {
     Port(u16),
     Text {
@@ -245,6 +263,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn detail_uses_the_filtered_row_while_kill_uses_the_shown_detail() {
+        let old = ProcessKey {
+            pid: 1,
+            start_time: 10,
+        };
+        let found = ProcessKey {
+            pid: 2,
+            start_time: 20,
+        };
+        assert_eq!(
+            action_target(ProcessAction::Detail, Some(old), None, Some(found)),
+            Some(found)
+        );
+        assert_eq!(
+            action_target(ProcessAction::Kill, Some(old), None, Some(found)),
+            Some(old)
+        );
+        assert_eq!(
+            action_target(ProcessAction::Detail, Some(old), None, None),
+            None
+        );
+    }
     #[test]
     fn ports_follow_svelte_parse_rules() {
         for term in [":1", ":65535", "port:443", " PORT:03000 "] {

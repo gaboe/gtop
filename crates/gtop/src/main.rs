@@ -29,6 +29,8 @@ struct Monitor {
     paused: bool,
     history: [history::HistoryView; 3],
     view: Option<usize>,
+    history_selected: Option<String>,
+    history_scroll: UniformListScrollHandle,
     metric: history::Metric,
     settings: palette::Settings,
     settings_open: bool,
@@ -174,9 +176,10 @@ impl Monitor {
             loop {
                 while events.try_recv().is_ok() {}
                 let Ok((running, ports, seconds)) = entity.update_in(cx, |this, window, cx| {
-                    (!this.paused && window.is_visible(), this.table.read(cx).search.needs_ports(), this.interval)
+                    (!this.paused, window.is_visible() && this.table.read(cx).search.needs_ports(), this.interval)
                 }) else { break; };
                 if !running {
+                    history.suspend();
                     if events.next().await.is_none() { break; }
                     continue;
                 }
@@ -214,10 +217,13 @@ impl Monitor {
                     }
                     match result {
                         Ok(snapshot) => {
-                            if !this.paused && window.is_visible() {
-                                this.tick_ms = tick_ms;
+                            if !this.paused {
+                                this.observe_sample(&snapshot);
                                 if let Some(views) = views { this.history = views; }
-                                this.accept(snapshot, window, cx);
+                                if window.is_visible() {
+                                    this.tick_ms = tick_ms;
+                                    this.accept(snapshot, window, cx);
+                                }
                             }
                         }
                         Err(error) => { this.status = format!("Refresh failed: {error}"); cx.notify(); }
@@ -238,6 +244,8 @@ impl Monitor {
             paused: false,
             history: std::array::from_fn(|_| history::HistoryView::default()),
             view: None,
+            history_selected: None,
+            history_scroll: UniformListScrollHandle::new(),
             metric: history::Metric::Cpu,
             settings,
             settings_open: false,
@@ -262,7 +270,7 @@ impl Monitor {
         let _ = self.wake.try_send(());
     }
 
-    fn accept(&mut self, snapshot: Snapshot, window: &Window, cx: &mut Context<Self>) {
+    fn observe_sample(&mut self, snapshot: &Snapshot) {
         let now = rack::now();
         self.sample_seconds = self
             .last_snapshot
@@ -279,6 +287,8 @@ impl Monitor {
                 trace.pop_front();
             }
         }
+    }
+    fn accept(&mut self, snapshot: Snapshot, window: &Window, cx: &mut Context<Self>) {
         let snapshot = Rc::new(snapshot);
         let key = self
             .details

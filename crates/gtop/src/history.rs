@@ -183,13 +183,16 @@ impl History {
             self.buckets.pop_front();
         }
     }
+    pub fn suspend(&mut self) {
+        self.last_sample = None;
+    }
     pub fn record(&mut self, snapshot: &Snapshot, now: f64, interval: f64) -> bool {
         let previous = self.last_sample.replace(now);
         let elapsed = previous.map(|v| now - v).unwrap_or(0.);
         let minute = now as u64 / 60;
         self.prune(minute);
         let changed_minute = self.buckets.back().is_none_or(|b| b.minute != minute);
-        // Do not charge time while paused, covered, asleep, or between application runs.
+        // Do not charge time while paused, asleep, or between application runs.
         let seconds = if elapsed > 0. && elapsed <= interval * 2.5 {
             elapsed
         } else {
@@ -340,6 +343,9 @@ mod tests {
         assert_eq!(v.rows[0].1.cpu_seconds, 10.5);
         assert_eq!(v.rows[0].1.peak_memory, 2048);
         assert_eq!(v.leaders(Metric::Temperature)[0], ("Peak".into(), 80.));
+        h.suspend();
+        h.record(&s, 6006., 3.);
+        assert_eq!(h.view(1, 6006).rows[0].1.cpu_seconds, 10.5);
         h.record(&s, 6180., 3.);
         let v = h.view(1, 6180);
         assert_eq!(v.covered, 2);
