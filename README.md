@@ -1,8 +1,8 @@
 
 <div align="center">
   <img src="app-icon.png" alt="NeoHtop Logo" width="120" />
-  <h1>NeoHtop</h1>
-  <p>A modern, cross-platform system monitor built on top of Svelte, Rust, and Tauri.</p>
+  <h1>gtop</h1>
+  <p>A fork of <a href="https://github.com/Abdenasser/neohtop">NeoHtop</a> with faster refreshes, GPU and temperature monitoring on macOS, and port search.</p>
 
   [![License](https://img.shields.io/github/license/Abdenasser/neohtop)](https://github.com/Abdenasser/neohtop/blob/main/LICENSE)
   [![GitHub stars](https://img.shields.io/github/stars/Abdenasser/neohtop)](https://github.com/Abdenasser/neohtop/stargazers)
