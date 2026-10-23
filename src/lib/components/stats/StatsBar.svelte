@@ -2,9 +2,11 @@
   import type { SystemStats } from "$lib/types";
   import {
     CpuPanel,
+    GpuPanel,
     MemoryPanel,
     StoragePanel,
     SystemPanel,
+    TemperaturePanel,
     NetworkPanel,
   } from "$lib/components";
 
@@ -15,6 +17,13 @@
   {#if systemStats}
     <div class="stats-layout">
       <CpuPanel cpuUsage={systemStats.cpu_usage} />
+
+      {#each systemStats.gpus ?? [] as gpu, i}
+        <GpuPanel
+          {gpu}
+          title={(systemStats.gpus ?? []).length > 1 ? `GPU ${i}` : "GPU"}
+        />
+      {/each}
 
       <MemoryPanel
         memoryTotal={systemStats.memory_total}
@@ -29,6 +38,10 @@
       />
 
       <SystemPanel uptime={systemStats.uptime} loadAvg={systemStats.load_avg} />
+
+      {#if systemStats.temperatures?.length}
+        <TemperaturePanel temperatures={systemStats.temperatures} />
+      {/if}
 
       <NetworkPanel
         networkRxBytes={systemStats.network_rx_bytes}

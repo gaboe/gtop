@@ -13,6 +13,8 @@ pub struct ProcessInfo {
     pub name: String,
     /// CPU usage as percentage (0-100)
     pub cpu_usage: f32,
+    /// GPU usage as percentage, or `None` where the platform cannot report it
+    pub gpu_usage: Option<f32>,
     /// Physical memory usage in bytes
     pub memory_usage: u64,
     /// Process status as string
@@ -37,6 +39,39 @@ pub struct ProcessInfo {
     pub disk_usage: (u64, u64),
     /// Session ID of the process
     pub session_id: Option<u32>,
+}
+
+/// Statistics for a single GPU exposed to the frontend
+///
+/// Every reading is optional: which ones a card actually publishes depends on
+/// its driver, and the frontend hides whatever is missing.
+#[derive(Serialize, Debug, Clone)]
+pub struct GpuInfo {
+    /// Graphics card model name
+    pub name: String,
+    /// Graphics card vendor name
+    pub vendor: String,
+    /// Core utilization as percentage (0-100)
+    pub utilization: Option<f32>,
+    /// Total video memory in bytes
+    pub memory_total: Option<u64>,
+    /// Used video memory in bytes
+    pub memory_used: Option<u64>,
+    /// Core temperature in degrees Celsius
+    pub temperature: Option<f32>,
+    /// Board power draw in watts
+    pub power_watts: Option<f32>,
+    /// Shader clock in MHz
+    pub core_clock_mhz: Option<u32>,
+}
+
+/// Hottest sensor reading of one component group, such as "CPU"
+#[derive(Serialize, Debug, Clone)]
+pub struct Temperature {
+    /// Component group name
+    pub name: String,
+    /// Temperature in degrees Celsius
+    pub celsius: f32,
 }
 
 /// System-wide statistics exposed to the frontend
@@ -67,4 +102,8 @@ pub struct SystemStats {
     pub disk_used_bytes: u64,
     /// Free disk space in bytes
     pub disk_free_bytes: u64,
+    /// Per-GPU statistics; empty when no supported GPU was found
+    pub gpus: Vec<GpuInfo>,
+    /// Hottest reading per component group; empty when no sensor is readable
+    pub temperatures: Vec<Temperature>,
 }

@@ -3,7 +3,7 @@
 //! This module handles monitoring and managing system processes, including
 //! collecting process information and managing process lifecycle.
 
-use super::ProcessInfo;
+use super::{GpuProcessMonitor, ProcessInfo};
 use std::ffi::OsString;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
@@ -15,9 +15,20 @@ fn os_string_vec_to_string_vec(v: &[OsString]) -> Vec<String> {
 }
 
 /// Monitors and manages system processes
-pub struct ProcessMonitor;
+#[derive(Debug)]
+pub struct ProcessMonitor {
+    /// Tracks per-process GPU engine usage between refreshes
+    gpu_process_monitor: GpuProcessMonitor,
+}
 
 impl ProcessMonitor {
+    /// Creates a new process monitor instance
+    pub fn new() -> Self {
+        Self {
+            gpu_process_monitor: GpuProcessMonitor::new(),
+        }
+    }
+
     /// Refreshes the process list. Static fields (user, command, root) are read
     /// once per process; environment variables only when the caller shows them.
     pub fn refresh(sys: &mut System, include_environ: bool) {
@@ -45,10 +56,15 @@ impl ProcessMonitor {
     ///
     /// A vector of process information, or an error string if collection failed
     pub fn collect_processes(
+        &mut self,
         sys: &System,
         include_environ: bool,
     ) -> Result<Vec<ProcessInfo>, String> {
         let current_time = Self::get_current_time()?;
+        let gpu_usage = self.gpu_process_monitor.collect();
+        // Processes that hold no GPU client are idle rather than unknown, so
+        // they report zero wherever the platform supports the accounting
+        let gpu_supported = self.gpu_process_monitor.is_supported();
         Ok(sys
             .processes()
             .iter()
@@ -60,6 +76,8 @@ impl ProcessMonitor {
                     ppid: process.parent().map(|p| p.as_u32()).unwrap_or(0),
                     name: process.name().to_string_lossy().into_owned(),
                     cpu_usage: process.cpu_usage(),
+                    gpu_usage: gpu_supported
+                        .then(|| gpu_usage.get(&pid.as_u32()).copied().unwrap_or(0.0)),
                     memory_usage: process.memory(),
                     status: Self::format_status(process.status()),
                     user: process
@@ -150,7 +168,9 @@ mod tests {
         ProcessMonitor::refresh(&mut sys, false);
         let own_pid = std::process::id();
 
-        let processes = ProcessMonitor::collect_processes(&sys, false).unwrap();
+        let processes = ProcessMonitor::new()
+            .collect_processes(&sys, false)
+            .unwrap();
         let own = processes.iter().find(|p| p.pid == own_pid).unwrap();
         assert!(!own.command.is_empty(), "command is read on first refresh");
         assert!(own.environ.is_empty(), "environ is skipped by default");
