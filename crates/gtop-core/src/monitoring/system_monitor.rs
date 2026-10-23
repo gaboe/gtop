@@ -147,8 +147,8 @@ mod tests {
     fn test_system_monitor_creation() {
         let networks = Networks::new();
         let monitor = SystemMonitor::new(&networks);
-        assert!(monitor.last_network_update.1 >= 0);
-        assert!(monitor.last_network_update.2 >= 0);
+        assert_eq!(monitor.last_network_update.1, 0);
+        assert_eq!(monitor.last_network_update.2, 0);
     }
 
     /// Tests system statistics collection

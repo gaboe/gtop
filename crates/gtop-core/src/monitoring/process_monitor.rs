@@ -22,6 +22,12 @@ pub struct ProcessMonitor {
     gpu_process_monitor: GpuProcessMonitor,
 }
 
+impl Default for ProcessMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProcessMonitor {
     /// Creates a new process monitor instance
     pub fn new() -> Self {
