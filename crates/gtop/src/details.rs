@@ -19,24 +19,25 @@ enum Environment {
 pub(super) struct Details {
     pub(super) key: ProcessKey,
     environment: Environment,
-    kill: KillState,
+    environment_open: bool,
+    pub(super) kill: KillState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum KillState {
+pub(super) enum KillState {
     Ready,
     Confirming,
     Sending,
 }
 
 impl Details {
-    fn request_kill(&mut self, rendered_for: ProcessKey) {
+    pub(super) fn request_kill(&mut self, rendered_for: ProcessKey) {
         if self.key == rendered_for && self.kill == KillState::Ready {
             self.kill = KillState::Confirming;
         }
     }
 
-    fn cancel_kill(&mut self, rendered_for: ProcessKey) {
+    pub(super) fn cancel_kill(&mut self, rendered_for: ProcessKey) {
         if self.key == rendered_for && self.kill == KillState::Confirming {
             self.kill = KillState::Ready;
         }
@@ -63,12 +64,13 @@ impl Monitor {
         self.details = Some(Details {
             key,
             environment: Environment::Unrequested,
+            environment_open: false,
             kill: KillState::Ready,
         });
-        self.table.update(cx, |table, cx| {
-            table.delegate_mut().selected = Some(key);
-            if let Some(row) = table.delegate().row_for(key) {
-                table.set_selected_row(row, cx);
+        self.table.update(cx, |table, _cx| {
+            table.selected = Some(key);
+            if let Some(row) = table.row_for(key) {
+                table.selected = table.process(row).map(ProcessKey::from);
             }
         });
         cx.notify();
@@ -83,13 +85,22 @@ impl Monitor {
             .find(|process| ProcessKey::from(*process) == key)
     }
 
-    fn fetch_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn fetch_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(core) = self.core.clone() else {
             return;
         };
         let Some(details) = self.details.as_mut() else {
             return;
         };
+        if matches!(
+            details.environment,
+            Environment::Loaded(_) | Environment::Loading
+        ) {
+            details.environment_open = !details.environment_open;
+            cx.notify();
+            return;
+        }
+        details.environment_open = true;
         let key = details.key;
         details.environment = Environment::Loading;
         cx.notify();
@@ -111,7 +122,12 @@ impl Monitor {
         .detach();
     }
 
-    fn kill(&mut self, rendered_for: ProcessKey, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn kill(
+        &mut self,
+        rendered_for: ProcessKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(core) = self.core.clone() else {
             return;
         };
@@ -148,268 +164,280 @@ impl Monitor {
         .detach();
     }
 
+    pub(super) fn confirmation(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let d = self.details.as_ref()?;
+        if d.kill != KillState::Confirming {
+            return None;
+        }
+        let key = d.key;
+        Some(
+            div()
+                .id("kill-confirmation")
+                .role(Role::AlertDialog)
+                .flex()
+                .items_center()
+                .gap_3()
+                .p(px(8.))
+                .bg(rgb(theme::MANTLE))
+                .border_1()
+                .border_color(rgb(theme::RED))
+                .child(format!(
+                    "Kill {} · PID {} · started {}?",
+                    self.selected_process()
+                        .map(|p| p.name.as_str())
+                        .unwrap_or("exited process"),
+                    key.pid,
+                    key.start_time
+                ))
+                .child(
+                    Button::new("confirm-kill")
+                        .label("Kill · Y")
+                        .danger()
+                        .small()
+                        .on_click(cx.listener(move |this, _, w, cx| this.kill(key, w, cx))),
+                )
+                .child(
+                    Button::new("cancel-kill")
+                        .label("Keep · N")
+                        .small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(d) = this.details.as_mut() {
+                                d.cancel_kill(key);
+                            }
+                            cx.notify();
+                        })),
+                ),
+        )
+    }
     pub(super) fn details(&self, cx: &mut Context<Self>) -> Option<Div> {
         let details = self.details.as_ref()?;
-        let rendered_for = details.key;
-        let heading = div()
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .child(
-                div()
-                    .text_size(px(14.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(
-                        self.selected_process()
-                            .map(|process| format!("{}  ·  PID {}", process.name, process.pid))
-                            .unwrap_or_else(|| format!("PID {} has exited", details.key.pid)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        Button::new("kill")
-                            .label(if details.kill == KillState::Sending {
-                                "Sending…"
-                            } else {
-                                "Kill process"
-                            })
-                            .danger()
-                            .small()
-                            .disabled(
-                                self.selected_process().is_none()
-                                    || details.kill == KillState::Sending,
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(details) = this.details.as_mut() {
-                                    details.request_kill(rendered_for);
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("close-details")
-                            .label("Close details")
-                            .small()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.details = None;
-                                this.table.update(cx, |table, cx| {
-                                    table.delegate_mut().selected = None;
-                                    table.clear_selection(cx);
-                                });
-                                cx.notify();
-                            })),
-                    ),
-            );
-        let mut content = div()
-            .id("details-scroll")
-            .overflow_y_scroll()
-            .flex_1()
-            .min_h_0()
+        let key = details.key;
+        let t = self.draft.unwrap_or(self.settings.base()).tokens();
+        let mut panel = div()
+            .relative()
+            .child(crate::rack::screws(&t))
             .flex()
             .flex_col()
-            .gap_2();
-        if let Some(process) = self.selected_process() {
-            let command = process.command.clone();
-            content = content
-                .child(
-                    div()
-                        .flex()
-                        .flex_shrink_0()
-                        .items_start()
-                        .gap_3()
-                        .child(
-                            div()
-                                .w(px(80.))
-                                .flex_shrink_0()
-                                .text_color(rgb(theme::SUBTEXT))
-                                .child("Command"),
-                        )
-                        .child(
-                            div()
-                                .id("command-value")
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_x_scroll()
-                                .child(command.clone()),
-                        )
-                        .child(Button::new("copy-command").label("Copy").small().on_click(
-                            move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(command.clone()))
-                            },
-                        )),
-                )
-                .child(detail_line(
-                    "Root",
-                    if process.root.is_empty() {
-                        "Unavailable".into()
-                    } else {
-                        process.root.clone()
-                    },
-                ))
-                .child(detail_line(
-                    "Resources",
-                    format!(
-                        "CPU {:.1}%   GPU {}   RAM {}   VIRT {}   Run time {}",
-                        process.cpu_usage,
-                        model::ProcessColumn::Gpu.text(process),
-                        bytes(process.memory_usage),
-                        bytes(process.virtual_memory),
-                        duration(process.run_time)
-                    ),
-                ))
-                .child(detail_line(
-                    "Parent",
-                    format!(
-                        "{}   User {}   Status {}",
-                        process.ppid, process.user, process.status
-                    ),
-                ));
-            let children: Vec<_> = self
-                .snapshot
-                .as_ref()
-                .unwrap()
-                .processes
-                .iter()
-                .filter(|child| child.ppid == process.pid)
-                .collect();
-            content = content.child(
+            .flex_shrink_0()
+            .w(px(380.))
+            .h_full()
+            .bg(rgb(t.base.plate))
+            .border_1()
+            .border_color(rgb(t.rule_hi));
+        if let Some(p) = self.selected_process() {
+            panel = panel.child(
                 div()
-                    .flex()
-                    .flex_shrink_0()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
+                    .p(px(18.))
+                    .border_b_1()
+                    .border_color(rgb(t.rule))
+                    .child(crate::rack::label(
+                        format!("PID {} · {} · CLICK ANOTHER ROW TO SWITCH", p.pid, p.user),
+                        &t,
+                    ))
                     .child(
                         div()
-                            .w(px(80.))
-                            .text_color(rgb(theme::SUBTEXT))
-                            .child("Children"),
-                    )
-                    .when(children.is_empty(), |this| this.child("None"))
-                    .children(children.into_iter().map(|child| {
-                        let key = ProcessKey::from(child);
-                        Button::new(("child", child.pid as usize))
-                            .label(format!("{} ({})", child.name, child.pid))
-                            .small()
-                            .on_click(cx.listener(move |this, _, _, cx| this.select(key, cx)))
-                    })),
+                            .font_family("Archivo Display")
+                            .font_weight(FontWeight::EXTRA_BOLD)
+                            .text_size(px(30.))
+                            .child(p.name.to_uppercase()),
+                    ),
             );
+            let trace = self.traces.get(&key);
+            let top = self.snapshot.as_ref().unwrap().stats.cpu_usage.len() as f32 * 50.;
+            let bars = div()
+                .h(px(64.))
+                .flex()
+                .items_end()
+                .gap(px(1.))
+                .children((0..60).map(|i| {
+                    let at = crate::rack::now() - 90. + i as f64 * 1.5;
+                    let v = trace
+                        .and_then(|t| {
+                            t.iter()
+                                .rev()
+                                .find(|(time, _)| *time <= at + 1.5 && *time > at - 3.)
+                        })
+                        .map(|(_, v)| *v);
+                    div()
+                        .flex_1()
+                        .h(px(v
+                            .map(|v| (v / top.max(1.) * 64.).clamp(1., 64.))
+                            .unwrap_or(1.)))
+                        .bg(rgb(v
+                            .map(|v| if v > 400. { t.base.hot } else { t.base.led })
+                            .unwrap_or(t.led_off)))
+                }));
+            panel = panel.child(
+                div().p(px(18.)).child(
+                    crate::rack::win(&t)
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .child(crate::rack::label("CPU · LAST 90 S", &t))
+                                .child(crate::rack::lit(
+                                    format!("{:.0}%", p.cpu_usage),
+                                    22.,
+                                    p.cpu_usage > 400.,
+                                    &t,
+                                )),
+                        )
+                        .child(bars),
+                ),
+            );
+            panel = panel.child(
+                div()
+                    .p(px(18.))
+                    .border_b_1()
+                    .border_color(rgb(t.rule))
+                    .child(
+                        crate::rack::win(&t)
+                            .child(detail_line("Memory", bytes(p.memory_usage)))
+                            .child(detail_line("GPU", model::ProcessColumn::Gpu.text(p)))
+                            .child(detail_line(
+                                "Disk read",
+                                format!(
+                                    "{:.1} MB/s",
+                                    p.disk_usage.0 as f64 / self.sample_seconds / 1e6
+                                ),
+                            ))
+                            .child(detail_line(
+                                "Disk write",
+                                format!(
+                                    "{:.1} MB/s",
+                                    p.disk_usage.1 as f64 / self.sample_seconds / 1e6
+                                ),
+                            )),
+                    )
+                    .child(detail_line(
+                        "Ports",
+                        if p.ports.is_empty() {
+                            "none".into()
+                        } else {
+                            p.ports
+                                .iter()
+                                .map(u16::to_string)
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        },
+                    ))
+                    .child(detail_line(
+                        "Started",
+                        crate::rack::timestamp(p.start_time, "%x %X"),
+                    ))
+                    .child(detail_line("Running for", duration(p.run_time))),
+            );
+            panel = panel.child(
+                div()
+                    .p(px(18.))
+                    .border_b_1()
+                    .border_color(rgb(t.rule))
+                    .child(crate::rack::label("COMMAND", &t))
+                    .child(
+                        div()
+                            .id("command-value")
+                            .overflow_x_scroll()
+                            .p_2()
+                            .bg(rgb(t.well))
+                            .child(selectable("command-text", &p.command)),
+                    ),
+            );
+        } else {
+            panel = panel.child(format!("PID {} has exited", key.pid));
         }
         let environment = match &details.environment {
             Environment::Unrequested => div().child(
                 Button::new("environment")
-                    .label("Load environment variables")
+                    .label("Load · E")
                     .small()
-                    .disabled(self.selected_process().is_none())
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.fetch_environment(window, cx)),
+                    .on_click(cx.listener(|this, _, w, cx| this.fetch_environment(w, cx))),
+            ),
+            Environment::Loading => div().child("Reading environment..."),
+            Environment::Failed(e) => div().text_color(rgb(t.base.hot)).child(e.clone()),
+            Environment::Loaded(values) if details.environment_open => {
+                div().child(selectable("environment-text", &values.join("\n")))
+            }
+            Environment::Loaded(_) => div().child("Environment hidden"),
+        };
+        panel = panel.child(
+            div()
+                .id("environment-scroll")
+                .min_h_0()
+                .overflow_y_scroll()
+                .p(px(18.))
+                .child(crate::rack::label("ENVIRONMENT", &t))
+                .when(
+                    !matches!(details.environment, Environment::Unrequested),
+                    |d| {
+                        d.child(
+                            Button::new("toggle-environment")
+                                .label(if details.environment_open {
+                                    "Hide · E"
+                                } else {
+                                    "Load · E"
+                                })
+                                .small()
+                                .on_click(
+                                    cx.listener(|this, _, w, cx| this.fetch_environment(w, cx)),
+                                ),
+                        )
+                    },
+                )
+                .child(environment),
+        );
+        Some(
+            panel.child(div().flex_1()).child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .p(px(18.))
+                    .child(
+                        Button::new("close-details")
+                            .label("Close · Esc")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.details = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("kill")
+                            .label("Kill · X")
+                            .danger()
+                            .disabled(self.selected_process().is_none())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(d) = this.details.as_mut() {
+                                    d.request_kill(key);
+                                }
+                                cx.notify();
+                            })),
                     ),
             ),
-            Environment::Loading => div()
-                .text_color(rgb(theme::SUBTEXT))
-                .child("Reading environment variables…"),
-            Environment::Failed(error) => div()
-                .text_color(rgb(theme::RED))
-                .child(format!("Environment read failed: {error}")),
-            Environment::Loaded(values) => div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .child(format!("Environment variables ({})", values.len()))
-                        .child(
-                            Button::new("copy-environment")
-                                .label("Copy")
-                                .small()
-                                .on_click({
-                                    let text = values.join("\n");
-                                    move |_, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            text.clone(),
-                                        ))
-                                    }
-                                }),
-                        ),
-                )
-                .when(values.is_empty(), |this| {
-                    this.child("No variables are available. The process may deny access.")
-                })
-                .children(values.iter().map(|value| {
-                    div()
-                        .text_size(px(12.))
-                        .font_family("Menlo")
-                        .child(value.clone())
-                })),
-        };
-        content = content.child(environment.flex_shrink_0());
-        Some(
-            div()
-                .flex()
-                .flex_col()
-                .flex_shrink_0()
-                .h(px(275.))
-                .gap_3()
-                .p_3()
-                .bg(rgb(theme::MANTLE))
-                .border_t_1()
-                .border_color(rgb(theme::SURFACE))
-                .child(heading)
-                .when(details.kill == KillState::Confirming, |this| {
-                    this.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(div().text_color(rgb(theme::RED)).child(format!(
-                                "Kill PID {}? Unsaved work can be lost.",
-                                details.key.pid
-                            )))
-                            .child(
-                                Button::new("confirm-kill")
-                                    .label(format!("Kill PID {}", rendered_for.pid))
-                                    .danger()
-                                    .small()
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.kill(rendered_for, window, cx)
-                                    })),
-                            )
-                            .child(Button::new("cancel-kill").label("Cancel").small().on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    if let Some(details) = this.details.as_mut() {
-                                        details.cancel_kill(rendered_for);
-                                    }
-                                    cx.notify();
-                                }),
-                            )),
-                    )
-                })
-                .child(content),
         )
     }
 }
-
+fn selectable(id: &'static str, text: &str) -> gpui_component::text::TextView {
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    gpui_component::text::TextView::html(id, format!("<pre>{escaped}</pre>"))
+        .selectable(true)
+        .scrollable(false)
+}
 fn detail_line(label: &str, value: String) -> Div {
     div()
         .flex()
         .flex_shrink_0()
-        .gap_3()
+        .gap_2()
+        .py(px(3.))
         .child(
             div()
-                .w(px(80.))
-                .flex_shrink_0()
-                .text_color(rgb(theme::SUBTEXT))
-                .child(label.to_string()),
+                .w(px(96.))
+                .font_family("Archivo Labels")
+                .text_size(px(10.))
+                .child(label.to_uppercase()),
         )
-        .child(div().flex_1().child(value))
+        .child(div().flex_1().min_w_0().child(value))
 }
 
 #[cfg(test)]
@@ -421,6 +449,7 @@ mod tests {
         Details {
             key,
             environment: Environment::Unrequested,
+            environment_open: false,
             kill: KillState::Ready,
         }
     }

@@ -90,6 +90,8 @@ pub struct SystemStats {
     pub memory_free: u64,
     /// Cached memory in bytes
     pub memory_cached: u64,
+    /// Swap in use in bytes, from the same memory refresh.
+    pub swap_used: u64,
     /// System uptime in seconds
     pub uptime: u64,
     /// Load averages for 1, 5, and 15 minutes

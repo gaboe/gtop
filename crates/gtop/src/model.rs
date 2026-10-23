@@ -2,7 +2,7 @@ use gtop_core::ProcessInfo;
 use regex::{Regex, RegexBuilder};
 use std::cmp::Ordering;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProcessKey {
     pub pid: u32,
     pub start_time: u64,
@@ -78,6 +78,10 @@ impl Search {
                     process.name.to_lowercase().contains(text)
                         || process.command.to_lowercase().contains(text)
                         || process.pid.to_string().contains(text)
+                        || process
+                            .ports
+                            .iter()
+                            .any(|port| port.to_string().contains(text))
                         || pattern
                             .as_ref()
                             .is_some_and(|pattern| pattern.is_match(&process.name))
@@ -88,85 +92,76 @@ impl Search {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessColumn {
+    Lamp,
     Name,
     Pid,
-    Status,
     User,
     Cpu,
-    Gpu,
     Memory,
-    VirtualMemory,
-    Disk,
-    Runtime,
+    Gpu,
+    Ports,
+    Command,
 }
-
 impl ProcessColumn {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
+        Self::Lamp,
         Self::Name,
         Self::Pid,
-        Self::Status,
         Self::User,
         Self::Cpu,
-        Self::Gpu,
         Self::Memory,
-        Self::VirtualMemory,
-        Self::Disk,
-        Self::Runtime,
+        Self::Gpu,
+        Self::Ports,
+        Self::Command,
     ];
-
     pub fn label(self) -> &'static str {
         match self {
-            Self::Name => "Process name",
+            Self::Lamp => "",
+            Self::Name => "Process",
             Self::Pid => "PID",
-            Self::Status => "Status",
             Self::User => "User",
-            Self::Cpu => "CPU %",
+            Self::Cpu => "CPU % · bar = share of Mac",
+            Self::Memory => "Memory",
             Self::Gpu => "GPU %",
-            Self::Memory => "RAM",
-            Self::VirtualMemory => "VIRT",
-            Self::Disk => "Disk R / W",
-            Self::Runtime => "Run time",
+            Self::Ports => "Ports",
+            Self::Command => "Command",
         }
     }
-
     pub fn compare(self, a: &ProcessInfo, b: &ProcessInfo) -> Ordering {
         match self {
             Self::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             Self::Pid => a.pid.cmp(&b.pid),
-            Self::Status => a.status.cmp(&b.status),
             Self::User => a.user.cmp(&b.user),
-            Self::Cpu => a.cpu_usage.total_cmp(&b.cpu_usage),
+            Self::Cpu | Self::Lamp => a.cpu_usage.total_cmp(&b.cpu_usage),
+            Self::Memory => a.memory_usage.cmp(&b.memory_usage),
             Self::Gpu => a
                 .gpu_usage
                 .partial_cmp(&b.gpu_usage)
                 .unwrap_or(Ordering::Equal),
-            Self::Memory => a.memory_usage.cmp(&b.memory_usage),
-            Self::VirtualMemory => a.virtual_memory.cmp(&b.virtual_memory),
-            Self::Disk => (a.disk_usage.0.saturating_add(a.disk_usage.1))
-                .cmp(&b.disk_usage.0.saturating_add(b.disk_usage.1)),
-            Self::Runtime => a.run_time.cmp(&b.run_time),
+            Self::Ports => a.ports.cmp(&b.ports),
+            Self::Command => a.command.cmp(&b.command),
         }
     }
-
-    pub fn text(self, process: &ProcessInfo) -> String {
+    pub fn text(self, p: &ProcessInfo) -> String {
         match self {
-            Self::Name => process.name.clone(),
-            Self::Pid => process.pid.to_string(),
-            Self::Status => process.status.clone(),
-            Self::User => process.user.clone(),
-            Self::Cpu => format!("{:.1}%", process.cpu_usage),
-            Self::Gpu => process
+            Self::Lamp => String::new(),
+            Self::Name => p.name.clone(),
+            Self::Pid => p.pid.to_string(),
+            Self::User => p.user.clone(),
+            Self::Cpu => format!("{:.1}", p.cpu_usage),
+            Self::Memory => bytes(p.memory_usage),
+            Self::Gpu => p
                 .gpu_usage
-                .map(|value| format!("{value:.1}%"))
-                .unwrap_or_else(|| "Unavailable".into()),
-            Self::Memory => bytes(process.memory_usage),
-            Self::VirtualMemory => bytes(process.virtual_memory),
-            Self::Disk => format!(
-                "{} / {}",
-                bytes(process.disk_usage.0),
-                bytes(process.disk_usage.1)
-            ),
-            Self::Runtime => duration(process.run_time),
+                .filter(|v| *v >= 0.05)
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "·".into()),
+            Self::Ports => p
+                .ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+            Self::Command => p.command.clone(),
         }
     }
 }

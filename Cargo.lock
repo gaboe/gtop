@@ -3164,6 +3164,7 @@ dependencies = [
 name = "gtop"
 version = "1.2.0"
 dependencies = [
+ "chrono",
  "futures",
  "gpui-component",
  "gpui-kit-assets",
@@ -3171,6 +3172,8 @@ dependencies = [
  "gpui-pre-platform",
  "gtop-core",
  "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

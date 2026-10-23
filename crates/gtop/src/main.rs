@@ -1,17 +1,19 @@
 mod details;
+mod history;
 mod model;
+mod palette;
 mod process_table;
-mod stats;
+mod rack;
+#[cfg(test)]
+mod test_data;
 mod theme;
 
 use details::Details;
 use futures::{channel::mpsc, FutureExt, StreamExt};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState},
-    table::{DataTable, TableEvent, TableState},
-    Root, Sizable,
+    input::{InputEvent, InputState},
+    Root,
 };
 use gtop_core::{AppState, Snapshot};
 use model::{ProcessKey, Search};
@@ -21,44 +23,72 @@ use std::{rc::Rc, sync::Arc, time::Duration};
 struct Monitor {
     core: Option<Arc<AppState>>,
     snapshot: Option<Rc<Snapshot>>,
-    table: Entity<TableState<Processes>>,
+    table: Entity<Processes>,
     search: Entity<InputState>,
     details: Option<Details>,
     paused: bool,
+    history: [history::HistoryView; 3],
+    view: Option<usize>,
+    metric: history::Metric,
+    settings: palette::Settings,
+    settings_open: bool,
+    tick_ms: f64,
+    sample_seconds: f64,
+    last_snapshot: Option<f64>,
+    focus: FocusHandle,
+    draft: Option<palette::Base>,
+    colors: [Entity<InputState>; 6],
+    mix_name: Entity<InputState>,
+    traces: std::collections::HashMap<ProcessKey, std::collections::VecDeque<(f64, f32)>>,
     interval: u64,
     status: String,
-    wake: mpsc::UnboundedSender<()>,
+    wake: mpsc::Sender<()>,
     _subscriptions: Vec<Subscription>,
     _refresh: Task<()>,
+    _ports: Task<()>,
 }
 
 impl Monitor {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search name, command, PID, :port or port:N")
+        let settings = palette::Settings::load();
+        theme::apply(settings.base(), cx);
+        let base = settings.base();
+        let colors = [
+            base.ground,
+            base.plate,
+            base.silk,
+            base.led,
+            base.hot,
+            base.ok,
+        ]
+        .map(|v| cx.new(|cx| InputState::new(window, cx).default_value(format!("#{v:06x}"))));
+        let mix_name = cx.new(|cx| InputState::new(window, cx).placeholder("Name this mix"));
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        let search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("name, pid, command or port"));
+        let table = cx.new(|_| {
+            let mut p = Processes::default();
+            p.root_focus = Some(focus.clone());
+            p.base = settings.base();
+            p
         });
-        let table = cx.new(|cx| {
-            TableState::new(Processes::default(), window, cx)
-                .col_movable(false)
-                .col_selectable(false)
-                .loop_selection(false)
-        });
-        let (wake, mut events) = mpsc::unbounded();
-        let subscriptions = vec![
+        let (wake, mut events) = mpsc::channel(1);
+        let mut subscriptions = vec![
             cx.subscribe_in(&search, window, |this, input, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     let query = input.read(cx).value();
                     let mut changed_ports = false;
                     this.table.update(cx, |table, cx| {
-                        let rows = table.delegate_mut();
+                        let rows = &mut *table;
                         let previous = rows.search.needs_ports();
                         rows.search = Search::new(&query);
                         changed_ports = previous != rows.search.needs_ports();
                         rows.reorder();
                         if let Some(row) = rows.selected.and_then(|key| rows.row_for(key)) {
-                            table.set_selected_row(row, cx);
+                            table.selected = table.process(row).map(ProcessKey::from);
                         } else {
-                            table.clear_selection(cx);
+                            table.selected = None;
                         }
                         cx.notify();
                     });
@@ -68,17 +98,11 @@ impl Monitor {
                     cx.notify();
                 }
             }),
-            cx.subscribe_in(&table, window, |this, table, event, _, cx| {
-                if let TableEvent::SelectRow(row) | TableEvent::DoubleClickedRow(row) = event {
-                    let key = table
-                        .read(cx)
-                        .delegate()
-                        .process(*row)
-                        .map(ProcessKey::from);
-                    if let Some(key) = key {
-                        this.select(key, cx);
-                    }
-                }
+            cx.subscribe_in(&table, window, |this, _, event, window, cx| {
+                window.focus(&this.focus, cx);
+                let process_table::SelectProcess(key) = event;
+                this.settings_open = false;
+                this.select(*key, cx);
             }),
             cx.observe_window_visibility(window, |this, visibility, _, _| {
                 if gtop_core::perf_enabled() {
@@ -87,23 +111,114 @@ impl Monitor {
                 this.wake();
             }),
         ];
+        for (index, input) in colors.iter().enumerate() {
+            subscriptions.push(
+                cx.subscribe_in(input, window, move |this, input, event, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let text = input.read(cx).value();
+                        if let Some(v) = text
+                            .strip_prefix('#')
+                            .filter(|s| s.len() == 6)
+                            .and_then(|s| u32::from_str_radix(s, 16).ok())
+                        {
+                            let mut b = this.draft.unwrap_or(this.settings.base());
+                            if [b.ground, b.plate, b.silk, b.led, b.hot, b.ok][index] == v {
+                                return;
+                            }
+                            match index {
+                                0 => b.ground = v,
+                                1 => b.plate = v,
+                                2 => b.silk = v,
+                                3 => b.led = v,
+                                4 => b.hot = v,
+                                _ => b.ok = v,
+                            };
+                            this.draft = Some(b);
+                            this.apply_palette(cx);
+                        }
+                    }
+                }),
+            );
+        }
+        let cached_ports = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            u32,
+            Vec<u16>,
+        >::new()));
+        let port_cache = cached_ports.clone();
+        let ports_task = cx.spawn_in(window, async move |entity, cx| loop {
+            let Ok(running) =
+                entity.update_in(cx, |this, window, _| !this.paused && window.is_visible())
+            else {
+                break;
+            };
+            if running {
+                let cache = port_cache.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let ports = gtop_core::monitoring::collect_ports_by_pid();
+                        if let Ok(mut cached) = cache.lock() {
+                            *cached = ports;
+                        }
+                    })
+                    .await;
+            }
+            cx.background_executor()
+                .timer(Duration::from_secs(10))
+                .await;
+        });
         let refresh = cx.spawn_in(window, async move |entity, cx| {
             let core = cx.background_executor().spawn(async { Arc::new(AppState::new()) }).await;
             if entity.update_in(cx, |this, _, _| this.core = Some(core.clone())).is_err() { return; }
+            let mut history = cx.background_executor().spawn(async { history::History::load(&history::support_path("history.json"), rack::now() as u64) }).await;
+            let mut cached_minute = None;
             loop {
+                while events.try_recv().is_ok() {}
                 let Ok((running, ports, seconds)) = entity.update_in(cx, |this, window, cx| {
-                    (!this.paused && window.is_visible(), this.table.read(cx).delegate().search.needs_ports(), this.interval)
+                    (!this.paused && window.is_visible(), this.table.read(cx).search.needs_ports(), this.interval)
                 }) else { break; };
                 if !running {
                     if events.next().await.is_none() { break; }
                     continue;
                 }
                 let state = core.clone();
-                let result = cx.background_executor().spawn(async move { state.snapshot(false, ports) }).await;
+                let port_cache=cached_ports.clone();
+                let result = cx.background_executor().spawn(async move {
+                    let start = std::time::Instant::now();
+                    let mut snapshot = state.snapshot(false, ports);
+                    if let Ok(ref mut snapshot)=snapshot {
+                        if !ports { if let Ok(cached)=port_cache.lock(){for p in &mut snapshot.processes {if let Some(ports)=cached.get(&p.pid){p.ports=ports.clone();}}} }
+                    }
+                    let tick_ms = start.elapsed().as_secs_f64() * 1000.;
+                    let mut views = None;
+                    let mut history_save = None;
+                    if let Ok(ref snapshot) = snapshot {
+                        let now = rack::now();
+
+                        history.record(snapshot, now, seconds as f64);
+                        let minute = now as u64 / 60;
+                        if cached_minute != Some(minute) {
+                            cached_minute = Some(minute);
+                            views = Some([1,8,24].map(|hours| history.view(hours, now as u64)));
+                            history_save=Some(history.save(&history::support_path("history.json")).map_err(|e|e.to_string()));
+                        }
+                    }
+                    (snapshot, tick_ms, views, history, cached_minute, history_save)
+                }).await;
+                let (result, tick_ms, views, returned_history, returned_minute, history_save) = result;
+                cached_minute=returned_minute;
+                history = returned_history;
                 if entity.update_in(cx, |this, window, cx| {
+                    if let Some(save)=history_save {
+                        if let Err(error)=save {this.status=format!("History could not be saved: {error}");}
+                        else if this.status.starts_with("History could not be saved") {this.status="Select a process for details".into();}
+                    }
                     match result {
                         Ok(snapshot) => {
-                            if !this.paused && window.is_visible() { this.accept(snapshot, window, cx); }
+                            if !this.paused && window.is_visible() {
+                                this.tick_ms = tick_ms;
+                                if let Some(views) = views { this.history = views; }
+                                this.accept(snapshot, window, cx);
+                            }
                         }
                         Err(error) => { this.status = format!("Refresh failed: {error}"); cx.notify(); }
                     }
@@ -121,30 +236,64 @@ impl Monitor {
             search,
             details: None,
             paused: false,
+            history: std::array::from_fn(|_| history::HistoryView::default()),
+            view: None,
+            metric: history::Metric::Cpu,
+            settings,
+            settings_open: false,
+            tick_ms: 0.,
+            sample_seconds: 3.,
+            last_snapshot: None,
+            focus,
+            draft: None,
+            colors,
+            mix_name,
+            traces: std::collections::HashMap::new(),
             interval: 3,
             status: "Reading system information…".into(),
             wake,
             _subscriptions: subscriptions,
             _refresh: refresh,
+            _ports: ports_task,
         }
     }
 
-    fn wake(&self) {
-        let _ = self.wake.unbounded_send(());
+    fn wake(&mut self) {
+        let _ = self.wake.try_send(());
     }
 
     fn accept(&mut self, snapshot: Snapshot, window: &Window, cx: &mut Context<Self>) {
-        let snapshot = Rc::new(snapshot);
-        let key = self.details.as_ref().map(|details| details.key);
-        self.table.update(cx, |table, cx| {
-            table.delegate_mut().snapshot = Some(snapshot.clone());
-            table.delegate_mut().reorder();
-            if let Some(row) = key.and_then(|key| table.delegate().row_for(key)) {
-                table.set_selected_row(row, cx);
-            } else {
-                table.clear_selection(cx);
+        let now = rack::now();
+        self.sample_seconds = self
+            .last_snapshot
+            .replace(now)
+            .map(|t| (now - t).max(0.001))
+            .unwrap_or(self.interval as f64);
+        let keys: std::collections::HashSet<_> =
+            snapshot.processes.iter().map(ProcessKey::from).collect();
+        self.traces.retain(|k, _| keys.contains(k));
+        for p in &snapshot.processes {
+            let trace = self.traces.entry(ProcessKey::from(p)).or_default();
+            trace.push_back((now, p.cpu_usage));
+            while trace.front().is_some_and(|(t, _)| *t < now - 90.) || trace.len() > 90 {
+                trace.pop_front();
             }
-            table.refresh(cx);
+        }
+        let snapshot = Rc::new(snapshot);
+        let key = self
+            .details
+            .as_ref()
+            .map(|details| details.key)
+            .or(self.table.read(cx).selected);
+        self.table.update(cx, |table, cx| {
+            table.snapshot = Some(snapshot.clone());
+            table.reorder();
+            if let Some(row) = key.and_then(|key| table.row_for(key)) {
+                table.selected = table.process(row).map(ProcessKey::from);
+            } else {
+                table.selected = None;
+            }
+
             cx.notify();
         });
         self.snapshot = Some(snapshot);
@@ -155,109 +304,17 @@ impl Monitor {
             eprintln!(
                 "perf ui tick visible=true active={} rows={} total={}",
                 window.is_window_active(),
-                self.table.read(cx).delegate().order.len(),
+                self.table.read(cx).order.len(),
                 self.snapshot.as_ref().unwrap().processes.len()
             );
         }
         cx.notify();
     }
-
-    fn toolbar(&self, cx: &mut Context<Self>) -> Div {
-        div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .px_3()
-            .py_2()
-            .bg(rgb(theme::MANTLE))
-            .child(
-                div()
-                    .flex_1()
-                    .max_w(px(520.))
-                    .child(Input::new(&self.search).cleanable(true)),
-            )
-            .child(div().flex_1())
-            .child(div().text_color(rgb(theme::SUBTEXT)).child("Refresh"))
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .children([1, 2, 3, 5, 10].map(|seconds| {
-                        Button::new(("interval", seconds as usize))
-                            .label(format!("{seconds}s"))
-                            .small()
-                            .when(self.interval == seconds, |button| button.primary())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.interval = seconds;
-                                this.wake();
-                                cx.notify();
-                            }))
-                    })),
-            )
-            .child(
-                Button::new("pause")
-                    .label(if self.paused { "Resume" } else { "Pause" })
-                    .small()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.paused = !this.paused;
-                        this.wake();
-                        cx.notify();
-                    })),
-            )
-    }
 }
 
 impl Render for Monitor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let count = self.table.read(cx).delegate().order.len();
-        let total = self
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.processes.len())
-            .unwrap_or(0);
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(theme::BASE))
-            .text_color(rgb(theme::TEXT))
-            .text_size(px(13.))
-            .when_some(self.snapshot.as_ref(), |this, snapshot| {
-                this.child(stats::render(&snapshot.stats))
-            })
-            .child(self.toolbar(cx))
-            .child(
-                div().flex_1().min_h_0().child(
-                    DataTable::new(&self.table)
-                        .stripe(true)
-                        .bordered(false)
-                        .scroll_bounce(false),
-                ),
-            )
-            .when_some(self.details(cx), |this, details| this.child(details))
-            .child(
-                div()
-                    .id("status")
-                    .role(Role::Status)
-                    .aria_label(format!(
-                        "{count} of {total} processes. {}. {}",
-                        if self.paused { "Paused" } else { "Live" },
-                        self.status
-                    ))
-                    .flex()
-                    .justify_between()
-                    .gap_4()
-                    .px_3()
-                    .py_2()
-                    .bg(rgb(theme::MANTLE))
-                    .text_size(px(12.))
-                    .text_color(rgb(theme::SUBTEXT))
-                    .child(format!(
-                        "{count} / {total} processes   ·   {}",
-                        if self.paused { "Paused" } else { "Live" }
-                    ))
-                    .child(self.status.clone()),
-            )
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.rack(window, cx)
     }
 }
 
@@ -269,6 +326,17 @@ fn main() {
         .run(|cx| {
             gpui_component::init(cx);
             theme::init(cx);
+            for bytes in [
+                include_bytes!("../assets/fonts/DotoDisplay.ttf").as_slice(),
+                include_bytes!("../assets/fonts/ArchivoDisplay.ttf").as_slice(),
+                include_bytes!("../assets/fonts/JetBrainsMono.ttf").as_slice(),
+                include_bytes!("../assets/fonts/ArchivoLabels.ttf").as_slice(),
+                include_bytes!("../assets/fonts/Silkscreen.ttf").as_slice(),
+            ] {
+                cx.text_system()
+                    .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
+                    .expect("bundled font");
+            }
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
             cx.on_window_closed(|cx, _| {
@@ -297,4 +365,25 @@ fn main() {
             .expect("open gtop window");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod wake_tests {
+    #[test]
+    fn repeated_controls_coalesce_and_can_be_drained() {
+        let (mut send, mut receive) = futures::channel::mpsc::channel(1);
+        let mut sent = 0;
+        for _ in 0..100 {
+            if send.try_send(()).is_ok() {
+                sent += 1;
+            }
+        }
+        assert!(sent <= 2);
+        let mut drained = 0;
+        while receive.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(sent, drained);
+        assert!(send.try_send(()).is_ok());
+    }
 }
