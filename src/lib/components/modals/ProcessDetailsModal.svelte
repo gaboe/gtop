@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Modal } from "$lib/components";
   import { formatBytes } from "$lib/utils";
+  import { invoke } from "@tauri-apps/api/core";
   import type { Process } from "$lib/types";
   import Fa from "svelte-fa";
   import {
@@ -16,6 +17,20 @@
   export let onClose: () => void;
   export let processes: Process[] = [];
   export let onShowDetails: (process: Process) => void;
+
+  let environ: string[] = [];
+  let environPid: number | null = null;
+
+  async function loadEnviron(pid: number) {
+    environPid = pid;
+    environ = [];
+    const result = await invoke<string[]>("get_process_environ", { pid });
+    if (environPid === pid) environ = result;
+  }
+
+  $: if (!show) environPid = null;
+  $: if (show && process && process.pid !== environPid)
+    loadEnviron(process.pid);
 
   $: childProcesses = process
     ? processes.filter((p) => p.ppid === process.pid)
@@ -196,7 +211,7 @@
           {/if}
 
           <!-- Environment Variables -->
-          {#if process.environ.length > 0}
+          {#if environ.length > 0}
             <div class="card">
               <div class="card-header">
                 <Fa icon={faList} />
@@ -204,7 +219,7 @@
               </div>
               <div class="card-content">
                 <div class="env-list">
-                  {#each process.environ as env}
+                  {#each environ as env}
                     <div class="env-item">{env}</div>
                   {/each}
                 </div>
@@ -448,8 +463,9 @@
   }
 
   .env-item {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-      "Liberation Mono", "Courier New", monospace;
+    font-family:
+      ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+      "Courier New", monospace;
     padding: 4px 8px;
     border-radius: 4px;
     color: var(--subtext1);

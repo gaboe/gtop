@@ -7,7 +7,7 @@ use super::SystemStats;
 use std::fmt::Debug;
 use std::path::Path;
 use std::time::Instant;
-use sysinfo::{Disk, Disks, Networks, System};
+use sysinfo::{Disk, DiskRefreshKind, Disks, Networks, System};
 
 /// Monitors system-wide statistics
 #[derive(Debug)]
@@ -70,18 +70,28 @@ impl SystemMonitor {
         }
     }
 
-    /// Filters disks based on platform-specific criteria
+    /// Refreshes storage of the shown disks only. Listing all volumes again
+    /// costs tens of milliseconds on macOS.
+    pub fn refresh_disks(disks: &mut Disks) {
+        for disk in disks
+            .list_mut()
+            .iter_mut()
+            .filter(|disk| Self::is_shown(disk))
+        {
+            disk.refresh_specifics(DiskRefreshKind::nothing().with_storage());
+        }
+    }
+
+    /// Whether a disk counts toward the storage panel
     #[cfg(not(target_os = "windows"))]
-    fn filter_disks(disks: &[Disk]) -> impl Iterator<Item = &Disk> {
-        disks
-            .iter()
-            .filter(|disk| disk.mount_point() == Path::new("/"))
+    fn is_shown(disk: &Disk) -> bool {
+        disk.mount_point() == Path::new("/")
     }
 
     /// Windows-specific disk filtering
     #[cfg(target_os = "windows")]
-    fn filter_disks(disks: &[Disk]) -> impl Iterator<Item = &Disk> {
-        disks.iter()
+    fn is_shown(_disk: &Disk) -> bool {
+        true
     }
 
     /// Calculates network usage rates
@@ -106,13 +116,16 @@ impl SystemMonitor {
 
     /// Calculates disk usage statistics and returns `(total, used, free)`.
     fn calculate_disk_stats(&self, disks: &Disks) -> (u64, u64, u64) {
-        Self::filter_disks(disks).fold((0, 0, 0), |(total, used, free), disk| {
-            (
-                total + disk.total_space(),
-                used + (disk.total_space() - disk.available_space()),
-                free + disk.available_space(),
-            )
-        })
+        disks.iter().filter(|disk| Self::is_shown(disk)).fold(
+            (0, 0, 0),
+            |(total, used, free), disk| {
+                (
+                    total + disk.total_space(),
+                    used + (disk.total_space() - disk.available_space()),
+                    free + disk.available_space(),
+                )
+            },
+        )
     }
 }
 

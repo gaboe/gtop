@@ -31,7 +31,10 @@
     sortConfig,
   } = $processStore);
 
-  let intervalId: NodeJS.Timeout;
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  let polling = false;
+  let destroyed = false;
+  let pollSettings = "";
   let lastProcessCount = 0;
   let cachedFilteredProcesses: Process[] = [];
   let cachedSortedProcesses: Process[] = [];
@@ -98,15 +101,27 @@
     }
   }
 
-  $: {
-    if (intervalId) clearInterval(intervalId);
-    if (!isFrozen) {
-      // Use adaptive refresh rate - slightly slower for 1s to reduce CPU usage
-      const adaptiveRefreshRate = refreshRate === 1000 ? 1500 : refreshRate;
-      intervalId = setInterval(() => {
-        processStore.getProcesses();
-      }, adaptiveRefreshRate);
-    }
+  // The next refresh is scheduled only after the previous one finished, so
+  // slow refreshes never queue up behind each other.
+  function schedulePoll() {
+    clearTimeout(pollTimer);
+    if (isFrozen || polling || destroyed) return;
+    // Use adaptive refresh rate - slightly slower for 1s to reduce CPU usage
+    const adaptiveRefreshRate = refreshRate === 1000 ? 1500 : refreshRate;
+    pollTimer = setTimeout(async () => {
+      polling = true;
+      try {
+        await processStore.getProcesses();
+      } finally {
+        polling = false;
+        schedulePoll();
+      }
+    }, adaptiveRefreshRate);
+  }
+
+  $: if (`${refreshRate}:${isFrozen}` !== pollSettings) {
+    pollSettings = `${refreshRate}:${isFrozen}`;
+    schedulePoll();
   }
 
   onMount(async () => {
@@ -123,7 +138,8 @@
   });
 
   onDestroy(() => {
-    if (intervalId) clearInterval(intervalId);
+    destroyed = true;
+    clearTimeout(pollTimer);
   });
 </script>
 
@@ -216,7 +232,8 @@
   :global(body) {
     margin: 0;
     padding: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+    font-family:
+      -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
       sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
     background-color: var(--base);
     color: var(--text);

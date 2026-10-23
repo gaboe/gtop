@@ -37,6 +37,7 @@ fn main() {
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_processes,
+            commands::get_process_environ,
             commands::kill_process,
         ])
         .run(tauri::generate_context!())

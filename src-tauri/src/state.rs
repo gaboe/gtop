@@ -5,7 +5,7 @@
 
 use crate::monitoring::{ProcessMonitor, SystemMonitor};
 use std::sync::Mutex;
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{DiskRefreshKind, Disks, Networks, System};
 
 /// Global application state
 ///
@@ -18,8 +18,6 @@ pub struct AppState {
     pub networks: Mutex<Networks>,
     /// Networks information handler
     pub disks: Mutex<Disks>,
-    /// Process monitoring component
-    pub process_monitor: Mutex<ProcessMonitor>,
     /// System statistics monitoring component
     pub system_monitor: Mutex<SystemMonitor>,
 }
@@ -33,12 +31,15 @@ impl AppState {
     ///
     /// A new `AppState` instance with initialized monitors
     pub fn new() -> Self {
-        let sys = System::new_all();
-        let disks = Disks::new_with_refreshed_list();
+        let mut sys = System::new();
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
+        ProcessMonitor::refresh(&mut sys, false);
+        let disks =
+            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
         let networks = Networks::new_with_refreshed_list();
 
         Self {
-            process_monitor: Mutex::new(ProcessMonitor::new()),
             system_monitor: Mutex::new(SystemMonitor::new(&networks)),
             sys: Mutex::new(sys),
             disks: Mutex::new(disks),
