@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gtop · Rack tower</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=JetBrains+Mono:wght@400;600&family=Silkscreen&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="rack-base.css">
+<style>
+#app { display: grid; grid-template-columns: 292px 1fr; gap: var(--gap); height: 100vh; padding: var(--edge); }
+#app.with-side { grid-template-columns: 292px 1fr 380px; }
+.tower { display: flex; flex-direction: column; overflow: auto; }
+.mod { padding: 14px 16px 12px; border-bottom: 1px solid var(--rule); }
+.mod:last-child { border-bottom: 0; }
+.mod h2 { margin: 0 0 9px; display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.brand { font-family: Archivo; font-stretch: 62%; font-weight: 800; font-size: 56px; line-height: 46px; text-transform: uppercase; color: var(--silk); }
+.src-who { color: var(--silk); font-weight: 600; font-size: 14px; margin: 2px 0 8px; overflow-wrap: anywhere; }
+.src .seg { grid-template-columns: repeat(32, 1fr); height: 16px; }
+.cores { display: grid; gap: 3px; }
+.core { display: grid; grid-template-columns: 22px 1fr 30px; gap: 8px; align-items: center; }
+.core .seg { grid-template-columns: repeat(32, 1fr); height: 7px; gap: 1px; }
+.core .n { font: 7px Silkscreen; color: var(--silk-dim); }
+.core .v { font: 8px Silkscreen; color: var(--silk-dim); text-align: right; }
+.row3 { display: grid; grid-template-columns: 42px 1fr; gap: 6px 10px; align-items: center; }
+.row3 .seg { grid-template-columns: repeat(32, 1fr); height: 9px; gap: 1px; }
+.row3 .px { grid-column: 2; font-size: 8px; line-height: 8px; color: var(--silk-dim); margin-top: -2px; }
+.therms { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.therm { display: grid; justify-items: center; gap: 6px; }
+.therm .seg { grid-template-rows: repeat(16, 1fr); grid-auto-flow: row; height: 96px; width: 14px; display: flex; flex-direction: column-reverse; }
+.therm .seg i { flex: 1; }
+.right { display: grid; grid-template-rows: auto 1fr auto; gap: var(--gap); min-height: 0; min-width: 0; }
+.nav { display: flex; gap: 6px; min-width: 0; }
+.right .strip .synth { display: none; }
+.right .strip { gap: 12px; flex-wrap: nowrap; overflow: hidden; }
+.hist { display: grid; grid-template-rows: auto 1fr; gap: var(--gap); min-height: 0; }
+.tape { padding: 12px 16px 10px; } .tape h2 { margin: 0 0 8px; display: flex; justify-content: space-between; } .tape .tape-cols { height: 110px; }
+.meta { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; }
+.meta span:nth-child(even) { color: var(--silk); text-align: right; font-family: "JetBrains Mono"; letter-spacing: 0; text-transform: none; font-weight: 400; font-size: 11px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="data.js"></script>
+<script src="ui.js"></script>
+<script src="theme.js"></script>
+<script src="rack-kit.js"></script>
+<script>
+const app = document.getElementById("app");
+UI.start((m) => {
+  const { ui, fmt, rows, s, hist } = m;
+  const { segs, screws } = KIT;
+  const src = KIT.source(rows);
+  const memPct = s.memUsed / s.memTotal * 100;
+  const row3 = (l, pct, v) => `<span class="silk">${l}</span><div class="seg">${segs(32, pct)}</div><span class="px">${v}</span>`;
+  const therm = (l, v, max, warn) => `<div class="therm"><div class="seg">${segs(16, v / max * 100, warn / max)}</div><span class="px ${v > warn ? "hot-t" : ""}" style="font-size:12px">${v.toFixed(0)}°</span><span class="silk">${l}</span></div>`;
+  const tower = `<aside class="tower panel screws" aria-label="System">${screws}
+    <div class="mod"><div class="silk">Apple M3 Max · 30-core GPU</div><div class="brand">gtop</div><div style="margin-top:10px">${KIT.self(s, "stack")}</div></div>
+    <div class="mod src"><h2 class="silk"><span><span class="led ${src && src.share > 50 ? "hot" : src ? "on" : ""}"></span> Load source</span><span class="px ${src && src.share > 50 ? "hot-t" : "led-t"}">${src ? src.share.toFixed(0) + "%" : "–"}</span></h2>
+      <div class="src-who">${src ? src.label : "Nothing above " + KIT.LIMIT.culprit + " % CPU"}</div><div class="seg">${segs(32, src ? src.share : 0, 0.75)}</div></div>
+    <div class="mod"><h2 class="silk"><span>CPU · ${KIT.CORES} cores</span><span class="px">${s.cpuTotal.toFixed(0)}%</span></h2>
+      <div class="cores">${s.cores.map((c, i) => `<div class="core"><span class="n">${i < 10 ? "P" + (i + 1) : "E" + (i - 9)}</span><div class="seg">${segs(32, c, 0.84)}</div><span class="v">${c.toFixed(0)}</span></div>`).join("")}</div></div>
+    <div class="mod"><div class="row3">${row3("GPU", s.gpuUtil, s.gpuUtil.toFixed(0) + "% · " + s.gpuMem.toFixed(1) + " GB")}${row3("Mem", memPct, s.memUsed.toFixed(1) + " / " + s.memTotal + " GB")}${row3("Swap", s.swap / 8 * 100, s.swap.toFixed(1) + " GB")}${row3("Disk", s.disk.used / s.disk.total * 100, (s.disk.total - s.disk.used).toFixed(0) + " GB free")}</div></div>
+    <div class="mod"><h2 class="silk"><span>Temperature</span><span>°C</span></h2><div class="therms">${therm("CPU", s.temps.CPU, 110, 90)}${therm("GPU", s.temps.GPU, 110, 90)}${therm("SSD", s.temps.SSD, 90, 70)}${therm("Bat", s.temps.Battery, 60, 45)}</div></div>
+    <div class="mod"><div class="meta silk"><span>Uptime</span><span>${fmt.up(s.uptime)}</span><span>Load</span><span>${s.load.map((l) => l.toFixed(1)).join(" ")}</span><span>Net</span><span>↓ ${s.net.rx.toFixed(1)} ↑ ${s.net.tx.toFixed(1)} MB/s</span></div></div>
+  </aside>`;
+  let main;
+  if (ui.view === "live") main = KIT.liveTable(m, { noCmd: !!(ui.detailPid || ui.settingsOpen), noUser: !!(ui.detailPid || ui.settingsOpen) });
+  else {
+    const c = KIT.columns(hist, fmt, ui);
+    main = `<div class="hist"><section class="tape panel"><h2 class="silk"><span>Total CPU · last ${ui.hours} h</span><span>${c.note}</span></h2><div class="tape-cols">${c.cols}</div><div class="axis">${c.ticks}</div></section>${KIT.histTable(m)}</div>`;
+  }
+  const side = KIT.side(m);
+  app.classList.toggle("with-side", !!side);
+  keepSearch(tower + `<div class="right"><nav class="nav">${KIT.bank(ui)}</nav>${main}${KIT.strip(m)}</div>` + side, app);
+}, THEME.hooks);
+</script>
+</body>
+</html>

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gtop · Bitmap specimen</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Silkscreen:wght@400;700&family=Geist+Mono:wght@400;600&family=Archivo:wdth,wght@100,500..800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --paper: #f4f2ec;
+  --paper-2: #e9e6dc;
+  --ink: #0a0a0a;
+  --ink-2: #3d3c38;
+  --ink-3: #6e6c66;
+  --hot: #ff2e63;
+  --rule: #0a0a0a;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--paper); color: var(--ink); }
+body { font: 12px/1.35 "Geist Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+::selection { background: var(--hot); color: var(--paper); }
+::-webkit-scrollbar { width: 12px; } ::-webkit-scrollbar-track { background: var(--paper); border-left: 2px solid var(--ink); } ::-webkit-scrollbar-thumb { background: var(--ink); }
+.cap { font-family: Archivo; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; font-size: 11px; }
+.bit { font-family: Silkscreen; font-weight: 700; line-height: 1; -webkit-font-smoothing: none; }
+#app { display: grid; grid-template-rows: auto auto auto 1fr auto; height: 100vh; }
+
+.mast { display: grid; grid-template-columns: 1fr auto; border-bottom: 2px solid var(--ink); }
+.culprit { padding: 14px 18px 10px; border-right: 2px solid var(--ink); min-width: 0; }
+.culprit .who { font-size: 64px; letter-spacing: -.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.culprit .who em { font-style: normal; color: var(--hot); }
+.culprit .why { margin-top: 8px; display: flex; gap: 22px; color: var(--ink-2); }
+.specimen { display: grid; grid-template-columns: repeat(3, auto); gap: 0; }
+.spec { padding: 12px 16px; border-left: 2px solid var(--ink); display: grid; align-content: space-between; min-width: 120px; }
+.spec:first-child { border-left: 0; }
+.spec .n { font-size: 32px; }
+.spec .n small { font-size: 16px; }
+.spec.hot .n { color: var(--hot); }
+
+.strip { display: grid; grid-template-columns: repeat(8, 1fr); border-bottom: 2px solid var(--ink); }
+.strip > div { padding: 6px 12px; border-right: 1px solid var(--ink); display: flex; justify-content: space-between; gap: 8px; }
+.strip > div:last-child { border-right: 0; }
+.strip .bit { font-size: 16px; }
+.dots { display: inline-flex; gap: 1px; }
+.dots i { width: 3px; height: 16px; background: var(--paper-2); } .dots i.on { background: var(--ink); } .dots i.hot { background: var(--hot); }
+
+.bar { display: flex; border-bottom: 2px solid var(--ink); }
+.b { font: inherit; background: var(--paper); border: 0; border-right: 2px solid var(--ink); padding: 8px 16px; cursor: pointer; color: var(--ink); }
+.b[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+.b:focus-visible, input:focus-visible { outline: 3px solid var(--hot); outline-offset: -3px; }
+.find { flex: 1; display: flex; align-items: center; gap: 10px; padding: 0 14px; }
+.find input { flex: 1; font: inherit; font-size: 13px; background: transparent; border: 0; color: var(--ink); caret-color: var(--hot); outline: none; }
+.find input::placeholder { color: var(--ink-3); }
+.pause { margin-left: auto; border-right: 0; border-left: 2px solid var(--ink); }
+.pause.off { background: var(--hot); color: var(--paper); }
+
+.table { overflow: auto; }
+table { width: 100%; border-collapse: collapse; }
+th { position: sticky; top: 0; background: var(--paper); border-bottom: 2px solid var(--ink); padding: 6px 10px; text-align: left; cursor: pointer; white-space: nowrap; }
+th.num { text-align: right; } th[aria-sort]::after { content: " ↓"; color: var(--hot); }
+td { padding: 2px 10px; height: 21px; border-bottom: 1px solid #cfcbbf; white-space: nowrap; }
+td.num { text-align: right; }
+td.cmd { color: var(--ink-3); max-width: 1px; width: 40%; overflow: hidden; text-overflow: ellipsis; }
+tr.hot td { color: var(--hot); font-weight: 600; }
+tr.sel td { background: var(--ink); color: var(--paper); }
+tr.sel.hot td { background: var(--hot); color: var(--paper); }
+.port { text-decoration: underline; text-underline-offset: 2px; }
+
+.hist-head { display: grid; grid-template-columns: auto 1fr; border-bottom: 2px solid var(--ink); }
+.hist-head .culprit { border-right: 2px solid var(--ink); }
+.chart { padding: 12px 16px 8px; display: grid; grid-template-rows: 1fr auto; }
+.cols { display: flex; align-items: flex-end; gap: 1px; height: 96px; }
+.cols b { flex: 1; background: var(--ink); }
+.cols b.hot { background: var(--hot); }
+.cols b.off { background: repeating-linear-gradient(90deg, var(--ink) 0 1px, transparent 1px 4px); height: 100% !important; opacity: .35; }
+.axis { display: flex; justify-content: space-between; margin-top: 4px; color: var(--ink-3); }
+
+footer { display: flex; gap: 16px; padding: 6px 14px; border-top: 2px solid var(--ink); align-items: center; }
+footer kbd { font: 700 9px Silkscreen; border: 1px solid var(--ink); padding: 1px 4px; margin-right: 4px; }
+footer.kill { background: var(--hot); color: var(--paper); }
+footer.kill button { font: inherit; border: 2px solid var(--paper); background: transparent; color: var(--paper); padding: 2px 12px; cursor: pointer; }
+footer.kill button.yes { background: var(--paper); color: var(--hot); font-weight: 600; }
+.synth { margin-left: auto; color: var(--ink-3); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="data.js"></script>
+<script src="ui.js"></script>
+<script>
+const app = document.getElementById("app");
+const dots = (n, pct, hot = 0.85) => { let o = ""; const on = Math.round(pct / 100 * n); for (let i = 0; i < n; i++) o += `<i class="${i < on ? (i >= n * hot ? "hot" : "on") : ""}"></i>`; return `<span class="dots">${o}</span>`; };
+UI.start(({ ui, fmt, rows, s, hist }) => {
+  const memPct = s.memUsed / s.memTotal * 100;
+  const tab = (l, act, on) => `<button class="b cap" data-act="${act}" aria-pressed="${on}">${l}</button>`;
+  const strip = `<section class="strip" aria-label="System">
+    <div><span class="cap">CPU</span><span class="bit">${s.cpuTotal.toFixed(0)}%</span></div>
+    <div><span class="cap">GPU</span><span class="bit">${s.gpuUtil.toFixed(0)}%</span></div>
+    <div><span class="cap">Mem</span><span class="bit">${s.memUsed.toFixed(1)}G</span></div>
+    <div><span class="cap">Swap</span><span class="bit">${s.swap.toFixed(1)}G</span></div>
+    <div><span class="cap">CPU °C</span><span class="bit" style="color:${s.temps.CPU > 85 ? "var(--hot)" : "inherit"}">${s.temps.CPU.toFixed(0)}</span></div>
+    <div><span class="cap">GPU °C</span><span class="bit">${s.temps.GPU.toFixed(0)}</span></div>
+    <div><span class="cap">SSD °C</span><span class="bit">${s.temps.SSD.toFixed(0)}</span></div>
+    <div><span class="cap">Up</span><span class="cap" style="font-weight:500">${fmt.up(s.uptime)}</span></div></section>`;
+  const bar = `<nav class="bar">${tab("Live", "view:live", ui.view === "live")}${tab("1 h", "hours:1", ui.view === "history" && ui.hours === 1)}${tab("8 h", "hours:8", ui.view === "history" && ui.hours === 8)}${tab("24 h", "hours:24", ui.view === "history" && ui.hours === 24)}
+    <label class="find"><span class="cap">Find</span><input data-search placeholder="name, pid, command or port" aria-label="Search processes"></label>
+    <button class="b cap pause ${ui.paused ? "off" : ""}" data-act="pause">${ui.paused ? "Paused" : "Live"}</button></nav>`;
+
+  let mast, body;
+  if (ui.view === "live") {
+    const top = rows[ui.selected] || rows[0];
+    mast = `<header class="mast"><div class="culprit"><div class="cap" style="color:var(--ink-3)">${ui.selected ? "Selected" : "Using the most " + ui.sort.toUpperCase()}</div>
+      <div class="who bit">${top ? `${top.name} <em>${top.cpu.toFixed(0)}%</em>` : "—"}</div>
+      <div class="why">${top ? `<span>PID ${top.pid}</span><span>${top.user}</span><span>${fmt.mem(top.rss)}</span><span>GPU ${top.gpu.toFixed(1)} %</span><span>${top.ports.length ? "port " + top.ports.join(" ") : "no ports"}</span>` : ""}</div></div>
+      <div class="specimen">
+        <div class="spec ${s.cpuTotal > 80 ? "hot" : ""}"><span class="cap">CPU · 14 cores</span><span class="n bit">${s.cpuTotal.toFixed(0)}<small>%</small></span><span class="dots" style="align-items:flex-end;height:16px">${s.cores.map((c) => `<i class="${c > 90 ? "hot" : "on"}" style="height:${Math.max(2, Math.round(c / 100 * 16))}px"></i>`).join("")}</span></div>
+        <div class="spec"><span class="cap">GPU</span><span class="n bit">${s.gpuUtil.toFixed(0)}<small>%</small></span>${dots(24, s.gpuUtil)}</div>
+        <div class="spec ${s.temps.CPU > 85 ? "hot" : ""}"><span class="cap">CPU °C</span><span class="n bit">${s.temps.CPU.toFixed(0)}<small>°</small></span>${dots(24, s.temps.CPU)}</div>
+      </div></header>`;
+    const th = (k, l, num) => `<th class="cap ${num ? "num" : ""}" data-act="sort:${k}" ${ui.sort === k ? 'aria-sort="descending"' : ""}>${l}</th>`;
+    body = `<div class="table"><table><thead><tr>${th("name", "Process")}${th("pid", "PID", 1)}<th class="cap">User</th>${th("cpu", "CPU %", 1)}${th("mem", "Memory", 1)}${th("gpu", "GPU %", 1)}<th class="cap">Ports</th><th class="cap">Command</th></tr></thead><tbody>
+      ${rows.map((p, i) => `<tr data-act="row:${i}" class="${p.cpu > 300 ? "hot" : ""} ${i === ui.selected ? "sel" : ""}"><td>${p.name}</td><td class="num">${p.pid}</td><td>${p.user}</td><td class="num">${fmt.pct(p.cpu)}</td><td class="num">${fmt.mem(p.rss)}</td><td class="num">${p.gpu ? fmt.pct(p.gpu) : "·"}</td><td class="port">${p.ports.join(" ")}</td><td class="cmd">${p.cmd}</td></tr>`).join("")}</tbody></table></div>`;
+  } else {
+    const top = hist.rows[0];
+    const step = ui.hours === 1 ? 1 : ui.hours === 8 ? 5 : 10;
+    const cols = [];
+    for (let i = 0; i < hist.slice.length; i += step) {
+      const g = hist.slice.slice(i, i + step), live = g.filter((b) => !b.closed);
+      if (!live.length) { cols.push(`<b class="off"></b>`); continue; }
+      const v = live.reduce((a, b) => a + b.cpu, 0) / live.length;
+      cols.push(`<b class="${v > 70 ? "hot" : ""}" style="height:${Math.max(2, v)}%"></b>`);
+    }
+    const gapStart = hist.slice.find((b) => b.closed), gapEnd = [...hist.slice].reverse().find((b) => b.closed);
+    mast = `<header class="hist-head"><div class="culprit"><div class="cap" style="color:var(--ink-3)">Used the most CPU · last ${ui.hours} h</div>
+      <div class="who bit">${top ? `${top.name} <em>${fmt.mins(top.cpuMin).replace(" min", "m")}</em>` : "—"}</div>
+      <div class="why">${top ? `<span>${(top.cpuMin / hist.total * 100).toFixed(0)} % of all CPU time</span><span>peak ${fmt.pct(top.peakCpu)} %</span><span>peak ${fmt.mem(top.peakMem)}</span>` : ""}</div></div>
+      <div class="chart"><div class="cols">${cols.join("")}</div><div class="axis cap" style="font-weight:500">${[0, .5, 1].map((f) => `<span>${fmt.clock(hist.slice[Math.min(hist.slice.length - 1, Math.floor(f * (hist.slice.length - 1)))].t)}</span>`).join("")}<span>${gapStart ? `Striped: gtop off ${fmt.clock(gapStart.t)}–${fmt.clock(gapEnd.t)}` : `${hist.covered} of ${hist.minutes} min recorded`}</span></div></div></header>`;
+    body = `<div class="table"><table><thead><tr><th class="cap">Process</th><th class="cap num" aria-sort="descending">Core time</th><th class="cap num">Of total</th><th class="cap num">GPU time</th><th class="cap num">Peak memory</th><th class="cap num">Peak CPU %</th></tr></thead><tbody>
+      ${hist.rows.map((r, i) => `<tr data-act="row:${i}" class="${i === 0 ? "hot" : ""} ${i === ui.selected ? "sel" : ""}"><td>${r.name}</td><td class="num">${fmt.mins(r.cpuMin)}</td><td class="num">${(r.cpuMin / hist.total * 100).toFixed(1)} %</td><td class="num">${r.gpuMin > 0.05 ? fmt.mins(r.gpuMin) : "·"}</td><td class="num">${fmt.mem(r.peakMem)}</td><td class="num">${fmt.pct(r.peakCpu)}</td></tr>`).join("")}</tbody></table></div>`;
+  }
+  const foot = ui.confirmKill
+    ? `<footer class="kill cap" role="alertdialog"><span>Kill ${ui.confirmKill.name} · PID ${ui.confirmKill.pid}?</span><button class="yes" data-act="confirm">Kill · Y</button><button data-act="cancel">Keep · N</button></footer>`
+    : `<footer class="cap" role="status" style="font-weight:500"><span><kbd>/</kbd>find</span><span><kbd>J K</kbd>move</span><span><kbd>C M G P</kbd>sort</span><span><kbd>SPACE</kbd>pause</span><span><kbd>X</kbd>kill</span><span><kbd>TAB</kbd>live / history</span><span class="synth">Synthetic demo data</span></footer>`;
+  keepSearch(mast + strip + bar + body + foot, app);
+});
+</script>
+</body>
+</html>

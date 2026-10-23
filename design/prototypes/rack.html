@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gtop · Rack 1U</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=JetBrains+Mono:wght@400;600&family=Silkscreen&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="rack-base.css">
+<style>
+#app { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--gap); height: 100vh; padding: var(--edge); }
+.face { display: grid; grid-template-columns: auto 1fr minmax(250px, auto); }
+.bay { padding: 14px 18px 12px; border-right: 1px solid var(--rule); min-width: 0; }
+.bay:last-of-type { border-right: 0; }
+.bay h2 { margin: 0 0 8px; display: flex; justify-content: space-between; gap: 18px; align-items: baseline; }
+.cores { display: flex; gap: 4px; height: 74px; align-items: flex-end; }
+.core { display: flex; flex-direction: column-reverse; gap: 2px; width: 9px; }
+.core i { height: 4px; }
+.core-n { display: flex; gap: 4px; margin-top: 5px; } .core-n span { width: 9px; text-align: center; font: 7px Silkscreen; color: var(--silk-dim); }
+.meters { display: grid; grid-template-columns: 46px 1fr 74px; row-gap: 9px; column-gap: 12px; align-items: center; }
+.meters .seg { grid-template-columns: repeat(50, 1fr); height: 10px; }
+.meters .val { text-align: right; }
+.ident { display: grid; align-content: space-between; gap: 8px; }
+.ident .name { font-family: Archivo; font-stretch: 62%; font-weight: 800; font-size: 44px; line-height: 38px; text-transform: uppercase; color: var(--silk); }
+.temps { display: grid; grid-template-columns: auto auto auto auto; gap: 6px 12px; align-items: baseline; }
+.source { grid-column: 1 / -1; display: flex; align-items: center; gap: 14px; padding: 8px 18px; border-top: 1px solid var(--rule); background: color-mix(in oklab, var(--plate) 70%, var(--ground)); min-height: 34px; }
+.source .who { color: var(--silk); font-family: "JetBrains Mono"; font-weight: 600; font-size: 13px; letter-spacing: 0; text-transform: none; }
+.source .seg { grid-template-columns: repeat(40, 4px); height: 8px; }
+.nav { display: flex; gap: 6px; }
+.work { display: grid; grid-template-columns: 1fr; gap: var(--gap); min-height: 0; }
+.work.with-side { grid-template-columns: 1fr 400px; }
+.hist { display: grid; grid-template-rows: auto 1fr; gap: var(--gap); min-height: 0; }
+.tape { padding: 12px 16px 10px; }
+.tape h2 { margin: 0 0 8px; display: flex; justify-content: space-between; }
+.tape .tape-cols { height: 84px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="data.js"></script>
+<script src="ui.js"></script>
+<script src="theme.js"></script>
+<script src="rack-kit.js"></script>
+<script>
+const app = document.getElementById("app");
+UI.start((m) => {
+  const { ui, fmt, rows, s, hist } = m;
+  const { segs, screws } = KIT;
+  const memPct = s.memUsed / s.memTotal * 100;
+  const temp = (k, v, warn, hot) => `<span class="silk">${k}</span><span class="px ${v > hot ? "hot-t" : v > warn ? "led-t" : ""}">${v.toFixed(0)}°</span>`;
+  const src = KIT.source(rows);
+  const meter = (l, pct, val) => `<span class="silk">${l}</span><div class="seg">${segs(50, pct)}</div><span class="px val">${val}</span>`;
+  const face = `<section class="face panel screws" aria-label="System">${screws}
+    <div class="bay"><h2 class="silk"><span>CPU · ${KIT.CORES} cores</span><span class="px">${s.cpuTotal.toFixed(0)}%</span></h2>
+      <div class="cores">${s.cores.map((c) => `<div class="core seg">${segs(14, c, 0.84)}</div>`).join("")}</div>
+      <div class="core-n">${s.cores.map((_, i) => `<span>${i < 10 ? "P" : "E"}</span>`).join("")}</div></div>
+    <div class="bay"><div class="meters">
+      ${meter("GPU", s.gpuUtil, s.gpuUtil.toFixed(0) + "%")}${meter("VRAM", s.gpuMem / s.memTotal * 100, s.gpuMem.toFixed(1) + "G")}
+      ${meter("Mem", memPct, s.memUsed.toFixed(1) + "G")}${meter("Swap", s.swap / 8 * 100, s.swap.toFixed(1) + "G")}
+      ${meter("Disk", s.disk.used / s.disk.total * 100, (s.disk.total - s.disk.used).toFixed(0) + "G")}</div></div>
+    <div class="bay ident"><div><div class="silk">Apple M3 Max · 30-core GPU</div><div class="name">gtop</div></div>
+      <div class="temps">${temp("CPU", s.temps.CPU, 80, 90)}${temp("GPU", s.temps.GPU, 80, 90)}${temp("SSD", s.temps.SSD, 60, 70)}${temp("Bat", s.temps.Battery, 40, 45)}</div>
+      <div class="silk">Up ${fmt.up(s.uptime)} · load ${s.load.map((l) => l.toFixed(1)).join(" ")} · net ↓ ${s.net.rx.toFixed(1)} ↑ ${s.net.tx.toFixed(1)} MB/s</div></div>
+    <div class="source silk">${src
+      ? `<span class="led ${src.share > 50 ? "hot" : "on"}"></span><span>Load source</span><span class="who">${src.label}</span><span class="seg">${segs(40, src.share, 0.75)}</span><span class="px ${src.share > 50 ? "hot-t" : "led-t"}">${src.share.toFixed(0)}%</span><span>of the Mac</span>`
+      : `<span class="led"></span><span>Load source</span><span>Nothing above ${KIT.LIMIT.culprit} % CPU</span>`}<span style="margin-left:auto">${KIT.self(s)}</span></div>
+  </section>`;
+  const nav = `<nav class="nav" aria-label="View">${KIT.bank(ui)}</nav>`;
+  let main;
+  if (ui.view === "live") main = KIT.liveTable(m);
+  else {
+    const c = KIT.columns(hist, fmt, ui);
+    main = `<div class="hist"><section class="tape panel" aria-label="CPU over time"><h2 class="silk"><span>Total CPU · last ${ui.hours} h · one column per ${c.step} min</span><span>${c.note}</span></h2>
+      <div class="tape-cols">${c.cols}</div><div class="axis">${c.ticks}</div></section>${KIT.histTable(m)}</div>`;
+  }
+  const side = KIT.side(m);
+  keepSearch(face + nav + `<div class="work ${side ? "with-side" : ""}">${main}${side}</div>` + KIT.strip(m), app);
+}, THEME.hooks);
+</script>
+</body>
+</html>

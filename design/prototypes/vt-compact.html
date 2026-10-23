@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gtop · VFD tower compact</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=JetBrains+Mono:wght@400;600&family=Silkscreen&family=Doto:wght@600;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="rack-base.css">
+<link rel="stylesheet" href="vfd.css">
+<style>
+:root { --tw: 236px; }
+#app { display: grid; grid-template-columns: var(--tw) minmax(0, 1fr); gap: var(--gap); height: 100vh; padding: var(--edge); }
+#app.with-side { grid-template-columns: var(--tw) minmax(0, 1fr) 380px; }
+.right { display: grid; gap: var(--gap); min-height: 0; min-width: 0; }
+.nav { display: flex; gap: 6px; min-width: 0; }
+.right .strip { overflow: hidden; } .right .strip .synth { display: none; }
+.right { grid-template-rows: auto 1fr auto auto; }
+.right.no-drawer { grid-template-rows: auto 1fr auto; }
+.brand { font-size: 36px; line-height: 30px; }
+.blades td { height: 18px; padding-top: 1px; padding-bottom: 1px; font-size: 11px; }
+.blades .mini { grid-template-columns: repeat(14, 3px); }
+.tower .win { padding: 8px 10px 7px; }
+.tower .self.stack { grid-template-columns: auto auto; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="data.js"></script>
+<script src="ui.js"></script>
+<script src="theme.js"></script>
+<script src="rack-kit.js"></script>
+<script src="vfd-kit.js"></script>
+<script>
+const app = document.getElementById("app");
+UI.start((m) => {
+  const { ui } = m;
+  const side = ui.settingsOpen ? THEME.panel() : "";
+  const drawer = ui.view === "live" && m.detail && !side ? VFD.detailDrawer(m) : "";
+  const main = ui.view === "live" ? `<div class="screen">${KIT.liveTable(m, { noUser: true })}</div>` : VFD.histMain(m, 90);
+  app.classList.toggle("with-side", !!side);
+  keepSearch(VFD.tower(m, { compact: true }) + `<div class="right ${drawer ? "" : "no-drawer"}"><nav class="nav">${KIT.bank(ui)}</nav>${main}${drawer}${KIT.strip(m)}</div>` + side, app);
+}, THEME.hooks);
+</script>
+</body>
+</html>

@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gtop · Control room</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Martian+Mono:wdth,wght@75..112.5,400..700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --ground: #2b2d2f;
+  --panel: #333638;
+  --panel-2: #3c3f42;
+  --rule: #4a4e52;
+  --ink: #d7dadc;
+  --ink-2: #a3a8ac;
+  --ink-3: #7f858a;
+  --track: #24262a;
+  --fill: #8c9399;
+  --warn: #ffd400;
+  --alarm: #ff2d2d;
+  --ok: #7fd0a0;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--ground); color: var(--ink); }
+body { font: 12px/1.4 "Martian Mono", ui-monospace, monospace; font-stretch: 87.5%; font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased; }
+::selection { background: var(--warn); color: #000; }
+::-webkit-scrollbar { width: 10px; } ::-webkit-scrollbar-track { background: var(--ground); } ::-webkit-scrollbar-thumb { background: var(--rule); }
+.lab { font-family: "Barlow Condensed", sans-serif; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; font-size: 12px; color: var(--ink-3); }
+#app { display: grid; grid-template-rows: auto auto auto 1fr auto; height: 100vh; }
+
+.alarms { display: flex; min-height: 34px; align-items: stretch; border-bottom: 1px solid #000; background: #232527; }
+.alarms .none { padding: 9px 14px; color: var(--ink-3); }
+.alarm { display: flex; align-items: center; gap: 10px; padding: 0 14px; border-right: 1px solid #000; font-weight: 600; }
+.alarm.a { background: var(--alarm); color: #000; }
+.alarm.w { background: var(--warn); color: #000; }
+.alarm .sym { width: 14px; height: 14px; }
+.alarm .lab { color: #000; font-size: 13px; font-weight: 700; }
+
+.overview { display: grid; grid-template-columns: 1.3fr 1fr 1fr 1fr; gap: 1px; background: #000; border-bottom: 1px solid #000; }
+.cell { background: var(--panel); padding: 10px 14px 12px; }
+.cell h2 { margin: 0 0 8px; display: flex; justify-content: space-between; align-items: baseline; }
+.big { font-family: "Barlow Condensed"; font-weight: 600; font-size: 30px; line-height: 28px; color: var(--ink); }
+.big small { font-size: 15px; color: var(--ink-3); margin-left: 2px; }
+.gauge { position: relative; height: 12px; background: var(--track); margin-top: 6px; }
+.gauge > b { position: absolute; inset: 0 auto 0 0; background: var(--fill); }
+.gauge > u { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink); }
+.gauge.w > b { background: var(--warn); } .gauge.a > b { background: var(--alarm); }
+.cores { display: grid; grid-template-columns: repeat(14, 1fr); gap: 3px; height: 40px; align-items: end; }
+.cores b { background: var(--fill); }
+.cores b.w { background: var(--warn); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
+.kv span:nth-child(even) { text-align: right; color: var(--ink); }
+
+.controls { display: flex; gap: 0; background: var(--panel-2); border-bottom: 1px solid #000; }
+.tab { font: inherit; background: transparent; border: 0; border-right: 1px solid var(--rule); color: var(--ink-2); padding: 8px 16px; cursor: pointer; }
+.tab[aria-pressed="true"] { background: var(--ground); color: var(--ink); box-shadow: inset 0 -2px 0 var(--ink); }
+.tab:focus-visible, input:focus-visible { outline: 2px solid var(--warn); outline-offset: -2px; }
+.find { flex: 1; display: flex; align-items: center; gap: 10px; padding: 0 14px; }
+.find input { flex: 1; font: inherit; background: var(--track); border: 1px solid var(--rule); color: var(--ink); padding: 5px 8px; caret-color: var(--warn); }
+.find input::placeholder { color: var(--ink-3); }
+.run { font: inherit; background: transparent; color: var(--ink-2); border: 0; border-left: 1px solid var(--rule); padding: 0 16px; cursor: pointer; }
+.run.off { color: #000; background: var(--warn); font-weight: 700; }
+
+.table { overflow: auto; }
+table { width: 100%; border-collapse: collapse; }
+th { position: sticky; top: 0; z-index: 1; background: var(--panel); border-bottom: 1px solid #000; padding: 6px 10px; text-align: left; cursor: pointer; white-space: nowrap; }
+th.num { text-align: right; } th[aria-sort] { color: var(--ink); box-shadow: inset 0 -2px 0 var(--ink); }
+td { padding: 2px 10px; height: 22px; white-space: nowrap; border-bottom: 1px solid #303234; color: var(--ink-2); }
+td.num { text-align: right; }
+td.cmd { color: var(--ink-3); max-width: 1px; width: 38%; overflow: hidden; text-overflow: ellipsis; }
+td.meter { width: 150px; }
+.m { position: relative; height: 8px; background: var(--track); }
+.m b { position: absolute; inset: 0 auto 0 0; background: var(--fill); }
+.m u { position: absolute; top: -2px; bottom: -2px; left: 50%; width: 1px; background: var(--ink-3); }
+tr.w td { color: var(--ink); } tr.w .m b { background: var(--warn); }
+tr.a td { color: var(--ink); } tr.a .m b { background: var(--alarm); }
+td.flag { width: 26px; padding-right: 0; }
+.flag svg { display: block; width: 13px; height: 13px; }
+tr.sel td { background: #45494d; color: var(--ink); }
+tr.sel td:first-child { box-shadow: inset 3px 0 0 var(--ink); }
+.port { color: var(--ok); }
+
+.trend { background: var(--panel); border-bottom: 1px solid #000; padding: 10px 14px; }
+.trend svg { width: 100%; height: 90px; display: block; }
+.legend { display: flex; justify-content: space-between; margin-top: 4px; }
+
+.status { display: flex; gap: 18px; align-items: center; padding: 6px 14px; background: #232527; border-top: 1px solid #000; color: var(--ink-3); }
+.status kbd { font: inherit; color: var(--ink); background: var(--panel-2); padding: 0 5px; margin-right: 4px; }
+.confirm { background: var(--alarm); color: #000; font-weight: 600; }
+.confirm button { font: inherit; border: 2px solid #000; background: transparent; padding: 2px 12px; cursor: pointer; }
+.confirm button.yes { background: #000; color: var(--alarm); }
+.synth { margin-left: auto; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<svg width="0" height="0" style="position:absolute"><defs>
+  <symbol id="tri" viewBox="0 0 14 14"><path d="M7 1 13 13H1Z" fill="currentColor"/><path d="M7 5v4M7 10.5v1" stroke="#000" stroke-width="1.6"/></symbol>
+  <symbol id="dia" viewBox="0 0 14 14"><path d="M7 1 13 7 7 13 1 7Z" fill="currentColor"/><path d="M7 4.5v3.5M7 9.5v1" stroke="#000" stroke-width="1.6"/></symbol>
+</defs></svg>
+<script src="data.js"></script>
+<script src="ui.js"></script>
+<script>
+const LIMIT = { cpuWarn: 200, cpuAlarm: 400, temp: 90, tempWarn: 80, mem: 85 };
+const app = document.getElementById("app");
+UI.start(({ ui, fmt, rows, s, hist }) => {
+  const memPct = s.memUsed / s.memTotal * 100;
+  const alarms = [];
+  rows.filter((p) => p.cpu > LIMIT.cpuAlarm).slice(0, 2).forEach((p) => alarms.push(["a", "tri", `${p.name} ${p.pid}`, `CPU ${p.cpu.toFixed(0)} % over ${LIMIT.cpuAlarm}`]));
+  if (s.temps.CPU > LIMIT.temp) alarms.push(["a", "tri", "CPU temperature", `${s.temps.CPU.toFixed(0)} °C over ${LIMIT.temp}`]);
+  else if (s.temps.CPU > LIMIT.tempWarn) alarms.push(["w", "dia", "CPU temperature", `${s.temps.CPU.toFixed(0)} °C over ${LIMIT.tempWarn}`]);
+  if (memPct > LIMIT.mem) alarms.push(["w", "dia", "Memory", `${memPct.toFixed(0)} % used`]);
+  const alarmBar = `<section class="alarms" aria-label="Alarms" role="status">${alarms.length ? alarms.map(([k, sym, who, what]) => `<div class="alarm ${k}"><svg class="sym"><use href="#${sym}"/></svg><span class="lab">${who}</span><span>${what}</span></div>`).join("") : `<div class="none lab">No alarms</div>`}</section>`;
+
+  const gauge = (pct, mark, cls) => `<div class="gauge ${cls}"><b style="width:${Math.min(100, pct)}%"></b>${mark ? `<u style="left:${mark}%"></u>` : ""}</div>`;
+  const tCls = s.temps.CPU > LIMIT.temp ? "a" : s.temps.CPU > LIMIT.tempWarn ? "w" : "";
+  const overview = `<section class="overview" aria-label="System">
+    <div class="cell"><h2><span class="lab">CPU · 14 cores</span><span class="big">${s.cpuTotal.toFixed(0)}<small>%</small></span></h2>
+      <div class="cores">${s.cores.map((c) => `<b class="${c > 90 ? "w" : ""}" style="height:${c}%"></b>`).join("")}</div></div>
+    <div class="cell"><h2><span class="lab">GPU · M3 Max 30-core</span><span class="big">${s.gpuUtil.toFixed(0)}<small>%</small></span></h2>${gauge(s.gpuUtil)}
+      <div class="kv lab" style="margin-top:10px"><span>Memory in use</span><span>${s.gpuMem.toFixed(1)} GB</span></div></div>
+    <div class="cell"><h2><span class="lab">Memory</span><span class="big">${s.memUsed.toFixed(1)}<small>/ ${s.memTotal} GB</small></span></h2>${gauge(memPct, LIMIT.mem, memPct > LIMIT.mem ? "w" : "")}
+      <div class="kv lab" style="margin-top:10px"><span>Swap</span><span>${s.swap.toFixed(1)} GB</span><span>Disk free</span><span>${(s.disk.total - s.disk.used).toFixed(0)} GB</span></div></div>
+    <div class="cell"><h2><span class="lab">Temperature</span><span class="big">${s.temps.CPU.toFixed(0)}<small>°C CPU</small></span></h2>${gauge(s.temps.CPU, LIMIT.temp, tCls)}
+      <div class="kv lab" style="margin-top:10px"><span>GPU</span><span>${s.temps.GPU.toFixed(0)} °C</span><span>SSD</span><span>${s.temps.SSD.toFixed(0)} °C</span><span>Battery</span><span>${s.temps.Battery.toFixed(0)} °C</span></div></div>
+  </section>`;
+
+  const tab = (l, act, on) => `<button class="tab lab" data-act="${act}" aria-pressed="${on}">${l}</button>`;
+  const controls = `<nav class="controls">${tab("Live", "view:live", ui.view === "live")}${tab("Last 1 h", "hours:1", ui.view === "history" && ui.hours === 1)}${tab("Last 8 h", "hours:8", ui.view === "history" && ui.hours === 8)}${tab("Last 24 h", "hours:24", ui.view === "history" && ui.hours === 24)}
+    <label class="find"><span class="lab">Find</span><input data-search placeholder="name, pid, command or port" aria-label="Search processes"></label>
+    <button class="run lab ${ui.paused ? "off" : ""}" data-act="pause">${ui.paused ? "Paused · Space to resume" : "Live · every 1.5 s"}</button></nav>`;
+
+  let body;
+  if (ui.view === "live") {
+    const th = (k, l, num) => `<th class="lab ${num ? "num" : ""}" data-act="sort:${k}" ${ui.sort === k ? 'aria-sort="descending"' : ""}>${l}</th>`;
+    const tr = rows.map((p, i) => {
+      const st = p.cpu > LIMIT.cpuAlarm ? "a" : p.cpu > LIMIT.cpuWarn ? "w" : "";
+      const flag = st === "a" ? `<svg style="color:var(--alarm)"><use href="#tri"/></svg>` : st === "w" ? `<svg style="color:var(--warn)"><use href="#dia"/></svg>` : "";
+      return `<tr data-act="row:${i}" class="${st} ${i === ui.selected ? "sel" : ""}"><td class="flag">${flag}</td><td>${p.name}</td><td class="num">${p.pid}</td><td>${p.user}</td>
+        <td class="meter"><div class="m"><b style="width:${Math.min(100, p.cpu / 8)}%"></b><u></u></div></td><td class="num">${fmt.pct(p.cpu)}</td>
+        <td class="num">${fmt.mem(p.rss)}</td><td class="num">${p.gpu ? fmt.pct(p.gpu) : "–"}</td><td class="port">${p.ports.join(" ")}</td><td class="cmd">${p.cmd}</td></tr>`;
+    }).join("");
+    body = `<div class="table"><table><thead><tr><th></th>${th("name", "Process")}${th("pid", "PID", 1)}<th class="lab">User</th><th class="lab">CPU load · mark 400 %</th>${th("cpu", "CPU %", 1)}${th("mem", "Memory", 1)}${th("gpu", "GPU %", 1)}<th class="lab">Ports</th><th class="lab">Command</th></tr></thead><tbody>${tr}</tbody></table></div>`;
+  } else {
+    const W = 1000, H = 90;
+    const n = hist.slice.length;
+    let d = "", gaps = "", inGap = null;
+    hist.slice.forEach((b, i) => {
+      const x = i / (n - 1) * W;
+      if (b.closed) { if (inGap === null) inGap = x; d += " "; return; }
+      if (inGap !== null) { gaps += `<rect x="${inGap}" y="0" width="${x - inGap}" height="${H}" fill="url(#hatch)"/>`; inGap = null; }
+      const y = H - b.cpu / 100 * H;
+      d += (d.endsWith(" ") || !d ? "M" : "L") + x.toFixed(1) + "," + y.toFixed(1);
+    });
+    if (inGap !== null) gaps += `<rect x="${inGap}" y="0" width="${W - inGap}" height="${H}" fill="url(#hatch)"/>`;
+    const gapStart = hist.slice.find((b) => b.closed), gapEnd = [...hist.slice].reverse().find((b) => b.closed);
+    const trend = `<section class="trend"><h2 class="lab" style="margin:0 0 6px;display:flex;justify-content:space-between"><span>Total CPU · last ${ui.hours} h</span><span>${gapStart ? `Hatched: gtop not running ${fmt.clock(gapStart.t)}–${fmt.clock(gapEnd.t)}` : `Recorded ${hist.covered} of ${hist.minutes} min`}</span></h2>
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="2" height="6" fill="#4a4e52"/></pattern></defs>
+      ${gaps}<line x1="0" x2="${W}" y1="${H * 0.3}" y2="${H * 0.3}" stroke="#7f858a" stroke-dasharray="4 4" vector-effect="non-scaling-stroke"/><path d="${d}" fill="none" stroke="#d7dadc" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>
+      <div class="legend lab">${[0, .25, .5, .75, 1].map((f) => `<span>${fmt.clock(hist.slice[Math.min(n - 1, Math.floor(f * (n - 1)))].t)}</span>`).join("")}</div></section>`;
+    const max = hist.rows.length ? hist.rows[0].cpuMin : 1;
+    const tr = hist.rows.map((r, i) => `<tr data-act="row:${i}" class="${i === ui.selected ? "sel" : ""} ${r.peakCpu > LIMIT.cpuAlarm ? "a" : ""}"><td class="flag">${r.peakCpu > LIMIT.cpuAlarm ? `<svg style="color:var(--alarm)"><use href="#tri"/></svg>` : ""}</td><td>${r.name}</td>
+      <td class="num">${fmt.mins(r.cpuMin)}</td><td class="meter"><div class="m"><b style="width:${r.cpuMin / max * 100}%"></b></div></td><td class="num">${(r.cpuMin / hist.total * 100).toFixed(1)} %</td>
+      <td class="num">${r.gpuMin > 0.05 ? fmt.mins(r.gpuMin) : "–"}</td><td class="num">${fmt.mem(r.peakMem)}</td><td class="num">${fmt.pct(r.peakCpu)}</td></tr>`).join("");
+    body = `<div style="display:grid;grid-template-rows:auto 1fr;min-height:0">${trend}<div class="table"><table><thead><tr><th></th><th class="lab">Process</th><th class="lab num" aria-sort="descending">Core time</th><th class="lab">Share</th><th class="lab num">Of total</th><th class="lab num">GPU time</th><th class="lab num">Peak memory</th><th class="lab num">Peak CPU %</th></tr></thead><tbody>${tr}</tbody></table></div></div>`;
+  }
+  const status = ui.confirmKill
+    ? `<footer class="status confirm" role="alertdialog"><span>Kill ${ui.confirmKill.name} · PID ${ui.confirmKill.pid} · started ${new Date(ui.confirmKill.start).toLocaleString()}?</span><button class="yes" data-act="confirm">Kill (Y)</button><button data-act="cancel">Keep (N)</button></footer>`
+    : `<footer class="status lab" role="status"><span><kbd>/</kbd>find</span><span><kbd>J K</kbd>move</span><span><kbd>C M G P</kbd>sort</span><span><kbd>Space</kbd>pause</span><span><kbd>X</kbd>kill</span><span><kbd>Tab</kbd>live / history</span><span><kbd>1 8 2</kbd>1 h 8 h 24 h</span><span class="synth">Synthetic demo data · ${rows.length} processes</span></footer>`;
+  keepSearch(alarmBar + overview + controls + body + status, app);
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gtop · Rack VFD</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=JetBrains+Mono:wght@400;600&family=Silkscreen&family=Doto:wght@600;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="rack-base.css">
+<style>
+/* A front panel with recessed vacuum-fluorescent windows. The window glass is darker than the panel; text in it glows in the LED color. */
+#app { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--gap); height: 100vh; padding: var(--edge); }
+.face { display: grid; grid-template-columns: 1.15fr 1fr 1fr 1fr auto; gap: 12px; padding: 16px 18px 14px; }
+.win { position: relative; background: color-mix(in oklab, var(--ground) 80%, #000); border: 1px solid #000; box-shadow: inset 0 1px 0 color-mix(in oklab, var(--plate) 50%, #000), 0 1px 0 var(--rule-hi); padding: 10px 12px 9px; overflow: hidden; }
+.win::after { content: ""; position: absolute; inset: 0; background: radial-gradient(circle, color-mix(in srgb, var(--led) 7%, transparent) 0.6px, transparent 1px) 0 0 / 3px 3px; pointer-events: none; }
+.win .lab { font-family: Archivo; font-stretch: 75%; font-weight: 700; font-size: 9px; letter-spacing: .16em; text-transform: uppercase; color: color-mix(in oklab, var(--led) 55%, var(--ground)); }
+.vfd { font-family: Doto, monospace; font-weight: 900; color: var(--led); text-shadow: 0 0 calc(8px * var(--glow)) color-mix(in srgb, var(--led) 60%, transparent); letter-spacing: .02em; }
+.vfd.hot { color: var(--hot); text-shadow: 0 0 calc(8px * var(--glow)) color-mix(in srgb, var(--hot) 65%, transparent); }
+.vfd.dim { color: color-mix(in oklab, var(--led) 18%, var(--ground)); text-shadow: none; }
+.big { font-size: 46px; line-height: 44px; }
+.mid { font-size: 22px; line-height: 22px; }
+.ghost { position: relative; } .ghost > .vfd.dim { position: absolute; inset: 0; } .ghost > .vfd:not(.dim) { position: relative; }
+.win .bar { display: grid; grid-template-columns: repeat(40, 1fr); gap: 2px; height: 8px; margin-top: 8px; }
+.win .bar i { background: color-mix(in oklab, var(--led) 12%, var(--ground)); } .win .bar i.on { background: var(--led); box-shadow: 0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--led) 60%, transparent); } .win .bar i.hot { background: var(--hot); }
+.cores { display: flex; gap: 3px; height: 44px; align-items: flex-end; margin-top: 6px; }
+.cores b { flex: 1; background: var(--led); box-shadow: 0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--led) 50%, transparent); }
+.cores b.hot { background: var(--hot); }
+.split2 { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.brandcol { display: grid; align-content: space-between; padding-left: 6px; min-width: 150px; }
+.brand { font-family: Archivo; font-stretch: 62%; font-weight: 800; font-size: 44px; line-height: 38px; text-transform: uppercase; color: var(--silk); }
+.marquee { grid-column: 1 / -1; display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: center; }
+.marquee .vfd { font-size: 20px; line-height: 22px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nav { display: flex; gap: 6px; }
+.work { display: grid; gap: var(--gap); min-height: 0; } .work.with-side { grid-template-columns: 1fr 400px; }
+.screen { min-height: 0; display: grid; }
+/* the process table inside a big VFD window */
+.screen .blades { background: color-mix(in oklab, var(--ground) 80%, #000); border-color: #000; }
+.screen .blades thead th { background: color-mix(in oklab, var(--plate) 60%, #000); }
+.screen .blades tr.culprit td, .screen .blades tr.sel td { color: var(--led); text-shadow: 0 0 calc(6px * var(--glow)) color-mix(in srgb, var(--led) 45%, transparent); }
+.screen .blades tr.culprit td.cmd { color: color-mix(in oklab, var(--led) 55%, var(--ground)); text-shadow: none; }
+.hist { display: grid; grid-template-rows: auto 1fr; gap: var(--gap); min-height: 0; }
+.tapewin { padding: 12px 14px 10px; } .tapewin .tape-cols { height: 110px; position: relative; z-index: 1; }
+.tapewin .tape-cols b { box-shadow: 0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--led) 50%, transparent); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="data.js"></script>
+<script src="ui.js"></script>
+<script src="theme.js"></script>
+<script src="rack-kit.js"></script>
+<script>
+const app = document.getElementById("app");
+// Unlit segments show behind lit ones, as on a real VFD tube.
+const lit = (txt, cls = "", ghost = "8") => `<span class="ghost"><span class="vfd dim ${cls}">${String(txt).replace(/[0-9]/g, ghost)}</span><span class="vfd ${cls}">${txt}</span></span>`;
+UI.start((m) => {
+  const { ui, fmt, rows, s, hist } = m;
+  const { segs, screws } = KIT;
+  const memPct = s.memUsed / s.memTotal * 100;
+  const src = KIT.source(rows);
+  const bar = (pct, hotAt = 0.85) => `<div class="bar">${segs(40, pct, hotAt)}</div>`;
+  const pad = (v, n) => String(v).padStart(n, " ");
+  const face = `<section class="face panel screws" aria-label="System">${screws}
+    <div class="win"><div class="split2"><span class="lab">CPU · ${KIT.CORES} cores</span><span class="lab">Load ${s.load[0].toFixed(1)}</span></div>
+      <div class="big">${lit(pad(s.cpuTotal.toFixed(0), 3) + "%", s.cpuTotal > 85 ? "hot" : "")}</div>
+      <div class="cores">${s.cores.map((c) => `<b class="${c > 90 ? "hot" : ""}" style="height:${Math.max(3, c)}%"></b>`).join("")}</div></div>
+    <div class="win"><div class="lab">GPU · 30-core</div><div class="big">${lit(pad(s.gpuUtil.toFixed(0), 3) + "%")}</div>${bar(s.gpuUtil)}<div class="split2" style="margin-top:6px"><span class="lab">VRAM</span><span class="mid">${lit(s.gpuMem.toFixed(1) + "G")}</span></div></div>
+    <div class="win"><div class="lab">Memory · ${s.memTotal} GB</div><div class="big">${lit(s.memUsed.toFixed(1), memPct > 90 ? "hot" : "")}</div>${bar(memPct)}<div class="split2" style="margin-top:6px"><span class="lab">Swap</span><span class="mid">${lit(s.swap.toFixed(1) + "G")}</span></div></div>
+    <div class="win"><div class="lab">Temperature °C</div><div class="big">${lit(s.temps.CPU.toFixed(0) + "°", s.temps.CPU > 90 ? "hot" : "")}</div>
+      <div class="split2" style="margin-top:8px"><span class="lab">GPU</span><span class="mid">${lit(s.temps.GPU.toFixed(0))}</span><span class="lab">SSD</span><span class="mid">${lit(s.temps.SSD.toFixed(0))}</span><span class="lab">Bat</span><span class="mid">${lit(s.temps.Battery.toFixed(0))}</span></div></div>
+    <div class="brandcol"><div><div class="silk">Apple M3 Max</div><div class="brand">gtop</div></div>${KIT.self(s, "stack")}</div>
+    <div class="win marquee"><span class="lab">Load source</span><span class="vfd ${src && src.share > 50 ? "hot" : ""}">${src ? src.label.toUpperCase() : "IDLE · NOTHING ABOVE " + KIT.LIMIT.culprit + " % CPU"}</span><span class="mid">${src ? lit(pad(src.share.toFixed(0), 3) + "% OF MAC", src.share > 50 ? "hot" : "") : ""}</span></div>
+  </section>`;
+  let main;
+  if (ui.view === "live") main = `<div class="screen">${KIT.liveTable(m)}</div>`;
+  else {
+    const c = KIT.columns(hist, fmt, ui);
+    main = `<div class="hist"><section class="win tapewin"><div class="split2" style="margin-bottom:8px"><span class="lab">Total CPU · last ${ui.hours} h</span><span class="lab">${c.note}</span></div><div class="tape-cols">${c.cols}</div><div class="axis">${c.ticks}</div></section><div class="screen">${KIT.histTable(m)}</div></div>`;
+  }
+  const side = KIT.side(m);
+  keepSearch(face + `<nav class="nav">${KIT.bank(ui)}</nav><div class="work ${side ? "with-side" : ""}">${main}${side}</div>` + KIT.strip(m), app);
+}, THEME.hooks);
+</script>
+</body>
+</html>
