@@ -4,6 +4,7 @@
 //! collecting process information and managing process lifecycle.
 
 use super::{GpuProcessMonitor, ProcessInfo};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
@@ -51,6 +52,7 @@ impl ProcessMonitor {
     ///
     /// * `sys` - System information provider
     /// * `include_environ` - Whether to include environment variables
+    /// * `ports_by_pid` - Local bound ports keyed by PID (empty to skip)
     ///
     /// # Returns
     ///
@@ -59,6 +61,7 @@ impl ProcessMonitor {
         &mut self,
         sys: &System,
         include_environ: bool,
+        ports_by_pid: &HashMap<u32, Vec<u16>>,
     ) -> Result<Vec<ProcessInfo>, String> {
         let current_time = Self::get_current_time()?;
         let gpu_usage = self.gpu_process_monitor.collect();
@@ -104,6 +107,7 @@ impl ProcessMonitor {
                     },
                     disk_usage: (disk_usage.read_bytes, disk_usage.written_bytes),
                     session_id: process.session_id().map(|id| id.as_u32()),
+                    ports: ports_by_pid.get(&pid.as_u32()).cloned().unwrap_or_default(),
                 }
             })
             .collect())
@@ -169,7 +173,7 @@ mod tests {
         let own_pid = std::process::id();
 
         let processes = ProcessMonitor::new()
-            .collect_processes(&sys, false)
+            .collect_processes(&sys, false, &HashMap::new())
             .unwrap();
         let own = processes.iter().find(|p| p.pid == own_pid).unwrap();
         assert!(!own.command.is_empty(), "command is read on first refresh");

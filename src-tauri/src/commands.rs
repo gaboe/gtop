@@ -4,7 +4,9 @@
 //! through Tauri's IPC mechanism. These commands provide the interface between
 //! the frontend and the system monitoring functionality.
 
-use crate::monitoring::{ProcessInfo, ProcessMonitor, SystemMonitor, SystemStats};
+use crate::monitoring::{
+    collect_ports_by_pid, ProcessInfo, ProcessMonitor, SystemMonitor, SystemStats,
+};
 use crate::state::AppState;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -21,6 +23,8 @@ fn perf_enabled() -> bool {
 /// # Arguments
 ///
 /// * `include_environ` - Whether to read environment variables of every process
+/// * `include_ports` - Whether to attach local bound ports to each process;
+///   only port searches need them
 /// * `state` - The application state containing system monitoring components
 ///
 /// # Returns
@@ -37,14 +41,16 @@ fn perf_enabled() -> bool {
 #[tauri::command]
 pub async fn get_processes(
     include_environ: bool,
+    include_ports: bool,
     state: State<'_, AppState>,
 ) -> Result<(Vec<ProcessInfo>, SystemStats), String> {
-    snapshot(&state, include_environ)
+    snapshot(&state, include_environ, include_ports)
 }
 
 fn snapshot(
     state: &AppState,
     include_environ: bool,
+    include_ports: bool,
 ) -> Result<(Vec<ProcessInfo>, SystemStats), String> {
     let mut sys = state.sys.lock().map_err(|e| e.to_string())?;
     let mut disks = state.disks.lock().map_err(|e| e.to_string())?;
@@ -60,7 +66,12 @@ fn snapshot(
     let mut process_monitor = state.process_monitor.lock().map_err(|e| e.to_string())?;
     let mut system_monitor = state.system_monitor.lock().map_err(|e| e.to_string())?;
 
-    let processes = process_monitor.collect_processes(&sys, include_environ)?;
+    let ports_by_pid = if include_ports {
+        collect_ports_by_pid()
+    } else {
+        Default::default()
+    };
+    let processes = process_monitor.collect_processes(&sys, include_environ, &ports_by_pid)?;
     let system_stats = system_monitor.collect_stats(&sys, &networks, &disks);
     let collected = Instant::now();
 
@@ -121,7 +132,7 @@ mod tests {
         let state = AppState::new();
         for _ in 0..20 {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            snapshot(&state, false).unwrap();
+            snapshot(&state, false, false).unwrap();
         }
     }
 }

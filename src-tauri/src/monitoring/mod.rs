@@ -10,6 +10,7 @@ mod gpu_monitor;
 mod gpu_process_monitor;
 #[cfg(target_os = "macos")]
 mod iokit;
+mod port_monitor;
 mod process_monitor;
 mod system_monitor;
 mod temperature_monitor;
@@ -17,6 +18,7 @@ mod types;
 
 pub use gpu_monitor::GpuMonitor;
 pub use gpu_process_monitor::GpuProcessMonitor;
+pub use port_monitor::collect_ports_by_pid;
 pub use process_monitor::ProcessMonitor;
 pub use system_monitor::SystemMonitor;
 pub use temperature_monitor::TemperatureMonitor;
