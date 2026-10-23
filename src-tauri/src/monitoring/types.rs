@@ -1,54 +1,5 @@
 use serde::Serialize;
 use std::fmt::Debug;
-use sysinfo::{DiskUsage, ProcessStatus};
-
-/// Internal representation of process data collected from the system
-/// This struct is used internally and not exposed directly to the frontend
-#[derive(Clone, Debug)]
-pub(crate) struct ProcessData {
-    /// Process ID
-    pub pid: u32,
-    /// Name of the process
-    pub name: String,
-    /// Complete command line arguments
-    pub cmd: Vec<String>,
-    /// User ID that owns the process
-    pub user_id: Option<String>,
-    /// CPU usage as percentage (0-100)
-    pub cpu_usage: f32,
-    /// Physical memory usage in bytes
-    pub memory: u64,
-    /// Current process status
-    pub status: ProcessStatus,
-    /// Parent process ID
-    pub ppid: Option<u32>,
-    /// Environment variables
-    pub environ: Vec<String>,
-    /// Root directory of the process
-    pub root: String,
-    /// Virtual memory usage in bytes
-    pub virtual_memory: u64,
-    /// Process start time (Unix timestamp)
-    pub start_time: u64,
-    /// Process running time in seconds
-    pub run_time: u64,
-    /// Disk I/O statistics
-    pub disk_usage: DiskUsage,
-    /// Session ID of the process
-    pub session_id: Option<u32>,
-}
-
-/// Static information about a process that doesn't change frequently
-/// Used for caching purposes to avoid frequent updates of stable data
-#[derive(Clone, Debug)]
-pub struct ProcessStaticInfo {
-    /// Process name
-    pub name: String,
-    /// Full command string
-    pub command: String,
-    /// Username of the process owner
-    pub user: String,
-}
 
 /// Process information exposed to the frontend via Tauri
 /// Contains formatted and filtered process data for UI consumption

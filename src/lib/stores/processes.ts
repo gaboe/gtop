@@ -1,6 +1,7 @@
-import { writable, derived } from "svelte/store";
+import { writable, derived, get } from "svelte/store";
 import type { Process, SystemStats } from "$lib/types";
 import { invoke } from "@tauri-apps/api/core";
+import { settingsStore } from "./settings";
 
 interface ProcessStore {
   processes: Process[];
@@ -53,7 +54,11 @@ function createProcessStore() {
 
   const getProcesses = async () => {
     try {
-      const result = await invoke<[Process[], SystemStats]>("get_processes");
+      const includeEnviron =
+        get(settingsStore).appearance.columnVisibility.environ ?? false;
+      const result = await invoke<[Process[], SystemStats]>("get_processes", {
+        includeEnviron,
+      });
       update((state) => {
         let updatedSelectedProcess = state.selectedProcess;
         if (state.selectedProcessPid) {
