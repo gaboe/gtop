@@ -10,7 +10,7 @@ export const ASCII_ART = `
 export const APP_INFO = {
   name: "gtop",
   developer: "gaboe, fork of NeoHtop by Abdenasser",
-  github: "https://github.com/gaboe/neohtop",
+  github: "https://github.com/gaboe/gtop",
   stack: ["Tauri", "Rust", "Svelte", "TypeScript"],
 };
 

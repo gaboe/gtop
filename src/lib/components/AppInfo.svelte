@@ -14,7 +14,7 @@
   async function checkLatestVersion() {
     try {
       const response = await fetch(
-        "https://api.github.com/repos/gaboe/neohtop/releases/latest",
+        "https://api.github.com/repos/gaboe/gtop/releases/latest",
       );
       const data = await response.json();
 
@@ -80,7 +80,7 @@
             <span>gtop v{version}</span>
             {#if hasUpdate}
               <a
-                href={`https://github.com/gaboe/neohtop/releases/latest`}
+                href={`https://github.com/gaboe/gtop/releases/latest`}
                 class="update-button"
                 target="_blank"
                 rel="noopener noreferrer"
