@@ -156,7 +156,7 @@
 {#if isLoading}
   <div class="loading-container">
     <div class="loading-content">
-      <img src="128x128.png" alt="NeoHtop Logo" class="logo" />
+      <img src="128x128.png" alt="gtop logo" class="logo" />
     </div>
   </div>
 {:else}

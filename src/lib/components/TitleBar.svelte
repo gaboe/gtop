@@ -3,8 +3,8 @@
 
 <div class="title-bar" data-tauri-drag-region>
   <div class="title">
-    <img src="/32x32.png" alt="NeoHtop" class="app-icon" />
-    <div class="neon">NeoHtop</div>
+    <img src="/32x32.png" alt="gtop" class="app-icon" />
+    <div class="neon">gtop</div>
   </div>
 </div>
 

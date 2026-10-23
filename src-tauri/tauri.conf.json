@@ -22,10 +22,10 @@
     },
     "targets": ["app", "dmg"]
   },
-  "productName": "NeoHtop",
-  "mainBinaryName": "NeoHtop",
+  "productName": "gtop",
+  "mainBinaryName": "gtop",
   "version": "1.2.0",
-  "identifier": "com.neohtop.dev",
+  "identifier": "com.gtop.app",
   "plugins": {
     "os": {
       "all": true
@@ -39,7 +39,7 @@
         "theme": "Dark",
         "height": 900,
         "resizable": true,
-        "title": "NeoHtop",
+        "title": "gtop",
         "width": 1280,
         "minWidth": 1120,
         "minHeight": 700,
