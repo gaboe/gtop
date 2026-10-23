@@ -32,6 +32,12 @@ pub struct TemperatureMonitor {
     readings: Vec<Temperature>,
 }
 
+impl Default for TemperatureMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TemperatureMonitor {
     /// Lists the sensors once; they do not change while the application runs
     pub fn new() -> Self {

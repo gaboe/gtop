@@ -70,6 +70,12 @@ enum Source {
     IoAccelerator(super::iokit::Accelerator),
 }
 
+impl Default for GpuMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GpuMonitor {
     /// Discovers the GPUs that can be monitored
     ///
