@@ -29,11 +29,14 @@
       : null,
   );
 
+  // Apple GPUs share system memory, so they report what they use but no total
   $: vram = latch(
     "vram",
-    gpu.memory_total != null && gpu.memory_used != null
-      ? `${formatBytes(gpu.memory_used)} / ${formatBytes(gpu.memory_total)}`
-      : null,
+    gpu.memory_used == null
+      ? null
+      : gpu.memory_total != null
+        ? `${formatBytes(gpu.memory_used)} / ${formatBytes(gpu.memory_total)}`
+        : formatBytes(gpu.memory_used),
   );
 
   $: temperature = latch(

@@ -6,7 +6,8 @@
 //! On Linux the numbers are read straight out of the DRM sysfs interface, which
 //! the `amdgpu` driver populates with everything the UI needs, so no additional
 //! dependency is required. NVIDIA cards are read through `nvidia-smi` when it is
-//! installed, on Linux and Windows alike. Cards that report neither a
+//! installed, on Linux and Windows alike. On macOS every GPU is read from its
+//! IOKit `IOAccelerator` service. Cards that report neither a
 //! utilization nor a memory figure are left out, and the panel disappears when
 //! nothing at all is found.
 
@@ -64,6 +65,9 @@ enum Source {
         /// Index of the card in the `nvidia-smi` listing
         index: usize,
     },
+    /// The card's IOKit `IOAccelerator` service
+    #[cfg(target_os = "macos")]
+    IoAccelerator(super::iokit::Accelerator),
 }
 
 impl GpuMonitor {
@@ -75,6 +79,16 @@ impl GpuMonitor {
     pub fn new() -> Self {
         let mut devices = discover_sysfs_devices();
         devices.extend(discover_nvidia_devices());
+        #[cfg(target_os = "macos")]
+        devices.extend(
+            super::iokit::Accelerator::all()
+                .into_iter()
+                .map(|accelerator| GpuDevice {
+                    name: accelerator.name(),
+                    vendor: "Apple".to_string(),
+                    source: Source::IoAccelerator(accelerator),
+                }),
+        );
 
         let uses_nvidia_smi = devices
             .iter()
@@ -118,6 +132,12 @@ impl GpuMonitor {
                         if let Some(row) = nvidia_rows.get(*index) {
                             read_nvidia_stats(row, &mut info);
                         }
+                    }
+                    #[cfg(target_os = "macos")]
+                    Source::IoAccelerator(accelerator) => {
+                        let stats = accelerator.stats();
+                        info.utilization = stats.utilization;
+                        info.memory_used = stats.memory_used;
                     }
                 }
 

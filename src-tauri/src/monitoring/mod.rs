@@ -4,8 +4,12 @@
 //! and processes. It includes process monitoring, system statistics collection,
 //! and data structures for representing system state.
 
+#[cfg(not(target_os = "macos"))]
+mod drm;
 mod gpu_monitor;
 mod gpu_process_monitor;
+#[cfg(target_os = "macos")]
+mod iokit;
 mod process_monitor;
 mod system_monitor;
 mod types;
