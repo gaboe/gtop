@@ -18,6 +18,8 @@ pub struct AppState {
     pub networks: Mutex<Networks>,
     /// Networks information handler
     pub disks: Mutex<Disks>,
+    /// Process monitoring component
+    pub process_monitor: Mutex<ProcessMonitor>,
     /// System statistics monitoring component
     pub system_monitor: Mutex<SystemMonitor>,
 }
@@ -40,6 +42,7 @@ impl AppState {
         let networks = Networks::new_with_refreshed_list();
 
         Self {
+            process_monitor: Mutex::new(ProcessMonitor::new()),
             system_monitor: Mutex::new(SystemMonitor::new(&networks)),
             sys: Mutex::new(sys),
             disks: Mutex::new(disks),

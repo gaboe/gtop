@@ -50,9 +50,10 @@ pub async fn get_processes(
     networks.refresh(true);
     let refreshed = Instant::now();
 
+    let mut process_monitor = state.process_monitor.lock().map_err(|e| e.to_string())?;
     let mut system_monitor = state.system_monitor.lock().map_err(|e| e.to_string())?;
 
-    let processes = ProcessMonitor::collect_processes(&sys, include_environ)?;
+    let processes = process_monitor.collect_processes(&sys, include_environ)?;
     let system_stats = system_monitor.collect_stats(&sys, &networks, &disks);
     let collected = Instant::now();
 
