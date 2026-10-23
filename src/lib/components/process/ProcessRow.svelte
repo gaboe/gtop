@@ -21,7 +21,7 @@
           <span class="process-name">{process.name}</span>
         </div>
       {:else if column.format}
-        {@html column.format(process[column.id])}
+        {column.format(process[column.id])}
       {:else}
         {process[column.id]}
       {/if}
