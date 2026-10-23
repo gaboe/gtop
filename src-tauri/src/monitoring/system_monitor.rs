@@ -3,7 +3,7 @@
 //! This module handles collection and monitoring of system-wide statistics
 //! including CPU, memory, network, and disk usage.
 
-use super::{GpuMonitor, SystemStats};
+use super::{GpuMonitor, SystemStats, TemperatureMonitor};
 use std::fmt::Debug;
 use std::path::Path;
 use std::time::Instant;
@@ -16,6 +16,8 @@ pub struct SystemMonitor {
     last_network_update: (Instant, u64, u64),
     /// Reads the GPUs found at start-up
     gpu_monitor: GpuMonitor,
+    /// Reads the temperature sensors
+    temperature_monitor: TemperatureMonitor,
 }
 
 impl SystemMonitor {
@@ -38,6 +40,7 @@ impl SystemMonitor {
         Self {
             last_network_update: (Instant::now(), initial_rx, initial_tx),
             gpu_monitor: GpuMonitor::new(),
+            temperature_monitor: TemperatureMonitor::new(),
         }
     }
 
@@ -71,6 +74,7 @@ impl SystemMonitor {
             disk_used_bytes: disk_used,
             disk_free_bytes: disk_free,
             gpus: self.gpu_monitor.collect(),
+            temperatures: self.temperature_monitor.collect(),
         }
     }
 

@@ -6,6 +6,7 @@
     MemoryPanel,
     StoragePanel,
     SystemPanel,
+    TemperaturePanel,
     NetworkPanel,
   } from "$lib/components";
 
@@ -37,6 +38,10 @@
       />
 
       <SystemPanel uptime={systemStats.uptime} loadAvg={systemStats.load_avg} />
+
+      {#if systemStats.temperatures?.length}
+        <TemperaturePanel temperatures={systemStats.temperatures} />
+      {/if}
 
       <NetworkPanel
         networkRxBytes={systemStats.network_rx_bytes}

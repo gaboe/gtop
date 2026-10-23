@@ -12,10 +12,12 @@ mod gpu_process_monitor;
 mod iokit;
 mod process_monitor;
 mod system_monitor;
+mod temperature_monitor;
 mod types;
 
 pub use gpu_monitor::GpuMonitor;
 pub use gpu_process_monitor::GpuProcessMonitor;
 pub use process_monitor::ProcessMonitor;
 pub use system_monitor::SystemMonitor;
+pub use temperature_monitor::TemperatureMonitor;
 pub use types::*; // Re-export all types

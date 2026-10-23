@@ -30,6 +30,11 @@ export interface GpuInfo {
   core_clock_mhz: number | null;
 }
 
+export interface Temperature {
+  name: string;
+  celsius: number;
+}
+
 export interface SystemStats {
   cpu_usage: number[];
   memory_total: number;
@@ -44,6 +49,7 @@ export interface SystemStats {
   disk_used_bytes: number;
   disk_free_bytes: number;
   gpus: GpuInfo[];
+  temperatures: Temperature[];
 }
 
 export interface Column {

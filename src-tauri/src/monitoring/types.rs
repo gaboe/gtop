@@ -65,6 +65,15 @@ pub struct GpuInfo {
     pub core_clock_mhz: Option<u32>,
 }
 
+/// Hottest sensor reading of one component group, such as "CPU"
+#[derive(Serialize, Debug, Clone)]
+pub struct Temperature {
+    /// Component group name
+    pub name: String,
+    /// Temperature in degrees Celsius
+    pub celsius: f32,
+}
+
 /// System-wide statistics exposed to the frontend
 /// Provides overall system resource usage and performance metrics
 #[derive(Serialize, Debug)]
@@ -95,4 +104,6 @@ pub struct SystemStats {
     pub disk_free_bytes: u64,
     /// Per-GPU statistics; empty when no supported GPU was found
     pub gpus: Vec<GpuInfo>,
+    /// Hottest reading per component group; empty when no sensor is readable
+    pub temperatures: Vec<Temperature>,
 }
