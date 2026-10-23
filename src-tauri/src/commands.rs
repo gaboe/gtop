@@ -6,7 +6,15 @@
 
 use crate::monitoring::{ProcessInfo, ProcessMonitor, SystemStats};
 use crate::state::AppState;
+use std::sync::OnceLock;
+use std::time::Instant;
 use tauri::State;
+
+/// `NEOHTOP_PERF=1` logs the cost of every refresh tick to stderr.
+fn perf_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEOHTOP_PERF").is_some())
+}
 
 /// Retrieves the current list of processes and system statistics
 ///
@@ -32,17 +40,31 @@ pub async fn get_processes(
     let mut sys = state.sys.lock().map_err(|e| e.to_string())?;
     let mut disks = state.disks.lock().map_err(|e| e.to_string())?;
     let mut networks = state.networks.lock().map_err(|e| e.to_string())?;
+    let started = Instant::now();
     sys.refresh_all();
     disks.refresh(true);
     networks.refresh(true);
+    let refreshed = Instant::now();
 
     let mut process_monitor = state.process_monitor.lock().map_err(|e| e.to_string())?;
     let mut system_monitor = state.system_monitor.lock().map_err(|e| e.to_string())?;
 
     let processes = process_monitor.collect_processes(&sys)?;
     let system_stats = system_monitor.collect_stats(&sys, &networks, &disks);
+    let collected = Instant::now();
 
-    Ok((processes, system_stats))
+    let result = (processes, system_stats);
+    if perf_enabled() {
+        let bytes = serde_json::to_vec(&result).map(|v| v.len()).unwrap_or(0);
+        eprintln!(
+            "perf tick refresh_us={} collect_us={} bytes={} procs={}",
+            (refreshed - started).as_micros(),
+            (collected - refreshed).as_micros(),
+            bytes,
+            result.0.len()
+        );
+    }
+    Ok(result)
 }
 
 /// Attempts to kill a process with the specified PID
