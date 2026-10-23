@@ -275,21 +275,29 @@ impl Monitor {
             .bg(rgb(t.base.plate))
             .border_1()
             .border_color(rgb(t.rule))
-            .child(label(
-                self.snapshot
-                    .as_ref()
-                    .and_then(|s| s.stats.gpus.first())
-                    .map(|g| g.name.clone())
-                    .unwrap_or_else(|| "SYSTEM MONITOR".into()),
-                t,
-            ))
             .child(
                 div()
-                    .font_family("Archivo Display")
-                    .font_weight(FontWeight::EXTRA_BOLD)
-                    .text_size(px(48.))
-                    .line_height(px(40.))
-                    .child("GTOP"),
+                    .px(px(4.))
+                    .pb(px(2.))
+                    .child(
+                        label(
+                            self.snapshot
+                                .as_ref()
+                                .and_then(|s| s.stats.gpus.first())
+                                .map(|g| g.name.to_uppercase())
+                                .unwrap_or_else(|| "SYSTEM MONITOR".into()),
+                            t,
+                        )
+                        .text_color(rgb(t.silk_dim)),
+                    )
+                    .child(
+                        div()
+                            .font_family("Archivo Display")
+                            .font_weight(FontWeight::EXTRA_BOLD)
+                            .text_size(px(48.))
+                            .line_height(px(40.))
+                            .child("GTOP"),
+                    ),
             );
         let Some(s) = self.snapshot.as_ref() else {
             return tower.child("Reading system information");
@@ -326,6 +334,7 @@ impl Monitor {
         let cpu = stats.cpu_usage.iter().sum::<f32>() / cores.max(1) as f32;
         tower = tower.child(
             win(t)
+                .gap(px(2.))
                 .child(
                     div()
                         .flex()
@@ -416,6 +425,21 @@ impl Monitor {
             ),
         ));
         let own = s.processes.iter().find(|p| p.pid == std::process::id());
+        let cost = |name: &str, value: String, unit: &str| {
+            div()
+                .flex()
+                .items_baseline()
+                .gap(px(4.))
+                .child(label(name.to_string(), t).text_color(rgb(t.silk_dim)))
+                .child(
+                    div()
+                        .font_family("Silkscreen")
+                        .text_size(px(10.))
+                        .text_color(rgb(t.base.ok))
+                        .child(value),
+                )
+                .child(label(unit.to_string(), t).text_color(rgb(t.silk_dim)))
+        };
         tower
             .child(
                 div()
@@ -423,16 +447,29 @@ impl Monitor {
                     .flex_col()
                     .gap(px(5.))
                     .px(px(4.))
-                    .child(label("● GTOP SELF", t))
-                    .child(format!(
-                        "CPU {} %   Mem {}",
-                        own.map(|p| format!("{:.2}", p.cpu_usage))
-                            .unwrap_or_else(|| "N/A".into()),
-                        own.map(|p| bytes(p.memory_usage))
-                            .unwrap_or_else(|| "N/A".into())
-                    ))
-                    .child(format!("Tick {:.1} ms", self.tick_ms))
-                    .child("Frame unavailable · fps unavailable"),
+                    .pt(px(4.))
+                    .child(label("● GTOP SELF", t).text_color(rgb(t.base.silk)))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(10.))
+                            .child(cost(
+                                "CPU",
+                                own.map(|p| format!("{:.2}", p.cpu_usage))
+                                    .unwrap_or_else(|| "N/A".into()),
+                                "%",
+                            ))
+                            .child(cost(
+                                "MEM",
+                                own.map(|p| format!("{:.0}", p.memory_usage as f64 / 1_048_576.))
+                                    .unwrap_or_else(|| "N/A".into()),
+                                "MB",
+                            ))
+                            .child(cost("TICK", format!("{:.1}", self.tick_ms), "MS")),
+                    )
+                    .child(
+                        label("FRAME UNAVAILABLE · FPS UNAVAILABLE", t).text_color(rgb(t.silk_dim)),
+                    ),
             )
             .child(div().flex_1())
             .child(label(

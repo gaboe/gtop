@@ -114,6 +114,9 @@ impl Render for Processes {
                     .role(Role::ColumnHeader)
                     .w(px(self.width(kind)))
                     .flex_shrink_0()
+                    .when(kind == ProcessColumn::Command, |d| {
+                        d.flex_1().min_w_0().flex_shrink(1.)
+                    })
                     .px(px(10.))
                     .py(px(7.))
                     .font_family("Archivo Labels")
@@ -121,7 +124,7 @@ impl Render for Processes {
                     .text_size(px(9.))
                     .text_color(rgb(if selected { t.base.led } else { t.silk_dim }))
                     .cursor_pointer()
-                    .child(format!(
+                    .child(crate::rack::tracked(format!(
                         "{}{}",
                         kind.label().to_uppercase(),
                         if selected {
@@ -133,8 +136,11 @@ impl Render for Processes {
                         } else {
                             ""
                         }
-                    ))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    )))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(focus) = &this.root_focus {
+                            window.focus(focus, cx);
+                        }
                         this.sort(kind, true);
                         cx.notify();
                     }))
