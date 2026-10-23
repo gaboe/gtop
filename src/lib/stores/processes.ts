@@ -2,6 +2,7 @@ import { writable, derived, get } from "svelte/store";
 import type { Process, SystemStats } from "$lib/types";
 import { invoke } from "@tauri-apps/api/core";
 import { settingsStore } from "./settings";
+import { searchHasPortQuery } from "$lib/utils";
 
 interface ProcessStore {
   processes: Process[];
@@ -56,8 +57,10 @@ function createProcessStore() {
     try {
       const includeEnviron =
         get(settingsStore).appearance.columnVisibility.environ ?? false;
+      const includePorts = searchHasPortQuery(get({ subscribe }).searchTerm);
       const result = await invoke<[Process[], SystemStats]>("get_processes", {
         includeEnviron,
+        includePorts,
       });
       update((state) => {
         let updatedSelectedProcess = state.selectedProcess;
