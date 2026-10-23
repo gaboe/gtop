@@ -49,6 +49,7 @@ fi
 cp "$gtop_registry/LICENSE-APACHE" "$gtop_bundle/Contents/Resources/licenses/GPUI-LICENSE-APACHE"
 cp "$gtop_assets_registry/LICENSE-LUCIDE" "$gtop_bundle/Contents/Resources/licenses/Lucide-Feather-NOTICE"
 
+cp crates/gtop/assets/fonts/*-OFL.txt "$gtop_bundle/Contents/Resources/licenses/"
 codesign --force --deep --sign - "$gtop_bundle"
 codesign --verify --deep --strict "$gtop_bundle"
 printf '%s\n' "$gtop_bundle"
