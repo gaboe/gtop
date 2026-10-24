@@ -129,6 +129,19 @@ impl AppState {
         ProcessMonitor::read_environment(&mut sys, pid)
     }
 
+    pub fn process_stopped(&self, pid: u32, start_time: u64) -> Result<bool, String> {
+        let mut sys = self.sys.lock().map_err(|e| e.to_string())?;
+        let id = sysinfo::Pid::from_u32(pid);
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[id]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
+        Ok(sys.process(id).is_none_or(|process| {
+            process.start_time() != start_time || process.status() == sysinfo::ProcessStatus::Zombie
+        }))
+    }
+
     pub fn kill_process_if_matches(&self, pid: u32, start_time: u64) -> Result<bool, String> {
         let mut sys = self.sys.lock().map_err(|e| e.to_string())?;
         let id = sysinfo::Pid::from_u32(pid);
@@ -206,6 +219,12 @@ mod tests {
             .find(|p| p.pid == child.id())
             .unwrap();
         assert!(!state
+            .process_stopped(child.id(), process.start_time)
+            .unwrap());
+        assert!(state
+            .process_stopped(child.id(), process.start_time + 1)
+            .unwrap());
+        assert!(!state
             .kill_process_if_matches(child.id(), process.start_time + 1)
             .unwrap());
         assert!(child.try_wait().unwrap().is_none());
@@ -213,6 +232,9 @@ mod tests {
             .kill_process_if_matches(child.id(), process.start_time)
             .unwrap());
         assert!(!child.wait().unwrap().success());
+        assert!(state
+            .process_stopped(child.id(), process.start_time)
+            .unwrap());
     }
 
     #[test]

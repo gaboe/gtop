@@ -207,6 +207,34 @@ impl Monitor {
                 }
                 if !running {
                     history.suspend();
+                    if let Some(selection) = moment {
+                        if cached_moment != Some(selection) || cached_metric != Some(metric) {
+                            let detail = history.moment(selection);
+                            let _ = entity.update_in(cx, |this, _, cx| {
+                                if this.moment == Some(selection) {
+                                    this.moment_rows = detail.ranked(metric);
+                                    this.moment_detail = Some(detail);
+                                    cx.notify();
+                                }
+                            });
+                            cached_moment = Some(selection);
+                            cached_metric = Some(metric);
+                        }
+                    }
+                    let pending = entity.update_in(cx, |this, _, _| this.pending_kill).ok().flatten();
+                    if let Some(key) = pending {
+                        let state = core.clone();
+                        let stopped = cx.background_executor().spawn(async move {
+                            state.process_stopped(key.pid, key.start_time)
+                        }).await;
+                        let _ = entity.update_in(cx, |this, _, cx| {
+                            if this.pending_kill == Some(key) && matches!(stopped, Ok(true)) {
+                                this.pending_kill = None;
+                                this.status = format!("PID {} stopped.", key.pid);
+                                cx.notify();
+                            }
+                        });
+                    }
                     if let Some((key, name, command, cpu, needs_analysis)) = selected_detail.as_ref() {
                         if *needs_analysis || cached_analysis_key != Some(*key) {
                             let analysis = history.analyze_process(
@@ -226,7 +254,12 @@ impl Monitor {
                     } else {
                         cached_analysis_key = None;
                     }
-                    if events.next().await.is_none() { break; }
+                    if pending.is_some() {
+                        let timer = cx.background_executor().timer(Duration::from_secs(seconds)).fuse();
+                        let event = events.next().fuse();
+                        futures::pin_mut!(timer, event);
+                        futures::select! { _ = timer => {}, event = event => { if event.is_none() { break; } } }
+                    } else if events.next().await.is_none() { break; }
                     continue;
                 }
                 let state = core.clone();
