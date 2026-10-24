@@ -112,6 +112,17 @@
   // Unlit segments show behind lit ones, as on a real VFD tube.
   const lit = (txt, cls = "", ghost = "8") => `<span class="ghost"><span class="vfd dim ${cls}">${String(txt).replace(/[0-9]/g, ghost)}</span><span class="vfd ${cls}">${txt}</span></span>`;
 
+  // Units as 5x7 dot-matrix characters, the way a VFD tube draws them, with unlit dots behind.
+  const GLYPH = {
+    "%": ["11000", "11001", "00010", "00100", "01000", "10011", "00011"],
+    "°": ["01100", "10010", "10010", "01100", "00000", "00000", "00000"],
+  };
+  const glyph = (u, hot) => `<svg class="u-dm ${hot ? "hot" : ""}" viewBox="0 0 10 14" role="img" aria-label="${u === "%" ? "percent" : "degrees"}">${GLYPH[u].map((r, y) => [...r].map((b, x) => `<circle class="${b === "1" ? "on" : "off"}" cx="${x * 2 + 1}" cy="${y * 2 + 1}" r=".82"/>`).join("")).join("")}</svg>`;
+  const unit = (txt, u, cls = "") => {
+    const hot = /\bhot\b/.test(cls), size = cls.replace(/\bhot\b/, "").trim(), h = hot ? "hot" : "";
+    return `<span class="unit ${size}"><span class="ghost"><span class="vfd dim ${h}">${String(txt).replace(/[0-9 ]/g, "8")}</span><span class="vfd ${h}">${txt}</span></span>${glyph(u, hot)}</span>`;
+  };
+
   function side(m) { return m.ui.settingsOpen ? THEME.panel() : m.detail ? detailPanel(m) : ""; }
 
   function strip({ ui, rows }) {
@@ -125,5 +136,5 @@
       <span class="end"><span class="synth">Synthetic demo data · ${rows.length} processes</span><button class="sw silk" data-act="settings" aria-pressed="${ui.settingsOpen}"><span class="lamp"></span>Settings · S</button></span></footer>`;
   }
 
-  window.KIT = { METRICS, lit, self, CORES, LIMIT, segs, machine, screws, source, bank, liveTable, histTable, columns, detailPanel, side, strip };
+  window.KIT = { METRICS, lit, unit, self, CORES, LIMIT, segs, machine, screws, source, bank, liveTable, histTable, columns, detailPanel, side, strip };
 })();

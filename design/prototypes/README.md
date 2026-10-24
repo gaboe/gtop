@@ -39,3 +39,9 @@ A click on any column of the last-hour strip or the history tape opens the momen
 - `←` `→` step one column. A second click on the same column or `Esc` closes it. In the live view, `Full hour · 1` opens the 1 h history.
 
 References: `reference/13-moment-live.png`, `reference/14-moment-history-24h.png`.
+
+## Units in VFD readouts
+
+Percent and degree signs in VFD readouts are 5×7 dot-matrix characters, the way a VFD tube draws them (`KIT.unit` in `rack-kit.js`, `.u-dm` in `vfd.css`). Each is lit at digit height with unlit dots behind it, like the `888` field behind the digits. The Doto `%` glyph read as a crossed block, so it is never used. Numbers sit in a fixed-width field (for example `888` for 0 to 100), so the readout does not jump as values change. `percent-lab.html` compares the variants that were considered.
+
+The reference images 01, 02, 07-hour-temp, 13 and 14 show the final units. The other references predate this rule; where they differ, this section wins.

@@ -45,7 +45,7 @@ function leaders(h, fmt) {
     const live = h.slice.filter((b) => !b.closed);
     const peak = live.reduce((a, b) => (b.temp > a.temp ? b : a), live[0]);
     const avg = live.reduce((a, b) => a + b.temp, 0) / live.length;
-    return `<span><span class="lab">Peak at ${fmt.clock(peak.t)}</span> ${KIT.lit(peak.temp.toFixed(0) + "°", peak.temp > 90 ? "sm hot" : "sm")}</span><span><span class="lab">Average</span> ${KIT.lit(avg.toFixed(0) + "°", "sm")}</span>`;
+    return `<span><span class="lab">Peak at ${fmt.clock(peak.t)}</span> ${KIT.unit(peak.temp.toFixed(0), "°", peak.temp > 90 ? "sm hot" : "sm")}</span><span><span class="lab">Average</span> ${KIT.unit(avg.toFixed(0), "°", "sm")}</span>`;
   }
   const key = { cpu: "cpuMin", gpu: "gpuMin", mem: "peakMem" }[metric];
   const show = { cpu: (r) => fmt.mins(r.cpuMin).replace(" min", "m"), gpu: (r) => fmt.mins(r.gpuMin).replace(" min", "m"), mem: (r) => fmt.mem(r.peakMem) }[metric];

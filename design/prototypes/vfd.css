@@ -57,3 +57,11 @@
 .mtable td:nth-child(3) { width: 72px; }
 .mtable td:nth-child(3) .share { display: grid; width: 100%; }
 .mtable td:nth-child(4) { width: 68px; }
+
+/* Units sit beside the dot-matrix digits as 5x7 dot-matrix glyphs at digit height, lit and glowing with them. */
+.unit { display: inline-flex; align-items: baseline; white-space: nowrap; }
+.unit .vfd { white-space: pre; }
+.u-dm { height: .74em; width: auto; margin-left: .12em; color: var(--led); overflow: visible; filter: drop-shadow(0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--led) 60%, transparent)); }
+.u-dm.hot { color: var(--hot); filter: drop-shadow(0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--hot) 65%, transparent)); }
+.u-dm .on { fill: currentColor; }
+.u-dm .off { fill: color-mix(in oklab, var(--led) 18%, var(--ground)); }
