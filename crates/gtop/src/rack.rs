@@ -11,7 +11,29 @@ use gpui_component::{
     Sizable,
 };
 use gtop_core::ProcessInfo;
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Mutex, OnceLock},
+};
+
+const UNIT_GLYPHS: [(char, [&str; 7]); 2] = [
+    (
+        '%',
+        [
+            "11000", "11001", "00010", "00100", "01000", "10011", "00011",
+        ],
+    ),
+    (
+        '°',
+        [
+            "01100", "10010", "10010", "01100", "00000", "00000", "00000",
+        ],
+    ),
+];
+
+type UnitPaths = (Path<Pixels>, Path<Pixels>);
+type UnitCacheKey = (char, u32, u32, u32);
+static UNIT_PATHS: OnceLock<Mutex<HashMap<UnitCacheKey, UnitPaths>>> = OnceLock::new();
 
 pub fn timestamp(seconds: u64, format: &str) -> String {
     chrono::DateTime::from_timestamp(seconds as i64, 0)
@@ -93,6 +115,144 @@ pub fn lit(text: String, size: f32, hot: bool, t: &Tokens) -> Div {
                 .child(ghost),
         )
         .child(div().relative().child(text))
+}
+
+fn unit_paths(bounds: Bounds<Pixels>, unit: char) -> UnitPaths {
+    let key = (
+        unit,
+        f32::from(bounds.origin.x).to_bits(),
+        f32::from(bounds.origin.y).to_bits(),
+        f32::from(bounds.size.height).to_bits(),
+    );
+    let cache = UNIT_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some(paths) = cache.get(&key) {
+            return paths.clone();
+        }
+    }
+    let rows = UNIT_GLYPHS
+        .iter()
+        .find_map(|(glyph, rows)| (*glyph == unit).then_some(rows))
+        .expect("unit glyph is defined");
+    let scale = f32::from(bounds.size.height) / 14.;
+    let origin_x = f32::from(bounds.origin.x);
+    let origin_y = f32::from(bounds.origin.y);
+    let mut lit = PathBuilder::fill();
+    let mut ghost = PathBuilder::fill();
+    for (y, row) in rows.iter().enumerate() {
+        for (x, bit) in row.bytes().enumerate() {
+            let center_x = origin_x + (x as f32 * 2. + 1.) * scale;
+            let center_y = origin_y + (y as f32 * 2. + 1.) * scale;
+            let path = if bit == b'1' { &mut lit } else { &mut ghost };
+            let radius = scale * 0.82;
+            let points = (0..12)
+                .map(|i| {
+                    let angle = i as f32 * std::f32::consts::TAU / 12.;
+                    point(
+                        px(center_x + angle.cos() * radius),
+                        px(center_y + angle.sin() * radius),
+                    )
+                })
+                .collect::<Vec<_>>();
+            path.add_polygon(&points, true);
+        }
+    }
+    let paths = (
+        lit.build().expect("lit unit geometry"),
+        ghost.build().expect("ghost unit geometry"),
+    );
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, paths.clone());
+    }
+    paths
+}
+
+fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
+    let led = if hot { t.base.hot } else { t.base.led };
+    let ghost = palette::mix(t.base.led, t.base.ground, 0.18);
+    div().ml(px(size * 0.12)).child(
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let (lit, ghost_path) = unit_paths(bounds, unit);
+                window.paint_path(ghost_path, rgb(ghost));
+                window.paint_path(lit, rgb(led));
+            },
+        )
+        .w(px(size * 0.74 * 10. / 14.))
+        .h(px(size * 0.74)),
+    )
+}
+
+pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
+    let width_chars = value.chars().count().max(3);
+    let value = format!("{value:>width_chars$}");
+    let ghost: String = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_digit() || c.is_whitespace() {
+                '8'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let width = px(size * 0.56 * width_chars as f32);
+    div()
+        .flex()
+        .items_baseline()
+        .child(
+            div()
+                .relative()
+                .w(width)
+                .h(px(size))
+                .font_family("Doto Display")
+                .font_weight(FontWeight::BLACK)
+                .text_size(px(size))
+                .line_height(px(size))
+                .text_color(rgb(if hot { t.base.hot } else { t.base.led }))
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .text_color(rgb(palette::mix(t.base.led, t.base.ground, 0.18)))
+                        .child(ghost),
+                )
+                .child(div().relative().child(value)),
+        )
+        .child(unit_glyph(unit, size, hot, t))
+}
+
+fn unit_with_peak(
+    name: &str,
+    average: Option<f64>,
+    peak: Option<f64>,
+    unit: char,
+    size: f32,
+    hot: bool,
+    t: &Tokens,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .child(label(name, t))
+        .child(
+            average
+                .map(|v| lit_unit(format!("{v:3.0}"), unit, size, hot, t))
+                .unwrap_or_else(|| lit("·".into(), size, false, t)),
+        )
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap(px(3.))
+                .child(label("PEAK", t))
+                .child(
+                    peak.map(|v| lit_unit(format!("{v:3.0}"), unit, 9., hot, t))
+                        .unwrap_or_else(|| lit("·".into(), 9., false, t)),
+                ),
+        )
 }
 pub fn screws(t: &Tokens) -> Div {
     let mut d = div().absolute().size_full();
@@ -205,10 +365,17 @@ pub fn segments(value: f32, n: usize, t: &Tokens) -> Div {
         }))
 }
 fn readout(name: &str, value: String, t: &Tokens) -> Div {
+    let display = if let Some(number) = value.strip_suffix('%') {
+        lit_unit(number.to_string(), '%', 22., false, t)
+    } else if let Some(number) = value.strip_suffix('°') {
+        lit_unit(number.to_string(), '°', 22., false, t)
+    } else {
+        lit(value, 22., false, t)
+    };
     div()
         .flex_1()
         .child(label(name.to_uppercase(), t))
-        .child(lit(value, 22., false, t))
+        .child(display)
 }
 fn tape(
     view: &HistoryView,
@@ -332,41 +499,62 @@ impl Monitor {
                 (
                     Metric::Cpu,
                     "CPU",
-                    detail.cpu_average.map(|v| format!("{v:.0}%")),
-                    detail.cpu_peak.map(|v| format!("PEAK {v:.0}%")),
+                    detail.cpu_average,
+                    detail.cpu_peak,
+                    Some('%'),
                 ),
                 (
                     Metric::Memory,
                     "Memory",
-                    detail.memory_average.map(|v| bytes(v as u64)),
-                    detail
-                        .memory_peak
-                        .map(|v| format!("PEAK {}", bytes(v as u64))),
+                    detail.memory_average,
+                    detail.memory_peak,
+                    None,
                 ),
                 (
                     Metric::Gpu,
                     "GPU",
-                    detail.gpu_average.map(|v| format!("{v:.0}%")),
-                    detail.gpu_peak.map(|v| format!("PEAK {v:.0}%")),
+                    detail.gpu_average,
+                    detail.gpu_peak,
+                    Some('%'),
                 ),
                 (
                     Metric::Temperature,
                     "CPU °C",
-                    detail.temperature_average.map(|v| format!("{v:.0}°")),
-                    detail.temperature_peak.map(|v| format!("PEAK {v:.0}°")),
+                    detail.temperature_average,
+                    detail.temperature_peak,
+                    Some('°'),
                 ),
             ];
             let mut metrics = div().grid().grid_cols(2).gap(px(6.)).p(px(10.));
-            for (metric, name, average, peak) in values {
+            for (metric, name, average, peak, unit) in values {
                 let active = metric == self.metric;
+                let readout = if let Some(unit) = unit {
+                    unit_with_peak(name, average, peak, unit, 18., false, t)
+                } else {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(label(name, t))
+                        .child(lit(
+                            average
+                                .map(|v| bytes(v as u64))
+                                .unwrap_or_else(|| "·".into()),
+                            18.,
+                            false,
+                            t,
+                        ))
+                        .child(label(
+                            peak.map(|v| format!("PEAK {}", bytes(v as u64)))
+                                .unwrap_or_else(|| "PEAK ·".into()),
+                            t,
+                        ))
+                };
                 metrics = metrics.child(
                     div()
                         .p(px(8.))
                         .border_1()
                         .border_color(rgb(if active { t.base.silk } else { t.rule }))
-                        .child(label(name, t))
-                        .child(lit(average.unwrap_or_else(|| "·".into()), 18., false, t))
-                        .child(label(peak.unwrap_or_else(|| "PEAK ·".into()), t)),
+                        .child(readout),
                 );
             }
             let rows = self.moment_rows.clone();
@@ -540,14 +728,11 @@ impl Monitor {
                         .flex()
                         .justify_between()
                         .child(label("LOAD SOURCE", t))
-                        .child(lit(
-                            src.as_ref()
-                                .map(|s| format!("{:3.0}%", s.1))
-                                .unwrap_or_default(),
-                            15.,
-                            src.as_ref().is_some_and(|s| s.1 > 50.),
-                            t,
-                        )),
+                        .child(if let Some((_, value)) = src.as_ref() {
+                            lit_unit(format!("{value:3.0}"), '%', 15., *value > 50., t)
+                        } else {
+                            lit(String::new(), 15., false, t)
+                        }),
                 )
                 .child(lit(
                     src.as_ref()
@@ -570,7 +755,7 @@ impl Monitor {
                         .child(label(format!("CPU · {cores} CORES"), t))
                         .child(label(format!("LOAD {:.1}", stats.load_avg[0]), t)),
                 )
-                .child(lit(format!("{cpu:3.0}%"), 42., cpu > 85., t))
+                .child(lit_unit(format!("{cpu:3.0}"), '%', 42., cpu > 85., t))
                 .child(div().flex().items_end().gap(px(3.)).h(px(40.)).children(
                     stats.cpu_usage.iter().map(|v| {
                         div()
@@ -639,14 +824,13 @@ impl Monitor {
                             .map(|v| v.celsius);
                         div()
                             .flex_1()
-                            .child(lit(
+                            .child(
                                 value
-                                    .map(|v| format!("{v:.0}"))
-                                    .unwrap_or_else(|| "N/A".into()),
-                                22.,
-                                value.is_some_and(|v| v > limit),
-                                t,
-                            ))
+                                    .map(|value| {
+                                        lit_unit(format!("{value:2.0}"), '°', 22., value > limit, t)
+                                    })
+                                    .unwrap_or_else(|| lit("N/A".into(), 22., false, t)),
+                            )
                             .child(label(if name == "Battery" { "BAT" } else { name }, t))
                     },
                 ),
@@ -870,16 +1054,22 @@ impl Monitor {
                                     .items_center()
                                     .gap_2()
                                     .child(label(name, &t))
-                                    .child(lit(
-                                        match self.metric {
-                                            Metric::Cpu | Metric::Gpu => format!("{:.1}m", v / 60.),
-                                            Metric::Memory => bytes(v as u64),
-                                            Metric::Temperature => format!("{v:.0}°"),
-                                        },
-                                        15.,
-                                        false,
-                                        &t,
-                                    ))
+                                    .child(if self.metric == Metric::Temperature {
+                                        lit_unit(format!("{v:3.0}"), '°', 15., false, &t)
+                                    } else {
+                                        lit(
+                                            match self.metric {
+                                                Metric::Cpu | Metric::Gpu => {
+                                                    format!("{:.1}m", v / 60.)
+                                                }
+                                                Metric::Memory => bytes(v as u64),
+                                                Metric::Temperature => unreachable!(),
+                                            },
+                                            15.,
+                                            false,
+                                            &t,
+                                        )
+                                    })
                             }),
                         ))
                         .child(tape(h, self.metric, 54., mem, &t, self.moment, cx)),
@@ -1327,7 +1517,24 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests {
-    use super::source;
+    use super::{source, UNIT_GLYPHS};
+    #[test]
+    fn vfd_unit_glyphs_match_the_5_by_7_design() {
+        assert_eq!(
+            UNIT_GLYPHS,
+            [
+                (
+                    '%',
+                    ["11000", "11001", "00010", "00100", "01000", "10011", "00011"]
+                ),
+                (
+                    '°',
+                    ["01100", "10010", "10010", "01100", "00000", "00000", "00000"]
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn load_source_groups_heavy_names_on_the_machine_scale() {
         let s = crate::test_data::snapshot();

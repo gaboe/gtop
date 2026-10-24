@@ -1,5 +1,5 @@
 use crate::{
-    model::{self, bytes, duration, ProcessKey},
+    model::{bytes, duration, ProcessKey},
     theme, Monitor,
 };
 use gpui::{prelude::*, *};
@@ -276,8 +276,9 @@ impl Monitor {
                                 .flex()
                                 .justify_between()
                                 .child(crate::rack::label("CPU · LAST 90 S", &t))
-                                .child(crate::rack::lit(
-                                    format!("{:.0}%", p.cpu_usage),
+                                .child(crate::rack::lit_unit(
+                                    format!("{:3.0}", p.cpu_usage),
+                                    '%',
                                     22.,
                                     p.cpu_usage > 400.,
                                     &t,
@@ -294,7 +295,27 @@ impl Monitor {
                     .child(
                         crate::rack::win(&t)
                             .child(detail_line("Memory", bytes(p.memory_usage)))
-                            .child(detail_line("GPU", model::ProcessColumn::Gpu.text(p)))
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .child(crate::rack::label("GPU", &t))
+                                    .child(
+                                        p.gpu_usage
+                                            .map(|v| {
+                                                crate::rack::lit_unit(
+                                                    format!("{v:4.1}"),
+                                                    '%',
+                                                    14.,
+                                                    false,
+                                                    &t,
+                                                )
+                                            })
+                                            .unwrap_or_else(|| {
+                                                crate::rack::lit("N/A".into(), 14., false, &t)
+                                            }),
+                                    ),
+                            )
                             .child(detail_line(
                                 "Disk read",
                                 format!(
