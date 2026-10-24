@@ -97,8 +97,8 @@ impl Processes {
                 }
             }
             ProcessColumn::Pid => 70.,
-            ProcessColumn::User => 80.,
-            ProcessColumn::Cpu => 190.,
+            ProcessColumn::User => 85.,
+            ProcessColumn::Cpu => 160.,
             ProcessColumn::Memory => 100.,
             ProcessColumn::Gpu => 65.,
             ProcessColumn::Ports => 90.,
@@ -146,7 +146,7 @@ impl Processes {
                 .border_b_1()
                 .border_color(rgb(t.row_rule))
                 .bg(rgb(if selected {
-                    t.plate2
+                    crate::palette::mix(t.plate2, t.base.led, 0.7)
                 } else {
                     crate::palette::mix(t.base.ground, 0, 0.8)
                 }))
@@ -237,7 +237,7 @@ impl Render for Processes {
                     .py(px(7.))
                     .font_family("Archivo Labels")
                     .font_weight(FontWeight::BOLD)
-                    .text_size(px(9.))
+                    .text_size(px(10.))
                     .text_color(rgb(if selected { t.base.led } else { t.silk_dim }))
                     .cursor_pointer()
                     .child(crate::rack::tracked(format!(
@@ -245,9 +245,9 @@ impl Render for Processes {
                         kind.label().to_uppercase(),
                         if selected {
                             if self.descending {
-                                " ↓"
+                                " ▼"
                             } else {
-                                " ↑"
+                                " ▲"
                             }
                         } else {
                             ""

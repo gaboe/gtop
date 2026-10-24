@@ -223,7 +223,7 @@ pub fn process_order(
 
 pub fn bytes(value: u64) -> String {
     let mut amount = value as f64;
-    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let units = ["B", "KB", "MB", "GB", "TB"];
     let mut unit = 0;
     while amount >= 1024. && unit < units.len() - 1 {
         amount /= 1024.;

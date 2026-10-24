@@ -87,6 +87,7 @@ fn parse_macos_environment(data: &[u8]) -> Result<Vec<String>, String> {
 pub struct ProcessMonitor {
     /// Tracks per-process GPU engine usage between refreshes
     gpu_process_monitor: GpuProcessMonitor,
+    users: sysinfo::Users,
 }
 
 impl Default for ProcessMonitor {
@@ -100,6 +101,7 @@ impl ProcessMonitor {
     pub fn new() -> Self {
         Self {
             gpu_process_monitor: GpuProcessMonitor::new(),
+            users: sysinfo::Users::new_with_refreshed_list(),
         }
     }
 
@@ -158,7 +160,12 @@ impl ProcessMonitor {
                     status: Self::format_status(process.status()),
                     user: process
                         .user_id()
-                        .map(|uid| uid.to_string())
+                        .map(|uid| {
+                            self.users
+                                .get_user_by_id(uid)
+                                .map(|user| user.name().to_string())
+                                .unwrap_or_else(|| uid.to_string())
+                        })
                         .unwrap_or_else(|| "-".to_string()),
                     command: os_string_vec_to_string_vec(process.cmd()).join(" "),
                     threads: None,
