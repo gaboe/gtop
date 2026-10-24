@@ -38,8 +38,8 @@ struct Monitor {
     history_scroll: UniformListScrollHandle,
     metric: history::Metric,
     settings: palette::Settings,
-    settings_writes: mpsc::UnboundedSender<palette::Settings>,
-    _settings_writer: Task<()>,
+    settings_writes: Option<mpsc::UnboundedSender<palette::Settings>>,
+    settings_writer: Option<Task<()>>,
     settings_open: bool,
     tick_ms: f64,
     sample_seconds: f64,
@@ -393,8 +393,8 @@ impl Monitor {
             history_scroll: UniformListScrollHandle::new(),
             metric: history::Metric::Cpu,
             settings,
-            settings_writes,
-            _settings_writer: settings_writer,
+            settings_writes: Some(settings_writes),
+            settings_writer: Some(settings_writer),
             settings_open: false,
             tick_ms: 0.,
             sample_seconds: 3.,
@@ -522,6 +522,32 @@ fn main() {
     gpui_platform::application()
         .with_assets(gpui_kit_assets::Assets)
         .run(|cx| {
+            let quit_monitor: Rc<std::cell::RefCell<Option<Entity<Monitor>>>> =
+                Rc::new(std::cell::RefCell::new(None));
+            let quit_monitor_for_shutdown = quit_monitor.clone();
+            cx.on_app_quit(move |cx| {
+                let state = quit_monitor_for_shutdown
+                    .borrow()
+                    .as_ref()
+                    .cloned()
+                    .map(|monitor| {
+                        cx.update_entity(&monitor, |monitor, _| {
+                            (
+                                monitor.settings_writes.take(),
+                                monitor.settings_writer.take(),
+                                monitor.settings.clone(),
+                            )
+                        })
+                    });
+                async move {
+                    if let Some((sender, writer, settings)) = state {
+                        if let (Some(sender), Some(writer)) = (sender, writer) {
+                            palette::finish_writer(sender, settings, writer).await;
+                        }
+                    }
+                }
+            })
+            .detach();
             gpui_component::init(cx);
             theme::init(cx);
             for bytes in [
@@ -561,6 +587,7 @@ fn main() {
                 },
                 |window, cx| {
                     let monitor = cx.new(|cx| Monitor::new(window, cx));
+                    *quit_monitor.borrow_mut() = Some(monitor.clone());
                     cx.new(|cx| Root::new(monitor, window, cx))
                 },
             )

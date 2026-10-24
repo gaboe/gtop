@@ -208,6 +208,18 @@ pub async fn next_settings(
     Some(latest)
 }
 
+pub async fn finish_writer<W>(
+    sender: futures::channel::mpsc::UnboundedSender<Settings>,
+    latest: Settings,
+    writer: W,
+) where
+    W: std::future::Future<Output = ()>,
+{
+    let _ = sender.unbounded_send(latest);
+    drop(sender);
+    writer.await;
+}
+
 impl Settings {
     pub fn load() -> Self {
         std::fs::read(super::history::support_path("palette.json"))
@@ -280,6 +292,37 @@ mod tests {
         let stored: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(stored.active, 99);
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn finish_writer_publishes_latest_settings_before_returning() {
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded();
+        sender
+            .unbounded_send(Settings {
+                active: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("gtop-settings-shutdown-{}", std::process::id()));
+        let path = directory.join("palette.json");
+        let writer_path = path.clone();
+        let writer = async move {
+            while let Some(settings) = next_settings(&mut receiver).await {
+                settings.save_to(&writer_path).unwrap();
+            }
+        };
+        futures::executor::block_on(finish_writer(
+            sender,
+            Settings {
+                active: 2,
+                ..Default::default()
+            },
+            writer,
+        ));
+        let stored: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored.active, 2);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

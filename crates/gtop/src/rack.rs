@@ -1450,7 +1450,9 @@ impl Monitor {
         cx.notify();
     }
     fn persist_settings(&self, _window: &mut Window, _cx: &mut Context<Self>) {
-        let _ = self.settings_writes.unbounded_send(self.settings.clone());
+        if let Some(settings_writes) = self.settings_writes.as_ref() {
+            let _ = settings_writes.unbounded_send(self.settings.clone());
+        }
     }
     fn use_palette(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.active == index && self.draft.is_none() {
