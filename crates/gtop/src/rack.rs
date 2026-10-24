@@ -1526,12 +1526,36 @@ impl Monitor {
                     .flex()
                     .gap_1()
                     .child(
-                        Button::new(("palette", i))
-                            .label(p.name)
-                            .rack(&t)
-                            .when(i == self.settings.active && self.draft.is_none(), |b| {
-                                b.primary()
-                            })
+                        div()
+                            .id(("palette", i))
+                            .role(Role::Button)
+                            .cursor_pointer()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .px(px(8.))
+                            .py(px(6.))
+                            .border_1()
+                            .border_color(rgb(
+                                if i == self.settings.active && self.draft.is_none() {
+                                    t.base.silk
+                                } else {
+                                    t.rule
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .border_1()
+                                    .border_color(rgb(t.rule_hi))
+                                    .children(
+                                        [p.base.plate, p.base.led, p.base.hot, p.base.ok].map(
+                                            |color| div().w(px(12.)).h(px(12.)).bg(rgb(color)),
+                                        ),
+                                    ),
+                            )
+                            .child(label(p.name.to_uppercase(), t))
                             .on_click(
                                 cx.listener(move |this, _, w, cx| this.use_palette(i, w, cx)),
                             ),
@@ -1601,7 +1625,13 @@ impl Monitor {
                         .items_center()
                         .gap_3()
                         .child(div().w(px(34.)).h(px(20.)).bg(rgb(color)))
-                        .child(div().flex_1().child(label(name, t)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(12.))
+                                .text_color(rgb(t.base.silk))
+                                .child(name),
+                        )
                         .child(div().w(px(110.)).child(Input::new(&self.colors[i])))
                 }),
             )
@@ -1613,11 +1643,11 @@ impl Monitor {
                 },
                 t,
             ))
-            .child(Input::new(&self.mix_name))
             .child(
                 div()
                     .flex()
                     .gap_2()
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.mix_name)))
                     .child(Button::new("save-palette").label("Save").rack(&t).on_click(
                         cx.listener(|this, _, w, cx| {
                             if let Some(base) = this.draft {
@@ -1644,11 +1674,13 @@ impl Monitor {
                             })),
                     ),
             )
-            .child(label("REFRESH INTERVAL", t))
+            .child(div().flex_1())
             .child(
                 div()
                     .flex()
+                    .items_center()
                     .gap_1()
+                    .child(label("REFRESH", t))
                     .children([1, 2, 3, 5, 10].into_iter().map(|seconds| {
                         Button::new(("interval", seconds as usize))
                             .label(format!("{seconds}s"))
