@@ -2,7 +2,7 @@ use crate::{
     history::{HistoryView, Metric},
     model::{bytes, duration, ProcessColumn},
     palette::{self, Tokens},
-    Monitor,
+    DrawMetrics, Monitor,
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -79,11 +79,9 @@ fn keycap(key: &str, description: &str, t: &Tokens) -> Div {
         )
 }
 
-// Doto's 9 ink bounds set the glyph span; the 5x7 canvas keeps its 10:14 ratio.
-const DOTO_DIGIT_INK_TOP: f32 = 0.155;
-const DOTO_DIGIT_INK_BOTTOM: f32 = 0.845;
-const UNIT_GLYPH_TOP: f32 = DOTO_DIGIT_INK_TOP;
-const UNIT_GLYPH_HEIGHT: f32 = DOTO_DIGIT_INK_BOTTOM - DOTO_DIGIT_INK_TOP;
+// These match Doto's 9 ink span; the 5x7 canvas keeps its 10:14 ratio.
+const UNIT_GLYPH_TOP: f32 = 0.155;
+const UNIT_GLYPH_HEIGHT: f32 = 0.69;
 const UNIT_GLYPH_WIDTH_RATIO: f32 = 10. / 14.;
 
 #[derive(Clone, Copy)]
@@ -168,6 +166,20 @@ pub fn label(text: impl Into<SharedString>, t: &Tokens) -> Div {
         .text_size(px(10.))
         .text_color(rgb(t.silk_dim))
         .child(tracked(text.as_ref()))
+}
+
+fn draw_readout_text(metrics: DrawMetrics) -> String {
+    format!(
+        "CPU DRAW LAST {} MS · {} FPS / 1S",
+        metrics
+            .mean_ms
+            .map(|ms| format!("{ms:.2}"))
+            .unwrap_or_else(|| "N/A".into()),
+        metrics
+            .fps
+            .map(|fps| format!("{fps:.1}"))
+            .unwrap_or_else(|| "N/A".into())
+    )
 }
 pub fn lit(text: String, size: f32, hot: bool, t: &Tokens) -> Div {
     let ghost: String = text
@@ -1014,7 +1026,7 @@ impl Monitor {
                             .child(cost("TICK", format!("{:.1}", self.tick_ms), "MS")),
                     )
                     .child(
-                        label("FRAME UNAVAILABLE · FPS UNAVAILABLE", t).text_color(rgb(t.silk_dim)),
+                        label(draw_readout_text(self.draw_metrics), t).text_color(rgb(t.silk_dim)),
                     ),
             )
             .child(div().flex_1())
@@ -1998,8 +2010,8 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::{
-        div, lit_unit, vfd_digit_width, Tokens, DOTO_DIGIT_INK_BOTTOM, DOTO_DIGIT_INK_TOP,
-        UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS,
+        div, draw_readout_text, lit_unit, vfd_digit_width, DrawMetrics, Tokens, UNIT_GLYPHS,
+        UNIT_GLYPH_TEST_BOUNDS,
     };
     use gpui::{prelude::*, TestAppContext, Window};
 
@@ -2015,6 +2027,23 @@ mod tests {
                     .map(|(size, unit)| lit_unit("99".into(), unit, size, false, &self.tokens)),
             )
         }
+    }
+
+    fn doto_nine_ink_span(size: f32) -> (f32, f32) {
+        let font = ttf_parser::Face::parse(include_bytes!("../assets/fonts/DotoDisplay.ttf"), 0)
+            .expect("Doto Display font");
+        let units_per_em = f32::from(font.units_per_em());
+        let ascent = f32::from(font.ascender()) / units_per_em;
+        let descent = f32::from(font.descender()) / units_per_em;
+        let line_height = 1.;
+        let leading = (line_height - (ascent - descent)) / 2.;
+        let baseline = leading + ascent;
+        let digit = font.glyph_index('9').expect("Doto Display 9 glyph");
+        let ink = font.glyph_bounding_box(digit).expect("Doto Display 9 ink");
+        (
+            size * (baseline - f32::from(ink.y_max) / units_per_em),
+            size * (baseline - f32::from(ink.y_min) / units_per_em),
+        )
     }
     #[test]
     fn settings_escape_closes_from_button_focus_but_keeps_text_editing_behavior() {
@@ -2066,17 +2095,15 @@ mod tests {
         let bounds = bounds.split_off(bounds.len() - 4);
         let mut row_top = 0.;
         for (glyph, size) in bounds.into_iter().zip([9., 15., 22., 42.]) {
+            let (digit_ink_top, digit_ink_bottom) = doto_nine_ink_span(size);
             assert!(
-                (f32::from(glyph.origin.y) - row_top - size * DOTO_DIGIT_INK_TOP).abs() < 0.5,
+                (f32::from(glyph.origin.y) - row_top - digit_ink_top).abs() < 0.5,
                 "unit glyph top differs from digit ink at {size}px: got {}, expected {}",
                 f32::from(glyph.origin.y) - row_top,
-                size * DOTO_DIGIT_INK_TOP
+                digit_ink_top
             );
             assert!(
-                (f32::from(glyph.size.height)
-                    - size * (DOTO_DIGIT_INK_BOTTOM - DOTO_DIGIT_INK_TOP))
-                    .abs()
-                    < 0.5,
+                (f32::from(glyph.size.height) - (digit_ink_bottom - digit_ink_top)).abs() < 0.5,
                 "unit glyph height differs from digit ink at {size}px"
             );
             assert!(
@@ -2091,5 +2118,20 @@ mod tests {
     fn vfd_digit_box_keeps_three_and_four_character_values_on_one_line() {
         assert!((vfd_digit_width(42., 3) - 90.72).abs() < 0.001);
         assert!((vfd_digit_width(22., 4) - 63.36).abs() < 0.001);
+    }
+
+    #[test]
+    fn self_draw_readout_shows_values_after_the_first_sample() {
+        assert_eq!(
+            draw_readout_text(DrawMetrics::default()),
+            "CPU DRAW LAST N/A MS · N/A FPS / 1S"
+        );
+        assert_eq!(
+            draw_readout_text(DrawMetrics {
+                mean_ms: Some(6.64),
+                fps: Some(45.3),
+            }),
+            "CPU DRAW LAST 6.64 MS · 45.3 FPS / 1S"
+        );
     }
 }

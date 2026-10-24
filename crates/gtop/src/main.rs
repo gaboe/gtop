@@ -25,6 +25,23 @@ fn clamp_moment_row(selected: usize, row_count: usize) -> usize {
     selected.min(row_count.saturating_sub(1))
 }
 
+#[derive(Clone, Copy, Default)]
+struct DrawMetrics {
+    mean_ms: Option<f64>,
+    fps: Option<f64>,
+}
+
+impl DrawMetrics {
+    fn record(&mut self, draw_count: u64, elapsed_seconds: f64, sampled_mean_ms: Option<f64>) {
+        if let Some(mean_ms) = sampled_mean_ms {
+            self.mean_ms = Some(mean_ms);
+        }
+        if self.mean_ms.is_some() {
+            self.fps = Some(draw_count as f64 / elapsed_seconds);
+        }
+    }
+}
+
 struct Monitor {
     core: Option<Arc<AppState>>,
     snapshot: Option<Rc<Snapshot>>,
@@ -46,6 +63,7 @@ struct Monitor {
     settings_writer: Option<Task<()>>,
     settings_open: bool,
     tick_ms: f64,
+    draw_metrics: DrawMetrics,
     sample_seconds: f64,
     last_snapshot: Option<f64>,
     focus: FocusHandle,
@@ -60,6 +78,7 @@ struct Monitor {
     _subscriptions: Vec<Subscription>,
     _refresh: Task<()>,
     _ports: Task<()>,
+    _frames: Task<()>,
 }
 
 impl Monitor {
@@ -380,6 +399,47 @@ impl Monitor {
                 futures::select! { _ = timer => {}, event = event => { if event.is_none() { break; } } }
             }
         });
+        let frames = cx.spawn_in(window, async move |entity, cx| {
+            let mut previous = None;
+            let mut sampled_at = std::time::Instant::now();
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(sampled_at).as_secs_f64();
+                sampled_at = now;
+                if entity
+                    .update_in(cx, |this, window, _| {
+                        let snapshot = window.frame_duration_snapshot();
+                        let mut draws = snapshot.draw_duration_histogram.clone();
+                        if let Some(baseline) = previous.as_ref() {
+                            if draws.subtract(baseline).is_err() {
+                                previous = Some(snapshot.draw_duration_histogram);
+                                return;
+                            }
+                        }
+                        let draw_ms = (!draws.is_empty()).then(|| draws.mean() / 1_000_000.);
+                        this.draw_metrics.record(draws.len(), elapsed, draw_ms);
+                        if gtop_core::perf_enabled() {
+                            eprintln!(
+                                "perf frames draws={} seconds={elapsed:.6} draw_mean_ms={} fps={}",
+                                draws.len(),
+                                draw_ms
+                                    .map(|v| format!("{v:.6}"))
+                                    .unwrap_or_else(|| "unavailable".into()),
+                                this.draw_metrics
+                                    .fps
+                                    .map(|fps| format!("{fps:.3}"))
+                                    .unwrap_or_else(|| "unavailable".into())
+                            );
+                        }
+                        previous = Some(snapshot.draw_duration_histogram);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             core: None,
             snapshot: None,
@@ -401,6 +461,7 @@ impl Monitor {
             settings_writer: Some(settings_writer),
             settings_open: false,
             tick_ms: 0.,
+            draw_metrics: DrawMetrics::default(),
             sample_seconds: 3.,
             last_snapshot: None,
             focus,
@@ -414,6 +475,7 @@ impl Monitor {
             wake,
             _subscriptions: subscriptions,
             _refresh: refresh,
+            _frames: frames,
             _ports: ports_task,
         }
     }
@@ -607,6 +669,24 @@ fn main() {
 
 #[cfg(test)]
 mod wake_tests {
+    use super::DrawMetrics;
+
+    #[test]
+    fn draw_metrics_are_unavailable_until_the_first_completed_draw() {
+        let mut metrics = DrawMetrics::default();
+        metrics.record(0, 1., None);
+        assert_eq!(metrics.mean_ms, None);
+        assert_eq!(metrics.fps, None);
+
+        metrics.record(45, 1., Some(6.64));
+        assert_eq!(metrics.mean_ms, Some(6.64));
+        assert_eq!(metrics.fps, Some(45.));
+
+        metrics.record(0, 1., None);
+        assert_eq!(metrics.mean_ms, Some(6.64));
+        assert_eq!(metrics.fps, Some(0.));
+    }
+
     #[test]
     fn moment_row_selection_stays_within_replacement_ranking() {
         assert_eq!(super::clamp_moment_row(7, 1), 0);
