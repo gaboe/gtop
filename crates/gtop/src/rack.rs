@@ -1200,6 +1200,13 @@ impl Monitor {
                     self.moment = None;
                 } else if search_focused && k == "escape" {
                     self.search.update(cx, |s, cx| s.set_value("", window, cx));
+                    self.table.update(cx, |table, cx| {
+                        table.search = crate::model::Search::default();
+                        table.reorder();
+                        table.selected = None;
+                        cx.notify();
+                    });
+                    self.wake();
                 }
                 window.focus(&self.focus, cx);
                 cx.stop_propagation();
