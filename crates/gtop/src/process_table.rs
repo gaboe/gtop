@@ -7,6 +7,22 @@ use gpui::{prelude::*, *};
 use gtop_core::{ProcessInfo, Snapshot};
 use std::rc::Rc;
 
+const TOP_ROWS: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowTier {
+    Priority,
+    Remaining,
+}
+
+fn row_tier(row: usize) -> RowTier {
+    if row < TOP_ROWS {
+        RowTier::Priority
+    } else {
+        RowTier::Remaining
+    }
+}
+
 pub struct SelectProcess(pub ProcessKey);
 pub struct Processes {
     pub snapshot: Option<Rc<Snapshot>>,
@@ -58,7 +74,10 @@ impl Processes {
     pub fn navigate(&mut self, row: usize) {
         if let Some(p) = self.process(row) {
             self.selected = Some(ProcessKey::from(p));
-            self.scroll.scroll_to_item(row, ScrollStrategy::Top);
+            if row >= TOP_ROWS {
+                self.scroll
+                    .scroll_to_item(row - TOP_ROWS, ScrollStrategy::Top);
+            }
         }
     }
     fn columns(&self) -> Vec<ProcessColumn> {
@@ -94,6 +113,103 @@ impl Processes {
         };
         self.column = column;
         self.reorder();
+    }
+
+    fn row(
+        &self,
+        row: usize,
+        t: &crate::palette::Tokens,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        let p = self.process(row)?;
+        let key = ProcessKey::from(p);
+        let priority = row_tier(row) == RowTier::Priority;
+        let culprit = p.cpu_usage > 100. && row < 4;
+        let selected = self.selected == Some(key);
+        let cores = self.snapshot.as_ref()?.stats.cpu_usage.len().max(1);
+        let height = if priority { 30. } else { 22. };
+        Some(
+            div()
+                .id(("process", row))
+                .role(Role::Row)
+                .aria_label(format!(
+                    "{} PID {} CPU {:.1}% memory {} ports {}",
+                    p.name,
+                    p.pid,
+                    p.cpu_usage,
+                    crate::model::bytes(p.memory_usage),
+                    ProcessColumn::Ports.text(p)
+                ))
+                .h(px(height))
+                .flex()
+                .items_center()
+                .border_b_1()
+                .border_color(rgb(t.row_rule))
+                .bg(rgb(if selected {
+                    t.plate2
+                } else {
+                    crate::palette::mix(t.base.ground, 0, 0.8)
+                }))
+                .cursor_pointer()
+                .children(self.columns().into_iter().map(|kind| {
+                    let color = if selected || (priority && culprit) {
+                        t.base.led
+                    } else if !priority {
+                        t.silk_dim
+                    } else if kind == ProcessColumn::Ports {
+                        t.base.ok
+                    } else if kind == ProcessColumn::Command {
+                        t.cmd
+                    } else {
+                        t.ink_row
+                    };
+                    let cell = div()
+                        .w(px(self.width(kind)))
+                        .flex_shrink_0()
+                        .when(kind == ProcessColumn::Command, |d| {
+                            d.flex_1().min_w_0().flex_shrink(1.)
+                        })
+                        .px(px(10.))
+                        .text_size(px(if priority { 14. } else { 12. }))
+                        .when(priority && kind == ProcessColumn::Name, |d| {
+                            d.font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .text_color(rgb(color))
+                        .truncate();
+                    if kind == ProcessColumn::Lamp {
+                        return cell.child(div().w(px(7.)).h(px(12.)).bg(rgb(
+                            if p.cpu_usage > 400. {
+                                if now_blink() {
+                                    t.base.hot
+                                } else {
+                                    t.hot_off
+                                }
+                            } else if culprit {
+                                t.base.led
+                            } else {
+                                t.seg_off
+                            },
+                        )));
+                    }
+                    cell.when(kind == ProcessColumn::Cpu, |d| {
+                        d.flex().items_center().justify_end().gap_2().child(
+                            rack::segments(
+                                p.cpu_usage / cores as f32,
+                                if priority { 18 } else { 14 },
+                                t,
+                            )
+                            .w(px(if priority { 78. } else { 69. }))
+                            .h(px(if priority { 12. } else { 8. })),
+                        )
+                    })
+                    .child(kind.text(p))
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.selected = Some(key);
+                    cx.emit(SelectProcess(key));
+                    cx.notify();
+                })),
+        )
     }
 }
 impl Render for Processes {
@@ -145,103 +261,19 @@ impl Render for Processes {
                         cx.notify();
                     }))
             }));
-        let list = uniform_list(
-            "process-rows",
-            self.order.len(),
+        let top_count = self.order.len().min(TOP_ROWS);
+        let has_remainder = self.order.len() > TOP_ROWS;
+        let top_rows = div()
+            .flex()
+            .flex_col()
+            .children((0..top_count).filter_map(|row| self.row(row, &t, cx)));
+        let remainder = uniform_list(
+            "process-rows-rest",
+            self.order.len().saturating_sub(TOP_ROWS),
             cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
                 let t = this.base.tokens();
-                let focus = this
-                    .order
-                    .first()
-                    .and_then(|i| {
-                        this.snapshot
-                            .as_ref()
-                            .map(|s| s.processes[*i].cpu_usage > 100.)
-                    })
-                    .unwrap_or(false);
                 range
-                    .filter_map(|row| {
-                        let p = this.process(row)?;
-                        let key = ProcessKey::from(p);
-                        let culprit = p.cpu_usage > 100. && row < 4;
-                        let selected = this.selected == Some(key);
-                        let cores = this.snapshot.as_ref().unwrap().stats.cpu_usage.len().max(1);
-                        Some(
-                            div()
-                                .id(("process", row))
-                                .role(Role::Row)
-                                .aria_label(format!(
-                                    "{} PID {} CPU {:.1}% memory {} ports {}",
-                                    p.name,
-                                    p.pid,
-                                    p.cpu_usage,
-                                    crate::model::bytes(p.memory_usage),
-                                    ProcessColumn::Ports.text(p)
-                                ))
-                                .h(px(22.))
-                                .flex()
-                                .items_center()
-                                .border_b_1()
-                                .border_color(rgb(t.row_rule))
-                                .bg(rgb(if selected {
-                                    t.plate2
-                                } else {
-                                    crate::palette::mix(t.base.ground, 0, 0.8)
-                                }))
-                                .cursor_pointer()
-                                .children(this.columns().into_iter().map(|kind| {
-                                    let color = if kind == ProcessColumn::Ports {
-                                        t.base.ok
-                                    } else if kind == ProcessColumn::Command {
-                                        t.cmd
-                                    } else if culprit || selected {
-                                        t.base.led
-                                    } else if focus {
-                                        t.silk_dim
-                                    } else {
-                                        t.ink_row
-                                    };
-                                    let cell = div()
-                                        .w(px(this.width(kind)))
-                                        .flex_shrink_0()
-                                        .when(kind == ProcessColumn::Command, |d| {
-                                            d.flex_1().min_w_0().flex_shrink(1.)
-                                        })
-                                        .px(px(10.))
-                                        .text_size(px(12.))
-                                        .text_color(rgb(color))
-                                        .truncate();
-                                    if kind == ProcessColumn::Lamp {
-                                        return cell.child(div().w(px(7.)).h(px(12.)).bg(rgb(
-                                            if p.cpu_usage > 400. {
-                                                if now_blink() {
-                                                    t.base.hot
-                                                } else {
-                                                    t.hot_off
-                                                }
-                                            } else if culprit {
-                                                t.base.led
-                                            } else {
-                                                t.seg_off
-                                            },
-                                        )));
-                                    }
-                                    cell.when(kind == ProcessColumn::Cpu, |d| {
-                                        d.flex().items_center().justify_end().gap_2().child(
-                                            rack::segments(p.cpu_usage / cores as f32, 14, &t)
-                                                .w(px(69.))
-                                                .h(px(8.)),
-                                        )
-                                    })
-                                    .child(kind.text(p))
-                                }))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selected = Some(key);
-                                    cx.emit(SelectProcess(key));
-                                    cx.notify();
-                                })),
-                        )
-                    })
+                    .filter_map(|row| this.row(row + TOP_ROWS, &t, cx))
                     .collect::<Vec<_>>()
             }),
         )
@@ -265,7 +297,13 @@ impl Render for Processes {
                     "No process matches. Esc clears the search."
                 }))
             })
-            .child(list)
+            .when(!self.order.is_empty(), |d| {
+                d.child(top_rows)
+                    .when(has_remainder, |d| {
+                        d.child(div().h(px(1.)).w_full().bg(rgb(t.rule_hi)))
+                    })
+                    .child(remainder)
+            })
     }
 }
 fn now_blink() -> bool {
@@ -274,7 +312,7 @@ fn now_blink() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Processes, SelectProcess};
+    use super::{row_tier, Processes, RowTier, SelectProcess, TOP_ROWS};
     use crate::model::{ProcessColumn, ProcessKey, Search};
     use std::rc::Rc;
     #[test]
@@ -315,5 +353,12 @@ mod tests {
         p.sort(ProcessColumn::Pid, true);
         assert_ne!(rendered.0, ProcessKey::from(p.process(0).unwrap()));
         assert_eq!(rendered.0.pid, 1);
+    }
+
+    #[test]
+    fn classifies_the_current_order_top_ten() {
+        assert_eq!(row_tier(0), RowTier::Priority);
+        assert_eq!(row_tier(TOP_ROWS - 1), RowTier::Priority);
+        assert_eq!(row_tier(TOP_ROWS), RowTier::Remaining);
     }
 }
