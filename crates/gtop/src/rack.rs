@@ -16,6 +16,10 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+fn settings_escape_closes(key: &str, settings_open: bool, editing: bool) -> bool {
+    key == "escape" && settings_open && !editing
+}
+
 pub trait RackButton {
     fn rack(self, t: &Tokens) -> Self;
 }
@@ -1545,9 +1549,6 @@ impl Monitor {
             window.prevent_default();
             return;
         }
-        if self.settings_open && !editing && !self.focus.is_focused(window) {
-            return;
-        }
         if editing {
             if k == "escape" || k == "enter" {
                 if k == "escape" && self.moment.is_some() {
@@ -1565,6 +1566,16 @@ impl Monitor {
                 window.focus(&self.focus, cx);
                 cx.stop_propagation();
             }
+            return;
+        }
+        if settings_escape_closes(k, self.settings_open, editing) {
+            self.settings_open = false;
+            window.focus(&self.focus, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.settings_open && !self.focus.is_focused(window) {
             return;
         }
         if let Some(selection) = self.moment {
@@ -1957,6 +1968,13 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::{vfd_digit_width, UNIT_GLYPHS};
+    #[test]
+    fn settings_escape_closes_from_button_focus_but_keeps_text_editing_behavior() {
+        assert!(super::settings_escape_closes("escape", true, false));
+        assert!(!super::settings_escape_closes("escape", true, true));
+        assert!(!super::settings_escape_closes("enter", true, false));
+    }
+
     #[test]
     fn unit_geometry_retention_is_bounded_when_positions_change() {
         for x in 0..100 {
