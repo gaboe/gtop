@@ -58,8 +58,10 @@ pub struct Bucket {
     pub peak_memory: f64,
     pub gpu: Option<f64>,
     pub peak_gpu: Option<f64>,
+    pub gpu_seconds: Option<f64>,
     pub temperature: Option<f64>,
     pub peak_temperature: Option<f64>,
+    pub temperature_seconds: Option<f64>,
     pub processes: BTreeMap<String, ProcessTotal>,
 }
 
@@ -120,14 +122,15 @@ pub fn step_moment(
     end: u64,
 ) -> MomentSelection {
     let step = selection.step.max(1) as u64;
-    let next = if direction < 0 {
-        selection.start_minute.saturating_sub(step)
+    let offset = selection.start_minute.saturating_sub(start);
+    let index = if direction < 0 {
+        offset.div_ceil(step).saturating_sub(1)
     } else {
-        selection.start_minute.saturating_add(step)
+        offset / step + 1
     };
-    let last = end.saturating_sub(step);
+    let last = end.saturating_sub(start).saturating_sub(1) / step;
     MomentSelection {
-        start_minute: next.clamp(start, last.max(start)),
+        start_minute: start + index.min(last) * step,
         step: step as usize,
     }
 }
@@ -145,6 +148,8 @@ pub struct Column {
     pub gpu: Option<f64>,
     pub temperature: Option<f64>,
     pub peak_temperature: Option<f64>,
+    pub gpu_seconds: f64,
+    pub temperature_seconds: f64,
 }
 impl From<&Bucket> for Column {
     fn from(b: &Bucket) -> Self {
@@ -156,10 +161,28 @@ impl From<&Bucket> for Column {
             gpu: b.gpu,
             temperature: b.temperature,
             peak_temperature: b.peak_temperature,
+            gpu_seconds: b.gpu_seconds.unwrap_or(b.seconds),
+            temperature_seconds: b.temperature_seconds.unwrap_or(b.seconds),
         }
     }
 }
+pub fn weighted_average(values: impl IntoIterator<Item = (f64, f64)>) -> Option<f64> {
+    let (sum, seconds) = values
+        .into_iter()
+        .fold((0., 0.), |(sum, seconds), (value, weight)| {
+            (sum + value * weight, seconds + weight)
+        });
+    (seconds > 0.).then(|| sum / seconds)
+}
+
 impl Column {
+    pub fn weight(&self, metric: Metric) -> f64 {
+        match metric {
+            Metric::Gpu => self.gpu_seconds,
+            Metric::Temperature => self.temperature_seconds,
+            _ => self.seconds,
+        }
+    }
     pub fn value(&self, metric: Metric) -> Option<f64> {
         match metric {
             Metric::Cpu => Some(self.cpu),
@@ -196,9 +219,9 @@ impl HistoryView {
                 .fold(0., f64::max);
             let sum: f64 = live
                 .iter()
-                .map(|b| b.temperature.unwrap() * b.seconds)
+                .map(|b| b.temperature.unwrap() * b.temperature_seconds)
                 .sum();
-            let seconds: f64 = live.iter().map(|b| b.seconds).sum();
+            let seconds: f64 = live.iter().map(|b| b.temperature_seconds).sum();
             return vec![
                 ("Peak".into(), peak),
                 ("Average".into(), sum / seconds.max(0.001)),
@@ -233,6 +256,8 @@ pub struct History {
     buckets: VecDeque<Bucket>,
     #[serde(skip)]
     last_sample: Option<f64>,
+    #[serde(skip)]
+    pub touched: std::ops::Range<u64>,
 }
 impl History {
     pub fn analyze_process(
@@ -305,6 +330,7 @@ impl History {
         } else {
             0.
         };
+        self.touched = ((now - seconds) as u64 / 60)..minute + 1;
         if seconds == 0. {
             self.record_part(snapshot, minute, 0.);
         } else {
@@ -352,7 +378,14 @@ impl History {
         b.memory = mean(b.memory, snapshot.stats.memory_used as f64);
         b.peak_memory = b.peak_memory.max(snapshot.stats.memory_used as f64);
         if let Some(v) = snapshot.stats.gpus.first().and_then(|g| g.utilization) {
-            b.gpu = Some(mean(b.gpu.unwrap_or(0.), v as f64));
+            let observed = b
+                .gpu_seconds
+                .unwrap_or(if b.gpu.is_some() { old } else { 0. });
+            let total = observed + weight;
+            if total > 0. {
+                b.gpu = Some((b.gpu.unwrap_or(0.) * observed + v as f64 * weight) / total);
+            }
+            b.gpu_seconds = Some(total);
             b.peak_gpu = Some(b.peak_gpu.unwrap_or(v as f64).max(v as f64));
         }
         if let Some(v) = snapshot
@@ -362,7 +395,14 @@ impl History {
             .find(|t| t.name == "CPU")
             .map(|t| t.celsius as f64)
         {
-            b.temperature = Some(mean(b.temperature.unwrap_or(0.), v));
+            let observed =
+                b.temperature_seconds
+                    .unwrap_or(if b.temperature.is_some() { old } else { 0. });
+            let total = observed + weight;
+            if total > 0. {
+                b.temperature = Some((b.temperature.unwrap_or(0.) * observed + v * weight) / total);
+            }
+            b.temperature_seconds = Some(total);
             b.peak_temperature = Some(b.peak_temperature.unwrap_or(v).max(v));
         }
         let mut sampled_processes = BTreeMap::<String, ProcessTotal>::new();
@@ -427,17 +467,20 @@ impl History {
             recorded_minutes: span.len(),
             ..Default::default()
         };
-        let average = |values: Vec<f64>| {
-            (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
-        };
         let peak = |values: Vec<f64>| values.into_iter().reduce(f64::max);
-        detail.cpu_average = average(span.iter().map(|b| b.cpu).collect());
+        detail.cpu_average = weighted_average(span.iter().map(|b| (b.cpu, b.seconds)));
         detail.cpu_peak = peak(span.iter().map(|b| b.peak_cpu).collect());
-        detail.memory_average = average(span.iter().map(|b| b.memory).collect());
+        detail.memory_average = weighted_average(span.iter().map(|b| (b.memory, b.seconds)));
         detail.memory_peak = peak(span.iter().map(|b| b.peak_memory).collect());
-        detail.gpu_average = average(span.iter().filter_map(|b| b.gpu).collect());
+        detail.gpu_average = weighted_average(
+            span.iter()
+                .filter_map(|b| b.gpu.map(|v| (v, b.gpu_seconds.unwrap_or(b.seconds)))),
+        );
         detail.gpu_peak = peak(span.iter().filter_map(|b| b.peak_gpu).collect());
-        detail.temperature_average = average(span.iter().filter_map(|b| b.temperature).collect());
+        detail.temperature_average = weighted_average(span.iter().filter_map(|b| {
+            b.temperature
+                .map(|v| (v, b.temperature_seconds.unwrap_or(b.seconds)))
+        }));
         detail.temperature_peak = peak(span.iter().filter_map(|b| b.peak_temperature).collect());
         let mut rows: BTreeMap<String, ProcessTotal> = BTreeMap::new();
         for bucket in span {
@@ -459,6 +502,96 @@ pub fn support_path(file: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn partial_minutes_use_observed_time() {
+        let mut history = History::default();
+        history.buckets.push_back(Bucket {
+            minute: 100,
+            seconds: 60.,
+            cpu: 100.,
+            memory: 100.,
+            gpu: Some(100.),
+            temperature: Some(100.),
+            ..Default::default()
+        });
+        history.buckets.push_back(Bucket {
+            minute: 101,
+            seconds: 1.,
+            gpu: Some(0.),
+            temperature: Some(0.),
+            ..Default::default()
+        });
+        let detail = history.moment(MomentSelection {
+            start_minute: 100,
+            step: 5,
+        });
+        assert!((detail.cpu_average.unwrap() - 6000. / 61.).abs() < 0.0001);
+        assert_eq!(detail.cpu_average, detail.memory_average);
+        assert_eq!(detail.gpu_average, detail.cpu_average);
+        assert_eq!(detail.temperature_average, detail.cpu_average);
+    }
+
+    #[test]
+    fn missing_temperature_does_not_count_as_zero() {
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.stats.temperatures.clear();
+        let mut history = History::default();
+        history.record(&snapshot, 6000., 3.);
+        history.record(&snapshot, 6003., 3.);
+        snapshot.stats.temperatures = crate::test_data::snapshot().stats.temperatures;
+        snapshot.stats.gpus.push(gtop_core::monitoring::GpuInfo {
+            name: "test".into(),
+            vendor: "test".into(),
+            utilization: Some(80.),
+            memory_total: None,
+            memory_used: None,
+            temperature: None,
+            power_watts: None,
+            core_clock_mhz: None,
+        });
+        history.record(&snapshot, 6006., 3.);
+        assert_eq!(history.buckets[0].gpu, Some(80.));
+        assert_eq!(history.buckets[0].gpu_seconds, Some(3.));
+        assert_eq!(history.buckets[0].temperature, Some(80.));
+        assert_eq!(history.buckets[0].temperature_seconds, Some(3.));
+    }
+
+    #[test]
+    fn rollover_marks_the_closed_minute_changed() {
+        let snapshot = crate::test_data::snapshot();
+        let mut history = History::default();
+        history.record(&snapshot, 6057., 3.);
+        history.record(&snapshot, 6060., 3.);
+        assert!(history.touched.contains(&100));
+        assert!(history.touched.contains(&101));
+        assert_eq!(
+            history
+                .moment(MomentSelection {
+                    start_minute: 100,
+                    step: 1
+                })
+                .rows[1]
+                .1
+                .cpu_seconds,
+            10.5
+        );
+    }
+
+    #[test]
+    fn stepping_tracks_columns_after_rollover() {
+        let selection = MomentSelection {
+            start_minute: 100,
+            step: 10,
+        };
+        assert_eq!(step_moment(selection, 1, 91, 1531).start_minute, 101);
+        assert_eq!(step_moment(selection, -1, 91, 1531).start_minute, 91);
+        let first = MomentSelection {
+            start_minute: 91,
+            step: 10,
+        };
+        assert_eq!(step_moment(first, -1, 91, 1531), first);
+    }
+
     #[test]
     fn concurrent_history_writers_publish_complete_files() {
         let directory =
@@ -586,6 +719,8 @@ mod tests {
                 gpu: Some(1.),
                 temperature: None,
                 peak_temperature: None,
+                gpu_seconds: 1.,
+                temperature_seconds: 1.,
             })],
             rows: (0..4)
                 .map(|i| {
@@ -684,6 +819,7 @@ mod tests {
             );
             h.buckets.push_back(Bucket {
                 minute,
+                seconds: 60.,
                 cpu,
                 peak_cpu,
                 memory,

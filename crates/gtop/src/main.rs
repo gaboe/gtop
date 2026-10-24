@@ -296,8 +296,8 @@ impl Monitor {
                             }
                         }
                         if let Some(selection) = moment {
-                            let span_changed = selection.start_minute <= minute
-                                && minute < selection.start_minute + selection.step as u64;
+                            let span_changed = selection.start_minute < history.touched.end
+                                && history.touched.start < selection.start_minute + selection.step as u64;
                             if previous_moment != Some(selection) || previous_metric != Some(metric) || span_changed {
                                 moment_detail = Some(history.moment(selection));
                             }

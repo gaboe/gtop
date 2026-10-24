@@ -532,14 +532,14 @@ fn tape(
             let values: Vec<_> = group
                 .iter()
                 .flatten()
-                .filter_map(|b| b.value(metric))
+                .filter_map(|b| b.value(metric).map(|value| (value, b.weight(metric))))
                 .collect();
             let column = if group.iter().all(Option::is_none) {
                 hatch(palette::mix(t.base.led, t.base.ground, 0.14))
             } else if values.is_empty() {
                 div().flex_1().h(px(1.)).bg(rgb(t.led_off))
             } else {
-                let value = values.iter().sum::<f64>() / values.len() as f64;
+                let value = crate::history::weighted_average(values).unwrap_or(0.);
                 let percent = match metric {
                     Metric::Cpu | Metric::Gpu => value,
                     Metric::Memory => value / mem_total.max(1) as f64 * 100.,
@@ -1547,6 +1547,10 @@ impl Monitor {
                     let end = view.start_minute + view.columns.len() as u64;
                     let next =
                         crate::history::step_moment(selection, direction, view.start_minute, end);
+                    if next == selection {
+                        cx.stop_propagation();
+                        return;
+                    }
                     self.moment = Some(next);
                     if next != selection {
                         self.moment_detail = None;
