@@ -138,7 +138,7 @@ fn unit_paths(bounds: Bounds<Pixels>, unit: char) -> UnitPaths {
 fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
     let led = if hot { t.base.hot } else { t.base.led };
     let ghost = palette::mix(t.base.led, t.base.ground, 0.18);
-    div().ml(px(size * 0.12)).child(
+    div().ml(px(size * 0.12)).flex_shrink_0().child(
         canvas(
             |_, _, _| {},
             move |bounds, _, window, _| {
@@ -165,15 +165,18 @@ pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> 
             }
         })
         .collect();
-    let width = px(size * 0.56 * width_chars as f32);
+    let width = px(vfd_digit_width(size, width_chars));
     div()
         .flex()
         .items_baseline()
+        .flex_shrink_0()
         .child(
             div()
                 .relative()
                 .w(width)
                 .h(px(size))
+                .flex_shrink_0()
+                .whitespace_nowrap()
                 .font_family("Doto Display")
                 .font_weight(FontWeight::BLACK)
                 .text_size(px(size))
@@ -185,11 +188,16 @@ pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> 
                         .top_0()
                         .left_0()
                         .text_color(rgb(palette::mix(t.base.led, t.base.ground, 0.18)))
+                        .whitespace_nowrap()
                         .child(ghost),
                 )
-                .child(div().relative().child(value)),
+                .child(div().relative().whitespace_nowrap().child(value)),
         )
         .child(unit_glyph(unit, size, hot, t))
+}
+
+fn vfd_digit_width(size: f32, characters: usize) -> f32 {
+    size * 0.72 * characters.max(3) as f32
 }
 
 fn unit_with_peak(
@@ -819,9 +827,7 @@ impl Monitor {
                             .flex_1()
                             .child(
                                 value
-                                    .map(|value| {
-                                        lit_unit(format!("{value:2.0}"), '°', 22., value > limit, t)
-                                    })
+                                    .map(|value| lit(format!("{value:2.0}"), 22., value > limit, t))
                                     .unwrap_or_else(|| lit("N/A".into(), 22., false, t)),
                             )
                             .child(label(if name == "Battery" { "BAT" } else { name }, t))
@@ -1510,7 +1516,7 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests {
-    use super::UNIT_GLYPHS;
+    use super::{vfd_digit_width, UNIT_GLYPHS};
     #[test]
     fn vfd_unit_glyphs_match_the_5_by_7_design() {
         assert_eq!(
@@ -1526,5 +1532,11 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn vfd_digit_box_keeps_three_and_four_character_values_on_one_line() {
+        assert!((vfd_digit_width(42., 3) - 90.72).abs() < 0.001);
+        assert!((vfd_digit_width(22., 4) - 63.36).abs() < 0.001);
     }
 }
