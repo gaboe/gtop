@@ -79,6 +79,29 @@ fn keycap(key: &str, description: &str, t: &Tokens) -> Div {
         )
 }
 
+// Doto's 9 ink bounds set the glyph span; the 5x7 canvas keeps its 10:14 ratio.
+const DOTO_DIGIT_INK_TOP: f32 = 0.155;
+const DOTO_DIGIT_INK_BOTTOM: f32 = 0.845;
+const UNIT_GLYPH_TOP: f32 = DOTO_DIGIT_INK_TOP;
+const UNIT_GLYPH_HEIGHT: f32 = DOTO_DIGIT_INK_BOTTOM - DOTO_DIGIT_INK_TOP;
+const UNIT_GLYPH_WIDTH_RATIO: f32 = 10. / 14.;
+
+#[derive(Clone, Copy)]
+struct UnitGlyphBounds {
+    top: f32,
+    width: f32,
+    height: f32,
+}
+
+fn unit_glyph_bounds(size: f32) -> UnitGlyphBounds {
+    let height = size * UNIT_GLYPH_HEIGHT;
+    UnitGlyphBounds {
+        top: size * UNIT_GLYPH_TOP,
+        width: height * UNIT_GLYPH_WIDTH_RATIO,
+        height,
+    }
+}
+
 const UNIT_GLYPHS: [(char, [&str; 7]); 2] = [
     (
         '%',
@@ -97,6 +120,9 @@ const UNIT_GLYPHS: [(char, [&str; 7]); 2] = [
 type UnitPaths = (Path<Pixels>, Path<Pixels>);
 type UnitCacheKey = (char, u32, u32, u32);
 static UNIT_PATHS: OnceLock<Mutex<HashMap<UnitCacheKey, UnitPaths>>> = OnceLock::new();
+
+#[cfg(test)]
+static UNIT_GLYPH_TEST_BOUNDS: Mutex<Vec<Bounds<Pixels>>> = Mutex::new(Vec::new());
 
 fn core_time(seconds: f64) -> String {
     let minutes = seconds / 60.;
@@ -222,17 +248,21 @@ fn unit_paths(bounds: Bounds<Pixels>, unit: char) -> UnitPaths {
 fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
     let led = if hot { t.base.hot } else { t.base.led };
     let ghost = palette::mix(t.base.led, t.base.ground, 0.18);
+    let bounds = unit_glyph_bounds(size);
     div().ml(px(size * 0.12)).flex_shrink_0().child(
         canvas(
             |_, _, _| {},
             move |bounds, _, window, _| {
+                #[cfg(test)]
+                UNIT_GLYPH_TEST_BOUNDS.lock().unwrap().push(bounds);
                 let (lit, ghost_path) = unit_paths(bounds, unit);
                 window.paint_path(ghost_path, rgb(ghost));
                 window.paint_path(lit, rgb(led));
             },
         )
-        .w(px(size * 0.74 * 10. / 14.))
-        .h(px(size * 0.74)),
+        .mt(px(bounds.top))
+        .w(px(bounds.width))
+        .h(px(bounds.height)),
     )
 }
 
@@ -252,7 +282,7 @@ pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> 
     let width = px(vfd_digit_width(size, width_chars));
     div()
         .flex()
-        .items_baseline()
+        .items_start()
         .flex_shrink_0()
         .child(
             div()
@@ -1967,7 +1997,25 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests {
-    use super::{vfd_digit_width, UNIT_GLYPHS};
+    use super::{
+        div, lit_unit, vfd_digit_width, Tokens, DOTO_DIGIT_INK_BOTTOM, DOTO_DIGIT_INK_TOP,
+        UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS,
+    };
+    use gpui::{prelude::*, TestAppContext, Window};
+
+    struct UnitLayoutTestView {
+        tokens: Tokens,
+    }
+
+    impl Render for UnitLayoutTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().flex().flex_col().children(
+                [(9., '%'), (15., '°'), (22., '%'), (42., '°')]
+                    .into_iter()
+                    .map(|(size, unit)| lit_unit("99".into(), unit, size, false, &self.tokens)),
+            )
+        }
+    }
     #[test]
     fn settings_escape_closes_from_button_focus_but_keeps_text_editing_behavior() {
         assert!(super::settings_escape_closes("escape", true, false));
@@ -2004,6 +2052,39 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[gpui::test]
+    async fn vfd_unit_glyph_matches_digit_ink_span_at_supported_sizes(cx: &mut TestAppContext) {
+        let tokens = crate::palette::presets()[0].base.tokens();
+        let window = cx.add_window(|_, _| UnitLayoutTestView { tokens });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let mut bounds = std::mem::take(&mut *UNIT_GLYPH_TEST_BOUNDS.lock().unwrap());
+        assert!(bounds.len() >= 4 && bounds.len().is_multiple_of(4));
+        let bounds = bounds.split_off(bounds.len() - 4);
+        let mut row_top = 0.;
+        for (glyph, size) in bounds.into_iter().zip([9., 15., 22., 42.]) {
+            assert!(
+                (f32::from(glyph.origin.y) - row_top - size * DOTO_DIGIT_INK_TOP).abs() < 0.5,
+                "unit glyph top differs from digit ink at {size}px: got {}, expected {}",
+                f32::from(glyph.origin.y) - row_top,
+                size * DOTO_DIGIT_INK_TOP
+            );
+            assert!(
+                (f32::from(glyph.size.height)
+                    - size * (DOTO_DIGIT_INK_BOTTOM - DOTO_DIGIT_INK_TOP))
+                    .abs()
+                    < 0.5,
+                "unit glyph height differs from digit ink at {size}px"
+            );
+            assert!(
+                (f32::from(glyph.size.width) - f32::from(glyph.size.height) * 10. / 14.).abs()
+                    < 0.5
+            );
+            row_top += size;
+        }
     }
 
     #[test]
