@@ -10,9 +10,8 @@ use gpui_component::{
     input::Input,
     Sizable,
 };
-use gtop_core::ProcessInfo;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::{Mutex, OnceLock},
 };
 
@@ -45,38 +44,6 @@ pub fn now() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
-}
-pub fn source<'a>(
-    processes: impl IntoIterator<Item = &'a ProcessInfo>,
-    cores: usize,
-) -> Option<(String, f32)> {
-    let mut groups: BTreeMap<&str, (usize, f32)> = BTreeMap::new();
-    for p in processes.into_iter().filter(|p| p.cpu_usage > 100.) {
-        let g = groups.entry(&p.name).or_default();
-        g.0 += 1;
-        g.1 += p.cpu_usage;
-    }
-    let mut groups: Vec<_> = groups.into_iter().collect();
-    groups.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
-    groups.truncate(3);
-    if groups.is_empty() {
-        return None;
-    }
-    let share = groups.iter().map(|g| g.1 .1).sum::<f32>() / cores.max(1) as f32;
-    Some((
-        groups
-            .iter()
-            .map(|(n, (count, _))| {
-                if *count > 1 {
-                    format!("{n} ×{count}")
-                } else {
-                    n.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" + "),
-        share,
-    ))
 }
 pub fn tracked(text: impl AsRef<str>) -> String {
     text.as_ref()
@@ -666,7 +633,7 @@ impl Monitor {
         panel.child(actions)
     }
 
-    fn tower(&self, t: &Tokens, cx: &App) -> Stateful<Div> {
+    fn tower(&self, t: &Tokens) -> Stateful<Div> {
         let mut tower = div()
             .relative()
             .id("tower")
@@ -713,37 +680,6 @@ impl Monitor {
         };
         let stats = &s.stats;
         let cores = stats.cpu_usage.len();
-        let src = source(
-            self.table
-                .read(cx)
-                .order
-                .iter()
-                .filter_map(|i| s.processes.get(*i)),
-            cores,
-        );
-        tower = tower.child(
-            win(t)
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .child(label("LOAD SOURCE", t))
-                        .child(if let Some((_, value)) = src.as_ref() {
-                            lit_unit(format!("{value:3.0}"), '%', 15., *value > 50., t)
-                        } else {
-                            lit(String::new(), 15., false, t)
-                        }),
-                )
-                .child(lit(
-                    src.as_ref()
-                        .map(|s| s.0.to_uppercase())
-                        .unwrap_or_else(|| "IDLE".into()),
-                    15.,
-                    src.as_ref().is_some_and(|s| s.1 > 50.),
-                    t,
-                ))
-                .child(segments(src.as_ref().map(|s| s.1).unwrap_or(0.), 40, t)),
-        );
         let cpu = stats.cpu_usage.iter().sum::<f32>() / cores.max(1) as f32;
         tower = tower.child(
             win(t)
@@ -763,6 +699,30 @@ impl Monitor {
                             .h(px((v / 100. * 40.).max(1.2)))
                             .bg(rgb(if *v > 90. { t.base.hot } else { t.base.led }))
                     }),
+                )),
+        );
+        tower = tower.child(
+            win(t)
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .child(div().flex_1().child(label("MEM GB", t)).child(lit(
+                            format!("{:.1}", stats.memory_used as f64 / 1e9),
+                            22.,
+                            stats.memory_used as f64 / stats.memory_total.max(1) as f64 > 0.92,
+                            t,
+                        )))
+                        .child(readout(
+                            "Swap GB",
+                            format!("{:.1}", stats.swap_used as f64 / 1e9),
+                            t,
+                        )),
+                )
+                .child(segments(
+                    stats.memory_used as f32 / stats.memory_total.max(1) as f32 * 100.,
+                    40,
+                    t,
                 )),
         );
         let gpu = stats.gpus.first();
@@ -788,30 +748,6 @@ impl Monitor {
                         )),
                 )
                 .child(segments(util.unwrap_or(0.), 40, t)),
-        );
-        tower = tower.child(
-            win(t)
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(10.))
-                        .child(div().flex_1().child(label("MEM GB", t)).child(lit(
-                            format!("{:.1}", stats.memory_used as f64 / 1e9),
-                            22.,
-                            stats.memory_used as f64 / stats.memory_total.max(1) as f64 > 0.92,
-                            t,
-                        )))
-                        .child(readout(
-                            "Swap GB",
-                            format!("{:.1}", stats.swap_used as f64 / 1e9),
-                            t,
-                        )),
-                )
-                .child(segments(
-                    stats.memory_used as f32 / stats.memory_total.max(1) as f32 * 100.,
-                    40,
-                    t,
-                )),
         );
         tower = tower.child(win(t).child(label("TEMPERATURE °C", t)).child(
             div().flex().gap(px(8.)).children(
@@ -1102,7 +1038,7 @@ impl Monitor {
             .text_color(rgb(t.base.silk))
             .font_family("JetBrains Mono")
             .text_size(px(12.))
-            .child(self.tower(&t, cx))
+            .child(self.tower(&t))
             .child(right);
         if self.settings_open {
             root = root.child(self.palette_panel(&t, cx));
@@ -1517,7 +1453,7 @@ impl Monitor {
 
 #[cfg(test)]
 mod tests {
-    use super::{source, UNIT_GLYPHS};
+    use super::UNIT_GLYPHS;
     #[test]
     fn vfd_unit_glyphs_match_the_5_by_7_design() {
         assert_eq!(
@@ -1533,14 +1469,5 @@ mod tests {
                 ),
             ]
         );
-    }
-
-    #[test]
-    fn load_source_groups_heavy_names_on_the_machine_scale() {
-        let s = crate::test_data::snapshot();
-        let (name, share) = source(&s.processes, 4).unwrap();
-        assert_eq!(name, "rustc ×2 + cargo");
-        assert_eq!(share, 115.);
-        assert!(source(&[crate::test_data::process(1, "quiet", 100.)], 4).is_none());
     }
 }
