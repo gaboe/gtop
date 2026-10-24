@@ -1582,6 +1582,7 @@ impl Monitor {
                     self.moment = Some(next);
                     if next != selection {
                         self.moment_detail = None;
+                        self.moment_selected = 0;
                         self.moment_rows.clear();
                     }
                     self.wake();

@@ -21,6 +21,10 @@ use model::{ProcessKey, Search};
 use process_table::Processes;
 use std::{rc::Rc, sync::Arc, time::Duration};
 
+fn clamp_moment_row(selected: usize, row_count: usize) -> usize {
+    selected.min(row_count.saturating_sub(1))
+}
+
 struct Monitor {
     core: Option<Arc<AppState>>,
     snapshot: Option<Rc<Snapshot>>,
@@ -225,7 +229,7 @@ impl Monitor {
                             let detail = history.moment(selection);
                             let _ = entity.update_in(cx, |this, _, cx| {
                                 if this.moment == Some(selection) {
-                                    this.moment_rows = detail.ranked(metric);
+                                    this.replace_moment_rows(detail.ranked(metric));
                                     this.moment_detail = Some(detail);
                                     cx.notify();
                                 }
@@ -345,7 +349,7 @@ impl Monitor {
                         this.history = views;
                     }
                     if let Some(detail) = moment_detail.filter(|_| this.moment == selection) {
-                        this.moment_rows = detail.ranked(metric);
+                        this.replace_moment_rows(detail.ranked(metric));
                         this.moment_detail = Some(detail);
                     }
                     if let Some((key, analysis)) = process_analysis {
@@ -437,6 +441,11 @@ impl Monitor {
         }
         self.wake();
         cx.notify();
+    }
+
+    fn replace_moment_rows(&mut self, rows: Vec<(String, history::ProcessTotal, f64)>) {
+        self.moment_selected = clamp_moment_row(self.moment_selected, rows.len());
+        self.moment_rows = rows;
     }
 
     fn observe_sample(&mut self, snapshot: &Snapshot) {
@@ -598,6 +607,13 @@ fn main() {
 
 #[cfg(test)]
 mod wake_tests {
+    #[test]
+    fn moment_row_selection_stays_within_replacement_ranking() {
+        assert_eq!(super::clamp_moment_row(7, 1), 0);
+        assert_eq!(super::clamp_moment_row(7, 8), 7);
+        assert_eq!(super::clamp_moment_row(7, 0), 0);
+    }
+
     #[test]
     fn repeated_controls_coalesce_and_can_be_drained() {
         let (mut send, mut receive) = futures::channel::mpsc::channel(1);
