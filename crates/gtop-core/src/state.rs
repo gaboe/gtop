@@ -154,7 +154,7 @@ impl AppState {
     }
 
     pub fn process_stopped(&self, pid: u32, start_time: u64) -> Result<bool, String> {
-        let mut sys = self.sys.lock().map_err(|e| e.to_string())?;
+        let mut sys = System::new();
         let id = sysinfo::Pid::from_u32(pid);
         sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::Some(&[id]),
@@ -269,6 +269,35 @@ mod tests {
             .any(|process| process.pid == child.id()));
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn abandoned_stop_checks_do_not_retain_processes_in_app_state() {
+        let state = AppState::new();
+        for _ in 0..3 {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let snapshot = state.snapshot(false, false).unwrap();
+            let process = snapshot
+                .processes
+                .iter()
+                .find(|process| process.pid == child.id())
+                .unwrap();
+            assert!(!state
+                .process_stopped(child.id(), process.start_time)
+                .unwrap());
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert!(state
+                .sys
+                .lock()
+                .unwrap()
+                .process(sysinfo::Pid::from_u32(child.id()))
+                .is_none());
+        }
     }
 
     #[cfg(unix)]
