@@ -18,6 +18,9 @@ enum Environment {
 
 pub(super) struct Details {
     pub(super) key: ProcessKey,
+    pub(super) name: String,
+    pub(super) command: String,
+    pub(super) analysis: Option<crate::analysis::ProcessAnalysis>,
     environment: Environment,
     environment_open: bool,
     pub(super) kill: KillState,
@@ -62,12 +65,27 @@ impl Monitor {
         {
             return;
         }
+        let (name, command) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .processes
+                    .iter()
+                    .find(|process| ProcessKey::from(*process) == key)
+                    .map(|process| (process.name.clone(), process.command.clone()))
+            })
+            .unwrap_or_default();
         self.details = Some(Details {
             key,
+            name,
+            command,
+            analysis: None,
             environment: Environment::Unrequested,
             environment_open: false,
             kill: KillState::Ready,
         });
+        self.wake();
         self.table.update(cx, |table, _cx| {
             table.selected = Some(key);
             if let Some(row) = table.row_for(key) {
@@ -287,6 +305,15 @@ impl Monitor {
                         .child(bars),
                 ),
             );
+            panel = panel.child(analysis_panel(
+                details.analysis.as_ref(),
+                &details.name,
+                self.snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.stats.cpu_usage.len())
+                    .unwrap_or(1),
+                &t,
+            ));
             panel = panel.child(
                 div()
                     .p(px(18.))
@@ -365,7 +392,17 @@ impl Monitor {
                     ),
             );
         } else {
-            panel = panel.child(format!("PID {} has exited", key.pid));
+            panel = panel
+                .child(format!("PID {} has exited", key.pid))
+                .child(analysis_panel(
+                    details.analysis.as_ref(),
+                    &details.name,
+                    self.snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.stats.cpu_usage.len())
+                        .unwrap_or(1),
+                    &t,
+                ));
         }
         let environment = match &details.environment {
             Environment::Unrequested => div().child(
@@ -437,6 +474,120 @@ impl Monitor {
         )
     }
 }
+
+fn analysis_panel(
+    analysis: Option<&crate::analysis::ProcessAnalysis>,
+    name: &str,
+    cores: usize,
+    t: &crate::palette::Tokens,
+) -> Div {
+    let mut panel = div().p(px(18.)).border_b_1().border_color(rgb(t.rule));
+    let Some(analysis) = analysis else {
+        return panel.child(crate::rack::win(t).child("Reading process analysis…"));
+    };
+    panel = panel.child(
+        crate::rack::win(t)
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(crate::rack::label("WHAT IT IS", t))
+                    .child(crate::rack::label(analysis.identity.source, t)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(14.))
+                            .text_color(rgb(t.base.silk))
+                            .child(analysis.identity.what.clone()),
+                    )
+                    .child(crate::rack::label(analysis.identity.kind.to_uppercase(), t)),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(t.ink_row))
+                    .child(analysis.identity.about.clone()),
+            ),
+    );
+    let mut history_panel = crate::rack::win(t).child(
+        div()
+            .flex()
+            .justify_between()
+            .child(crate::rack::label("HISTORY · 24 H", t))
+            .when(analysis.history.is_some(), |d| {
+                d.child(crate::rack::label(format!("ALL {name} PROCESSES"), t))
+            }),
+    );
+    if let Some(history) = &analysis.history {
+        history_panel =
+            history_panel.child(div().flex().items_end().gap(px(1.)).h(px(40.)).children(
+                history.columns.iter().map(|value| match value {
+                    None => {
+                        crate::rack::hatch(crate::palette::mix(t.base.led, t.base.ground, 0.14))
+                    }
+                    Some(value) => {
+                        let height = (value / (cores.max(1) as f32 * 50.) * 40.).clamp(2., 40.);
+                        div().flex_1().min_w_0().h_full().flex().items_end().child(
+                            div().w_full().h(px(height)).bg(rgb(if *value > 400. {
+                                t.base.hot
+                            } else {
+                                t.base.led
+                            })),
+                        )
+                    }
+                }),
+            ));
+        history_panel = history_panel.child(
+            div()
+                .flex()
+                .justify_between()
+                .child(crate::rack::label("24 H AGO", t))
+                .child(crate::rack::label("NOW", t)),
+        );
+        history_panel = history_panel.child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(t.ink_row))
+                .child(format!("{} {}", history.pattern, history.now)),
+        );
+        history_panel = history_panel
+            .child(detail_line(
+                "Core time",
+                format!("{:.1} min", history.core_minutes),
+            ))
+            .child(detail_line(
+                "Busy average",
+                format!("{:.0} %", history.busy_average),
+            ))
+            .child(detail_line(
+                "Peak CPU",
+                format!(
+                    "{:.0} % at {}",
+                    history.peak_cpu,
+                    crate::rack::timestamp(history.peak_minute * 60, "%H:%M")
+                ),
+            ))
+            .child(detail_line(
+                "Longest busy run",
+                format!("{} min over 50 %", history.longest_busy_minutes),
+            ))
+            .child(detail_line("Peak memory", bytes(history.peak_memory)));
+    } else {
+        history_panel = history_panel.child(
+            div()
+                .text_size(px(12.))
+                .child("Not seen in the recorded history. gtop records only while it runs."),
+        );
+    }
+    panel.child(history_panel)
+}
+
 fn selectable(id: &'static str, text: &str) -> gpui_component::text::TextView {
     let escaped = text
         .replace('&', "&amp;")
@@ -470,6 +621,9 @@ mod tests {
     fn selected(key: ProcessKey) -> Details {
         Details {
             key,
+            name: "builder".into(),
+            command: "builder".into(),
+            analysis: None,
             environment: Environment::Unrequested,
             environment_open: false,
             kill: KillState::Ready,

@@ -1,3 +1,4 @@
+mod analysis;
 mod details;
 mod history;
 mod model;
@@ -178,10 +179,26 @@ impl Monitor {
             let mut cached_minute = None;
             let mut cached_moment = None;
             let mut cached_metric = None;
+            let mut cached_analysis_key = None;
             loop {
                 while events.try_recv().is_ok() {}
-                let Ok((running, ports, seconds, moment, metric)) = entity.update_in(cx, |this, window, cx| {
-                    (!this.paused, window.is_visible() && this.table.read(cx).search.needs_ports(), this.interval, this.moment, this.metric)
+                let Ok((running, ports, seconds, moment, metric, selected_detail)) = entity.update_in(cx, |this, window, cx| {
+                    let selected_detail = this.details.as_ref().map(|details| {
+                        let current_cpu = this.snapshot.as_ref().and_then(|snapshot| {
+                            snapshot.processes.iter().find(|process| {
+                                process.pid == details.key.pid
+                                    && process.start_time == details.key.start_time
+                            })
+                        }).map(|process| process.cpu_usage).unwrap_or(0.);
+                        (
+                            details.key,
+                            details.name.clone(),
+                            details.command.clone(),
+                            current_cpu,
+                            details.analysis.is_none(),
+                        )
+                    });
+                    (!this.paused, window.is_visible() && this.table.read(cx).search.needs_ports(), this.interval, this.moment, this.metric, selected_detail)
                 }) else { break; };
                 if moment.is_none() {
                     cached_moment = None;
@@ -189,6 +206,25 @@ impl Monitor {
                 }
                 if !running {
                     history.suspend();
+                    if let Some((key, name, command, cpu, needs_analysis)) = selected_detail.as_ref() {
+                        if *needs_analysis || cached_analysis_key != Some(*key) {
+                            let analysis = history.analyze_process(
+                                name,
+                                command,
+                                *cpu,
+                                rack::now() as u64 / 60,
+                            );
+                            let _ = entity.update_in(cx, |this, _, cx| {
+                                if let Some(details) = this.details.as_mut().filter(|details| details.key == *key) {
+                                    details.analysis = Some(analysis);
+                                    cx.notify();
+                                }
+                            });
+                        }
+                        cached_analysis_key = Some(*key);
+                    } else {
+                        cached_analysis_key = None;
+                    }
                     if events.next().await.is_none() { break; }
                     continue;
                 }
@@ -196,6 +232,7 @@ impl Monitor {
                 let port_cache=cached_ports.clone();
                 let previous_moment = cached_moment;
                 let previous_metric = cached_metric;
+                let previous_analysis_key = cached_analysis_key;
                 let result = cx.background_executor().spawn(async move {
                     let start = std::time::Instant::now();
                     let mut snapshot = state.snapshot(false, ports);
@@ -205,12 +242,25 @@ impl Monitor {
                     let tick_ms = start.elapsed().as_secs_f64() * 1000.;
                     let mut views = None;
                     let mut moment_detail = None;
+                    let mut process_analysis = None;
                     let mut history_save = None;
                     if let Ok(ref snapshot) = snapshot {
                         let now = rack::now();
 
                         history.record(snapshot, now, seconds as f64);
                         let minute = now as u64 / 60;
+                        let minute_changed = cached_minute != Some(minute);
+                        if let Some((key, name, command, fallback_cpu, needs_analysis)) = selected_detail.as_ref() {
+                            if *needs_analysis || previous_analysis_key != Some(*key) || minute_changed {
+                                let current_cpu = snapshot.processes.iter().find(|process| {
+                                    process.pid == key.pid && process.start_time == key.start_time
+                                }).map(|process| process.cpu_usage).unwrap_or(*fallback_cpu);
+                                process_analysis = Some((
+                                    *key,
+                                    history.analyze_process(name, command, current_cpu, minute),
+                                ));
+                            }
+                        }
                         if let Some(selection) = moment {
                             let span_changed = selection.start_minute <= minute
                                 && minute < selection.start_minute + selection.step as u64;
@@ -218,16 +268,21 @@ impl Monitor {
                                 moment_detail = Some(history.moment(selection));
                             }
                         }
-                        if cached_minute != Some(minute) {
+                        if minute_changed {
                             cached_minute = Some(minute);
                             views = Some([1,8,24].map(|hours| history.view(hours, now as u64)));
                             history_save=Some(history.save(&history::support_path("history.json")).map_err(|e|e.to_string()));
                         }
                     }
-                    (snapshot, tick_ms, views, moment_detail, history, cached_minute, history_save, moment, metric)
+                    let selected_key = match selected_detail {
+                        Some((key, _, _, _, _)) if snapshot.is_ok() || previous_analysis_key == Some(key) => Some(key),
+                        _ => None,
+                    };
+                    (snapshot, tick_ms, views, moment_detail, process_analysis, history, cached_minute, history_save, moment, metric, selected_key)
                 }).await;
-                let (result, tick_ms, views, moment_detail, returned_history, returned_minute, history_save, selection, metric) = result;
+                let (result, tick_ms, views, moment_detail, process_analysis, returned_history, returned_minute, history_save, selection, metric, selected_key) = result;
                 cached_minute=returned_minute;
+                cached_analysis_key = selected_key;
                 history = returned_history;
                 if moment_detail.is_some() {
                     cached_moment = selection;
@@ -247,6 +302,11 @@ impl Monitor {
                     if let Some(detail) = moment_detail.filter(|_| this.moment == selection) {
                         this.moment_rows = detail.ranked(metric);
                         this.moment_detail = Some(detail);
+                    }
+                    if let Some((key, analysis)) = process_analysis {
+                        if let Some(details) = this.details.as_mut().filter(|details| details.key == key) {
+                            details.analysis = Some(analysis);
+                        }
                     }
                     if let Some(save)=history_save {
                         if let Err(error)=save {this.status=format!("History could not be saved: {error}");}

@@ -235,6 +235,16 @@ pub struct History {
     last_sample: Option<f64>,
 }
 impl History {
+    pub fn analyze_process(
+        &self,
+        name: &str,
+        command: &str,
+        current_cpu: f32,
+        now_minute: u64,
+    ) -> crate::analysis::ProcessAnalysis {
+        crate::analysis::analyze(name, command, current_cpu, now_minute, self.buckets.iter())
+    }
+
     pub fn load(path: &std::path::Path, now: u64) -> Self {
         let mut history: Self = std::fs::metadata(path)
             .ok()
@@ -348,19 +358,22 @@ impl History {
             b.temperature = Some(mean(b.temperature.unwrap_or(0.), v));
             b.peak_temperature = Some(b.peak_temperature.unwrap_or(v).max(v));
         }
-        for p in &snapshot.processes {
-            if !b.processes.contains_key(&p.name) && b.processes.len() >= MAX_NAMES {
+        let mut sampled_processes = BTreeMap::<String, ProcessTotal>::new();
+        for process in &snapshot.processes {
+            if !b.processes.contains_key(&process.name)
+                && !sampled_processes.contains_key(&process.name)
+                && b.processes.len() + sampled_processes.len() >= MAX_NAMES
+            {
                 continue;
             }
-            b.processes
-                .entry(p.name.clone())
-                .or_default()
-                .merge(&ProcessTotal {
-                    cpu_seconds: p.cpu_usage as f64 / 100. * seconds,
-                    gpu_seconds: p.gpu_usage.unwrap_or(0.) as f64 / 100. * seconds,
-                    peak_memory: p.memory_usage,
-                    peak_cpu: p.cpu_usage,
-                });
+            let total = sampled_processes.entry(process.name.clone()).or_default();
+            total.cpu_seconds += process.cpu_usage as f64 / 100. * seconds;
+            total.gpu_seconds += process.gpu_usage.unwrap_or(0.) as f64 / 100. * seconds;
+            total.peak_memory = total.peak_memory.max(process.memory_usage);
+            total.peak_cpu += process.cpu_usage;
+        }
+        for (name, total) in sampled_processes {
+            b.processes.entry(name).or_default().merge(&total);
         }
     }
 
@@ -488,6 +501,15 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert_eq!(loaded.view(1, 6180).covered, 2);
         assert!(loaded.last_sample.is_none());
+    }
+
+    #[test]
+    fn process_peak_cpu_sums_same_name_processes_in_each_sample() {
+        let snapshot = crate::test_data::snapshot();
+        let mut history = History::default();
+        history.record(&snapshot, 6000., 3.);
+        assert_eq!(history.buckets[0].processes["rustc"].peak_cpu, 350.);
+        assert_eq!(history.buckets[0].processes["cargo"].peak_cpu, 110.);
     }
     #[test]
     fn elapsed_time_splits_at_minute_boundaries() {

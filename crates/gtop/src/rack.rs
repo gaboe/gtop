@@ -298,7 +298,7 @@ pub fn win(t: &Tokens) -> Div {
             .size_full(),
         )
 }
-fn hatch(color: u32) -> Div {
+pub fn hatch(color: u32) -> Div {
     div().flex_1().h_full().child(
         canvas(
             |_, _, _| {},
