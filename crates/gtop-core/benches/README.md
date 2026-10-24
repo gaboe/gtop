@@ -13,6 +13,11 @@ rtk proxy python3 crates/gtop-core/benches/compare.py /absolute/base /absolute/c
 
 The defaults are five alternating pairs, 60 measured ticks per run, and the native app's default three-second interval.
 Each run discards two warmup ticks.
+The CPU counter is macOS `getrusage(RUSAGE_SELF)` user plus system time across all process threads.
+It excludes CPU charged to child processes.
+The runner reports CPU median and p90 per run, and paired CPU deltas.
+Run identical binaries first to establish the largest absolute control-pair delta.
+Treat wall times as diagnostics on a busy host.
 The timer covers the complete `AppState::snapshot(false, false)` call.
 It includes refresh, GPU collection, temperatures, and process output construction.
 The native app collects ports in a separate worker and loads environment variables on demand.

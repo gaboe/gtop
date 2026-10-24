@@ -47,20 +47,33 @@ def main():
             parse_errors = 0
             for line in result.stdout.splitlines():
                 try:
-                    rows.append(json.loads(line))
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ValueError("tick is not an object")
+                    for key in ("elapsed_us", "cpu_us", "processes"):
+                        value = row.get(key)
+                        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                                or not math.isfinite(value) or value <= 0):
+                            raise ValueError(f"invalid {key}")
+                    if row.get("tick") != len(rows) or row.get("errors") != 0:
+                        raise ValueError("invalid tick sequence or failed snapshot")
+                    rows.append(row)
                 except (ValueError, TypeError):
                     parse_errors += 1
             errors = parse_errors + sum(row.get("errors", 1) for row in rows)
             errors += int(result.returncode != 0) + int(len(rows) != args.ticks)
             errors += sum(int(row.get("processes", 0) <= 0) for row in rows)
             times = [row["elapsed_us"] / 1000 for row in rows]
+            cpu_times = [row["cpu_us"] / 1000 for row in rows]
             run = {"pair": pair + 1, "side": side, "started": started,
                    "load_before": load, "load_after": os.getloadavg(),
                    "noisy": max(load[0], os.getloadavg()[0]) > report["cores"],
                    "returncode": result.returncode, "errors": errors,
                    "work_ticks": len(rows), "rows": rows}
             if times:
-                run.update(median_ms=statistics.median(times), p90_ms=percentile(times, .9),
+                run.update(cpu_median_ms=statistics.median(cpu_times),
+                           cpu_p90_ms=percentile(cpu_times, .9),
+                           median_ms=statistics.median(times), p90_ms=percentile(times, .9),
                            process_min=min(row["processes"] for row in rows),
                            process_max=max(row["processes"] for row in rows))
             report["runs"].append(run)
@@ -68,11 +81,17 @@ def main():
             print(json.dumps({k: v for k, v in run.items() if k != "rows"}), flush=True)
             if errors:
                 raise SystemExit("Invalid run. See saved output.")
+    for side, binary in report["binaries"].items():
+        if hashlib.sha256(Path(binary["path"]).read_bytes()).hexdigest() != binary["sha256"]:
+            raise SystemExit(f"{side} binary changed during measurement")
     summary = {}
     for side in ("base", "candidate"):
         runs = [run for run in report["runs"] if run["side"] == side]
         medians = [run["median_ms"] for run in runs]
-        summary[side] = {"median_ms": statistics.median(medians),
+        cpu_medians = [run["cpu_median_ms"] for run in runs]
+        summary[side] = {"cpu_median_ms": statistics.median(cpu_medians),
+                         "cpu_range_ms": [min(cpu_medians), max(cpu_medians)],
+                         "median_ms": statistics.median(medians),
                          "range_ms": [min(medians), max(medians)],
                          "p90_ms": statistics.median([run["p90_ms"] for run in runs]),
                          "noisy_runs": sum(run["noisy"] for run in runs)}
@@ -87,6 +106,9 @@ def main():
             "similar_load": max(loads) - min(loads) <= max(1., min(loads) * .2),
             "similar_process_count": max(process_counts) <= min(process_counts) * 1.1,
             "noisy": base["noisy"] or candidate["noisy"],
+            "cpu_delta_percent": (candidate["cpu_median_ms"] / base["cpu_median_ms"] - 1) * 100,
+            "base_cpu_ms": base["cpu_median_ms"],
+            "candidate_cpu_ms": candidate["cpu_median_ms"],
             "base_ms": base["median_ms"], "candidate_ms": candidate["median_ms"]})
     summary["verdict"] = "diagnostic only; compare paired loads and variation before acceptance"
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
