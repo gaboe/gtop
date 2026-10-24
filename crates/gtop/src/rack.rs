@@ -1097,6 +1097,20 @@ impl Monitor {
         let mut root = div()
             .size_full()
             .track_focus(&self.focus)
+            .key_context("Gtop")
+            .capture_action(cx.listener(|this, _: &crate::ToggleView, window, cx| {
+                this.switch_view_from_tab(window, cx)
+            }))
+            .capture_action(cx.listener(
+                |this, _: &gpui_component::input::IndentInline, window, cx| {
+                    this.switch_view_from_tab(window, cx)
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_component::input::OutdentInline, window, cx| {
+                    this.switch_view_from_tab(window, cx)
+                },
+            ))
             .capture_key_down(cx.listener(Self::key))
             .flex()
             .gap(px(8.))
@@ -1179,6 +1193,15 @@ impl Monitor {
         }
         self.apply_palette(cx);
     }
+    fn switch_view_from_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.search.read(cx).focus_handle(cx).is_focused(window) {
+            self.view = if self.view.is_some() { None } else { Some(0) };
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+        cx.stop_propagation();
+    }
+
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.modifiers.platform
             || event.keystroke.modifiers.control
@@ -1194,6 +1217,16 @@ impl Monitor {
                 .colors
                 .iter()
                 .any(|i| i.read(cx).focus_handle(cx).is_focused(window));
+        if k == "tab" {
+            if !search_focused {
+                self.view = if self.view.is_some() { None } else { Some(0) };
+                window.focus(&self.focus, cx);
+                cx.notify();
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         if editing {
             if k == "escape" || k == "enter" {
                 if k == "escape" && self.moment.is_some() {

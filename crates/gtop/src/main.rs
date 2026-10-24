@@ -447,7 +447,7 @@ impl Render for Monitor {
     }
 }
 
-actions!(gtop, [Quit]);
+actions!(gtop, [Quit, ToggleView]);
 
 fn main() {
     gpui_platform::application()
@@ -467,7 +467,11 @@ fn main() {
                     .expect("bundled font");
             }
             cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+            cx.bind_keys([
+                KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("tab", ToggleView, Some("Gtop")),
+                KeyBinding::new("shift-tab", ToggleView, Some("Gtop")),
+            ]);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
