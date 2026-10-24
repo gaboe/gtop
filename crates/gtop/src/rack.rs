@@ -531,7 +531,10 @@ fn tape(
                 step,
             };
             let selected = selected_moment == Some(selection);
-            let click = cx.listener(move |this, _, _, cx| this.select_moment(selection, cx));
+            let click = cx.listener(move |this, _, window, cx| {
+                window.focus(&this.focus, cx);
+                this.select_moment(selection, cx);
+            });
             let values: Vec<_> = group
                 .iter()
                 .flatten()
@@ -709,7 +712,11 @@ impl Monitor {
                     .gap(px(7.))
                     .px_2()
                     .border_b_1()
-                    .border_color(rgb(t.row_rule))
+                    .border_color(rgb(if self.moment_selected == index {
+                        t.base.silk
+                    } else {
+                        t.row_rule
+                    }))
                     .text_color(rgb(if index < 3 { t.base.led } else { t.ink_row }))
                     .child(
                         div()
@@ -1399,16 +1406,19 @@ impl Monitor {
             .track_focus(&self.focus)
             .key_context("Gtop")
             .capture_action(cx.listener(|this, _: &crate::ToggleView, window, cx| {
-                this.switch_view_from_tab(window, cx)
+                this.switch_view_from_tab(false, window, cx)
+            }))
+            .capture_action(cx.listener(|this, _: &crate::PreviousView, window, cx| {
+                this.switch_view_from_tab(true, window, cx)
             }))
             .capture_action(cx.listener(
                 |this, _: &gpui_component::input::IndentInline, window, cx| {
-                    this.switch_view_from_tab(window, cx)
+                    this.switch_view_from_tab(false, window, cx)
                 },
             ))
             .capture_action(cx.listener(
                 |this, _: &gpui_component::input::OutdentInline, window, cx| {
-                    this.switch_view_from_tab(window, cx)
+                    this.switch_view_from_tab(true, window, cx)
                 },
             ))
             .capture_key_down(cx.listener(Self::key))
@@ -1493,7 +1503,31 @@ impl Monitor {
         }
         self.apply_palette(cx);
     }
-    fn switch_view_from_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn switch_view_from_tab(&mut self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_open {
+            if self.focus.is_focused(window) {
+                window.focus(
+                    &self.colors[if reverse { 5 } else { 0 }]
+                        .read(cx)
+                        .focus_handle(cx),
+                    cx,
+                );
+            } else if reverse {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let editing = self.mix_name.read(cx).focus_handle(cx).is_focused(window)
+            || self
+                .colors
+                .iter()
+                .any(|input| input.read(cx).focus_handle(cx).is_focused(window));
+        if editing {
+            return;
+        }
         if !self.search.read(cx).focus_handle(cx).is_focused(window) {
             self.view = if self.view.is_some() { None } else { Some(0) };
             window.focus(&self.focus, cx);
@@ -1518,13 +1552,11 @@ impl Monitor {
                 .iter()
                 .any(|i| i.read(cx).focus_handle(cx).is_focused(window));
         if k == "tab" {
-            if !search_focused {
-                self.view = if self.view.is_some() { None } else { Some(0) };
-                window.focus(&self.focus, cx);
-                cx.notify();
-            }
+            self.switch_view_from_tab(event.keystroke.modifiers.shift, window, cx);
             window.prevent_default();
-            cx.stop_propagation();
+            return;
+        }
+        if self.settings_open && !editing && !self.focus.is_focused(window) {
             return;
         }
         if editing {
@@ -1574,8 +1606,28 @@ impl Monitor {
                     cx.notify();
                     return;
                 }
-                "enter" if self.view.is_some() => {
-                    self.moment = None;
+                "j" | "down" | "k" | "up" => {
+                    self.moment_selected = if matches!(k, "j" | "down") {
+                        (self.moment_selected + 1).min(self.moment_rows.len().saturating_sub(1))
+                    } else {
+                        self.moment_selected.saturating_sub(1)
+                    };
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "enter" => {
+                    let key = self.moment_rows.get(self.moment_selected).and_then(|row| {
+                        self.snapshot
+                            .as_ref()
+                            .and_then(|snapshot| {
+                                crate::model::running_history_process(&row.0, &snapshot.processes)
+                            })
+                            .map(crate::model::ProcessKey::from)
+                    });
+                    if let Some(key) = key {
+                        self.select(key, cx);
+                    }
                     cx.stop_propagation();
                     cx.notify();
                     return;
@@ -1601,6 +1653,12 @@ impl Monitor {
             return;
         }
         match k {
+            "enter" | "left" | "right" if self.view.is_some() => {
+                let view = &self.history[self.view.unwrap()];
+                if let Some(selection) = crate::history::newest_moment(view) {
+                    self.select_moment(selection, cx);
+                }
+            }
             "/" => window.focus(&self.search.read(cx).focus_handle(cx), cx),
             "space" => {
                 self.paused = !self.paused;

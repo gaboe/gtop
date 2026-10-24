@@ -31,6 +31,7 @@ struct Monitor {
     history: [history::HistoryView; 3],
     moment: Option<history::MomentSelection>,
     moment_detail: Option<history::MomentDetail>,
+    moment_selected: usize,
     moment_rows: Vec<(String, history::ProcessTotal, f64)>,
     view: Option<usize>,
     history_selected: Option<String>,
@@ -368,6 +369,7 @@ impl Monitor {
             history: std::array::from_fn(|_| history::HistoryView::default()),
             moment: None,
             moment_detail: None,
+            moment_selected: 0,
             moment_rows: Vec::new(),
             view: None,
             history_selected: None,
@@ -402,6 +404,7 @@ impl Monitor {
             self.moment = None;
         } else {
             self.moment = Some(selection);
+            self.moment_selected = 0;
             if self
                 .moment_detail
                 .as_ref()
@@ -494,7 +497,7 @@ impl Render for Monitor {
     }
 }
 
-actions!(gtop, [Quit, ToggleView]);
+actions!(gtop, [Quit, ToggleView, PreviousView]);
 
 fn main() {
     gpui_platform::application()
@@ -517,7 +520,7 @@ fn main() {
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("tab", ToggleView, Some("Gtop")),
-                KeyBinding::new("shift-tab", ToggleView, Some("Gtop")),
+                KeyBinding::new("shift-tab", PreviousView, Some("Gtop")),
             ]);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {

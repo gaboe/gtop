@@ -115,6 +115,20 @@ impl MomentDetail {
     }
 }
 
+pub fn newest_moment(view: &HistoryView) -> Option<MomentSelection> {
+    let step = if view.columns.len() > 480 {
+        10
+    } else if view.columns.len() > 60 {
+        5
+    } else {
+        1
+    };
+    (!view.columns.is_empty()).then(|| MomentSelection {
+        start_minute: view.start_minute + ((view.columns.len() - 1) / step * step) as u64,
+        step,
+    })
+}
+
 pub fn step_moment(
     selection: MomentSelection,
     direction: i8,
@@ -518,6 +532,25 @@ pub fn support_path(file: &str) -> PathBuf {
 mod tests {
     use super::*;
     #[test]
+    fn keyboard_entry_selects_newest_displayed_column() {
+        for (minutes, step) in [(60, 1), (480, 5), (1440, 10)] {
+            let view = HistoryView {
+                start_minute: 91,
+                columns: vec![None; minutes],
+                ..Default::default()
+            };
+            assert_eq!(
+                newest_moment(&view),
+                Some(MomentSelection {
+                    start_minute: 91 + (minutes - step) as u64,
+                    step
+                })
+            );
+        }
+        assert!(newest_moment(&HistoryView::default()).is_none());
+    }
+
+    #[test]
     fn name_limit_counts_the_distinct_union() {
         let mut history = History::default();
         let mut snapshot = crate::test_data::snapshot();
@@ -699,7 +732,10 @@ mod tests {
         assert_eq!(v.rows[0].0, "rustc");
         assert_eq!(v.rows[0].1.cpu_seconds, 10.5);
         assert_eq!(v.rows[0].1.peak_memory, 3072);
-        assert_eq!(v.cached_leaders[Metric::Cpu as usize], v.leaders(Metric::Cpu));
+        assert_eq!(
+            v.cached_leaders[Metric::Cpu as usize],
+            v.leaders(Metric::Cpu)
+        );
         assert_eq!(v.leaders(Metric::Temperature)[0], ("Peak".into(), 80.));
         h.suspend();
         h.record(&s, 6006., 3.);
