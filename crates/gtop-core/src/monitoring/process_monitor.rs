@@ -114,6 +114,7 @@ impl ProcessMonitor {
             .with_disk_usage()
             .with_user(UpdateKind::OnlyIfNotSet)
             .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_exe(UpdateKind::OnlyIfNotSet)
             .with_root(UpdateKind::OnlyIfNotSet);
         if include_environ {
             kind = kind.with_environ(UpdateKind::OnlyIfNotSet);
@@ -168,6 +169,11 @@ impl ProcessMonitor {
                         })
                         .unwrap_or_else(|| "-".to_string()),
                     command: os_string_vec_to_string_vec(process.cmd()).join(" "),
+                    executable: process
+                        .exe()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    argv: os_string_vec_to_string_vec(process.cmd()),
                     threads: None,
                     environ: if include_environ {
                         os_string_vec_to_string_vec(process.environ())
@@ -284,6 +290,11 @@ mod tests {
         let own = processes.iter().find(|p| p.pid == own_pid).unwrap();
         assert!(!own.command.is_empty(), "command is read on first refresh");
         assert!(own.environ.is_empty(), "environ is skipped by default");
+        assert!(
+            !own.executable.is_empty(),
+            "executable is read on first refresh"
+        );
+        assert_eq!(own.argv.join(" "), own.command);
 
         assert!(
             !ProcessMonitor::process_environ(&mut sys, own_pid).is_empty(),

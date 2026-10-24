@@ -20,7 +20,7 @@ enum Environment {
 pub(super) struct Details {
     pub(super) key: ProcessKey,
     pub(super) name: String,
-    pub(super) command: String,
+    pub(super) executable: String,
     pub(super) analysis: Option<crate::analysis::ProcessAnalysis>,
     environment: Environment,
     environment_open: bool,
@@ -72,7 +72,7 @@ impl Monitor {
         {
             return;
         }
-        let (name, command) = self
+        let (name, executable) = self
             .snapshot
             .as_ref()
             .and_then(|snapshot| {
@@ -80,13 +80,13 @@ impl Monitor {
                     .processes
                     .iter()
                     .find(|process| ProcessKey::from(*process) == key)
-                    .map(|process| (process.name.clone(), process.command.clone()))
+                    .map(|process| (process.name.clone(), process.executable.clone()))
             })
             .unwrap_or_default();
         self.details = Some(Details {
             key,
             name,
-            command,
+            executable,
             analysis: None,
             environment: Environment::Unrequested,
             environment_open: false,
@@ -649,7 +649,7 @@ mod tests {
         Details {
             key,
             name: "builder".into(),
-            command: "builder".into(),
+            executable: "/bin/builder".into(),
             analysis: None,
             environment: Environment::Unrequested,
             environment_open: false,

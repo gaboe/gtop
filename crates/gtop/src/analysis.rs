@@ -123,21 +123,7 @@ fn process_history<'a>(
             recorded.len()
         )
     };
-    let ratio = if busy_average > 0. {
-        current_cpu as f64 / busy_average
-    } else {
-        0.
-    };
-    let now = if ratio > 1.5 {
-        format!(
-            "Now {:.0} %, {:.1}× its usual busy load.",
-            current_cpu, ratio
-        )
-    } else if ratio > 0. && ratio < 0.5 {
-        format!("Now {:.0} %, well below its usual busy load.", current_cpu)
-    } else {
-        format!("Now {:.0} %, about its usual busy load.", current_cpu)
-    };
+    let now = now_sentence(current_cpu, busy_average);
 
     let mut longest_busy_minutes = 0;
     let mut busy_run = 0;
@@ -173,6 +159,32 @@ fn process_history<'a>(
         peak_memory,
         recorded_minutes: recorded.len(),
     })
+}
+
+pub fn current_cpu(processes: &[gtop_core::ProcessInfo], name: &str) -> f32 {
+    processes
+        .iter()
+        .filter(|process| process.name == name)
+        .map(|process| process.cpu_usage)
+        .sum()
+}
+
+pub fn now_sentence(current_cpu: f32, busy_average: f64) -> String {
+    let ratio = if busy_average > 0. {
+        current_cpu as f64 / busy_average
+    } else {
+        0.
+    };
+    if ratio > 1.5 {
+        format!(
+            "Now {:.0} %, {:.1}× its usual busy load.",
+            current_cpu, ratio
+        )
+    } else if busy_average > 0. && ratio < 0.5 {
+        format!("Now {:.0} %, well below its usual busy load.", current_cpu)
+    } else {
+        format!("Now {:.0} %, about its usual busy load.", current_cpu)
+    }
 }
 
 #[derive(Deserialize)]
@@ -254,6 +266,37 @@ mod tests {
             processes,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn now_uses_live_name_total_and_includes_zero() {
+        let mut snapshot = crate::test_data::snapshot();
+        assert_eq!(super::current_cpu(&snapshot.processes, "rustc"), 350.);
+        assert!(super::now_sentence(350., 350.).contains("about its usual"));
+        snapshot.processes[0].cpu_usage = 0.;
+        snapshot.processes[1].cpu_usage = 0.;
+        assert!(
+            super::now_sentence(super::current_cpu(&snapshot.processes, "rustc"), 350.)
+                .contains("below its usual")
+        );
+    }
+
+    #[test]
+    fn executable_identity_does_not_use_an_app_argument() {
+        let mut process = crate::test_data::process(1, "custom-runner", 0.);
+        process.executable = "/opt/bin/custom-runner".into();
+        process.argv = vec![
+            process.executable.clone(),
+            "/Applications/Slack.app/Contents/script.py".into(),
+        ];
+        assert_eq!(
+            identity(&process.name, &process.executable).source,
+            "no match"
+        );
+        assert_eq!(
+            identity("custom", "/Applications/My App.app/Contents/MacOS/helper").what,
+            "Part of My App"
+        );
     }
 
     #[test]

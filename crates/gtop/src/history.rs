@@ -416,7 +416,7 @@ impl History {
             let total = sampled_processes.entry(process.name.clone()).or_default();
             total.cpu_seconds += process.cpu_usage as f64 / 100. * seconds;
             total.gpu_seconds += process.gpu_usage.unwrap_or(0.) as f64 / 100. * seconds;
-            total.peak_memory = total.peak_memory.max(process.memory_usage);
+            total.peak_memory += process.memory_usage;
             total.peak_cpu += process.cpu_usage;
         }
         for (name, total) in sampled_processes {
@@ -570,7 +570,10 @@ mod tests {
                     start_minute: 100,
                     step: 1
                 })
-                .rows[1]
+                .rows
+                .iter()
+                .find(|row| row.0 == "rustc")
+                .unwrap()
                 .1
                 .cpu_seconds,
             10.5
@@ -646,7 +649,7 @@ mod tests {
         assert_eq!(v.covered, 1);
         assert_eq!(v.rows[0].0, "rustc");
         assert_eq!(v.rows[0].1.cpu_seconds, 10.5);
-        assert_eq!(v.rows[0].1.peak_memory, 2048);
+        assert_eq!(v.rows[0].1.peak_memory, 3072);
         assert_eq!(v.leaders(Metric::Temperature)[0], ("Peak".into(), 80.));
         h.suspend();
         h.record(&s, 6006., 3.);
@@ -671,6 +674,7 @@ mod tests {
         let mut history = History::default();
         history.record(&snapshot, 6000., 3.);
         assert_eq!(history.buckets[0].processes["rustc"].peak_cpu, 350.);
+        assert_eq!(history.buckets[0].processes["rustc"].peak_memory, 3072);
         assert_eq!(history.buckets[0].processes["cargo"].peak_cpu, 110.);
     }
     #[test]

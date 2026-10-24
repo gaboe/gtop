@@ -23,6 +23,8 @@ pub struct ProcessInfo {
     pub user: String,
     /// Full command string
     pub command: String,
+    pub executable: String,
+    pub argv: Vec<String>,
     /// Number of threads (if available)
     pub threads: Option<u32>,
     /// Environment variables

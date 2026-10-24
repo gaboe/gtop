@@ -185,16 +185,11 @@ impl Monitor {
                 while events.try_recv().is_ok() {}
                 let Ok((running, ports, seconds, moment, metric, selected_detail)) = entity.update_in(cx, |this, window, cx| {
                     let selected_detail = this.details.as_ref().map(|details| {
-                        let current_cpu = this.snapshot.as_ref().and_then(|snapshot| {
-                            snapshot.processes.iter().find(|process| {
-                                process.pid == details.key.pid
-                                    && process.start_time == details.key.start_time
-                            })
-                        }).map(|process| process.cpu_usage).unwrap_or(0.);
+                        let current_cpu = this.snapshot.as_ref().map(|snapshot| crate::analysis::current_cpu(&snapshot.processes, &details.name)).unwrap_or(0.);
                         (
                             details.key,
                             details.name.clone(),
-                            details.command.clone(),
+                            details.executable.clone(),
                             current_cpu,
                             details.analysis.is_none(),
                         )
@@ -284,11 +279,9 @@ impl Monitor {
                         history.record(snapshot, now, seconds as f64);
                         let minute = now as u64 / 60;
                         let minute_changed = cached_minute != Some(minute);
-                        if let Some((key, name, command, fallback_cpu, needs_analysis)) = selected_detail.as_ref() {
+                        if let Some((key, name, command, _fallback_cpu, needs_analysis)) = selected_detail.as_ref() {
                             if *needs_analysis || previous_analysis_key != Some(*key) || minute_changed {
-                                let current_cpu = snapshot.processes.iter().find(|process| {
-                                    process.pid == key.pid && process.start_time == key.start_time
-                                }).map(|process| process.cpu_usage).unwrap_or(*fallback_cpu);
+                                let current_cpu = crate::analysis::current_cpu(&snapshot.processes, name);
                                 process_analysis = Some((
                                     *key,
                                     history.analyze_process(name, command, current_cpu, minute),
@@ -450,6 +443,18 @@ impl Monitor {
         }
     }
     fn accept(&mut self, snapshot: Snapshot, window: &Window, cx: &mut Context<Self>) {
+        if let Some(details) = self.details.as_mut() {
+            if let Some(history) = details
+                .analysis
+                .as_mut()
+                .and_then(|analysis| analysis.history.as_mut())
+            {
+                history.now = crate::analysis::now_sentence(
+                    crate::analysis::current_cpu(&snapshot.processes, &details.name),
+                    history.busy_average,
+                );
+            }
+        }
         let snapshot = Rc::new(snapshot);
         let key = self
             .details

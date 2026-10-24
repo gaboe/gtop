@@ -9,6 +9,8 @@ pub fn process(pid: u32, name: &str, cpu: f32) -> ProcessInfo {
         memory_usage: pid as u64 * 1024,
         status: "Running".into(),
         user: "test".into(),
+        executable: format!("/bin/{name}"),
+        argv: vec![format!("/bin/{name}")],
         command: format!("/bin/{name}"),
         threads: None,
         environ: vec![],

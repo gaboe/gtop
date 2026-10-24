@@ -285,6 +285,8 @@ mod tests {
             memory_usage: 0,
             status: "Running".into(),
             user: "501".into(),
+            executable: format!("/bin/{name}"),
+            argv: vec![format!("/bin/{name}")],
             command: format!("/bin/{name} --server"),
             threads: None,
             environ: vec![],
