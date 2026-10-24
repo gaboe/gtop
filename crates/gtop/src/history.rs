@@ -200,6 +200,7 @@ pub struct HistoryView {
     pub rows: Vec<(String, ProcessTotal)>,
     pub total_cpu: f64,
     pub covered: usize,
+    pub cached_leaders: [Vec<(String, f64)>; 4],
 }
 impl HistoryView {
     pub fn leaders(&self, metric: Metric) -> Vec<(String, f64)> {
@@ -463,6 +464,7 @@ impl History {
                 .then(a.0.cmp(&b.0))
         });
         result.total_cpu = result.rows.iter().map(|r| r.1.cpu_seconds).sum();
+        result.cached_leaders = Metric::ALL.map(|metric| result.leaders(metric));
         result
     }
 
@@ -522,7 +524,9 @@ mod tests {
         snapshot.processes = (1..=MAX_NAMES as u32)
             .map(|pid| crate::test_data::process(pid, &format!("process-{pid}"), 1.))
             .collect();
+        let rest = snapshot.processes.split_off(2048);
         history.record(&snapshot, 6000., 3.);
+        snapshot.processes.extend(rest);
         snapshot
             .processes
             .push(crate::test_data::process(9999, "extra", 1.));
@@ -695,6 +699,7 @@ mod tests {
         assert_eq!(v.rows[0].0, "rustc");
         assert_eq!(v.rows[0].1.cpu_seconds, 10.5);
         assert_eq!(v.rows[0].1.peak_memory, 3072);
+        assert_eq!(v.cached_leaders[Metric::Cpu as usize], v.leaders(Metric::Cpu));
         assert_eq!(v.leaders(Metric::Temperature)[0], ("Peak".into(), 80.));
         h.suspend();
         h.record(&s, 6006., 3.);

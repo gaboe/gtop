@@ -207,6 +207,9 @@ fn unit_paths(bounds: Bounds<Pixels>, unit: char) -> UnitPaths {
         ghost.build().expect("ghost unit geometry"),
     );
     if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= 32 {
+            cache.clear();
+        }
         cache.insert(key, paths.clone());
     }
     paths
@@ -1293,31 +1296,35 @@ impl Monitor {
                 .child(
                     win(&t)
                         .child(head)
-                        .child(div().flex().gap(px(16.)).children(
-                            h.leaders(self.metric).into_iter().map(|(name, v)| {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(label(name, &t))
-                                    .child(if self.metric == Metric::Temperature {
-                                        lit_unit(format!("{v:3.0}"), '°', 15., false, &t)
-                                    } else {
-                                        lit(
-                                            match self.metric {
-                                                Metric::Cpu | Metric::Gpu => {
-                                                    format!("{:.1}m", v / 60.)
-                                                }
-                                                Metric::Memory => bytes(v as u64),
-                                                Metric::Temperature => unreachable!(),
-                                            },
-                                            15.,
-                                            false,
-                                            &t,
-                                        )
-                                    })
-                            }),
-                        ))
+                        .child(
+                            div().flex().gap(px(16.)).children(
+                                h.cached_leaders[self.metric as usize]
+                                    .iter()
+                                    .map(|(name, v)| {
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(label(name, &t))
+                                            .child(if self.metric == Metric::Temperature {
+                                                lit_unit(format!("{v:3.0}"), '°', 15., false, &t)
+                                            } else {
+                                                lit(
+                                                    match self.metric {
+                                                        Metric::Cpu | Metric::Gpu => {
+                                                            format!("{:.1}m", v / 60.)
+                                                        }
+                                                        Metric::Memory => bytes(*v as u64),
+                                                        Metric::Temperature => unreachable!(),
+                                                    },
+                                                    15.,
+                                                    false,
+                                                    &t,
+                                                )
+                                            })
+                                    }),
+                            ),
+                        )
                         .child(tape(h, self.metric, 54., mem, &t, self.moment, cx)),
                 )
                 .child(div().flex_1().min_h_0().child(self.table.clone()));
@@ -1902,6 +1909,20 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::{vfd_digit_width, UNIT_GLYPHS};
+    #[test]
+    fn unit_geometry_retention_is_bounded_when_positions_change() {
+        for x in 0..100 {
+            super::unit_paths(
+                gpui::Bounds::new(
+                    gpui::point(gpui::px(x as f32), gpui::px(0.)),
+                    gpui::size(gpui::px(10.), gpui::px(14.)),
+                ),
+                '%',
+            );
+        }
+        assert!(super::UNIT_PATHS.get().unwrap().lock().unwrap().len() <= 32);
+    }
+
     #[test]
     fn vfd_unit_glyphs_match_the_5_by_7_design() {
         assert_eq!(
