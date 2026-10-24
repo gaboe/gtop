@@ -1,5 +1,5 @@
 use gtop_core::AppState;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "macos")]
 fn cpu_micros() -> u64 {
@@ -42,8 +42,24 @@ fn main() {
     let interval = Duration::from_secs_f64(interval);
     let state = AppState::new();
     let mut deadline = Instant::now() + interval;
+    if args.get(2).is_some_and(|arg| arg == "--barrier") {
+        use std::io::Write;
+        println!("ready");
+        std::io::stdout().flush().unwrap();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        let start_us: u64 = line.trim().parse().expect("start deadline");
+        let target = UNIX_EPOCH + Duration::from_micros(start_us);
+        deadline = Instant::now() + target.duration_since(SystemTime::now()).unwrap_or_default();
+    }
+    let mut previous_start = SystemTime::now();
     for tick in 0..ticks + 2 {
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        let sample_start = SystemTime::now();
+        let gap = sample_start
+            .duration_since(previous_start)
+            .expect("wall clock moved backwards");
+        previous_start = sample_start;
         let cpu_started = cpu_micros();
         let started = Instant::now();
         let result = state.snapshot(false, false);
@@ -60,10 +76,12 @@ fn main() {
         assert!(snapshot.stats.memory_total > 0 && !snapshot.stats.cpu_usage.is_empty());
         if tick >= 2 {
             println!(
-                "{{\"tick\":{},\"elapsed_us\":{},\"cpu_us\":{},\"processes\":{},\"errors\":0}}",
+                "{{\"tick\":{},\"elapsed_us\":{},\"cpu_us\":{},\"started_unix_us\":{},\"gap_us\":{},\"processes\":{},\"errors\":0}}",
                 tick - 2,
                 elapsed.as_micros(),
                 cpu_elapsed,
+                sample_start.duration_since(UNIX_EPOCH).unwrap().as_micros(),
+                gap.as_micros(),
                 snapshot.processes.len()
             );
         }

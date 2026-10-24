@@ -28,13 +28,31 @@ The runner saves stdout, stderr, binary hashes, errors, work counts, process cou
 It marks load above the logical core count as noisy.
 The summary marks a pair as similar only when all boundary loads differ by at most 20 percent or one load unit, and process counts differ by at most 10 percent.
 These flags help inspection. They do not prove that contention stayed constant between boundaries.
-Do not use mismatched pairs for a speed claim.
+Do not use mismatched sequential pairs for a wall-time speed claim.
 A gap smaller than run variation does not establish a win.
 
 The `--runs`, `--ticks`, and `--interval` options support diagnostic runs.
 A short run or a different interval does not satisfy the production measurement gate.
 A release profile with stripped symbols is suitable for timing.
 Use a separate run for profiling.
+
+## Compare under changing host load
+
+Add `--interleave` to run two collectors with alternating ticks.
+Both collectors initialize before a shared start barrier.
+Their ticks are offset by half the selected interval.
+Each collector still samples every three seconds with the default options.
+Each CPU counter includes only its own process threads.
+The runner checks actual sample timestamps and rejects cadence gaps above twice the interval.
+A false `ticks_alternate` or `snapshots_do_not_overlap` result invalidates a pair.
+Use `paired_counts_match` to compare corresponding tick counts within ten percent.
+The whole-run load and count-range flags describe drift within the shared window.
+Those sequential-comparison flags do not reject an otherwise matched CPU-time pair.
+Run five identical-base pairs first to establish this mode's control spread.
+Do not combine its noise estimate with sequential-run controls.
+Keep the host awake for the comparison, for example with a temporary `caffeinate -i` wrapper on macOS.
+This mode measures each collector beside one other idle-between-ticks collector.
+It does not measure visible UI cost.
 
 ## Measure the visible window later
 
