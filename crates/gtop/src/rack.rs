@@ -16,6 +16,65 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+pub trait RackButton {
+    fn rack(self, t: &Tokens) -> Self;
+}
+
+impl RackButton for Button {
+    fn rack(self, t: &Tokens) -> Self {
+        self.outline()
+            .rounded_none()
+            .border_1()
+            .border_color(rgb(t.rule_hi))
+            .font_family("Archivo Labels")
+            .font_weight(FontWeight::BOLD)
+            .text_size(px(10.))
+            .text_color(rgb(t.base.silk))
+    }
+}
+
+pub fn lamp(color: u32, active: bool, t: &Tokens) -> Div {
+    div()
+        .w(px(6.))
+        .h(px(6.))
+        .flex_shrink_0()
+        .bg(rgb(if active { color } else { t.seg_off }))
+        .when(active && !t.light, |lamp| {
+            lamp.shadow(vec![BoxShadow {
+                inset: false,
+                color: rgba((color << 8) | 0x88).into(),
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(6.),
+                spread_radius: px(1.),
+            }])
+        })
+}
+
+fn keycap(key: &str, description: &str, t: &Tokens) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .whitespace_nowrap()
+        .child(
+            div()
+                .border_1()
+                .border_color(rgb(t.rule_hi))
+                .px(px(4.))
+                .py(px(1.))
+                .font_family("Silkscreen")
+                .text_size(px(8.))
+                .text_color(rgb(t.base.silk))
+                .child(key.to_string()),
+        )
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(t.silk_dim))
+                .child(description.to_string()),
+        )
+}
+
 const UNIT_GLYPHS: [(char, [&str; 7]); 2] = [
     (
         '%',
@@ -688,6 +747,7 @@ impl Monitor {
         }
         let close = Button::new("close-moment")
             .label("Close · Esc")
+            .rack(&t)
             .small()
             .on_click(cx.listener(|this, _, _, cx| {
                 this.moment = None;
@@ -698,6 +758,7 @@ impl Monitor {
             actions = actions.child(
                 Button::new("moment-full-hour")
                     .label("Full hour · 1")
+                    .rack(&t)
                     .small()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.view = Some(0);
@@ -922,11 +983,7 @@ impl Monitor {
                     .bg(rgb(if active { t.plate2 } else { t.base.plate }))
                     .border_1()
                     .border_color(rgb(if active { t.rule_hi } else { t.rule }))
-                    .child(div().w(px(6.)).h(px(6.)).bg(rgb(if active {
-                        t.base.ok
-                    } else {
-                        t.seg_off
-                    })))
+                    .child(lamp(t.base.ok, active, &t))
                     .child(label(name.to_uppercase(), &t).text_color(rgb(if active {
                         t.base.silk
                     } else {
@@ -1028,7 +1085,12 @@ impl Monitor {
             for (i, m) in Metric::ALL.into_iter().enumerate() {
                 tabs = tabs.child(
                     Button::new(("metric", i))
-                        .label(m.label().to_uppercase())
+                        .label(format!(
+                            "{} {}",
+                            if self.metric == m { "■" } else { "□" },
+                            m.label().to_uppercase()
+                        ))
+                        .rack(&t)
                         .small()
                         .font_family("Archivo Labels")
                         .text_size(px(9.))
@@ -1082,7 +1144,63 @@ impl Monitor {
         if let Some(confirmation) = self.confirmation(cx) {
             right = right.child(confirmation);
         } else {
-            right=right.child(div().id("keys").role(Role::Status).flex().items_center().gap_2().p(px(8.)).bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule)).child(label("/ FIND   J K MOVE   ↵ DETAIL   C M G P SORT   SPACE PAUSE   X KILL   TAB HISTORY   T PALETTE",&t)).child(div().flex_1()).when(!self.status.starts_with("Reading") && self.status != "Select a process for details", |strip| strip.child(div().id("operation-status").role(Role::Status).text_size(px(10.)).text_color(rgb(if self.status.ends_with("stopped.") { t.base.ok } else { t.base.hot })).child(self.status.clone()))).child(Button::new("settings").label("Settings · S").small().on_click(cx.listener(|this,_,_,cx|{this.settings_open = !this.settings_open; if this.settings_open { this.moment = None; } cx.notify();}))));
+            right = right.child(
+                div()
+                    .id("keys")
+                    .role(Role::Status)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .p(px(8.))
+                    .bg(rgb(t.base.plate))
+                    .border_1()
+                    .border_color(rgb(t.rule))
+                    .children(
+                        [
+                            ("/", "find"),
+                            ("J K", "move"),
+                            ("↵", "detail"),
+                            ("C M G P", "sort"),
+                            ("SPACE", "pause"),
+                            ("X", "kill"),
+                            ("TAB", "history"),
+                            ("T", "palette"),
+                        ]
+                        .map(|(key, text)| keycap(key, text, &t)),
+                    )
+                    .child(div().flex_1())
+                    .when(
+                        !self.status.starts_with("Reading")
+                            && self.status != "Select a process for details",
+                        |strip| {
+                            strip.child(
+                                div()
+                                    .id("operation-status")
+                                    .role(Role::Status)
+                                    .text_size(px(10.))
+                                    .text_color(rgb(if self.status.ends_with("stopped.") {
+                                        t.base.ok
+                                    } else {
+                                        t.base.hot
+                                    }))
+                                    .child(self.status.clone()),
+                            )
+                        },
+                    )
+                    .child(
+                        Button::new("settings")
+                            .label("Settings · S")
+                            .rack(&t)
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.settings_open = !this.settings_open;
+                                if this.settings_open {
+                                    this.moment = None;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
         }
 
         let mut root = div()
@@ -1410,6 +1528,7 @@ impl Monitor {
                     .child(
                         Button::new(("palette", i))
                             .label(p.name)
+                            .rack(&t)
                             .when(i == self.settings.active && self.draft.is_none(), |b| {
                                 b.primary()
                             })
@@ -1418,12 +1537,15 @@ impl Monitor {
                             ),
                     )
                     .when(i >= 5, |d| {
-                        d.child(Button::new(("delete-palette", i)).label("Del").on_click(
-                            cx.listener(move |this, _, w, cx| {
-                                this.settings.saved.remove(i - 5);
-                                this.use_palette(0, w, cx);
-                            }),
-                        ))
+                        d.child(
+                            Button::new(("delete-palette", i))
+                                .label("Del")
+                                .rack(&t)
+                                .on_click(cx.listener(move |this, _, w, cx| {
+                                    this.settings.saved.remove(i - 5);
+                                    this.use_palette(0, w, cx);
+                                })),
+                        )
                     }),
             );
         }
@@ -1458,6 +1580,7 @@ impl Monitor {
                     .child(
                         Button::new("random")
                             .label("Random · R")
+                            .rack(&t)
                             .on_click(cx.listener(|this, _, w, cx| this.random_palette(w, cx))),
                     ),
             )
@@ -1495,28 +1618,31 @@ impl Monitor {
                 div()
                     .flex()
                     .gap_2()
+                    .child(Button::new("save-palette").label("Save").rack(&t).on_click(
+                        cx.listener(|this, _, w, cx| {
+                            if let Some(base) = this.draft {
+                                let name = this.mix_name.read(cx).value().trim().to_string();
+                                this.settings.saved.push(palette::Palette {
+                                    name: if name.is_empty() {
+                                        format!("Mix {}", this.settings.saved.len() + 1)
+                                    } else {
+                                        name
+                                    },
+                                    base,
+                                });
+                                let i = this.settings.palettes().len() - 1;
+                                this.use_palette(i, w, cx);
+                            }
+                        }),
+                    ))
                     .child(
-                        Button::new("save-palette")
-                            .label("Save")
+                        Button::new("discard-palette")
+                            .label("Discard")
+                            .rack(&t)
                             .on_click(cx.listener(|this, _, w, cx| {
-                                if let Some(base) = this.draft {
-                                    let name = this.mix_name.read(cx).value().trim().to_string();
-                                    this.settings.saved.push(palette::Palette {
-                                        name: if name.is_empty() {
-                                            format!("Mix {}", this.settings.saved.len() + 1)
-                                        } else {
-                                            name
-                                        },
-                                        base,
-                                    });
-                                    let i = this.settings.palettes().len() - 1;
-                                    this.use_palette(i, w, cx);
-                                }
+                                this.use_palette(this.settings.active, w, cx)
                             })),
-                    )
-                    .child(Button::new("discard-palette").label("Discard").on_click(
-                        cx.listener(|this, _, w, cx| this.use_palette(this.settings.active, w, cx)),
-                    )),
+                    ),
             )
             .child(label("REFRESH INTERVAL", t))
             .child(
@@ -1526,6 +1652,7 @@ impl Monitor {
                     .children([1, 2, 3, 5, 10].into_iter().map(|seconds| {
                         Button::new(("interval", seconds as usize))
                             .label(format!("{seconds}s"))
+                            .rack(&t)
                             .small()
                             .when(self.interval == seconds, |b| b.primary())
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1541,6 +1668,7 @@ impl Monitor {
             .child(
                 Button::new("close-settings")
                     .label("Close · Esc")
+                    .rack(&t)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.settings_open = false;
                         cx.notify();

@@ -1,3 +1,4 @@
+use crate::rack::RackButton;
 use crate::{
     model::{bytes, duration, ProcessKey},
     theme, Monitor,
@@ -191,6 +192,7 @@ impl Monitor {
     }
 
     pub(super) fn confirmation(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let t = self.draft.unwrap_or(self.settings.base()).tokens();
         let d = self.details.as_ref()?;
         if d.kill != KillState::Confirming {
             return None;
@@ -218,6 +220,7 @@ impl Monitor {
                 .child(
                     Button::new("confirm-kill")
                         .label("Kill · Y")
+                        .rack(&t)
                         .danger()
                         .small()
                         .on_click(cx.listener(move |this, _, w, cx| this.kill(key, w, cx))),
@@ -225,6 +228,7 @@ impl Monitor {
                 .child(
                     Button::new("cancel-kill")
                         .label("Keep · N")
+                        .rack(&t)
                         .small()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(d) = this.details.as_mut() {
@@ -415,6 +419,7 @@ impl Monitor {
             Environment::Unrequested => div().child(
                 Button::new("environment")
                     .label("Load · E")
+                    .rack(&t)
                     .small()
                     .on_click(cx.listener(|this, _, w, cx| this.fetch_environment(w, cx))),
             ),
@@ -446,6 +451,7 @@ impl Monitor {
                                 } else {
                                     "Load · E"
                                 })
+                                .rack(&t)
                                 .small()
                                 .on_click(
                                     cx.listener(|this, _, w, cx| this.fetch_environment(w, cx)),
@@ -464,6 +470,7 @@ impl Monitor {
                     .child(
                         Button::new("close-details")
                             .label("Close · Esc")
+                            .rack(&t)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.details = None;
                                 cx.notify();
@@ -472,6 +479,7 @@ impl Monitor {
                     .child(
                         Button::new("kill")
                             .label("Kill · X")
+                            .rack(&t)
                             .danger()
                             .disabled(self.selected_process().is_none())
                             .on_click(cx.listener(move |this, _, _, cx| {
