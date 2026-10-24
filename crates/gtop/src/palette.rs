@@ -197,6 +197,17 @@ pub struct Settings {
     pub active: usize,
     pub saved: Vec<Palette>,
 }
+pub async fn next_settings(
+    receiver: &mut futures::channel::mpsc::UnboundedReceiver<Settings>,
+) -> Option<Settings> {
+    use futures::StreamExt;
+    let mut latest = receiver.next().await?;
+    while let Ok(settings) = receiver.try_recv() {
+        latest = settings;
+    }
+    Some(latest)
+}
+
 impl Settings {
     pub fn load() -> Self {
         std::fs::read(super::history::support_path("palette.json"))
@@ -216,16 +227,62 @@ impl Settings {
             .base
     }
     pub fn save(&self) -> std::io::Result<()> {
-        let p = super::history::support_path("palette.json");
-        std::fs::create_dir_all(p.parent().unwrap())?;
-        let tmp = p.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec(self)?)?;
-        std::fs::rename(tmp, p)
+        self.save_to(&super::history::support_path("palette.json"))
+    }
+    fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        static NEXT_WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), sequence));
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            use std::io::Write;
+            file.write_all(&serde_json::to_vec(self)?)?;
+            file.sync_all()?;
+            std::fs::rename(&temp, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queued_settings_keep_latest_state_after_a_pending_write() {
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded();
+        sender
+            .unbounded_send(Settings {
+                active: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        let first = futures::executor::block_on(next_settings(&mut receiver)).unwrap();
+        for active in 1..100 {
+            sender
+                .unbounded_send(Settings {
+                    active,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let directory =
+            std::env::temp_dir().join(format!("gtop-settings-order-{}", std::process::id()));
+        let path = directory.join("palette.json");
+        first.save_to(&path).unwrap();
+        let latest = futures::executor::block_on(next_settings(&mut receiver)).unwrap();
+        latest.save_to(&path).unwrap();
+        let stored: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored.active, 99);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn tokens_preserve_bases_and_choose_light_rules() {
         for p in presets() {

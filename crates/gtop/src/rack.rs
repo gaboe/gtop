@@ -1449,21 +1449,8 @@ impl Monitor {
         });
         cx.notify();
     }
-    fn persist_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let settings = self.settings.clone();
-        cx.spawn_in(window, async move |entity, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { settings.save() })
-                .await;
-            if let Err(error) = result {
-                let _ = entity.update_in(cx, |this, _, cx| {
-                    this.status = format!("Palette could not be saved: {error}");
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+    fn persist_settings(&self, _window: &mut Window, _cx: &mut Context<Self>) {
+        let _ = self.settings_writes.unbounded_send(self.settings.clone());
     }
     fn use_palette(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.active == index && self.draft.is_none() {

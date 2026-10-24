@@ -38,6 +38,8 @@ struct Monitor {
     history_scroll: UniformListScrollHandle,
     metric: history::Metric,
     settings: palette::Settings,
+    settings_writes: mpsc::UnboundedSender<palette::Settings>,
+    _settings_writer: Task<()>,
     settings_open: bool,
     tick_ms: f64,
     sample_seconds: f64,
@@ -82,6 +84,21 @@ impl Monitor {
             p
         });
         let (wake, mut events) = mpsc::channel(1);
+        let (settings_writes, mut settings_events) = mpsc::unbounded();
+        let settings_writer = cx.spawn_in(window, async move |entity, cx| {
+            while let Some(settings) = palette::next_settings(&mut settings_events).await {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { settings.save() })
+                    .await;
+                if let Err(error) = result {
+                    let _ = entity.update_in(cx, |this, _, cx| {
+                        this.status = format!("Palette could not be saved: {error}");
+                        cx.notify();
+                    });
+                }
+            }
+        });
         let mut subscriptions = vec![
             cx.subscribe_in(&search, window, |this, input, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -376,6 +393,8 @@ impl Monitor {
             history_scroll: UniformListScrollHandle::new(),
             metric: history::Metric::Cpu,
             settings,
+            settings_writes,
+            _settings_writer: settings_writer,
             settings_open: false,
             tick_ms: 0.,
             sample_seconds: 3.,
