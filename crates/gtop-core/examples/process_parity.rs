@@ -10,6 +10,7 @@ fn main() {
     let mut monitor = ProcessMonitor::new();
     let mut sys = System::new();
     let ports = HashMap::new();
+    let mut failed = false;
     for tick in 0..4 {
         ProcessMonitor::refresh(&mut sys, false);
         let before = monitor.collect_processes(&sys, false, &ports).unwrap();
@@ -21,6 +22,8 @@ fn main() {
         let native: HashMap<_, _> = native.into_iter().map(|p| (p.pid, p)).collect();
         let mut missing = 0;
         let mut static_errors = 0;
+        let mut static_compared = 0;
+        let mut static_skipped = 0;
         let mut status_errors = 0;
         if std::env::args().any(|arg| arg == "--dump") {
             eprintln!("tick={tick} before={before:#?} native={native:#?} after={after:#?}");
@@ -35,28 +38,44 @@ fn main() {
                 missing += 1;
                 continue;
             };
-            let fields = |p: &gtop_core::ProcessInfo| {
-                format!(
-                    "{:?}",
-                    (
-                        p.ppid,
-                        &p.name,
-                        &p.user,
-                        &p.command,
-                        &p.executable,
-                        &p.argv,
-                        &p.root,
-                        p.start_time,
-                        p.threads,
-                        p.session_id,
-                        &p.environ,
-                        &p.ports
-                    )
-                )
-            };
-            if fields(a) == fields(b) && fields(n) != fields(a) {
-                static_errors += 1;
-                eprintln!("static tick={tick} pid={pid} before={a:?} native={n:?} after={b:?}");
+            let fields = [
+                ("ppid", a.ppid == b.ppid, n.ppid == a.ppid),
+                ("name", a.name == b.name, n.name == a.name),
+                ("user", a.user == b.user, n.user == a.user),
+                ("command", a.command == b.command, n.command == a.command),
+                (
+                    "executable",
+                    a.executable == b.executable,
+                    n.executable == a.executable,
+                ),
+                ("argv", a.argv == b.argv, n.argv == a.argv),
+                ("root", a.root == b.root, n.root == a.root),
+                (
+                    "start_time",
+                    a.start_time == b.start_time,
+                    n.start_time == a.start_time,
+                ),
+                ("threads", a.threads == b.threads, n.threads == a.threads),
+                (
+                    "session_id",
+                    a.session_id == b.session_id,
+                    n.session_id == a.session_id,
+                ),
+                ("environ", a.environ == b.environ, n.environ == a.environ),
+                ("ports", a.ports == b.ports, n.ports == a.ports),
+            ];
+            for (field, stable, matches) in fields {
+                if stable {
+                    static_compared += 1;
+                    if !matches {
+                        static_errors += 1;
+                        eprintln!(
+                            "static tick={tick} pid={pid} field={field} before={a:?} native={n:?} after={b:?}"
+                        );
+                    }
+                } else {
+                    static_skipped += 1;
+                }
             }
             if tick > 0 && a.status == b.status && n.status != a.status {
                 status_errors += 1;
@@ -71,8 +90,12 @@ fn main() {
                 memory_outside_bracket += 1;
             }
         }
-        println!("{{\"tick\":{tick},\"before\":{},\"native\":{},\"after\":{},\"missing\":{missing},\"static_errors\":{static_errors},\"status_errors\":{status_errors},\"memory_outside_bracket\":{memory_outside_bracket}}}", before.len(),native.len(),after.len());
+        failed |= missing > 0 || static_errors > 0 || status_errors > 0;
+        println!("{{\"tick\":{tick},\"before\":{},\"native\":{},\"after\":{},\"missing\":{missing},\"static_errors\":{static_errors},\"static_compared\":{static_compared},\"static_skipped\":{static_skipped},\"status_errors\":{status_errors},\"memory_outside_bracket\":{memory_outside_bracket}}}", before.len(),native.len(),after.len());
         std::thread::sleep(Duration::from_secs(1));
+    }
+    if failed {
+        std::process::exit(1);
     }
 }
 
