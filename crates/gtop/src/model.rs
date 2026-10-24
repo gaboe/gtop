@@ -8,6 +8,20 @@ pub struct ProcessKey {
     pub start_time: u64,
 }
 
+pub fn running_history_process<'a>(
+    name: &str,
+    processes: &'a [ProcessInfo],
+) -> Option<&'a ProcessInfo> {
+    processes
+        .iter()
+        .filter(|process| process.name == name)
+        .max_by(|a, b| {
+            a.cpu_usage
+                .total_cmp(&b.cpu_usage)
+                .then_with(|| b.pid.cmp(&a.pid))
+        })
+}
+
 impl From<&ProcessInfo> for ProcessKey {
     fn from(process: &ProcessInfo) -> Self {
         Self {
@@ -216,6 +230,27 @@ pub fn bytes(value: u64) -> String {
         unit += 1;
     }
     format!("{amount:.1} {}", units[unit])
+}
+
+#[cfg(test)]
+mod history_process_tests {
+    use super::*;
+
+    #[test]
+    fn history_process_match_prefers_the_highest_cpu_instance_and_marks_missing_names() {
+        let processes = crate::test_data::snapshot().processes;
+        let name = processes[0].name.clone();
+        let best = processes
+            .iter()
+            .filter(|p| p.name == name)
+            .max_by(|a, b| a.cpu_usage.total_cmp(&b.cpu_usage))
+            .unwrap();
+        assert_eq!(
+            running_history_process(&name, &processes).map(ProcessKey::from),
+            Some(ProcessKey::from(best))
+        );
+        assert!(running_history_process("process-that-exited", &processes).is_none());
+    }
 }
 
 pub fn duration(seconds: u64) -> String {

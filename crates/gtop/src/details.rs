@@ -54,6 +54,7 @@ impl Details {
 
 impl Monitor {
     pub(super) fn select(&mut self, key: ProcessKey, cx: &mut Context<Self>) {
+        self.moment = None;
         if self
             .details
             .as_ref()

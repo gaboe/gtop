@@ -28,6 +28,9 @@ struct Monitor {
     details: Option<Details>,
     paused: bool,
     history: [history::HistoryView; 3],
+    moment: Option<history::MomentSelection>,
+    moment_detail: Option<history::MomentDetail>,
+    moment_rows: Vec<(String, history::ProcessTotal, f64)>,
     view: Option<usize>,
     history_selected: Option<String>,
     history_scroll: UniformListScrollHandle,
@@ -173,11 +176,17 @@ impl Monitor {
             if entity.update_in(cx, |this, _, _| this.core = Some(core.clone())).is_err() { return; }
             let mut history = cx.background_executor().spawn(async { history::History::load(&history::support_path("history.json"), rack::now() as u64) }).await;
             let mut cached_minute = None;
+            let mut cached_moment = None;
+            let mut cached_metric = None;
             loop {
                 while events.try_recv().is_ok() {}
-                let Ok((running, ports, seconds)) = entity.update_in(cx, |this, window, cx| {
-                    (!this.paused, window.is_visible() && this.table.read(cx).search.needs_ports(), this.interval)
+                let Ok((running, ports, seconds, moment, metric)) = entity.update_in(cx, |this, window, cx| {
+                    (!this.paused, window.is_visible() && this.table.read(cx).search.needs_ports(), this.interval, this.moment, this.metric)
                 }) else { break; };
+                if moment.is_none() {
+                    cached_moment = None;
+                    cached_metric = None;
+                }
                 if !running {
                     history.suspend();
                     if events.next().await.is_none() { break; }
@@ -185,6 +194,8 @@ impl Monitor {
                 }
                 let state = core.clone();
                 let port_cache=cached_ports.clone();
+                let previous_moment = cached_moment;
+                let previous_metric = cached_metric;
                 let result = cx.background_executor().spawn(async move {
                     let start = std::time::Instant::now();
                     let mut snapshot = state.snapshot(false, ports);
@@ -193,24 +204,50 @@ impl Monitor {
                     }
                     let tick_ms = start.elapsed().as_secs_f64() * 1000.;
                     let mut views = None;
+                    let mut moment_detail = None;
                     let mut history_save = None;
                     if let Ok(ref snapshot) = snapshot {
                         let now = rack::now();
 
                         history.record(snapshot, now, seconds as f64);
                         let minute = now as u64 / 60;
+                        if let Some(selection) = moment {
+                            let span_changed = selection.start_minute <= minute
+                                && minute < selection.start_minute + selection.step as u64;
+                            if previous_moment != Some(selection) || previous_metric != Some(metric) || span_changed {
+                                moment_detail = Some(history.moment(selection));
+                            }
+                        }
                         if cached_minute != Some(minute) {
                             cached_minute = Some(minute);
                             views = Some([1,8,24].map(|hours| history.view(hours, now as u64)));
                             history_save=Some(history.save(&history::support_path("history.json")).map_err(|e|e.to_string()));
                         }
                     }
-                    (snapshot, tick_ms, views, history, cached_minute, history_save)
+                    (snapshot, tick_ms, views, moment_detail, history, cached_minute, history_save, moment, metric)
                 }).await;
-                let (result, tick_ms, views, returned_history, returned_minute, history_save) = result;
+                let (result, tick_ms, views, moment_detail, returned_history, returned_minute, history_save, selection, metric) = result;
                 cached_minute=returned_minute;
                 history = returned_history;
+                if moment_detail.is_some() {
+                    cached_moment = selection;
+                    cached_metric = selection.map(|_| metric);
+                }
                 if entity.update_in(cx, |this, window, cx| {
+                    if let Some(views) = views {
+                        let minute = rack::now() as u64 / 60;
+                        let oldest = minute.saturating_sub(1439);
+                        if this.moment.is_some_and(|selection| !history::selection_in_window(selection, oldest, minute + 1)) {
+                            this.moment = None;
+                            this.moment_detail = None;
+                            this.moment_rows.clear();
+                        }
+                        this.history = views;
+                    }
+                    if let Some(detail) = moment_detail.filter(|_| this.moment == selection) {
+                        this.moment_rows = detail.ranked(metric);
+                        this.moment_detail = Some(detail);
+                    }
                     if let Some(save)=history_save {
                         if let Err(error)=save {this.status=format!("History could not be saved: {error}");}
                         else if this.status.starts_with("History could not be saved") {this.status="Select a process for details".into();}
@@ -219,7 +256,6 @@ impl Monitor {
                         Ok(snapshot) => {
                             if !this.paused {
                                 this.observe_sample(&snapshot);
-                                if let Some(views) = views { this.history = views; }
                                 if window.is_visible() {
                                     this.tick_ms = tick_ms;
                                     this.accept(snapshot, window, cx);
@@ -243,6 +279,9 @@ impl Monitor {
             details: None,
             paused: false,
             history: std::array::from_fn(|_| history::HistoryView::default()),
+            moment: None,
+            moment_detail: None,
+            moment_rows: Vec::new(),
             view: None,
             history_selected: None,
             history_scroll: UniformListScrollHandle::new(),
@@ -268,6 +307,26 @@ impl Monitor {
 
     fn wake(&mut self) {
         let _ = self.wake.try_send(());
+    }
+
+    fn select_moment(&mut self, selection: history::MomentSelection, cx: &mut Context<Self>) {
+        if self.moment == Some(selection) {
+            self.moment = None;
+        } else {
+            self.moment = Some(selection);
+            if self
+                .moment_detail
+                .as_ref()
+                .is_none_or(|detail| detail.selection != selection)
+            {
+                self.moment_detail = None;
+                self.moment_rows.clear();
+            }
+            self.details = None;
+            self.settings_open = false;
+        }
+        self.wake();
+        cx.notify();
     }
 
     fn observe_sample(&mut self, snapshot: &Snapshot) {

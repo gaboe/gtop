@@ -210,7 +210,15 @@ fn readout(name: &str, value: String, t: &Tokens) -> Div {
         .child(label(name.to_uppercase(), t))
         .child(lit(value, 22., false, t))
 }
-fn tape(view: &HistoryView, metric: Metric, height: f32, mem_total: u64, t: &Tokens) -> Div {
+fn tape(
+    view: &HistoryView,
+    metric: Metric,
+    height: f32,
+    mem_total: u64,
+    t: &Tokens,
+    selected_moment: Option<crate::history::MomentSelection>,
+    cx: &mut Context<Monitor>,
+) -> Div {
     let step = if view.columns.len() > 480 {
         10
     } else if view.columns.len() > 60 {
@@ -218,48 +226,258 @@ fn tape(view: &HistoryView, metric: Metric, height: f32, mem_total: u64, t: &Tok
     } else {
         1
     };
-    div()
-        .flex()
-        .items_end()
-        .gap(px(1.))
-        .h(px(height))
-        .children(view.columns.chunks(step).map(|group| {
+    div().flex().items_end().gap(px(1.)).h(px(height)).children(
+        view.columns.chunks(step).enumerate().map(|(index, group)| {
+            let selection = crate::history::MomentSelection {
+                start_minute: view.start_minute + (index * step) as u64,
+                step,
+            };
+            let selected = selected_moment == Some(selection);
+            let click = cx.listener(move |this, _, _, cx| this.select_moment(selection, cx));
             let values: Vec<_> = group
                 .iter()
                 .flatten()
                 .filter_map(|b| b.value(metric))
                 .collect();
-            if group.iter().all(Option::is_none) {
-                return hatch(palette::mix(t.base.led, t.base.ground, 0.14));
-            }
-            if values.is_empty() {
-                return div().flex_1().h(px(1.)).bg(rgb(t.led_off));
-            }
-            let value = values.iter().sum::<f64>() / values.len() as f64;
-            let percent = match metric {
-                Metric::Cpu | Metric::Gpu => value,
-                Metric::Memory => value / mem_total.max(1) as f64 * 100.,
-                Metric::Temperature => (value - 30.) / 80. * 100.,
+            let column = if group.iter().all(Option::is_none) {
+                hatch(palette::mix(t.base.led, t.base.ground, 0.14))
+            } else if values.is_empty() {
+                div().flex_1().h(px(1.)).bg(rgb(t.led_off))
+            } else {
+                let value = values.iter().sum::<f64>() / values.len() as f64;
+                let percent = match metric {
+                    Metric::Cpu | Metric::Gpu => value,
+                    Metric::Memory => value / mem_total.max(1) as f64 * 100.,
+                    Metric::Temperature => (value - 30.) / 80. * 100.,
+                };
+                div()
+                    .flex_1()
+                    .h(px((percent as f32 / 100. * height).clamp(2., height)))
+                    .bg(rgb(
+                        if value
+                            > match metric {
+                                Metric::Memory => mem_total as f64 * 0.92,
+                                Metric::Temperature => 90.,
+                                _ => 70.,
+                            }
+                        {
+                            t.base.hot
+                        } else {
+                            t.base.led
+                        },
+                    ))
             };
-            div()
-                .flex_1()
-                .h(px((percent as f32 / 100. * height).clamp(2., height)))
-                .bg(rgb(
-                    if value
-                        > match metric {
-                            Metric::Memory => mem_total as f64 * 0.92,
-                            Metric::Temperature => 90.,
-                            _ => 70.,
-                        }
-                    {
-                        t.base.hot
-                    } else {
-                        t.base.led
-                    },
-                ))
-        }))
+            column
+                .id(("moment-column", index))
+                .role(Role::Button)
+                .cursor_pointer()
+                .when(selected, |column| column.bg(rgb(t.base.silk)))
+                .on_click(click)
+        }),
+    )
 }
+
 impl Monitor {
+    fn moment_panel(&self, t: &Tokens, cx: &mut Context<Self>) -> Stateful<Div> {
+        let Some(selection) = self.moment else {
+            return div().id("moment-panel");
+        };
+        let step = selection.step;
+        let start = selection.start_minute * 60;
+        let end = selection.start_minute.saturating_add(step as u64) * 60;
+        let when = if step == 1 {
+            timestamp(start, "%H:%M")
+        } else {
+            format!("{}–{}", timestamp(start, "%H:%M"), timestamp(end, "%H:%M"))
+        };
+        let detail = self
+            .moment_detail
+            .as_ref()
+            .filter(|d| d.selection == selection);
+        let recorded = detail.map(|d| d.recorded_minutes).unwrap_or(0);
+        let mut panel = div()
+            .id("moment-panel")
+            .w(px(380.))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(rgb(t.base.plate))
+            .border_1()
+            .border_color(rgb(t.rule))
+            .child(
+                div()
+                    .px(px(14.))
+                    .py(px(12.))
+                    .border_b_1()
+                    .border_color(rgb(t.rule))
+                    .child(label(
+                        format!(
+                            "{} · {} MIN · {} RECORDED · ← → STEP",
+                            timestamp(start, "%x"),
+                            step,
+                            recorded
+                        ),
+                        t,
+                    ))
+                    .child(lit(when, 26., false, t)),
+            );
+        if detail.is_some() && recorded == 0 {
+            panel =
+                panel.child(div().flex_1().p(px(14.)).child(
+                    win(t).child("gtop was not running. Nothing was recorded for this span."),
+                ));
+        } else if let Some(detail) = detail {
+            let values = [
+                (
+                    Metric::Cpu,
+                    "CPU",
+                    detail.cpu_average.map(|v| format!("{v:.0}%")),
+                    detail.cpu_peak.map(|v| format!("PEAK {v:.0}%")),
+                ),
+                (
+                    Metric::Memory,
+                    "Memory",
+                    detail.memory_average.map(|v| bytes(v as u64)),
+                    detail
+                        .memory_peak
+                        .map(|v| format!("PEAK {}", bytes(v as u64))),
+                ),
+                (
+                    Metric::Gpu,
+                    "GPU",
+                    detail.gpu_average.map(|v| format!("{v:.0}%")),
+                    detail.gpu_peak.map(|v| format!("PEAK {v:.0}%")),
+                ),
+                (
+                    Metric::Temperature,
+                    "CPU °C",
+                    detail.temperature_average.map(|v| format!("{v:.0}°")),
+                    detail.temperature_peak.map(|v| format!("PEAK {v:.0}°")),
+                ),
+            ];
+            let mut metrics = div().grid().grid_cols(2).gap(px(6.)).p(px(10.));
+            for (metric, name, average, peak) in values {
+                let active = metric == self.metric;
+                metrics = metrics.child(
+                    div()
+                        .p(px(8.))
+                        .border_1()
+                        .border_color(rgb(if active { t.base.silk } else { t.rule }))
+                        .child(label(name, t))
+                        .child(lit(average.unwrap_or_else(|| "·".into()), 18., false, t))
+                        .child(label(peak.unwrap_or_else(|| "PEAK ·".into()), t)),
+                );
+            }
+            let rows = self.moment_rows.clone();
+            let max = rows.first().map(|r| r.2).unwrap_or(1.).max(0.001);
+            let mut list = div().flex().flex_col().gap(px(1.));
+            for (index, (name, total, value)) in rows.into_iter().enumerate() {
+                let process = self.snapshot.as_ref().and_then(|snapshot| {
+                    crate::model::running_history_process(&name, &snapshot.processes)
+                });
+                let exited = process.is_none();
+                let value_label = match self.metric {
+                    Metric::Memory => bytes(total.peak_memory),
+                    Metric::Gpu => format!("{:.1} min", total.gpu_seconds / 60.),
+                    _ => format!("{:.1} min", total.cpu_seconds / 60.),
+                };
+                let mut row = div()
+                    .id(("moment-process", index))
+                    .h(px(26.))
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .px_2()
+                    .border_b_1()
+                    .border_color(rgb(t.row_rule))
+                    .text_color(rgb(if index < 3 { t.base.led } else { t.ink_row }))
+                    .child(
+                        div()
+                            .w(px(6.))
+                            .h(px(6.))
+                            .flex_shrink_0()
+                            .bg(rgb(if index < 3 { t.base.led } else { t.seg_off })),
+                    )
+                    .child(div().w(px(142.)).min_w_0().truncate().child(name.clone()))
+                    .child(
+                        div()
+                            .w(px(92.))
+                            .child(segments((value / max * 100.) as f32, 16, t)),
+                    )
+                    .child(
+                        div()
+                            .w(px(76.))
+                            .text_right()
+                            .text_size(px(10.))
+                            .child(if exited {
+                                format!("{value_label} · exited")
+                            } else {
+                                value_label
+                            }),
+                    );
+                if !exited {
+                    let process_name = name.clone();
+                    row = row
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(process) = this.snapshot.as_ref().and_then(|snapshot| {
+                                crate::model::running_history_process(
+                                    &process_name,
+                                    &snapshot.processes,
+                                )
+                            }) {
+                                this.select(crate::model::ProcessKey::from(process), cx);
+                            }
+                        }));
+                }
+                list = list.child(row);
+            }
+            let ranking = match self.metric {
+                Metric::Cpu => "CORE TIME",
+                Metric::Memory => "PEAK MEMORY",
+                Metric::Gpu => "GPU TIME",
+                Metric::Temperature => "CORE TIME",
+            };
+            panel = panel
+                .child(div().p(px(10.)).child(win(t).child(metrics)))
+                .child(
+                    div()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .child(label(format!("TOP PROCESSES · {ranking}"), t)),
+                )
+                .child(div().px(px(8.)).child(list))
+                .child(div().px(px(12.)).py(px(8.)).child(label(
+                    "CLICK A RUNNING PROCESS TO OPEN IT. EXITED PROCESSES KEEP ONLY THEIR HISTORY.",
+                    t,
+                )));
+        } else if detail.is_none() {
+            panel = panel.child(div().flex_1().p(px(14.)).child("Reading history…"));
+        }
+        let close = Button::new("close-moment")
+            .label("Close · Esc")
+            .small()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.moment = None;
+                cx.notify();
+            }));
+        let mut actions = div().mt_auto().p(px(8.)).flex().gap(px(6.)).child(close);
+        if self.view.is_none() {
+            actions = actions.child(
+                Button::new("moment-full-hour")
+                    .label("Full hour · 1")
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.view = Some(0);
+                        this.moment = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        panel.child(actions)
+    }
+
     fn tower(&self, t: &Tokens, cx: &App) -> Stateful<Div> {
         let mut tower = div()
             .relative()
@@ -494,7 +712,7 @@ impl Monitor {
     }
     pub fn rack(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
-        let compact = self.settings_open || self.details.is_some();
+        let compact = self.settings_open || self.details.is_some() || self.moment.is_some();
         if self.table.read(cx).compact != compact {
             self.table.update(cx, |p, cx| {
                 p.compact = compact;
@@ -606,7 +824,7 @@ impl Monitor {
                     let at = end - (h.columns.len().saturating_sub(1) as f64 * (1. - f)) as u64;
                     label(timestamp(at * 60, "%H:%M"), &t)
                 }));
-            right=right.child(win(&t).child(label(format!("TOTAL CPU · LAST {} H · RECORDED {} OF {} MIN · HATCHED: GTOP CLOSED OR PAUSED",[1,8,24][index],h.covered,[60,480,1440][index]),&t)).child(tape(h,Metric::Cpu,150.,mem,&t)).child(axis))
+            right=right.child(win(&t).child(label(format!("TOTAL CPU · LAST {} H · RECORDED {} OF {} MIN · HATCHED: GTOP CLOSED OR PAUSED",[1,8,24][index],h.covered,[60,480,1440][index]),&t)).child(tape(h,Metric::Cpu,150.,mem,&t,self.moment,cx)).child(axis))
                 .child(div().flex_1().min_h_0().flex().flex_col().border_1().border_color(rgb(t.rule)).child(div().h(px(29.)).px_2().flex().items_center().child(label("PROCESS                         CORE TIME        SHARE             OF ALL CPU      GPU TIME       PEAK MEMORY      PEAK CPU %",&t)))
                 .child(uniform_list("history-rows",h.rows.len(),cx.processor(move|this,range:std::ops::Range<usize>,_,cx|{
                     let h=&this.history[index];let t=this.draft.unwrap_or(this.settings.base()).tokens();
@@ -630,6 +848,9 @@ impl Monitor {
                         .when(self.metric == m, |b| b.primary())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.metric = m;
+                            if this.moment.is_some() {
+                                this.wake();
+                            }
                             cx.notify();
                         })),
                 );
@@ -661,14 +882,14 @@ impl Monitor {
                                     ))
                             }),
                         ))
-                        .child(tape(h, self.metric, 54., mem, &t)),
+                        .child(tape(h, self.metric, 54., mem, &t, self.moment, cx)),
                 )
                 .child(div().flex_1().min_h_0().child(self.table.clone()));
         }
         if let Some(confirmation) = self.confirmation(cx) {
             right = right.child(confirmation);
         } else {
-            right=right.child(div().id("keys").role(Role::Status).flex().items_center().gap_2().p(px(8.)).bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule)).child(label("/ FIND   J K MOVE   ↵ DETAIL   C M G P SORT   SPACE PAUSE   X KILL   TAB HISTORY   T PALETTE",&t)).child(div().flex_1()).child(Button::new("settings").label("Settings · S").small().on_click(cx.listener(|this,_,_,cx|{this.settings_open = !this.settings_open;cx.notify();}))));
+            right=right.child(div().id("keys").role(Role::Status).flex().items_center().gap_2().p(px(8.)).bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule)).child(label("/ FIND   J K MOVE   ↵ DETAIL   C M G P SORT   SPACE PAUSE   X KILL   TAB HISTORY   T PALETTE",&t)).child(div().flex_1()).child(Button::new("settings").label("Settings · S").small().on_click(cx.listener(|this,_,_,cx|{this.settings_open = !this.settings_open; if this.settings_open { this.moment = None; } cx.notify();}))));
         }
         if !self.status.starts_with("Reading") && self.status != "Select a process for details" {
             right = right.child(
@@ -695,6 +916,8 @@ impl Monitor {
             .child(right);
         if self.settings_open {
             root = root.child(self.palette_panel(&t, cx));
+        } else if self.moment.is_some() {
+            root = root.child(self.moment_panel(&t, cx));
         } else if let Some(details) = self.details(cx) {
             root = root.child(details.w(px(380.)).h_full());
         }
@@ -780,13 +1003,48 @@ impl Monitor {
                 .any(|i| i.read(cx).focus_handle(cx).is_focused(window));
         if editing {
             if k == "escape" || k == "enter" {
-                if search_focused && k == "escape" {
+                if k == "escape" && self.moment.is_some() {
+                    self.moment = None;
+                } else if search_focused && k == "escape" {
                     self.search.update(cx, |s, cx| s.set_value("", window, cx));
                 }
                 window.focus(&self.focus, cx);
                 cx.stop_propagation();
             }
             return;
+        }
+        if let Some(selection) = self.moment {
+            match k {
+                "left" | "h" | "right" | "l" => {
+                    let direction = if matches!(k, "left" | "h") { -1 } else { 1 };
+                    let view = &self.history[self.view.unwrap_or(0)];
+                    let end = view.start_minute + view.columns.len() as u64;
+                    let next =
+                        crate::history::step_moment(selection, direction, view.start_minute, end);
+                    self.moment = Some(next);
+                    if next != selection {
+                        self.moment_detail = None;
+                        self.moment_rows.clear();
+                    }
+                    self.wake();
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "escape" => {
+                    self.moment = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "enter" if self.view.is_some() => {
+                    self.moment = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
         }
         if let Some(d) = self
             .details
@@ -815,8 +1073,18 @@ impl Monitor {
             "1" => self.view = Some(0),
             "8" => self.view = Some(1),
             "2" => self.view = Some(2),
-            "v" => self.metric = self.metric.next(),
-            "s" => self.settings_open = !self.settings_open,
+            "v" => {
+                self.metric = self.metric.next();
+                if self.moment.is_some() {
+                    self.wake();
+                }
+            }
+            "s" => {
+                self.settings_open = !self.settings_open;
+                if self.settings_open {
+                    self.moment = None;
+                }
+            }
             "t" => self.use_palette(
                 (self.settings.active + 1) % self.settings.palettes().len(),
                 window,
