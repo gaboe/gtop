@@ -193,6 +193,28 @@ impl ProcessMonitor {
         Ok(rows)
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn collect_with_fallback(
+        &mut self,
+        include_environ: bool,
+        ports: &HashMap<u32, Vec<u16>>,
+    ) -> Result<Vec<ProcessInfo>, String> {
+        match self.collect_native_processes(include_environ, ports) {
+            Ok(rows) => Ok(rows),
+            Err(_) => {
+                let mut rows = self
+                    .native
+                    .collect_fallback(&self.users, include_environ, ports)?;
+                let gpu = self.gpu_process_monitor.collect();
+                let supported = self.gpu_process_monitor.is_supported();
+                for row in &mut rows {
+                    row.gpu_usage = supported.then(|| gpu.get(&row.pid).copied().unwrap_or(0.0));
+                }
+                Ok(rows)
+            }
+        }
+    }
+
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn fail_next_native_collection(&mut self) {
         self.fail_next_native_collection = true;

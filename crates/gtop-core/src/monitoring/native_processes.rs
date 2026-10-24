@@ -167,9 +167,43 @@ fn info<T>(pid: u32, flavor: i32) -> Option<T> {
 struct Record {
     identity: (u64, u64),
     row: ProcessInfo,
-    cpu: u64,
-    disk: (u64, u64),
+    sample: Option<Sample>,
+}
+
+#[derive(Debug)]
+struct Sample {
+    cpu_nanos: u64,
+    disk: Option<(u64, u64)>,
     sampled: Instant,
+}
+
+impl Record {
+    fn emit(&mut self, row: &mut ProcessInfo, mut sample: Sample) {
+        row.cpu_usage = self.sample.as_ref().map_or(0., |previous| {
+            (sample.cpu_nanos.saturating_sub(previous.cpu_nanos) as f64
+                / sample
+                    .sampled
+                    .duration_since(previous.sampled)
+                    .as_nanos()
+                    .max(1) as f64
+                * 100.) as f32
+        });
+        row.disk_usage = sample.disk.map_or((0, 0), |disk| {
+            let previous = self
+                .sample
+                .as_ref()
+                .and_then(|s| s.disk)
+                .unwrap_or_default();
+            (
+                disk.0.saturating_sub(previous.0),
+                disk.1.saturating_sub(previous.1),
+            )
+        });
+        if sample.disk.is_none() {
+            sample.disk = self.sample.as_ref().and_then(|s| s.disk);
+        }
+        self.sample = Some(sample);
+    }
 }
 #[derive(Debug, Default)]
 pub(super) struct Collector {
@@ -183,6 +217,12 @@ impl Collector {
         include_environ: bool,
         ports: &HashMap<u32, Vec<u16>>,
     ) -> Result<Vec<ProcessInfo>, String> {
+        let mut timebase = Timebase::default();
+        if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
+            return Err("macOS could not read the CPU timebase".into());
+        }
+        let nanos_per_unit = timebase.numer as f64 / timebase.denom as f64;
+        let now = ProcessMonitor::get_current_time()?;
         loop {
             if self.pids.is_empty() {
                 let count = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
@@ -244,12 +284,6 @@ impl Collector {
                 }
                 sys.refresh_processes_specifics(ProcessesToUpdate::Some(&metadata), true, kind);
             }
-            let mut timebase = Timebase::default();
-            if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
-                return Err("macOS could not read the CPU timebase".into());
-            }
-            let nanos_per_unit = timebase.numer as f64 / timebase.denom as f64;
-            let now = ProcessMonitor::get_current_time()?;
             let mut rows = Vec::with_capacity(samples.len());
             for (pid, bsd) in samples {
                 let sampled = Instant::now();
@@ -285,9 +319,7 @@ impl Collector {
                                 None,
                                 now,
                             ),
-                            cpu,
-                            disk: Default::default(),
-                            sampled,
+                            sample: None,
                         },
                     );
                 }
@@ -338,23 +370,8 @@ impl Collector {
                     };
                     row.status = ProcessMonitor::format_status(status);
                 }
-                row.cpu_usage = if existing && record.cpu > 0 {
-                    (cpu.saturating_sub(record.cpu) as f64 * nanos_per_unit
-                        / sampled.duration_since(record.sampled).as_nanos().max(1) as f64
-                        * 100.) as f32
-                } else {
-                    0.
-                };
                 row.memory_usage = task.pti_resident_size;
                 row.virtual_memory = task.pti_virtual_size;
-                row.disk_usage = disk
-                    .map(|d| {
-                        (
-                            d.0.saturating_sub(record.disk.0),
-                            d.1.saturating_sub(record.disk.1),
-                        )
-                    })
-                    .unwrap_or_default();
                 row.run_time = if row.start_time > 0 {
                     now.saturating_sub(row.start_time)
                 } else {
@@ -368,15 +385,63 @@ impl Collector {
                     row.environ =
                         super::process_monitor::macos_environment(pid).unwrap_or_default();
                 }
-                record.cpu = cpu;
-                if let Some(disk) = disk {
-                    record.disk = disk;
-                }
-                record.sampled = sampled;
+                record.emit(
+                    &mut row,
+                    Sample {
+                        cpu_nanos: (cpu as f64 * nanos_per_unit) as u64,
+                        disk,
+                        sampled,
+                    },
+                );
                 rows.push(row);
             }
             return Ok(rows);
         }
+    }
+
+    pub fn collect_fallback(
+        &mut self,
+        users: &sysinfo::Users,
+        include_environ: bool,
+        ports: &HashMap<u32, Vec<u16>>,
+    ) -> Result<Vec<ProcessInfo>, String> {
+        let now = ProcessMonitor::get_current_time()?;
+        let mut sys = System::new();
+        ProcessMonitor::refresh(&mut sys, include_environ);
+        let sampled = Instant::now();
+        let mut rows = Vec::with_capacity(sys.processes().len());
+        self.records
+            .retain(|pid, _| sys.process(Pid::from_u32(*pid)).is_some());
+        for (pid, process) in sys.processes() {
+            let pid = pid.as_u32();
+            let identity = info::<proc_bsdinfo>(pid, PROC_PIDTBSDINFO)
+                .map(|bsd| (bsd.pbi_start_tvsec, bsd.pbi_start_tvusec))
+                .unwrap_or((process.start_time(), 0));
+            let mut row = process_row(pid, process, users, include_environ, ports, None, now);
+            let record = self.records.entry(pid).or_insert_with(|| Record {
+                identity,
+                row: row.clone(),
+                sample: None,
+            });
+            if record.identity != identity {
+                *record = Record {
+                    identity,
+                    row: row.clone(),
+                    sample: None,
+                };
+            }
+            let disk = process.disk_usage();
+            record.emit(
+                &mut row,
+                Sample {
+                    cpu_nanos: process.accumulated_cpu_time().saturating_mul(1_000_000),
+                    disk: Some((disk.total_read_bytes, disk.total_written_bytes)),
+                    sampled,
+                },
+            );
+            rows.push(row);
+        }
+        Ok(rows)
     }
 }
 

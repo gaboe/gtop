@@ -37,6 +37,10 @@ impl AppState {
     ///
     /// A new `AppState` instance with initialized monitors
     pub fn new() -> Self {
+        Self::with_process_monitor(ProcessMonitor::new())
+    }
+
+    fn with_process_monitor(process_monitor: ProcessMonitor) -> Self {
         let mut sys = System::new();
         sys.refresh_cpu_usage();
         sys.refresh_memory();
@@ -46,11 +50,10 @@ impl AppState {
             Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
         let networks = Networks::new_with_refreshed_list();
 
-        let process_monitor = ProcessMonitor::new();
         #[cfg(target_os = "macos")]
         let process_monitor = {
             let mut monitor = process_monitor;
-            let _ = monitor.collect_native_processes(false, &Default::default());
+            let _ = monitor.collect_with_fallback(false, &Default::default());
             monitor
         };
         Self {
@@ -93,14 +96,7 @@ impl AppState {
         #[cfg(not(target_os = "macos"))]
         let processes = process_monitor.collect_processes(&sys, include_environ, &ports_by_pid)?;
         #[cfg(target_os = "macos")]
-        let processes =
-            match process_monitor.collect_native_processes(include_environ, &ports_by_pid) {
-                Ok(processes) => processes,
-                Err(_) => {
-                    ProcessMonitor::refresh(&mut sys, include_environ);
-                    process_monitor.collect_processes(&sys, include_environ, &ports_by_pid)?
-                }
-            };
+        let processes = process_monitor.collect_with_fallback(include_environ, &ports_by_pid)?;
         let stats = system_monitor.collect_stats(&sys, &networks, &disks);
         if perf_enabled() {
             eprintln!(
@@ -360,3 +356,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "state_transition_tests.rs"]
+mod transition_tests;
