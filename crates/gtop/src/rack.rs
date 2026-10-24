@@ -94,6 +94,24 @@ type UnitPaths = (Path<Pixels>, Path<Pixels>);
 type UnitCacheKey = (char, u32, u32, u32);
 static UNIT_PATHS: OnceLock<Mutex<HashMap<UnitCacheKey, UnitPaths>>> = OnceLock::new();
 
+fn core_time(seconds: f64) -> String {
+    let minutes = seconds / 60.;
+    if minutes >= 60. {
+        format!("{} h {:02} min", minutes as u64 / 60, minutes as u64 % 60)
+    } else {
+        format!("{minutes:.1} min")
+    }
+}
+
+fn history_cell(weight: f32, right: bool) -> Div {
+    div()
+        .flex_grow(weight)
+        .flex_basis(px(0.))
+        .min_w_0()
+        .px(px(10.))
+        .when(right, |cell| cell.text_right())
+}
+
 pub fn timestamp(seconds: u64, format: &str) -> String {
     chrono::DateTime::from_timestamp(seconds as i64, 0)
         .map(|t| t.with_timezone(&chrono::Local).format(format).to_string())
@@ -1068,12 +1086,166 @@ impl Monitor {
                     let at = end - (h.columns.len().saturating_sub(1) as f64 * (1. - f)) as u64;
                     label(timestamp(at * 60, "%H:%M"), &t)
                 }));
-            right=right.child(win(&t).child(label(format!("TOTAL CPU · LAST {} H · RECORDED {} OF {} MIN · HATCHED: GTOP CLOSED OR PAUSED",[1,8,24][index],h.covered,[60,480,1440][index]),&t)).child(tape(h,Metric::Cpu,150.,mem,&t,self.moment,cx)).child(axis))
-                .child(div().flex_1().min_h_0().flex().flex_col().border_1().border_color(rgb(t.rule)).child(div().h(px(29.)).px_2().flex().items_center().child(label("PROCESS                         CORE TIME        SHARE             OF ALL CPU      GPU TIME       PEAK MEMORY      PEAK CPU %",&t)))
-                .child(uniform_list("history-rows",h.rows.len(),cx.processor(move|this,range:std::ops::Range<usize>,_,cx|{
-                    let h=&this.history[index];let t=this.draft.unwrap_or(this.settings.base()).tokens();
-                    range.filter_map(|row|{let (name,p)=h.rows.get(row)?;let selected=this.history_selected.as_ref().map(|n|n==name).unwrap_or(row==0);let key=name.clone();Some(div().id(("history-row",row)).bg(rgb(if selected{t.plate2}else{t.base.ground})).on_click(cx.listener(move|this,_,_,cx|{this.history_selected=Some(key.clone());cx.notify();})).h(px(22.)).flex().items_center().gap_3().px_2().border_b_1().border_color(rgb(t.row_rule)).text_color(rgb(if row<3{t.base.led}else{t.ink_row})).child(div().w(px(190.)).truncate().child(name.clone())).child(div().w(px(105.)).child(format!("{:.1} min",p.cpu_seconds/60.))).child(segments((p.cpu_seconds/h.rows.first().map(|r|r.1.cpu_seconds).unwrap_or(1.).max(0.001)*100.) as f32,30,&t).w(px(120.))).child(div().w(px(100.)).child(format!("{:.1}%",p.cpu_seconds/h.total_cpu.max(0.001)*100.))).child(div().w(px(100.)).child(format!("{:.1} min",p.gpu_seconds/60.))).child(div().w(px(110.)).child(bytes(p.peak_memory))).child(format!("{:.1}",p.peak_cpu))) }).collect::<Vec<_>>()
-                })).track_scroll(&self.history_scroll).flex_1().min_h_0()));
+            let step = [1, 5, 10][index];
+            let coverage = format!("RECORDED {} OF {} MIN", h.covered, [60, 480, 1440][index]);
+            let heading = div()
+                .flex()
+                .justify_between()
+                .child(label(
+                    format!(
+                        "TOTAL CPU · LAST {} H · ONE COLUMN PER {step} MIN",
+                        [1, 8, 24][index]
+                    ),
+                    &t,
+                ))
+                .child(label(coverage, &t));
+            let headers = div()
+                .h(px(29.))
+                .flex()
+                .items_center()
+                .bg(rgb(t.base.plate))
+                .child(div().w(px(22.)).flex_shrink_0())
+                .children(
+                    [
+                        ("PROCESS", 28., false),
+                        ("CORE TIME ▼", 12., true),
+                        ("SHARE", 20., false),
+                        ("OF ALL CPU", 10., true),
+                        ("GPU TIME", 9., true),
+                        ("PEAK MEMORY", 12., true),
+                        ("PEAK CPU %", 10., true),
+                    ]
+                    .map(|(name, weight, right)| {
+                        history_cell(weight, right).child(label(name, &t).text_color(rgb(
+                            if name.starts_with("CORE") {
+                                t.base.led
+                            } else {
+                                t.silk_dim
+                            },
+                        )))
+                    }),
+                );
+            right = right
+                .child(
+                    win(&t)
+                        .child(heading)
+                        .child(tape(h, Metric::Cpu, 150., mem, &t, self.moment, cx))
+                        .child(axis),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .border_1()
+                        .border_color(rgb(t.rule))
+                        .child(headers)
+                        .child(
+                            uniform_list(
+                                "history-rows",
+                                h.rows.len(),
+                                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                                    let h = &this.history[index];
+                                    let t = this.draft.unwrap_or(this.settings.base()).tokens();
+                                    range
+                                        .filter_map(|row| {
+                                            let (name, p) = h.rows.get(row)?;
+                                            let selected = this
+                                                .history_selected
+                                                .as_ref()
+                                                .map(|n| n == name)
+                                                .unwrap_or(row == 0);
+                                            let key = name.clone();
+                                            Some(
+                                                div()
+                                                    .id(("history-row", row))
+                                                    .bg(rgb(if selected {
+                                                        t.plate2
+                                                    } else {
+                                                        t.base.ground
+                                                    }))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.history_selected = Some(key.clone());
+                                                        cx.notify();
+                                                    }))
+                                                    .h(px(22.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .border_b_1()
+                                                    .border_color(rgb(t.row_rule))
+                                                    .text_color(rgb(if row < 3 {
+                                                        t.base.led
+                                                    } else {
+                                                        t.ink_row
+                                                    }))
+                                                    .child(
+                                                        div()
+                                                            .w(px(22.))
+                                                            .flex_shrink_0()
+                                                            .px(px(10.))
+                                                            .child(
+                                                                lamp(t.base.led, row < 3, &t)
+                                                                    .w(px(7.))
+                                                                    .h(px(12.)),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        history_cell(28., false)
+                                                            .truncate()
+                                                            .child(name.clone()),
+                                                    )
+                                                    .child(
+                                                        history_cell(12., true)
+                                                            .child(core_time(p.cpu_seconds)),
+                                                    )
+                                                    .child(
+                                                        history_cell(20., false).child(
+                                                            segments(
+                                                                (p.cpu_seconds
+                                                                    / h.rows
+                                                                        .first()
+                                                                        .map(|r| r.1.cpu_seconds)
+                                                                        .unwrap_or(1.)
+                                                                        .max(0.001)
+                                                                    * 100.)
+                                                                    as f32,
+                                                                30,
+                                                                &t,
+                                                            )
+                                                            .w(px(120.)),
+                                                        ),
+                                                    )
+                                                    .child(history_cell(10., true).child(format!(
+                                                        "{:.1}%",
+                                                        p.cpu_seconds / h.total_cpu.max(0.001)
+                                                            * 100.
+                                                    )))
+                                                    .child(history_cell(9., true).child(
+                                                        if p.gpu_seconds > 3. {
+                                                            core_time(p.gpu_seconds)
+                                                        } else {
+                                                            "·".into()
+                                                        },
+                                                    ))
+                                                    .child(
+                                                        history_cell(12., true)
+                                                            .child(bytes(p.peak_memory)),
+                                                    )
+                                                    .child(
+                                                        history_cell(10., true)
+                                                            .child(format!("{:.1}", p.peak_cpu)),
+                                                    ),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                }),
+                            )
+                            .track_scroll(&self.history_scroll)
+                            .flex_1()
+                            .min_h_0(),
+                        ),
+                );
         } else {
             let h = &self.history[0];
             let mut head = div()
