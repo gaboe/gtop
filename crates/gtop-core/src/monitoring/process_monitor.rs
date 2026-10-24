@@ -62,16 +62,21 @@ fn parse_macos_environment(data: &[u8]) -> Result<Vec<String>, String> {
         .iter()
         .position(|byte| *byte == 0)
         .ok_or("macOS returned incomplete process arguments")?;
-    arguments = &arguments[executable_end..];
-    while arguments.first() == Some(&0) {
-        arguments = &arguments[1..];
-    }
+    // XNU pads the executable path to the target pointer size before argv.
+    // All supported macOS processes are 64-bit. Empty argv entries follow it.
+    let argv_start = (executable_end + 1).div_ceil(8) * 8;
+    arguments = arguments
+        .get(argv_start..)
+        .ok_or("macOS returned incomplete process arguments")?;
     for _ in 0..argc {
         let end = arguments
             .iter()
             .position(|byte| *byte == 0)
             .ok_or("macOS returned incomplete process arguments")?;
         arguments = &arguments[end + 1..];
+    }
+    if arguments.last().is_some_and(|byte| *byte != 0) {
+        return Err("macOS returned incomplete process environment".into());
     }
     let fields = arguments
         .split(|byte| *byte == 0)
@@ -266,11 +271,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn environment_parser_keeps_empty_first_argument_and_rejects_truncation() {
+        let mut data = 2i32.to_ne_bytes().to_vec();
+        data.extend_from_slice(b"/bin/foo\0");
+        data.resize(4 + 16, 0);
+        data.extend_from_slice(b"\0tail\0MARKER=value\0OTHER=two\0");
+        assert_eq!(
+            parse_macos_environment(&data).unwrap(),
+            ["MARKER=value", "OTHER=two"]
+        );
+        data.pop();
+        assert!(parse_macos_environment(&data).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_child_with_empty_argv0_keeps_first_environment_field() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg0("")
+            .arg("30")
+            .env_clear()
+            .env("GTOP_FIRST_MARKER", "retained")
+            .spawn()
+            .unwrap();
+        let result = macos_environment(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(result
+            .unwrap()
+            .iter()
+            .any(|value| value == "GTOP_FIRST_MARKER=retained"));
+    }
+
+    #[test]
     fn environment_parser_counts_empty_arguments() {
         let mut data = 3i32.to_ne_bytes().to_vec();
-        data.extend_from_slice(
-            b"/bin/proc\0\0/bin/proc\0\0tail\0PATH=/bin\0GTOP_ENV_MARKER=unit\0\0",
-        );
+        data.extend_from_slice(b"/bin/proc\0");
+        data.resize(4 + 16, 0);
+        data.extend_from_slice(b"/bin/proc\0\0tail\0PATH=/bin\0GTOP_ENV_MARKER=unit\0\0");
         assert_eq!(
             parse_macos_environment(&data).unwrap(),
             vec!["PATH=/bin", "GTOP_ENV_MARKER=unit"]
