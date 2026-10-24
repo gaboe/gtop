@@ -332,42 +332,40 @@ impl Monitor {
                     .border_color(rgb(t.rule))
                     .child(
                         crate::rack::win(&t)
-                            .child(detail_line("Memory", bytes(p.memory_usage)))
                             .child(
                                 div()
                                     .flex()
-                                    .justify_between()
-                                    .child(crate::rack::label("GPU", &t))
-                                    .child(
+                                    .gap(px(10.))
+                                    .child(detail_readout("MEMORY", bytes(p.memory_usage), &t))
+                                    .child(detail_readout(
+                                        "GPU",
                                         p.gpu_usage
-                                            .map(|v| {
-                                                crate::rack::lit_unit(
-                                                    format!("{v:4.1}"),
-                                                    '%',
-                                                    14.,
-                                                    false,
-                                                    &t,
-                                                )
-                                            })
-                                            .unwrap_or_else(|| {
-                                                crate::rack::lit("N/A".into(), 14., false, &t)
-                                            }),
-                                    ),
+                                            .map(|v| format!("{v:.1}%"))
+                                            .unwrap_or_else(|| "N/A".into()),
+                                        &t,
+                                    )),
                             )
-                            .child(detail_line(
-                                "Disk read",
-                                format!(
-                                    "{:.1} MB/s",
-                                    p.disk_usage.0 as f64 / self.sample_seconds / 1e6
-                                ),
-                            ))
-                            .child(detail_line(
-                                "Disk write",
-                                format!(
-                                    "{:.1} MB/s",
-                                    p.disk_usage.1 as f64 / self.sample_seconds / 1e6
-                                ),
-                            )),
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(10.))
+                                    .child(detail_readout(
+                                        "DISK READ",
+                                        format!(
+                                            "{:.1} MB/s",
+                                            p.disk_usage.0 as f64 / self.sample_seconds / 1e6
+                                        ),
+                                        &t,
+                                    ))
+                                    .child(detail_readout(
+                                        "DISK WRITE",
+                                        format!(
+                                            "{:.1} MB/s",
+                                            p.disk_usage.1 as f64 / self.sample_seconds / 1e6
+                                        ),
+                                        &t,
+                                    )),
+                            ),
                     )
                     .child(detail_line(
                         "Ports",
@@ -396,7 +394,8 @@ impl Monitor {
                     .child(
                         div()
                             .id("command-value")
-                            .overflow_x_scroll()
+                            .max_h(px(64.))
+                            .overflow_y_scroll()
                             .p_2()
                             .bg(rgb(t.well))
                             .child(selectable("command-text", &p.command)),
@@ -416,13 +415,7 @@ impl Monitor {
                 ));
         }
         let environment = match &details.environment {
-            Environment::Unrequested => div().child(
-                Button::new("environment")
-                    .label("Load · E")
-                    .rack(&t)
-                    .small()
-                    .on_click(cx.listener(|this, _, w, cx| this.fetch_environment(w, cx))),
-            ),
+            Environment::Unrequested => div(),
             Environment::Loading => div().child("Reading environment..."),
             Environment::Failed(e) => div().text_color(rgb(t.base.hot)).child(e.clone()),
             Environment::Loaded(values) if details.environment_open => {
@@ -440,24 +433,25 @@ impl Monitor {
                 .min_h_0()
                 .overflow_y_scroll()
                 .p(px(18.))
-                .child(crate::rack::label("ENVIRONMENT", &t))
-                .when(
-                    !matches!(details.environment, Environment::Unrequested),
-                    |d| {
-                        d.child(
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(crate::rack::label("ENVIRONMENT", &t))
+                        .child(
                             Button::new("toggle-environment")
                                 .label(if details.environment_open {
-                                    "Hide · E"
+                                    "HIDE · E"
                                 } else {
-                                    "Load · E"
+                                    "LOAD · E"
                                 })
                                 .rack(&t)
                                 .small()
                                 .on_click(
                                     cx.listener(|this, _, w, cx| this.fetch_environment(w, cx)),
                                 ),
-                        )
-                    },
+                        ),
                 )
                 .child(environment),
         );
@@ -469,6 +463,7 @@ impl Monitor {
                     .p(px(18.))
                     .child(
                         Button::new("close-details")
+                            .flex_1()
                             .label("Close · Esc")
                             .rack(&t)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -478,6 +473,7 @@ impl Monitor {
                     )
                     .child(
                         Button::new("kill")
+                            .flex_1()
                             .label("Kill · X")
                             .rack(&t)
                             .danger()
@@ -616,6 +612,18 @@ fn selectable(id: &'static str, text: &str) -> gpui_component::text::TextView {
         .selectable(true)
         .scrollable(false)
 }
+fn detail_readout(name: &str, value: String, t: &crate::palette::Tokens) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .child(crate::rack::label(name.to_string(), t))
+        .child(if let Some(number) = value.strip_suffix('%') {
+            crate::rack::lit_unit(number.to_string(), '%', 22., false, t)
+        } else {
+            crate::rack::lit(value, 22., false, t)
+        })
+}
+
 fn detail_line(label: &str, value: String) -> Div {
     div()
         .flex()
