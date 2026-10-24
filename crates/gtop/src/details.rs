@@ -414,7 +414,11 @@ impl Monitor {
             Environment::Loading => div().child("Reading environment..."),
             Environment::Failed(e) => div().text_color(rgb(t.base.hot)).child(e.clone()),
             Environment::Loaded(values) if details.environment_open => {
-                div().child(selectable("environment-text", &values.join("\n")))
+                if values.is_empty() {
+                    div().child("This process exposes no environment variables.")
+                } else {
+                    div().child(selectable("environment-text", &values.join("\n")))
+                }
             }
             Environment::Loaded(_) => div().child("Environment hidden"),
         };

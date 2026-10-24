@@ -15,6 +15,73 @@ fn os_string_vec_to_string_vec(v: &[OsString]) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+#[cfg(target_os = "macos")]
+fn macos_environment(pid: u32) -> Result<Vec<String>, String> {
+    unsafe extern "C" {
+        fn sysctl(
+            name: *mut i32,
+            count: u32,
+            old: *mut std::ffi::c_void,
+            size: *mut usize,
+            new: *mut std::ffi::c_void,
+            new_size: usize,
+        ) -> i32;
+    }
+    let mut mib = [1, 49, pid as i32];
+    let mut size = 0usize;
+    let read = |buffer: *mut std::ffi::c_void, size: &mut usize, mib: &mut [i32; 3]| unsafe {
+        sysctl(mib.as_mut_ptr(), 3, buffer, size, std::ptr::null_mut(), 0)
+    };
+    let error = || {
+        format!(
+            "macOS could not read this process environment: {}",
+            std::io::Error::last_os_error()
+        )
+    };
+    if read(std::ptr::null_mut(), &mut size, &mut mib) != 0 {
+        return Err(error());
+    }
+    let mut data = vec![0u8; size];
+    if read(data.as_mut_ptr().cast(), &mut size, &mut mib) != 0 {
+        return Err(error());
+    }
+    data.truncate(size);
+    parse_macos_environment(&data)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_environment(data: &[u8]) -> Result<Vec<String>, String> {
+    let argc = data
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(i32::from_ne_bytes)
+        .filter(|argc| *argc >= 0)
+        .ok_or("macOS returned incomplete process arguments")?;
+    let mut arguments = &data[4..];
+    let executable_end = arguments
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or("macOS returned incomplete process arguments")?;
+    arguments = &arguments[executable_end..];
+    while arguments.first() == Some(&0) {
+        arguments = &arguments[1..];
+    }
+    for _ in 0..argc {
+        let end = arguments
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or("macOS returned incomplete process arguments")?;
+        arguments = &arguments[end + 1..];
+    }
+    let fields = arguments
+        .split(|byte| *byte == 0)
+        .skip_while(|field| field.is_empty());
+    Ok(fields
+        .take_while(|field| field.contains(&b'='))
+        .map(|field| String::from_utf8_lossy(field).into_owned())
+        .collect())
+}
+
 /// Monitors and manages system processes
 #[derive(Debug)]
 pub struct ProcessMonitor {
@@ -132,6 +199,18 @@ impl ProcessMonitor {
             .unwrap_or_default()
     }
 
+    pub fn read_environment(sys: &mut System, pid: u32) -> Result<Vec<String>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = sys;
+            macos_environment(pid)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(Self::process_environ(sys, pid))
+        }
+    }
+
     /// Attempts to kill a process
     ///
     /// # Arguments
@@ -171,6 +250,19 @@ impl ProcessMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_parser_counts_empty_arguments() {
+        let mut data = 3i32.to_ne_bytes().to_vec();
+        data.extend_from_slice(
+            b"/bin/proc\0\0/bin/proc\0\0tail\0PATH=/bin\0GTOP_ENV_MARKER=unit\0\0",
+        );
+        assert_eq!(
+            parse_macos_environment(&data).unwrap(),
+            vec!["PATH=/bin", "GTOP_ENV_MARKER=unit"]
+        );
+        assert!(parse_macos_environment(&[]).is_err());
+    }
 
     #[test]
     fn collects_static_fields_but_environ_only_on_request() {

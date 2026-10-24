@@ -100,7 +100,7 @@ impl AppState {
 
     pub fn process_environ(&self, pid: u32) -> Result<Vec<String>, String> {
         let mut sys = self.sys.lock().map_err(|e| e.to_string())?;
-        Ok(ProcessMonitor::process_environ(&mut sys, pid))
+        ProcessMonitor::read_environment(&mut sys, pid)
     }
 
     pub fn kill_process(&self, pid: u32) -> Result<bool, String> {
@@ -126,7 +126,7 @@ impl AppState {
         {
             return Err("The process exited or its PID changed".into());
         }
-        Ok(ProcessMonitor::process_environ(&mut sys, pid))
+        ProcessMonitor::read_environment(&mut sys, pid)
     }
 
     pub fn kill_process_if_matches(&self, pid: u32, start_time: u64) -> Result<bool, String> {
@@ -146,6 +146,34 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_owned_child_environment_after_normal_refresh() {
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .args(["-c", "import time; time.sleep(30)", ""])
+            .env("GTOP_ENV_MARKER", "fix2-owned-child")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let state = AppState::new();
+        let snapshot = state.snapshot(false, false).unwrap();
+        let process = snapshot
+            .processes
+            .iter()
+            .find(|p| p.pid == child.id())
+            .unwrap();
+        let result = state.process_environ_if_matches(process.pid, process.start_time);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let values = result.unwrap();
+        assert!(
+            values
+                .iter()
+                .any(|value| value == "GTOP_ENV_MARKER=fix2-owned-child"),
+            "owned child marker missing"
+        );
+        assert!(values.iter().any(|value| value.starts_with("PATH=")));
+    }
 
     #[test]
     fn snapshot_contains_this_process_and_system_stats() {
