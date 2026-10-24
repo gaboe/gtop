@@ -115,6 +115,28 @@ const UNIT_GLYPHS: [(char, [&str; 7]); 2] = [
     ),
 ];
 
+const BRAND_GLYPHS: [(&str, [&str; 9]); 2] = [
+    (
+        "g",
+        [
+            ".....", ".....", ".####", "#...#", "#...#", "#...#", ".####", "....#", "####.",
+        ],
+    ),
+    (
+        "t",
+        [
+            ".#...", ".#...", "####.", ".#...", ".#...", ".#..#", "..##.", ".....", ".....",
+        ],
+    ),
+];
+const BRAND_LABEL: &str = "gtop";
+const BRAND_MARK_HEIGHT: f32 = 28.;
+const BRAND_MARK_COLUMNS: usize = 11;
+
+type BrandPaths = (Path<Pixels>, Path<Pixels>);
+type BrandCacheKey = (u32, u32, u32, u32);
+static BRAND_PATHS: OnceLock<Mutex<HashMap<BrandCacheKey, BrandPaths>>> = OnceLock::new();
+
 type UnitPaths = (Path<Pixels>, Path<Pixels>);
 type UnitCacheKey = (char, u32, u32, u32);
 static UNIT_PATHS: OnceLock<Mutex<HashMap<UnitCacheKey, UnitPaths>>> = OnceLock::new();
@@ -276,6 +298,97 @@ fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
         .w(px(bounds.width))
         .h(px(bounds.height)),
     )
+}
+
+fn brand_mark_paths(bounds: Bounds<Pixels>) -> BrandPaths {
+    let key = (
+        f32::from(bounds.origin.x).to_bits(),
+        f32::from(bounds.origin.y).to_bits(),
+        f32::from(bounds.size.width).to_bits(),
+        f32::from(bounds.size.height).to_bits(),
+    );
+    let cache = BRAND_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some(paths) = cache.get(&key) {
+            return paths.clone();
+        }
+    }
+
+    let scale = f32::from(bounds.size.height) / 9.;
+    let origin_x = f32::from(bounds.origin.x);
+    let origin_y = f32::from(bounds.origin.y);
+    let mut lit = PathBuilder::fill();
+    let mut ghost = PathBuilder::fill();
+    for y in 0..9 {
+        for x in 0..BRAND_MARK_COLUMNS {
+            let is_lit = BRAND_GLYPHS.iter().any(|(letter, rows)| {
+                let column = match *letter {
+                    "g" if x < 5 => Some(x),
+                    "t" if (6..11).contains(&x) => Some(x - 6),
+                    _ => None,
+                };
+                column.is_some_and(|column| rows[y].as_bytes()[column] == b'#')
+            });
+            let center_x = origin_x + (x as f32 + 0.5) * scale;
+            let center_y = origin_y + (y as f32 + 0.5) * scale;
+            let path = if is_lit { &mut lit } else { &mut ghost };
+            let radius = scale * 0.4;
+            let points = (0..12)
+                .map(|i| {
+                    let angle = i as f32 * std::f32::consts::TAU / 12.;
+                    point(
+                        px(center_x + angle.cos() * radius),
+                        px(center_y + angle.sin() * radius),
+                    )
+                })
+                .collect::<Vec<_>>();
+            path.add_polygon(&points, true);
+        }
+    }
+    let paths = (
+        lit.build().expect("lit brand geometry"),
+        ghost.build().expect("ghost brand geometry"),
+    );
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= 32 {
+            cache.clear();
+        }
+        cache.insert(key, paths.clone());
+    }
+    paths
+}
+
+fn brand_mark(t: &Tokens) -> Div {
+    let ghost = palette::mix(t.base.led, t.base.ground, 0.18);
+    let led = t.base.led;
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .px(px(3.))
+                .h(px(BRAND_MARK_HEIGHT + 6.))
+                .rounded(px(3.))
+                .border_1()
+                .border_color(rgb(t.rule_hi))
+                .bg(rgb(t.base.ground))
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            let (lit, ghost_path) = brand_mark_paths(bounds);
+                            window.paint_path(ghost_path, rgb(ghost));
+                            window.paint_path(lit, rgb(led));
+                        },
+                    )
+                    .w(px(BRAND_MARK_HEIGHT * BRAND_MARK_COLUMNS as f32 / 9.))
+                    .h(px(BRAND_MARK_HEIGHT)),
+                ),
+        )
+        .child(label(BRAND_LABEL, t))
 }
 
 pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
@@ -885,14 +998,7 @@ impl Monitor {
                         )
                         .text_color(rgb(t.silk_dim)),
                     )
-                    .child(
-                        div()
-                            .font_family("Archivo Display")
-                            .font_weight(FontWeight::EXTRA_BOLD)
-                            .text_size(px(48.))
-                            .line_height(px(40.))
-                            .child("GTOP"),
-                    ),
+                    .child(brand_mark(t)),
             );
         let Some(s) = self.snapshot.as_ref() else {
             return tower.child("Reading system information");
@@ -2010,8 +2116,8 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::{
-        div, draw_readout_text, lit_unit, vfd_digit_width, DrawMetrics, Tokens, UNIT_GLYPHS,
-        UNIT_GLYPH_TEST_BOUNDS,
+        div, draw_readout_text, lit_unit, vfd_digit_width, DrawMetrics, Tokens, BRAND_GLYPHS,
+        BRAND_LABEL, UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS,
     };
     use gpui::{prelude::*, TestAppContext, Window};
 
@@ -2081,6 +2187,33 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn tower_brand_uses_the_gt_mark_and_lowercase_label() {
+        assert_eq!(
+            BRAND_GLYPHS,
+            [
+                (
+                    "g",
+                    [
+                        ".....", ".....", ".####", "#...#", "#...#", "#...#", ".####", "....#",
+                        "####."
+                    ]
+                ),
+                (
+                    "t",
+                    [
+                        ".#...", ".#...", "####.", ".#...", ".#...", ".#..#", "..##.", ".....",
+                        "....."
+                    ]
+                )
+            ]
+        );
+        assert!(BRAND_GLYPHS[0].1[7..].iter().any(|row| row.contains('#')));
+        assert!(BRAND_GLYPHS[1].1[7..].iter().all(|row| !row.contains('#')));
+        assert_eq!(BRAND_LABEL, "gtop");
+        assert_ne!(BRAND_LABEL, "GTOP");
     }
 
     #[gpui::test]
