@@ -286,7 +286,7 @@ impl Collector {
                                 now,
                             ),
                             cpu,
-                            disk: disk.unwrap_or_default(),
+                            disk: Default::default(),
                             sampled,
                         },
                     );
@@ -476,5 +476,50 @@ mod tests {
         assert!(row.disk_usage.1 > 0, "owned writes missing");
         drop(child);
         std::fs::remove_file(scratch).unwrap();
+    }
+
+    #[test]
+    fn reports_disk_writes_before_first_collection_after_priming() {
+        let users = sysinfo::Users::new_with_refreshed_list();
+        let mut collector = Collector::default();
+        collector.collect(&users, false, &HashMap::new()).unwrap();
+
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        );
+        let scratch = std::env::temp_dir().join(format!("gtop-native-first-disk-{suffix}"));
+        let ready = scratch.with_extension("ready");
+        let script = "import os,sys,time; f=open(sys.argv[1],'wb',buffering=0); f.write(b'x'*(16*1024*1024)); os.fsync(f.fileno()); open(sys.argv[2],'w').close(); time.sleep(30)";
+        let mut child = OwnedChild(
+            Command::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    script,
+                    scratch.to_str().unwrap(),
+                    ready.to_str().unwrap(),
+                ])
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "owned child did not finish its fsync");
+
+        let rows = collector.collect(&users, false, &HashMap::new()).unwrap();
+        let row = rows.iter().find(|row| row.pid == child.0.id()).unwrap();
+        assert!(
+            row.disk_usage.1 >= 8 * 1024 * 1024,
+            "first disk delta was {} bytes",
+            row.disk_usage.1
+        );
+
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        std::fs::remove_file(scratch).unwrap();
+        std::fs::remove_file(ready).unwrap();
     }
 }
