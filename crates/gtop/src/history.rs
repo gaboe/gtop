@@ -270,10 +270,17 @@ impl History {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let temp = path.with_extension("tmp");
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(&temp)?);
+        static NEXT_WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), sequence));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        let mut writer = std::io::BufWriter::new(file);
         serde_json::to_writer(&mut writer, self)?;
         std::io::Write::flush(&mut writer)?;
+        writer.get_ref().sync_all()?;
         std::fs::rename(temp, path)
     }
     fn prune(&mut self, minute: u64) {
@@ -452,6 +459,28 @@ pub fn support_path(file: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn concurrent_history_writers_publish_complete_files() {
+        let directory =
+            std::env::temp_dir().join(format!("gtop-history-race-{}", std::process::id()));
+        let path = directory.join("nested/history.json");
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..30 {
+                        History::default().save(&path).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        serde_json::from_reader::<_, History>(std::fs::File::open(path).unwrap()).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     #[ignore]
     fn history_cost() {
