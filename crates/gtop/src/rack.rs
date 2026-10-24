@@ -365,12 +365,10 @@ fn core_bank(name: &str, values: &[f32], t: &Tokens) -> Div {
                         .min_w_0()
                         .child(div().flex().flex_col().gap(px(1.)).h(px(36.)).children(
                             (0..12).rev().map(|segment| {
-                                div().flex_1().bg(rgb(if segment < active {
-                                    if *value > 90. && segment >= 9 {
-                                        t.base.hot
-                                    } else {
-                                        t.base.led
-                                    }
+                                div().flex_1().bg(rgb(if *value > 90. && segment >= 9 {
+                                    t.base.hot
+                                } else if segment < active {
+                                    t.base.led
                                 } else {
                                     palette::mix(t.base.led, t.base.ground, 0.12)
                                 }))
