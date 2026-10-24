@@ -341,8 +341,8 @@ pub fn segments(value: f32, n: usize, t: &Tokens) -> Div {
         }))
 }
 
-fn core_bank(name: &str, values: &[f32], t: &Tokens) -> Div {
-    let average = values.iter().sum::<f32>() / values.len().max(1) as f32;
+fn core_bank(name: &str, values: &[(usize, f32)], t: &Tokens) -> Div {
+    let average = values.iter().map(|(_, value)| value).sum::<f32>() / values.len().max(1) as f32;
     div()
         .flex_1()
         .min_w_0()
@@ -358,7 +358,7 @@ fn core_bank(name: &str, values: &[f32], t: &Tokens) -> Div {
                 .flex()
                 .items_end()
                 .gap(px(2.))
-                .children(values.iter().enumerate().map(|(index, value)| {
+                .children(values.iter().map(|(index, value)| {
                     let active = (value.clamp(0., 100.) / 100. * 12.).round() as usize;
                     div()
                         .flex_1()
@@ -394,10 +394,16 @@ fn core_banks(usage: &[f32], topology: &CpuTopology, t: &Tokens) -> Div {
             efficiency,
         } => {
             banks = banks
-                .child(core_bank("P CORES", performance, t))
-                .child(core_bank("E CORES", efficiency, t));
+                .child(core_bank("P CORES", &performance, t))
+                .child(core_bank("E CORES", &efficiency, t));
         }
-        CpuBanks::Cores(cores) => banks = banks.child(core_bank("CORES", cores, t)),
+        CpuBanks::Cores(cores) => {
+            banks = banks.child(core_bank(
+                "CORES",
+                &cores.iter().copied().enumerate().collect::<Vec<_>>(),
+                t,
+            ))
+        }
     }
     banks
 }

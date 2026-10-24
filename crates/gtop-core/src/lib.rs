@@ -13,47 +13,51 @@ pub struct Snapshot {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CpuTopology {
-    performance: Option<usize>,
-    efficiency: Option<usize>,
+    performance: u128,
+    efficiency: u128,
 }
 
 pub enum CpuBanks<'a> {
     Hybrid {
-        performance: &'a [f32],
-        efficiency: &'a [f32],
+        performance: Vec<(usize, f32)>,
+        efficiency: Vec<(usize, f32)>,
     },
     Cores(&'a [f32]),
 }
 
 impl CpuTopology {
-    fn from_counts(performance: Option<usize>, efficiency: Option<usize>) -> Self {
-        Self {
-            performance: performance.filter(|count| *count > 0),
-            efficiency: efficiency.filter(|count| *count > 0),
+    fn from_device_tree(tree: &str) -> Self {
+        let mut topology = Self::default();
+        for node in tree.split("+-o ") {
+            let cluster = node.lines().find(|line| line.contains("\"cluster-type\""));
+            let id = node
+                .lines()
+                .find(|line| line.contains("\"logical-cpu-id\""))
+                .and_then(|line| line.split('=').nth(1))
+                .and_then(|value| value.trim().parse::<u32>().ok());
+            if let (Some(cluster), Some(id)) = (cluster, id) {
+                let Some(bit) = 1u128.checked_shl(id) else {
+                    return Self::default();
+                };
+                if cluster.contains("\"P\"") {
+                    topology.performance |= bit;
+                } else if cluster.contains("\"E\"") {
+                    topology.efficiency |= bit;
+                }
+            }
         }
+        topology
     }
 
     #[cfg(target_os = "macos")]
     fn detect() -> Self {
-        use std::process::Command;
-
-        let output = Command::new("sysctl")
-            .args(["-n", "hw.perflevel0.logicalcpu", "hw.perflevel1.logicalcpu"])
-            .output();
-        let Ok(output) = output else {
-            return Self::default();
-        };
-        if !output.status.success() {
-            return Self::default();
-        }
-        let counts = String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .filter_map(|value| value.parse::<usize>().ok())
-            .collect::<Vec<_>>();
-        match counts.as_slice() {
-            [performance, efficiency] => Self::from_counts(Some(*performance), Some(*efficiency)),
-            _ => Self::default(),
-        }
+        std::process::Command::new("/usr/sbin/ioreg")
+            .args(["-rd1", "-c", "IOPlatformDevice"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| Self::from_device_tree(&String::from_utf8_lossy(&output.stdout)))
+            .unwrap_or_default()
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -61,25 +65,42 @@ impl CpuTopology {
         Self::default()
     }
 
+    fn complete(&self, count: usize) -> bool {
+        count > 0
+            && count < 128
+            && self.performance != 0
+            && self.efficiency != 0
+            && self.performance & self.efficiency == 0
+            && self.performance | self.efficiency == (1u128 << count) - 1
+    }
+
     pub fn banks<'a>(&self, usage: &'a [f32]) -> CpuBanks<'a> {
-        match (self.performance, self.efficiency) {
-            (Some(performance), Some(efficiency)) if performance + efficiency == usage.len() => {
-                let (performance_values, efficiency_values) = usage.split_at(performance);
-                CpuBanks::Hybrid {
-                    performance: performance_values,
-                    efficiency: efficiency_values,
-                }
-            }
-            _ => CpuBanks::Cores(usage),
+        if !self.complete(usage.len()) {
+            return CpuBanks::Cores(usage);
+        }
+        let bank = |mask| {
+            usage
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(index, _)| mask & (1u128 << index) != 0)
+                .collect()
+        };
+        CpuBanks::Hybrid {
+            performance: bank(self.performance),
+            efficiency: bank(self.efficiency),
         }
     }
 
     pub fn label(&self, usage_len: usize) -> String {
-        match (self.performance, self.efficiency) {
-            (Some(performance), Some(efficiency)) if performance + efficiency == usage_len => {
-                format!("CPU · {performance} P + {efficiency} E cores")
-            }
-            _ => format!("CPU · {usage_len} cores"),
+        if self.complete(usage_len) {
+            format!(
+                "CPU · {} P + {} E cores",
+                self.performance.count_ones(),
+                self.efficiency.count_ones()
+            )
+        } else {
+            format!("CPU · {usage_len} cores")
         }
     }
 }
@@ -95,15 +116,15 @@ mod topology_tests {
 
     #[test]
     fn splits_performance_then_efficiency_cores() {
-        let topology = CpuTopology::from_counts(Some(2), Some(2));
+        let topology = CpuTopology::from_device_tree("+-o cpu0\n\"cluster-type\" = <\"E\">\n\"logical-cpu-id\" = 0\n+-o cpu1\n\"cluster-type\" = <\"E\">\n\"logical-cpu-id\" = 1\n+-o cpu2\n\"cluster-type\" = <\"P\">\n\"logical-cpu-id\" = 2\n+-o cpu3\n\"cluster-type\" = <\"P\">\n\"logical-cpu-id\" = 3");
         let usage = [10., 20., 30., 40.];
         match topology.banks(&usage) {
             CpuBanks::Hybrid {
                 performance,
                 efficiency,
             } => {
-                assert_eq!(performance, &[10., 20.]);
-                assert_eq!(efficiency, &[30., 40.]);
+                assert_eq!(performance, vec![(2, 30.), (3, 40.)]);
+                assert_eq!(efficiency, vec![(0, 10.), (1, 20.)]);
             }
             CpuBanks::Cores(_) => panic!("expected P and E banks"),
         }
@@ -115,8 +136,14 @@ mod topology_tests {
         let usage = [10., 20., 30.];
         for topology in [
             CpuTopology::default(),
-            CpuTopology::from_counts(Some(2), None),
-            CpuTopology::from_counts(Some(2), Some(2)),
+            CpuTopology {
+                performance: 3,
+                efficiency: 0,
+            },
+            CpuTopology {
+                performance: 3,
+                efficiency: 12,
+            },
         ] {
             match topology.banks(&usage) {
                 CpuBanks::Cores(cores) => assert_eq!(cores, &usage),
