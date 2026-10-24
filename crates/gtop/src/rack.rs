@@ -153,6 +153,10 @@ fn core_time(seconds: f64) -> String {
     }
 }
 
+fn history_row() -> Div {
+    div().w_full().h(px(22.)).flex().items_center()
+}
+
 fn history_cell(weight: f32, right: bool) -> Div {
     div()
         .flex_grow(weight)
@@ -1269,10 +1273,8 @@ impl Monitor {
                     &t,
                 ))
                 .child(label(coverage, &t));
-            let headers = div()
+            let headers = history_row()
                 .h(px(29.))
-                .flex()
-                .items_center()
                 .bg(rgb(t.base.plate))
                 .child(div().w(px(22.)).flex_shrink_0())
                 .children(
@@ -1328,7 +1330,7 @@ impl Monitor {
                                                 .unwrap_or(row == 0);
                                             let key = name.clone();
                                             Some(
-                                                div()
+                                                history_row()
                                                     .id(("history-row", row))
                                                     .bg(rgb(if selected {
                                                         t.plate2
@@ -1339,9 +1341,6 @@ impl Monitor {
                                                         this.history_selected = Some(key.clone());
                                                         cx.notify();
                                                     }))
-                                                    .h(px(22.))
-                                                    .flex()
-                                                    .items_center()
                                                     .border_b_1()
                                                     .border_color(rgb(t.row_rule))
                                                     .text_color(rgb(if row < 3 {
@@ -2151,6 +2150,85 @@ mod tests {
             size * (baseline - f32::from(ink.y_min) / units_per_em),
         )
     }
+    #[gpui::test]
+    async fn virtual_history_rows_match_header_columns(cx: &mut TestAppContext) {
+        use super::{history_cell, history_row};
+        use gpui::{canvas, px, uniform_list, Div};
+        use std::{cell::RefCell, rc::Rc};
+        type Widths = Rc<RefCell<Vec<(bool, usize, f32)>>>;
+        struct HistoryLayoutTest(Widths);
+        fn row(header: bool, widths: Widths) -> Div {
+            history_row()
+                .child(div().w(px(22.)).flex_shrink_0())
+                .children(
+                    [28., 12., 20., 10., 9., 12., 10.]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(column, weight)| {
+                            let widths = widths.clone();
+                            history_cell(weight, false).child(
+                                canvas(
+                                    move |bounds, _, _| {
+                                        widths.borrow_mut().push((
+                                            header,
+                                            column,
+                                            bounds.size.width.into(),
+                                        ));
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .w_full()
+                                .h(px(10.)),
+                            )
+                        }),
+                )
+        }
+        impl Render for HistoryLayoutTest {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let widths = self.0.clone();
+                div()
+                    .w(px(1000.))
+                    .flex()
+                    .flex_col()
+                    .child(row(true, widths.clone()))
+                    .child(
+                        uniform_list(
+                            "history-layout-test",
+                            3,
+                            cx.processor(move |_, range: std::ops::Range<usize>, _, _| {
+                                range.map(|_| row(false, widths.clone())).collect()
+                            }),
+                        )
+                        .h(px(66.)),
+                    )
+            }
+        }
+        let widths = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window(|_, _| HistoryLayoutTest(widths.clone()));
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let widths = widths.borrow();
+        for column in 0..7 {
+            let header = widths
+                .iter()
+                .find(|(h, c, _)| *h && *c == column)
+                .unwrap()
+                .2;
+            assert!(header > 40.);
+            let rows: Vec<_> = widths
+                .iter()
+                .filter(|(h, c, _)| !h && *c == column)
+                .collect();
+            assert!(!rows.is_empty());
+            for (_, _, width) in rows {
+                assert!(
+                    (header - width).abs() < 0.5,
+                    "column {column}: header {header}, row {width}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn settings_escape_closes_from_button_focus_but_keeps_text_editing_behavior() {
         assert!(super::settings_escape_closes("escape", true, false));
