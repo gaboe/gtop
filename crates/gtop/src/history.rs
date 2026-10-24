@@ -302,12 +302,19 @@ impl History {
             .write(true)
             .create_new(true)
             .open(&temp)?;
-        let mut writer = std::io::BufWriter::new(file);
-        serde_json::to_writer(&mut writer, self)?;
-        std::io::Write::flush(&mut writer)?;
-        writer.get_ref().sync_all()?;
-        std::fs::rename(temp, path)
+        let result = (|| {
+            let mut writer = std::io::BufWriter::new(file);
+            serde_json::to_writer(&mut writer, self)?;
+            std::io::Write::flush(&mut writer)?;
+            writer.get_ref().sync_all()?;
+            std::fs::rename(&temp, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
     }
+
     fn prune(&mut self, minute: u64) {
         self.buckets
             .retain(|b| b.minute <= minute && b.minute > minute.saturating_sub(MINUTES));
@@ -406,12 +413,18 @@ impl History {
             b.peak_temperature = Some(b.peak_temperature.unwrap_or(v).max(v));
         }
         let mut sampled_processes = BTreeMap::<String, ProcessTotal>::new();
+        let mut distinct_names = b.processes.len();
         for process in &snapshot.processes {
             if !b.processes.contains_key(&process.name)
                 && !sampled_processes.contains_key(&process.name)
-                && b.processes.len() + sampled_processes.len() >= MAX_NAMES
+                && distinct_names >= MAX_NAMES
             {
                 continue;
+            }
+            if !b.processes.contains_key(&process.name)
+                && !sampled_processes.contains_key(&process.name)
+            {
+                distinct_names += 1;
             }
             let total = sampled_processes.entry(process.name.clone()).or_default();
             total.cpu_seconds += process.cpu_usage as f64 / 100. * seconds;
@@ -502,6 +515,38 @@ pub fn support_path(file: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn name_limit_counts_the_distinct_union() {
+        let mut history = History::default();
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.processes = (1..=MAX_NAMES as u32)
+            .map(|pid| crate::test_data::process(pid, &format!("process-{pid}"), 1.))
+            .collect();
+        history.record(&snapshot, 6000., 3.);
+        snapshot
+            .processes
+            .push(crate::test_data::process(9999, "extra", 1.));
+        history.record(&snapshot, 6003., 3.);
+        assert_eq!(history.buckets[0].processes.len(), MAX_NAMES);
+        assert_eq!(
+            history.buckets[0].processes["process-4096"].cpu_seconds,
+            0.03
+        );
+        assert!(!history.buckets[0].processes.contains_key("extra"));
+    }
+
+    #[test]
+    fn failed_publish_removes_the_temporary_file() {
+        let directory =
+            std::env::temp_dir().join(format!("gtop-publish-fail-{}", std::process::id()));
+        std::fs::create_dir_all(directory.join("history.json")).unwrap();
+        assert!(History::default()
+            .save(&directory.join("history.json"))
+            .is_err());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn partial_minutes_use_observed_time() {
         let mut history = History::default();
