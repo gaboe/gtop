@@ -56,13 +56,14 @@
   };
   function columns(hist, fmt, ui, metric = "cpu") {
     const M = METRICS[metric];
-    const step = ui.hours === 1 ? 1 : ui.hours === 8 ? 5 : 10;
+    const step = ui.step || (ui.hours === 1 ? 1 : ui.hours === 8 ? 5 : 10);
     const cols = [];
     for (let i = 0; i < hist.slice.length; i += step) {
       const g = hist.slice.slice(i, i + step), live = g.filter((b) => !b.closed);
       if (!live.length) { cols.push(`<b class="off" title="gtop was not running"></b>`); continue; }
       const v = live.reduce((a, b) => a + M.get(b), 0) / live.length;
-      cols.push(`<b class="${v > M.hot ? "hot" : ""}" style="height:${Math.max(2, Math.min(100, M.pct(v)))}%" title="${fmt.clock(g[0].t)} · ${M.fmt(v)}"></b>`);
+      const at = GTOP.history.length - hist.slice.length + i, pick = ui.moment && ui.moment.at === at && ui.moment.step === step;
+      cols.push(`<b class="${v > M.hot ? "hot" : ""} ${pick ? "pick" : ""}" data-act="moment:${at}-${step}" style="height:${Math.max(2, Math.min(100, M.pct(v)))}%" title="${fmt.clock(g[0].t)} · ${M.fmt(v)} · click for detail"></b>`);
     }
     const gs = hist.slice.find((b) => b.closed), ge = [...hist.slice].reverse().find((b) => b.closed);
     const note = gs ? `Hatched: gtop not running ${fmt.clock(gs.t)}–${fmt.clock(ge.t)}` : `Recorded ${hist.covered} of ${hist.minutes} min`;

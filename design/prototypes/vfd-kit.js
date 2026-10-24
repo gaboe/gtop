@@ -75,11 +75,41 @@
     </section>`;
   }
 
+
+  // Detail of one histogram column: what the Mac and its processes did in that span.
+  function momentSide(m, metric = "cpu") {
+    const { fmt, ui } = m;
+    const { at, step } = ui.moment;
+    const span = GTOP.history.slice(at, at + step), live = span.filter((b) => !b.closed);
+    const t0 = span[0].t, t1 = new Date(span[span.length - 1].t.getTime() + 60000);
+    const when = step === 1 ? fmt.clock(t0) : `${fmt.clock(t0)}–${fmt.clock(t1)}`;
+    const head = `<header class="side-head"><div class="silk">${t0.toLocaleDateString()} · ${step} min · ${live.length} recorded · ← → step</div><div class="side-name">${when}</div></header>`;
+    if (!live.length) return `<aside class="side screws vside" aria-label="Moment detail">${screws}${head}<section class="side-sec"><div class="well">gtop was not running. Nothing was recorded for this span.</div></section><div class="side-actions silk"><button class="btn" data-act="close">Close · Esc</button></div></aside>`;
+    const avg = (f) => live.reduce((a, b) => a + f(b), 0) / live.length, peak = (f) => Math.max(...live.map(f));
+    const num = (k, l, f, d, u) => { const M = KIT.METRICS[k], a = avg(f), p = peak(f); return `<div class="${k === metric ? "mpick" : ""}"><span class="lab">${l}</span><div class="sm">${lit(a.toFixed(d) + u, a > M.hot ? "hot" : "")}</div><span class="lab">Peak ${p.toFixed(d)}${u}</span></div>`; };
+    const agg = {};
+    live.forEach((b) => Object.entries(b.per).forEach(([n, x]) => { const a = (agg[n] ||= { name: n, cpuMin: 0, gpuMin: 0, peakMem: 0 }); a.cpuMin += x.cpu / 100; a.gpuMin += x.gpu / 100; a.peakMem = Math.max(a.peakMem, x.mem); }));
+    const key = { cpu: "cpuMin", gpu: "gpuMin", mem: "peakMem", temp: "cpuMin" }[metric];
+    const rows = Object.values(agg).sort((a, b) => b[key] - a[key]).slice(0, 8);
+    const max = rows.length ? rows[0][key] || 1 : 1;
+    const show = (r) => key === "peakMem" ? fmt.mem(r.peakMem) : fmt.mins(r[key]);
+    const running = (n) => GTOP.state.procs.find((p) => p.name === n);
+    const list = rows.map((r, i) => { const p = running(r.name); return `<tr class="${i < 3 ? "culprit" : ""}" ${p ? `data-act="detail:${p.pid}" title="Open the running process"` : ""}>
+      <td class="lamp"><span class="led ${i < 3 ? "on" : ""}"></span></td><td>${r.name}${p ? "" : ' <span class="silk">· exited</span>'}</td>
+      <td><span class="share seg">${segs(16, r[key] / max * 100, 2)}</span></td><td class="num">${show(r)}</td></tr>`; }).join("");
+    const by = { cpu: "core time", mem: "peak memory", gpu: "GPU time", temp: "core time (heat follows CPU)" }[metric];
+    return `<aside class="side screws vside" aria-label="Moment detail" data-scroll="detail">${screws}${head}
+      <section class="side-sec"><div class="win mnums">${num("cpu", "CPU", (b) => b.cpu, 0, "%")}${num("mem", "Memory", (b) => b.mem, 1, "G")}${num("gpu", "GPU", (b) => b.gpu, 0, "%")}${num("temp", "CPU °C", (b) => b.temp, 0, "°")}</div></section>
+      <section class="side-sec"><h3 class="silk"><span>Top processes · ${by}</span></h3><div class="blades mtable"><table><tbody>${list}</tbody></table></div>
+        <p class="silk" style="margin:8px 0 0">Click a running process to open it. Exited processes keep only their history.</p></section>
+      <div class="side-actions silk"><button class="btn" data-act="close">Close · Esc</button>${ui.view === "live" ? '<button class="btn" data-act="momenthist">Full hour · 1</button>' : ""}</div></aside>`;
+  }
+
   function histMain(m, height = 110) {
     const c = KIT.columns(m.hist, m.fmt, m.ui);
     return `<div class="vhist"><section class="win"><div class="split2" style="margin-bottom:8px"><span class="lab">Total CPU · last ${m.ui.hours} h · one column per ${c.step} min</span><span class="lab">${c.note}</span></div>
       <div class="vtape" style="height:${height}px">${c.cols.replace(/<b class="off"/g, '<b class="off"')}</div><div class="axis" style="position:relative;z-index:1">${c.ticks}</div></section><div class="screen">${KIT.histTable(m)}</div></div>`;
   }
 
-  window.VFD = { tower, detailSide, detailDrawer, histMain, trace, vbar };
+  window.VFD = { tower, detailSide, momentSide, detailDrawer, histMain, trace, vbar };
 })();

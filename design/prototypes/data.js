@@ -77,14 +77,15 @@
   }
   tick();
 
-  // History: one bucket per minute for 24 h. gtop was closed from 03:10 to 07:40, so those buckets are null.
+  // History: one bucket per minute for 24 h. gtop was closed for 4.5 hours overnight, so those buckets are null.
   const now = new Date();
   const minutes = 24 * 60;
   const history = [];
   const heavy = ["rustc", "cargo", "dotnet", "Docker", "Google Chrome Helper (GPU)", "WindowServer", "node", "clang", "Code Helper (Renderer)", "photoanalysisd", "mds_stores", "kernel_task", "Spotify", "Slack Helper"];
   for (let m = minutes - 1; m >= 0; m--) {
     const t = new Date(now.getTime() - m * 60000);
-    const h = t.getHours() + t.getMinutes() / 60;
+    // Demo day shape is anchored to a 14:30 "now" so the recent hour always has activity; labels keep the real clock.
+    const h = (((14.5 - m / 60) % 24) + 24) % 24;
     const closed = h >= 3.17 && h < 7.67;
     if (closed) { history.push({ t, closed: true }); continue; }
     const work = h >= 9 && h < 19 ? 1 : h >= 20 && h < 23.5 ? 0.6 : 0.15;

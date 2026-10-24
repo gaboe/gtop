@@ -12,6 +12,7 @@
     detailPid: null,
     envOpen: false,
     settingsOpen: false,
+    moment: null,
   };
   const fmt = {
     pct: (v) => v.toFixed(1),
@@ -74,8 +75,8 @@
       else if (k === "1") { ui.view = "history"; ui.hours = 1; }
       else if (k === "8") { ui.view = "history"; ui.hours = 8; }
       else if (k === "2") { ui.view = "history"; ui.hours = 24; }
-      else if (k === "Enter" && ui.view === "live") { ui.detailPid = ui.selPid; ui.envOpen = false; }
-      else if (k === "Escape") { if (ui.settingsOpen) ui.settingsOpen = false; else if (ui.detailPid) ui.detailPid = null; else return; }
+      else if (k === "Enter" && ui.view === "live") { ui.detailPid = ui.selPid; ui.envOpen = false; ui.moment = null; }
+      else if (k === "Escape") { if (ui.settingsOpen) ui.settingsOpen = false; else if (ui.moment) ui.moment = null; else if (ui.detailPid) ui.detailPid = null; else return; }
       else if (k === "e" && ui.detailPid) ui.envOpen = !ui.envOpen;
       else if (k === "s") ui.settingsOpen = !ui.settingsOpen;
       else if (k === "x" && ui.view === "live") ui.confirmKill = GTOP.state.procs.find((p) => p.pid === (ui.detailPid || ui.selPid));
@@ -96,13 +97,13 @@
       if (act === "view") { ui.view = val; ui.selected = 0; moved = true; }
       else if (act === "hours") { ui.view = "history"; ui.hours = +val; }
       else if (act === "sort") ui.sort = val;
-      else if (act === "row") { ui.selected = +val; moved = true; if (ui.view === "live" && el.dataset.pid) { ui.detailPid = +el.dataset.pid; ui.envOpen = false; ui.settingsOpen = false; } }
+      else if (act === "row") { ui.selected = +val; moved = true; if (ui.view === "live" && el.dataset.pid) { ui.detailPid = +el.dataset.pid; ui.envOpen = false; ui.settingsOpen = false; ui.moment = null; } }
       else if (act === "pause") ui.paused = !ui.paused;
       else if (act === "kill") ui.confirmKill = GTOP.state.procs.find((p) => p.pid === (ui.detailPid || ui.selPid));
       else if (act === "confirm") kill();
       else if (act === "cancel") ui.confirmKill = null;
-      else if (act === "detail") { ui.detailPid = +val || ui.selPid; ui.envOpen = false; }
-      else if (act === "close") ui.detailPid = null;
+      else if (act === "detail") { ui.detailPid = +val || ui.selPid; ui.envOpen = false; ui.moment = null; }
+      else if (act === "close") { ui.detailPid = null; ui.moment = null; }
       else if (act === "env") ui.envOpen = !ui.envOpen;
       else if (act === "settings") ui.settingsOpen = !ui.settingsOpen;
       else if (!(hooks.click && hooks.click(act, val, el))) return;

@@ -53,18 +53,32 @@ function leaders(h, fmt) {
 }
 const hooks = {
   ...THEME.hooks,
-  key(k) { if (k === "v") { metric = ORDER[(ORDER.indexOf(metric) + 1) % ORDER.length]; return true; } return THEME.hooks.key(k); },
-  click(act, val, el) { if (act === "metric") { metric = val; return true; } return THEME.hooks.click(act, val, el); },
+  key(k) {
+    if (k === "v") { metric = ORDER[(ORDER.indexOf(metric) + 1) % ORDER.length]; return true; }
+    const mo = UI.ui.moment;
+    if (mo && (k === "ArrowLeft" || k === "ArrowRight" || k === "h" || k === "l")) {
+      const at = mo.at + (k === "ArrowLeft" || k === "h" ? -mo.step : mo.step);
+      if (at >= 0 && at + mo.step <= GTOP.history.length) mo.at = at;
+      return true;
+    }
+    return THEME.hooks.key(k);
+  },
+  click(act, val, el) {
+    if (act === "metric") { metric = val; return true; }
+    if (act === "moment") { const [at, step] = val.split("-").map(Number); const ui = UI.ui; ui.moment = ui.moment && ui.moment.at === at && ui.moment.step === step ? null : { at, step }; ui.detailPid = null; ui.settingsOpen = false; return true; }
+    if (act === "momenthist") { UI.ui.view = "history"; UI.ui.hours = 1; return true; }
+    return THEME.hooks.click(act, val, el);
+  },
 };
 UI.start((m) => {
   const { ui, fmt } = m;
-  const side = ui.settingsOpen ? THEME.panel() : m.detail ? VFD.detailSide(m) : "";
+  const side = ui.settingsOpen ? THEME.panel() : ui.moment ? VFD.momentSide(m, metric) : m.detail ? VFD.detailSide(m) : "";
   let main;
   if (ui.view === "live") {
-    const h = GTOP.window(1), c = KIT.columns(h, fmt, { hours: 1 }, metric);
+    const h = GTOP.window(1), c = KIT.columns(h, fmt, { hours: 1, moment: ui.moment }, metric);
     const tabs = ORDER.map((k) => `<button class="mtab" data-act="metric:${k}" aria-pressed="${k === metric}">${KIT.METRICS[k].label}</button>`).join("");
     const what = { cpu: "core time", mem: "peak memory", gpu: "GPU time", temp: "" }[metric];
-    const recent = `<section class="win recent" aria-label="Last hour"><div class="rhead"><span class="lab">Last hour</span><span class="mtabs" role="group" aria-label="Metric">${tabs}</span><span class="lab">V switches · 1 opens the full hour</span></div>
+    const recent = `<section class="win recent" aria-label="Last hour"><div class="rhead"><span class="lab">Last hour</span><span class="mtabs" role="group" aria-label="Metric">${tabs}</span><span class="lab">V switches · click a column for detail</span></div>
       <span class="top3">${what ? `<span class="lab">Most ${what}</span>` : ""}${leaders(h, fmt)}</span><div class="vtape">${c.cols}</div></section>`;
     main = recent + `<div class="screen">${KIT.liveTable(m, { noUser: !!side, noCmd: !!side })}</div>`;
   } else main = `<div></div>` + VFD.histMain(m, 150);

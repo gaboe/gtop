@@ -42,3 +42,18 @@
 .dr-nums { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; align-content: start; }
 .dr-meta { display: grid; align-content: space-between; gap: 8px; }
 .dr-actions { display: flex; gap: 6px; } .dr-actions .btn { flex: 1; padding: 6px 0; font-size: 10px; }
+
+.vtape b[data-act] { cursor: pointer; }
+.vtape b[data-act]:hover { filter: brightness(1.35); }
+.vtape b.pick { background: var(--silk); box-shadow: 0 0 0 1px var(--silk), 0 0 calc(8px * var(--glow)) color-mix(in srgb, var(--silk) 60%, transparent); }
+.mnums { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+.mnums > div { position: relative; z-index: 1; display: grid; gap: 3px; }
+.mnums > .mpick { outline: 1px solid color-mix(in oklab, var(--led) 45%, var(--ground)); outline-offset: 4px; }
+.mtable tr[data-act] { cursor: pointer; }
+.mtable td { padding: 4px 6px; }
+.mtable table { table-layout: fixed; width: 100%; }
+.mtable td:nth-child(1) { width: 18px; }
+.mtable td:nth-child(2) { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.mtable td:nth-child(3) { width: 72px; }
+.mtable td:nth-child(3) .share { display: grid; width: 100%; }
+.mtable td:nth-child(4) { width: 68px; }
