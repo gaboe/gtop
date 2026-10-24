@@ -93,7 +93,14 @@ impl AppState {
         #[cfg(not(target_os = "macos"))]
         let processes = process_monitor.collect_processes(&sys, include_environ, &ports_by_pid)?;
         #[cfg(target_os = "macos")]
-        let processes = process_monitor.collect_native_processes(include_environ, &ports_by_pid)?;
+        let processes =
+            match process_monitor.collect_native_processes(include_environ, &ports_by_pid) {
+                Ok(processes) => processes,
+                Err(_) => {
+                    ProcessMonitor::refresh(&mut sys, include_environ);
+                    process_monitor.collect_processes(&sys, include_environ, &ports_by_pid)?
+                }
+            };
         let stats = system_monitor.collect_stats(&sys, &networks, &disks);
         if perf_enabled() {
             eprintln!(
@@ -232,6 +239,36 @@ mod tests {
             .all(|p| p.environ.is_empty() && p.ports.is_empty()));
         assert!(snapshot.stats.memory_total > 0);
         assert!(!snapshot.stats.cpu_usage.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_failure_falls_back_to_sysinfo_and_retries_native_next_tick() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let state = AppState::new();
+        state
+            .process_monitor
+            .lock()
+            .unwrap()
+            .fail_next_native_collection();
+
+        let fallback = state.snapshot(false, false).unwrap();
+        assert!(fallback.stats.memory_total > 0);
+        assert!(fallback
+            .processes
+            .iter()
+            .any(|process| process.pid == child.id()));
+
+        let retry = state.snapshot(false, false).unwrap();
+        assert!(retry
+            .processes
+            .iter()
+            .any(|process| process.pid == child.id()));
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[cfg(unix)]

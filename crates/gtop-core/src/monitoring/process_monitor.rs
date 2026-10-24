@@ -95,6 +95,8 @@ pub struct ProcessMonitor {
     users: sysinfo::Users,
     #[cfg(target_os = "macos")]
     native: super::native_processes::Collector,
+    #[cfg(all(test, target_os = "macos"))]
+    fail_next_native_collection: bool,
 }
 
 impl Default for ProcessMonitor {
@@ -111,6 +113,8 @@ impl ProcessMonitor {
             users: sysinfo::Users::new_with_refreshed_list(),
             #[cfg(target_os = "macos")]
             native: super::native_processes::Collector::default(),
+            #[cfg(all(test, target_os = "macos"))]
+            fail_next_native_collection: false,
         }
     }
 
@@ -176,6 +180,10 @@ impl ProcessMonitor {
         include_environ: bool,
         ports: &HashMap<u32, Vec<u16>>,
     ) -> Result<Vec<ProcessInfo>, String> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_native_collection) {
+            return Err("forced native collection failure".into());
+        }
         let mut rows = self.native.collect(&self.users, include_environ, ports)?;
         let gpu = self.gpu_process_monitor.collect();
         let supported = self.gpu_process_monitor.is_supported();
@@ -183,6 +191,11 @@ impl ProcessMonitor {
             row.gpu_usage = supported.then(|| gpu.get(&row.pid).copied().unwrap_or(0.0));
         }
         Ok(rows)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn fail_next_native_collection(&mut self) {
+        self.fail_next_native_collection = true;
     }
 
     /// Reads the environment variables of one process
