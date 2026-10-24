@@ -40,13 +40,21 @@ impl AppState {
         let mut sys = System::new();
         sys.refresh_cpu_usage();
         sys.refresh_memory();
+        #[cfg(not(target_os = "macos"))]
         ProcessMonitor::refresh(&mut sys, false);
         let disks =
             Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
         let networks = Networks::new_with_refreshed_list();
 
+        let process_monitor = ProcessMonitor::new();
+        #[cfg(target_os = "macos")]
+        let process_monitor = {
+            let mut monitor = process_monitor;
+            let _ = monitor.collect_native_processes(false, &Default::default());
+            monitor
+        };
         Self {
-            process_monitor: Mutex::new(ProcessMonitor::new()),
+            process_monitor: Mutex::new(process_monitor),
             system_monitor: Mutex::new(SystemMonitor::new(&networks)),
             sys: Mutex::new(sys),
             disks: Mutex::new(disks),
@@ -70,6 +78,7 @@ impl AppState {
         let started = Instant::now();
         sys.refresh_cpu_usage();
         sys.refresh_memory();
+        #[cfg(not(target_os = "macos"))]
         ProcessMonitor::refresh(&mut sys, include_environ);
         SystemMonitor::refresh_disks(&mut disks);
         networks.refresh(true);
@@ -81,7 +90,10 @@ impl AppState {
         } else {
             Default::default()
         };
+        #[cfg(not(target_os = "macos"))]
         let processes = process_monitor.collect_processes(&sys, include_environ, &ports_by_pid)?;
+        #[cfg(target_os = "macos")]
+        let processes = process_monitor.collect_native_processes(include_environ, &ports_by_pid)?;
         let stats = system_monitor.collect_stats(&sys, &networks, &disks);
         if perf_enabled() {
             eprintln!(
@@ -99,12 +111,17 @@ impl AppState {
     }
 
     pub fn process_environ(&self, pid: u32) -> Result<Vec<String>, String> {
-        let mut sys = self.sys.lock().map_err(|e| e.to_string())?;
+        let mut sys = System::new();
         ProcessMonitor::read_environment(&mut sys, pid)
     }
 
     pub fn kill_process(&self, pid: u32) -> Result<bool, String> {
-        let sys = self.sys.lock().map_err(|e| e.to_string())?;
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
         Ok(ProcessMonitor::kill_process(&sys, pid))
     }
 
@@ -113,7 +130,7 @@ impl AppState {
         pid: u32,
         start_time: u64,
     ) -> Result<Vec<String>, String> {
-        let mut sys = self.sys.lock().map_err(|e| e.to_string())?;
+        let mut sys = System::new();
         let id = sysinfo::Pid::from_u32(pid);
         sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::Some(&[id]),
@@ -143,7 +160,7 @@ impl AppState {
     }
 
     pub fn kill_process_if_matches(&self, pid: u32, start_time: u64) -> Result<bool, String> {
-        let mut sys = self.sys.lock().map_err(|e| e.to_string())?;
+        let mut sys = System::new();
         let id = sysinfo::Pid::from_u32(pid);
         sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::Some(&[id]),
@@ -178,6 +195,19 @@ mod tests {
         let result = state.process_environ_if_matches(process.pid, process.start_time);
         child.kill().unwrap();
         child.wait().unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            state.snapshot(false, false).unwrap();
+            assert!(
+                state
+                    .sys
+                    .lock()
+                    .unwrap()
+                    .process(sysinfo::Pid::from_u32(child.id()))
+                    .is_none(),
+                "exited action metadata must not accumulate between native snapshots"
+            );
+        }
         let values = result.unwrap();
         assert!(
             values
@@ -235,6 +265,23 @@ mod tests {
         assert!(state
             .process_stopped(child.id(), process.start_time)
             .unwrap());
+    }
+
+    #[test]
+    fn legacy_kill_uses_the_latest_snapshot_process() {
+        let state = AppState::new();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let snapshot = state.snapshot(false, false).unwrap();
+        assert!(snapshot.processes.iter().any(|p| p.pid == child.id()));
+        let killed = state.kill_process(child.id()).unwrap();
+        if !killed {
+            let _ = child.kill();
+        }
+        child.wait().unwrap();
+        assert!(killed);
     }
 
     #[test]

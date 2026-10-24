@@ -16,7 +16,7 @@ fn os_string_vec_to_string_vec(v: &[OsString]) -> Vec<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_environment(pid: u32) -> Result<Vec<String>, String> {
+pub(super) fn macos_environment(pid: u32) -> Result<Vec<String>, String> {
     unsafe extern "C" {
         fn sysctl(
             name: *mut i32,
@@ -93,6 +93,8 @@ pub struct ProcessMonitor {
     /// Tracks per-process GPU engine usage between refreshes
     gpu_process_monitor: GpuProcessMonitor,
     users: sysinfo::Users,
+    #[cfg(target_os = "macos")]
+    native: super::native_processes::Collector,
 }
 
 impl Default for ProcessMonitor {
@@ -107,6 +109,8 @@ impl ProcessMonitor {
         Self {
             gpu_process_monitor: GpuProcessMonitor::new(),
             users: sysinfo::Users::new_with_refreshed_list(),
+            #[cfg(target_os = "macos")]
+            native: super::native_processes::Collector::default(),
         }
     }
 
@@ -153,55 +157,32 @@ impl ProcessMonitor {
             .processes()
             .iter()
             .map(|(pid, process)| {
-                let start_time = process.start_time();
-                let disk_usage = process.disk_usage();
-                ProcessInfo {
-                    pid: pid.as_u32(),
-                    ppid: process.parent().map(|p| p.as_u32()).unwrap_or(0),
-                    name: process.name().to_string_lossy().into_owned(),
-                    cpu_usage: process.cpu_usage(),
-                    gpu_usage: gpu_supported
-                        .then(|| gpu_usage.get(&pid.as_u32()).copied().unwrap_or(0.0)),
-                    memory_usage: process.memory(),
-                    status: Self::format_status(process.status()),
-                    user: process
-                        .user_id()
-                        .map(|uid| {
-                            self.users
-                                .get_user_by_id(uid)
-                                .map(|user| user.name().to_string())
-                                .unwrap_or_else(|| uid.to_string())
-                        })
-                        .unwrap_or_else(|| "-".to_string()),
-                    command: os_string_vec_to_string_vec(process.cmd()).join(" "),
-                    executable: process
-                        .exe()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    argv: os_string_vec_to_string_vec(process.cmd()),
-                    threads: None,
-                    environ: if include_environ {
-                        os_string_vec_to_string_vec(process.environ())
-                    } else {
-                        Vec::new()
-                    },
-                    root: process
-                        .root()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    virtual_memory: process.virtual_memory(),
-                    start_time,
-                    run_time: if start_time > 0 {
-                        current_time.saturating_sub(start_time)
-                    } else {
-                        0
-                    },
-                    disk_usage: (disk_usage.read_bytes, disk_usage.written_bytes),
-                    session_id: process.session_id().map(|id| id.as_u32()),
-                    ports: ports_by_pid.get(&pid.as_u32()).cloned().unwrap_or_default(),
-                }
+                process_row(
+                    pid.as_u32(),
+                    process,
+                    &self.users,
+                    include_environ,
+                    ports_by_pid,
+                    gpu_supported.then(|| gpu_usage.get(&pid.as_u32()).copied().unwrap_or(0.0)),
+                    current_time,
+                )
             })
             .collect())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn collect_native_processes(
+        &mut self,
+        include_environ: bool,
+        ports: &HashMap<u32, Vec<u16>>,
+    ) -> Result<Vec<ProcessInfo>, String> {
+        let mut rows = self.native.collect(&self.users, include_environ, ports)?;
+        let gpu = self.gpu_process_monitor.collect();
+        let supported = self.gpu_process_monitor.is_supported();
+        for row in &mut rows {
+            row.gpu_usage = supported.then(|| gpu.get(&row.pid).copied().unwrap_or(0.0));
+        }
+        Ok(rows)
     }
 
     /// Reads the environment variables of one process
@@ -246,7 +227,7 @@ impl ProcessMonitor {
     }
 
     /// Gets the current system time in seconds since UNIX epoch
-    fn get_current_time() -> Result<u64, String> {
+    pub(super) fn get_current_time() -> Result<u64, String> {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -263,6 +244,63 @@ impl ProcessMonitor {
             _ => "Unknown",
         }
         .to_string()
+    }
+}
+
+pub(super) fn process_row(
+    pid: u32,
+    process: &sysinfo::Process,
+    users: &sysinfo::Users,
+    include_environ: bool,
+    ports_by_pid: &HashMap<u32, Vec<u16>>,
+    gpu_usage: Option<f32>,
+    current_time: u64,
+) -> ProcessInfo {
+    let start_time = process.start_time();
+    let disk_usage = process.disk_usage();
+    ProcessInfo {
+        pid,
+        ppid: process.parent().map(|p| p.as_u32()).unwrap_or(0),
+        name: process.name().to_string_lossy().into_owned(),
+        cpu_usage: process.cpu_usage(),
+        gpu_usage,
+        memory_usage: process.memory(),
+        status: ProcessMonitor::format_status(process.status()),
+        user: process
+            .user_id()
+            .map(|uid| {
+                users
+                    .get_user_by_id(uid)
+                    .map(|user| user.name().to_string())
+                    .unwrap_or_else(|| uid.to_string())
+            })
+            .unwrap_or_else(|| "-".to_string()),
+        command: os_string_vec_to_string_vec(process.cmd()).join(" "),
+        executable: process
+            .exe()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        argv: os_string_vec_to_string_vec(process.cmd()),
+        threads: None,
+        environ: if include_environ {
+            os_string_vec_to_string_vec(process.environ())
+        } else {
+            Vec::new()
+        },
+        root: process
+            .root()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        virtual_memory: process.virtual_memory(),
+        start_time,
+        run_time: if start_time > 0 {
+            current_time.saturating_sub(start_time)
+        } else {
+            0
+        },
+        disk_usage: (disk_usage.read_bytes, disk_usage.written_bytes),
+        session_id: process.session_id().map(|id| id.as_u32()),
+        ports: ports_by_pid.get(&pid).cloned().unwrap_or_default(),
     }
 }
 
