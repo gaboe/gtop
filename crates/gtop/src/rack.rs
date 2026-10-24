@@ -973,7 +973,7 @@ impl Monitor {
                             ))
                             .child(cost(
                                 "MEM",
-                                own.map(|p| format!("{:.0}", p.memory_usage as f64 / 1_048_576.))
+                                own.map(|p| format!("{:.0}", p.memory_usage as f64 / 1_000_000.))
                                     .unwrap_or_else(|| "N/A".into()),
                                 "MB",
                             ))

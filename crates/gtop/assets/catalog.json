@@ -3,7 +3,7 @@
   {"name":"cargo","what":"Rust build tool","kind":"Developer tool","about":"Builds Rust packages and starts compiler processes for their crates."},
   {"name":"clang","what":"C and C++ compiler","kind":"Developer tool","about":"Compiles C and C++ source code, often as part of a native dependency build."},
   {"name":"dotnet","what":".NET runtime and CLI","kind":"Developer tool","about":"Runs .NET builds, tests, and applications."},
-  {"name":"Docker","what":"Docker virtual machine","kind":"Developer tool","about":"Runs the Linux virtual machine used by Docker Desktop containers."},
+  {"name":"Docker","what":"Docker Desktop","kind":"Developer tool","about":"Runs the Linux virtual machine used by Docker Desktop containers."},
   {"name":"com.docker.backend","what":"Docker Desktop backend","kind":"Developer tool","about":"Coordinates Docker Desktop services and container networking on macOS."},
   {"name":"node","what":"Node.js runtime","kind":"Developer tool","about":"Runs JavaScript tools such as development servers, test runners, and bundlers."},
   {"name":"bun","what":"Bun runtime","kind":"Developer tool","about":"Runs JavaScript and TypeScript tools, applications, and tests."},

@@ -225,8 +225,8 @@ pub fn bytes(value: u64) -> String {
     let mut amount = value as f64;
     let units = ["B", "KB", "MB", "GB", "TB"];
     let mut unit = 0;
-    while amount >= 1024. && unit < units.len() - 1 {
-        amount /= 1024.;
+    while amount >= 1000. && unit < units.len() - 1 {
+        amount /= 1000.;
         unit += 1;
     }
     format!("{amount:.1} {}", units[unit])
@@ -298,6 +298,13 @@ mod tests {
             session_id: None,
             ports,
         }
+    }
+
+    #[test]
+    fn byte_labels_use_decimal_units() {
+        assert_eq!(bytes(1_000_000), "1.0 MB");
+        assert_eq!(bytes(1_000_000_000), "1.0 GB");
+        assert_eq!(bytes(16_000_000_000), "16.0 GB");
     }
 
     #[test]
