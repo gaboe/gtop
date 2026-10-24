@@ -241,6 +241,7 @@ impl ProcessMonitor {
             ProcessStatus::Run => "Running",
             ProcessStatus::Sleep => "Sleeping",
             ProcessStatus::Idle => "Idle",
+            ProcessStatus::Zombie => "Zombie",
             _ => "Unknown",
         }
         .to_string()

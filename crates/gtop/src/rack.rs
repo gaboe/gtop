@@ -1082,16 +1082,7 @@ impl Monitor {
         if let Some(confirmation) = self.confirmation(cx) {
             right = right.child(confirmation);
         } else {
-            right=right.child(div().id("keys").role(Role::Status).flex().items_center().gap_2().p(px(8.)).bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule)).child(label("/ FIND   J K MOVE   ↵ DETAIL   C M G P SORT   SPACE PAUSE   X KILL   TAB HISTORY   T PALETTE",&t)).child(div().flex_1()).child(Button::new("settings").label("Settings · S").small().on_click(cx.listener(|this,_,_,cx|{this.settings_open = !this.settings_open; if this.settings_open { this.moment = None; } cx.notify();}))));
-        }
-        if !self.status.starts_with("Reading") && self.status != "Select a process for details" {
-            right = right.child(
-                div()
-                    .id("operation-status")
-                    .role(Role::Status)
-                    .text_color(rgb(t.base.hot))
-                    .child(self.status.clone()),
-            );
+            right=right.child(div().id("keys").role(Role::Status).flex().items_center().gap_2().p(px(8.)).bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule)).child(label("/ FIND   J K MOVE   ↵ DETAIL   C M G P SORT   SPACE PAUSE   X KILL   TAB HISTORY   T PALETTE",&t)).child(div().flex_1()).when(!self.status.starts_with("Reading") && self.status != "Select a process for details", |strip| strip.child(div().id("operation-status").role(Role::Status).text_size(px(10.)).text_color(rgb(if self.status.ends_with("stopped.") { t.base.ok } else { t.base.hot })).child(self.status.clone()))).child(Button::new("settings").label("Settings · S").small().on_click(cx.listener(|this,_,_,cx|{this.settings_open = !this.settings_open; if this.settings_open { this.moment = None; } cx.notify();}))));
         }
 
         let mut root = div()

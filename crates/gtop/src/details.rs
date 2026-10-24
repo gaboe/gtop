@@ -33,6 +33,12 @@ pub(super) enum KillState {
     Sending,
 }
 
+pub(super) fn kill_completed(key: ProcessKey, processes: &[ProcessInfo]) -> bool {
+    !processes
+        .iter()
+        .any(|process| ProcessKey::from(process) == key && process.status != "Zombie")
+}
+
 impl Details {
     pub(super) fn request_kill(&mut self, rendered_for: ProcessKey) {
         if self.key == rendered_for && self.kill == KillState::Ready {
@@ -165,6 +171,7 @@ impl Monitor {
             let _ = entity.update_in(cx, |this, _, cx| {
                 this.status = match result {
                     Ok(true) => {
+                        this.pending_kill = Some(key);
                         format!("Kill signal sent to PID {}. Waiting for refresh.", key.pid)
                     }
                     Ok(false) => format!(
@@ -206,7 +213,7 @@ impl Monitor {
                         .map(|p| p.name.as_str())
                         .unwrap_or("exited process"),
                     key.pid,
-                    key.start_time
+                    crate::rack::timestamp(key.start_time, "%Y-%m-%d %H:%M:%S")
                 ))
                 .child(
                     Button::new("confirm-kill")
@@ -619,7 +626,7 @@ fn detail_line(label: &str, value: String) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{Details, Environment, KillState};
+    use super::{kill_completed, Details, Environment, KillState};
     use crate::model::ProcessKey;
 
     fn selected(key: ProcessKey) -> Details {
@@ -632,6 +639,20 @@ mod tests {
             environment_open: false,
             kill: KillState::Ready,
         }
+    }
+
+    #[test]
+    fn kill_completion_accepts_exit_zombie_and_reused_pid() {
+        let mut snapshot = crate::test_data::snapshot();
+        let key = ProcessKey::from(&snapshot.processes[0]);
+        assert!(!kill_completed(key, &snapshot.processes));
+        snapshot.processes[0].status = "Zombie".into();
+        assert!(kill_completed(key, &snapshot.processes));
+        snapshot.processes[0].status = "Running".into();
+        snapshot.processes[0].start_time += 1;
+        assert!(kill_completed(key, &snapshot.processes));
+        snapshot.processes.clear();
+        assert!(kill_completed(key, &snapshot.processes));
     }
 
     #[test]

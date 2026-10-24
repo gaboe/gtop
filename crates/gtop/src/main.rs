@@ -48,6 +48,7 @@ struct Monitor {
     traces: std::collections::HashMap<ProcessKey, std::collections::VecDeque<(f64, f32)>>,
     interval: u64,
     status: String,
+    pending_kill: Option<ProcessKey>,
     wake: mpsc::Sender<()>,
     _subscriptions: Vec<Subscription>,
     _refresh: Task<()>,
@@ -358,6 +359,7 @@ impl Monitor {
             traces: std::collections::HashMap::new(),
             interval: 3,
             status: "Reading system information…".into(),
+            pending_kill: None,
             wake,
             _subscriptions: subscriptions,
             _refresh: refresh,
@@ -390,6 +392,13 @@ impl Monitor {
     }
 
     fn observe_sample(&mut self, snapshot: &Snapshot) {
+        if let Some(key) = self
+            .pending_kill
+            .filter(|key| crate::details::kill_completed(*key, &snapshot.processes))
+        {
+            self.pending_kill = None;
+            self.status = format!("PID {} stopped.", key.pid);
+        }
         let now = rack::now();
         self.sample_seconds = self
             .last_snapshot
