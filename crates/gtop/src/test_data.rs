@@ -49,5 +49,6 @@ pub fn snapshot() -> Snapshot {
                 celsius: 80.,
             }],
         },
+        cpu_topology: gtop_core::CpuTopology::default(),
     }
 }

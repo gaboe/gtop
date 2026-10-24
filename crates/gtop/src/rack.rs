@@ -10,6 +10,7 @@ use gpui_component::{
     input::Input,
     Sizable,
 };
+use gtop_core::{CpuBanks, CpuTopology};
 use std::{
     collections::HashMap,
     sync::{Mutex, OnceLock},
@@ -330,6 +331,69 @@ pub fn segments(value: f32, n: usize, t: &Tokens) -> Div {
                 },
             ))
         }))
+}
+
+fn core_bank(name: &str, values: &[f32], t: &Tokens) -> Div {
+    let average = values.iter().sum::<f32>() / values.len().max(1) as f32;
+    div()
+        .flex_1()
+        .min_w_0()
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .child(label(name, t))
+                .child(label(format!("{average:.0} %"), t)),
+        )
+        .child(
+            div()
+                .flex()
+                .items_end()
+                .gap(px(2.))
+                .children(values.iter().enumerate().map(|(index, value)| {
+                    let active = (value.clamp(0., 100.) / 100. * 12.).round() as usize;
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().flex().flex_col().gap(px(1.)).h(px(36.)).children(
+                            (0..12).rev().map(|segment| {
+                                div().flex_1().bg(rgb(if segment < active {
+                                    if *value > 90. && segment >= 9 {
+                                        t.base.hot
+                                    } else {
+                                        t.base.led
+                                    }
+                                } else {
+                                    palette::mix(t.base.led, t.base.ground, 0.12)
+                                }))
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .text_center()
+                                .font_family("JetBrains Mono")
+                                .text_size(px(8.))
+                                .text_color(rgb(t.silk_dim))
+                                .child((index + 1).to_string()),
+                        )
+                })),
+        )
+}
+
+fn core_banks(usage: &[f32], topology: &CpuTopology, t: &Tokens) -> Div {
+    let mut banks = div().flex().gap(px(8.));
+    match topology.banks(usage) {
+        CpuBanks::Hybrid {
+            performance,
+            efficiency,
+        } => {
+            banks = banks
+                .child(core_bank("P CORES", performance, t))
+                .child(core_bank("E CORES", efficiency, t));
+        }
+        CpuBanks::Cores(cores) => banks = banks.child(core_bank("CORES", cores, t)),
+    }
+    banks
 }
 fn readout(name: &str, value: String, t: &Tokens) -> Div {
     let display = if let Some(number) = value.strip_suffix('%') {
@@ -688,18 +752,11 @@ impl Monitor {
                     div()
                         .flex()
                         .justify_between()
-                        .child(label(format!("CPU · {cores} CORES"), t))
+                        .child(label(s.cpu_topology.label(cores), t))
                         .child(label(format!("LOAD {:.1}", stats.load_avg[0]), t)),
                 )
                 .child(lit_unit(format!("{cpu:3.0}"), '%', 42., cpu > 85., t))
-                .child(div().flex().items_end().gap(px(3.)).h(px(40.)).children(
-                    stats.cpu_usage.iter().map(|v| {
-                        div()
-                            .flex_1()
-                            .h(px((v / 100. * 40.).max(1.2)))
-                            .bg(rgb(if *v > 90. { t.base.hot } else { t.base.led }))
-                    }),
-                )),
+                .child(core_banks(&stats.cpu_usage, &s.cpu_topology, t)),
         );
         tower = tower.child(
             win(t)

@@ -4,7 +4,7 @@
 //! and process tracking capabilities.
 
 use crate::monitoring::{collect_ports_by_pid, ProcessMonitor, SystemMonitor};
-use crate::{perf_enabled, Snapshot};
+use crate::{perf_enabled, CpuTopology, Snapshot};
 use std::sync::Mutex;
 use std::time::Instant;
 use sysinfo::{DiskRefreshKind, Disks, Networks, System};
@@ -24,6 +24,8 @@ pub struct AppState {
     process_monitor: Mutex<ProcessMonitor>,
     /// System statistics monitoring component
     system_monitor: Mutex<SystemMonitor>,
+    /// Apple Silicon performance and efficiency core counts, read at startup.
+    cpu_topology: CpuTopology,
 }
 
 impl AppState {
@@ -49,6 +51,7 @@ impl AppState {
             sys: Mutex::new(sys),
             disks: Mutex::new(disks),
             networks: Mutex::new(networks),
+            cpu_topology: CpuTopology::detect(),
         }
     }
 }
@@ -88,7 +91,11 @@ impl AppState {
                 processes.len()
             );
         }
-        Ok(Snapshot { processes, stats })
+        Ok(Snapshot {
+            processes,
+            stats,
+            cpu_topology: self.cpu_topology,
+        })
     }
 
     pub fn process_environ(&self, pid: u32) -> Result<Vec<String>, String> {
