@@ -24,6 +24,7 @@ pub(super) struct Details {
     pub(super) analysis: Option<crate::analysis::ProcessAnalysis>,
     environment: Environment,
     environment_open: bool,
+    body_scroll: ScrollHandle,
     pub(super) kill: KillState,
 }
 
@@ -90,6 +91,7 @@ impl Monitor {
             analysis: None,
             environment: Environment::Unrequested,
             environment_open: false,
+            body_scroll: ScrollHandle::new(),
             kill: KillState::Ready,
         });
         self.wake();
@@ -123,10 +125,14 @@ impl Monitor {
             Environment::Loaded(_) | Environment::Loading
         ) {
             details.environment_open = !details.environment_open;
+            if details.environment_open {
+                details.body_scroll.scroll_to_bottom();
+            }
             cx.notify();
             return;
         }
         details.environment_open = true;
+        details.body_scroll.scroll_to_bottom();
         let key = details.key;
         details.environment = Environment::Loading;
         cx.notify();
@@ -137,6 +143,7 @@ impl Monitor {
                 .await;
             let _ = entity.update_in(cx, |this, _, cx| {
                 if let Some(details) = this.details.as_mut().filter(|details| details.key == key) {
+                    details.body_scroll.scroll_to_bottom();
                     details.environment = match result {
                         Ok(values) => Environment::Loaded(values),
                         Err(error) => Environment::Failed(error),
@@ -243,7 +250,7 @@ impl Monitor {
         let details = self.details.as_ref()?;
         let key = details.key;
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
-        let mut panel = div()
+        let mut frame = div()
             .relative()
             .child(crate::rack::screws(&t))
             .flex()
@@ -251,12 +258,16 @@ impl Monitor {
             .flex_shrink_0()
             .w(px(380.))
             .h_full()
+            .min_h_0()
+            .overflow_hidden()
             .bg(rgb(t.base.plate))
             .border_1()
             .border_color(rgb(t.rule_hi));
+        let mut panel = div().flex().flex_col().flex_shrink_0();
         if let Some(p) = self.selected_process() {
-            panel = panel.child(
+            frame = frame.child(
                 div()
+                    .flex_shrink_0()
                     .p(px(18.))
                     .border_b_1()
                     .border_color(rgb(t.rule))
@@ -430,7 +441,8 @@ impl Monitor {
         panel = panel.child(
             div()
                 .id("environment-scroll")
-                .min_h_0()
+                .max_h(px(240.))
+                .flex_shrink_0()
                 .overflow_y_scroll()
                 .p(px(18.))
                 .child(
@@ -456,10 +468,11 @@ impl Monitor {
                 .child(environment),
         );
         Some(
-            panel.child(div().flex_1()).child(
+            frame.child(detail_body(panel, &details.body_scroll)).child(
                 div()
                     .flex()
                     .gap_2()
+                    .flex_shrink_0()
                     .p(px(18.))
                     .child(
                         Button::new("close-details")
@@ -488,6 +501,16 @@ impl Monitor {
             ),
         )
     }
+}
+
+fn detail_body(content: Div, scroll: &ScrollHandle) -> Stateful<Div> {
+    div()
+        .id("detail-body")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .track_scroll(scroll)
+        .child(content)
 }
 
 fn analysis_panel(
@@ -644,6 +667,7 @@ fn detail_line(label: &str, value: String) -> Div {
 mod tests {
     use super::{kill_completed, Details, Environment, KillState};
     use crate::model::ProcessKey;
+    use gpui::ScrollHandle;
 
     fn selected(key: ProcessKey) -> Details {
         Details {
@@ -653,8 +677,40 @@ mod tests {
             analysis: None,
             environment: Environment::Unrequested,
             environment_open: false,
+            body_scroll: ScrollHandle::new(),
             kill: KillState::Ready,
         }
+    }
+
+    #[gpui::test]
+    async fn detail_body_scrolls_to_lower_content(cx: &mut gpui::TestAppContext) {
+        use gpui::{prelude::*, *};
+        struct DetailLayoutTest(ScrollHandle);
+        impl Render for DetailLayoutTest {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(380.))
+                    .h(px(600.))
+                    .flex()
+                    .flex_col()
+                    .child(div().h(px(80.)).flex_shrink_0())
+                    .child(super::detail_body(
+                        div().h(px(1200.)).flex_shrink_0(),
+                        &self.0,
+                    ))
+                    .child(div().h(px(60.)).flex_shrink_0())
+            }
+        }
+        let scroll = ScrollHandle::new();
+        let window = cx.add_window(|_, _| DetailLayoutTest(scroll.clone()));
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        assert_eq!(scroll.bounds().size.height, px(460.));
+        assert_eq!(scroll.offset().y, px(0.));
+        scroll.scroll_to_bottom();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        assert_eq!(scroll.offset().y, px(-740.));
     }
 
     #[test]
