@@ -45,3 +45,14 @@ References: `reference/13-moment-live.png`, `reference/14-moment-history-24h.png
 Percent and degree signs in VFD readouts are 5×7 dot-matrix characters, the way a VFD tube draws them (`KIT.unit` in `rack-kit.js`, `.u-dm` in `vfd.css`). Each is lit at digit height with unlit dots behind it, like the `888` field behind the digits. The Doto `%` glyph read as a crossed block, so it is never used. Numbers sit in a fixed-width field (for example `888` for 0 to 100), so the readout does not jump as values change. `percent-lab.html` compares the variants that were considered.
 
 The reference images 01, 02, 07-hour-temp, 13 and 14 show the final units. The other references predate this rule; where they differ, this section wins.
+
+## Layout changes, 2026-10-24
+
+- **Tower order.** CPU, then memory and swap, then GPU and VRAM, then temperatures, then gtop self. The load source window is removed.
+- **Per-core load.** The CPU window shows one 12-segment column per core. Performance cores and efficiency cores sit in separate banks, each with its core numbers and its average. The top three segments turn hot above 90 %. Read the P and E core counts from the system (`hw.perflevel0.logicalcpu`, `hw.perflevel1.logicalcpu`); a Mac without levels shows one bank named Cores. `cores-lab.html` keeps the variants that were considered.
+- **Top ten rows.** The first ten rows of the current order are taller (30 px instead of 22 px), use 14 px text, a brighter semibold name and a larger CPU bar. A rule separates them from the rest, and the rest are dimmed.
+- **Process analysis in the detail panel**, below the CPU trace:
+  - *What it is*: a name, a kind (Developer tool, macOS, App helper, App, Service, Unknown) and one sentence. The source is always shown: gtop's catalog, the process path (for example "Part of Slack" from a path inside `Slack.app`), or "no match". The catalog is a data file of common macOS and developer processes.
+  - *History · 24 h*: a 24 h tape for all processes with that name (10-minute columns, gaps hatched), a one-line summary of the pattern and of how now compares with its usual busy load, then core time, busy average, peak CPU with its time, longest run over 50 % and peak memory. Computed only from recorded buckets. A process that was never recorded says so.
+
+References: `reference/01-live.png`, `reference/02-detail.png`, `reference/02b-detail-history.png`.

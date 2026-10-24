@@ -30,12 +30,14 @@
       ${extra}${sw(ui.paused ? "Paused" : "Running", "pause", !ui.paused, ui.paused ? "alarm" : "")}`;
   }
 
+  // The first rows of the current order are the ones that matter, so they get a bigger row.
+  const TOP = 10;
   function liveTable({ ui, fmt, rows, detail }, opts = {}) {
     const th = (k, l, num) => `<th class="silk ${num ? "num" : ""}" ${k ? `data-act="sort:${k}"` : ""} ${ui.sort === k ? 'aria-sort="descending"' : ""}>${l}</th>`;
     const focus = rows.length && rows[0].cpu > LIMIT.culprit && !ui.query;
     const tr = rows.map((p, i) => {
       const hot = p.cpu > LIMIT.hot, culprit = p.cpu > LIMIT.culprit && i < 4;
-      return `<tr data-act="row:${i}" data-pid="${p.pid}" class="${i === ui.selected ? "sel" : ""} ${culprit ? "culprit" : ""} ${detail && detail.pid === p.pid ? "open" : ""}">
+      return `<tr data-act="row:${i}" data-pid="${p.pid}" class="${i < TOP ? "top" : ""} ${i === TOP - 1 ? "top-end" : ""} ${i === ui.selected ? "sel" : ""} ${culprit ? "culprit" : ""} ${detail && detail.pid === p.pid ? "open" : ""}">
         <td class="lamp"><span class="led ${hot ? "hot" : culprit ? "on" : ""}"></span></td><td>${p.name}</td><td class="num">${p.pid}</td>${opts.noUser ? "" : `<td>${p.user}</td>`}
         <td class="num"><span class="mini seg">${segs(14, machine(p.cpu), 0.72)}</span>${fmt.pct(p.cpu)}</td>
         <td class="num">${fmt.mem(p.rss)}</td><td class="num">${p.gpu >= 0.05 ? fmt.pct(p.gpu) : "·"}</td>

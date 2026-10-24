@@ -65,3 +65,29 @@
 .u-dm.hot { color: var(--hot); filter: drop-shadow(0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--hot) 65%, transparent)); }
 .u-dm .on { fill: currentColor; }
 .u-dm .off { fill: color-mix(in oklab, var(--led) 18%, var(--ground)); }
+
+/* The first ten rows are the processes that matter: taller, larger, brighter. */
+.blades tbody tr.top td { height: 30px; font-size: 14px; }
+.blades tbody tr.top td:nth-child(2) { color: var(--silk); font-weight: 600; }
+.blades tbody tr.top .mini { grid-template-columns: repeat(14, 5px); } .blades tbody tr.top .mini i { height: 11px; }
+.blades tbody tr.top-end { border-bottom: 1px solid var(--rule-hi); }
+.blades tbody tr:not(.top) td { color: color-mix(in oklab, var(--ink-row) 82%, var(--ground)); }
+
+/* Process analysis in the detail panel */
+.side-sec h3 .src { font-size: 9px; color: color-mix(in oklab, var(--silk-dim) 70%, var(--plate)); letter-spacing: .1em; }
+.what { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.what b { font: 600 15px/20px "JetBrains Mono", monospace; color: var(--silk); }
+.what .kind { font-family: Archivo; font-stretch: 75%; font-weight: 700; font-size: 9px; letter-spacing: .14em; text-transform: uppercase; color: var(--led); border: 1px solid color-mix(in oklab, var(--led) 40%, var(--ground)); padding: 2px 6px; white-space: nowrap; }
+.about { margin: 6px 0 0; font: 12px/18px "JetBrains Mono", monospace; color: var(--ink-row); max-width: 60ch; }
+.about.strong { color: var(--silk); margin: 8px 0; }
+
+/* Per-core banks in the tower CPU window */
+.cols { display: grid; grid-template-columns: 10fr 4fr; gap: 10px; margin-top: 8px; position: relative; z-index: 1; }
+.cgroup { display: grid; gap: 4px; }
+.cgroup .bank, .cnum { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 3px; }
+.ccol { display: flex; flex-direction: column-reverse; gap: 2px; height: 66px; }
+.ccol i { flex: 1; background: color-mix(in oklab, var(--led) 12%, var(--ground)); }
+.ccol i.on { background: var(--led); box-shadow: 0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--led) 55%, transparent); }
+.ccol i.hot { background: var(--hot); box-shadow: 0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--hot) 60%, transparent); }
+.cnum { text-align: center; } .cnum span { font: 8px/10px Silkscreen, monospace; color: color-mix(in oklab, var(--led) 45%, var(--ground)); }
+.gname { display: flex; justify-content: space-between; align-items: baseline; white-space: nowrap; border-top: 1px solid color-mix(in oklab, var(--led) 22%, var(--ground)); padding-top: 3px; }
