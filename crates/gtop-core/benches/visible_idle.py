@@ -8,6 +8,7 @@ Window::draw work, not GPU completion. FPS counts draws in each sampled second.
 """
 import argparse
 import json
+import re
 from pathlib import Path
 import subprocess
 import time
@@ -44,9 +45,12 @@ def main():
         logs = source.read().decode(errors="replace")
     frames = [line for line in logs.splitlines() if line.startswith("perf frames ")]
     ticks = [line for line in logs.splitlines() if line.startswith("perf tick ")]
-    valid = all(row["valid"] for row in rows) and len(frames) >= 55 and bool(ticks)
+    drawn_frames = sum(int(value) for line in frames
+                       for value in re.findall(r"(?:^| )draws=(\d+)(?: |$)", line))
+    valid = (all(row["valid"] for row in rows) and len(frames) >= 55
+             and drawn_frames > 0 and bool(ticks))
     args.output.write_text(json.dumps({"valid": valid, "samples": rows,
-        "frame_samples": frames, "tick_samples": ticks,
+        "frame_samples": frames, "drawn_frames": drawn_frames, "tick_samples": ticks,
         "limitations": "Frontmost is checked per sample. No pixel exposure proof. CPU draw only; GPU completion unmeasured."}, indent=2) + "\n")
     raise SystemExit(0 if valid else "Invalid measurement. See saved samples.")
 

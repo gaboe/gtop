@@ -43,7 +43,7 @@ rtk proxy python3 crates/gtop-core/benches/visible_idle.py GTOP_PID /absolute/ne
 ```
 
 The script checks the frontmost PID before each of 60 `ps` samples.
-It fails if the PID differs, sampling fails, frame telemetry is absent, or tick telemetry is absent.
+It fails if the PID differs, sampling fails, frame telemetry is absent, no drawn frame is recorded, or tick telemetry is absent.
 The host may require Automation permission for the frontmost check.
 The script never changes focus.
 A frontmost check does not prove that every pixel was exposed.
