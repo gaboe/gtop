@@ -221,11 +221,9 @@ impl Collector {
                     self.records.remove(&pid);
                     metadata.push(Pid::from_u32(pid));
                 }
-                if self
-                    .records
-                    .get(&pid)
-                    .is_some_and(|r| r.row.command.is_empty() || r.row.name.is_empty())
-                {
+                if self.records.get(&pid).is_some_and(|r| {
+                    r.row.command.is_empty() || r.row.name.is_empty() || r.row.executable.is_empty()
+                }) {
                     metadata.push(Pid::from_u32(pid));
                 }
                 samples.push((pid, bsd));
@@ -294,17 +292,24 @@ impl Collector {
                     );
                 }
                 let record = self.records.get_mut(&pid).unwrap();
-                if record.row.command.is_empty() || record.row.name.is_empty() {
+                if record.row.command.is_empty()
+                    || record.row.name.is_empty()
+                    || record.row.executable.is_empty()
+                {
                     if let Some(process) = sys.process(Pid::from_u32(pid)) {
                         if record.row.name.is_empty() {
                             record.row.name = process.name().to_string_lossy().into_owned();
                         }
-                        record.row.command = process
+                        record.row.argv = process
                             .cmd()
                             .iter()
-                            .map(|s| s.to_string_lossy())
-                            .collect::<Vec<_>>()
-                            .join(" ");
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .collect();
+                        record.row.command = record.row.argv.join(" ");
+                        record.row.executable = process
+                            .exe()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_default();
                     }
                 }
                 if record.row.root.is_empty() {
@@ -421,18 +426,25 @@ mod tests {
         let first = collector.collect(&users, false, &ports).unwrap();
         let first = first.iter().find(|p| p.pid == child.0.id()).unwrap();
         assert!(first.command.contains("bytearray"));
+        assert!(!first.executable.is_empty());
+        assert_eq!(first.command, first.argv.join(" "));
         assert!(!first.user.is_empty());
         assert!(first.environ.is_empty());
         assert!(first.memory_usage >= 16 * 1024 * 1024);
         assert!(first.virtual_memory >= first.memory_usage);
         assert_eq!(first.ports, [12345]);
         let identity = collector.records[&child.0.id()].identity;
+        let cached = &mut collector.records.get_mut(&child.0.id()).unwrap().row;
+        cached.executable.clear();
+        cached.argv.clear();
         std::thread::sleep(Duration::from_millis(250));
         let rows = collector.collect(&users, true, &ports).unwrap();
         let row = rows.iter().find(|p| p.pid == child.0.id()).unwrap();
         assert_eq!(row.name, first.name);
         assert_eq!(row.user, first.user);
         assert_eq!(row.command, first.command);
+        assert_eq!(row.executable, first.executable);
+        assert_eq!(row.argv, first.argv);
         assert_eq!(row.root, first.root);
         assert_eq!(row.start_time, first.start_time);
         assert_eq!(row.ppid, std::process::id());
