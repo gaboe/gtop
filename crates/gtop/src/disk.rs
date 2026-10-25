@@ -944,7 +944,7 @@ impl Monitor {
         if let Some(confirmation) = &disk.confirmation {
             let rendered_proposal = disk.proposal_id;
             panel=panel.child(div().id("disk-confirmation").role(Role::AlertDialog).p(px(12.)).border_1().border_color(rgb(t.base.hot))
-                .child(format!("Move {} to Trash? Scanned size {}. Allocated size is a past observation. Incomplete folders may contain more. Trash retains disk space.",confirmation.path.display(),bytes(confirmation.allocated)))
+                .child(format!("Move {} to Trash? Scanned size {}. Allocated size is a past observation. Incomplete folders may contain more. Trash retains disk space. Finder Put Back is unavailable for items gtop moves to Trash. To restore this item, move it from Trash to its original folder.",confirmation.path.display(),bytes(confirmation.allocated)))
                 .child(Button::new("disk-confirm").label("Move to Trash · Y").rack(&t).danger().small().on_click(cx.listener(move |this,_,_,cx| { this.disk.as_mut().unwrap().confirm(rendered_proposal); cx.notify(); })))
                 .child(Button::new("disk-keep").label("Keep · N").rack(&t).small().on_click(cx.listener(|this,_,_,cx| { this.disk.as_mut().unwrap().confirmation=None; cx.notify(); }))));
         }
@@ -1073,6 +1073,57 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missing_trash_is_created_and_worker_refreshes_after_native_move() {
+        use std::os::unix::fs::MetadataExt;
+        let home = scratch();
+        fs::create_dir_all(home.join("node_modules/pkg")).unwrap();
+        fs::write(home.join("node_modules/pkg/index.js"), b"scratch fixture").unwrap();
+        let expected = fs::metadata(home.join("node_modules")).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        let folder = receive(&mut disk, ScanState::Complete);
+        let row = folder
+            .rows
+            .iter()
+            .find(|row| row.path.ends_with("node_modules"))
+            .unwrap()
+            .clone();
+        disk.folder = Some(folder);
+        disk.request_trash(&row);
+        let (generation, proposal, result) = receive_proposal(&disk);
+        assert!(disk.apply_proposal(generation, proposal, result));
+        disk.confirm(disk.proposal_id);
+        let folder = receive(&mut disk, ScanState::Complete);
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = disk
+                .mailbox
+                .lock()
+                .unwrap()
+                .status
+                .clone()
+                .filter(|s| !s.contains("Rescanning"))
+            {
+                break status;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let destination = home.join(".Trash/node_modules");
+        assert_eq!(status, format!("Moved to {}.", destination.display()));
+        assert!(!folder.cleanable.iter().any(|item| item.path == row.path));
+        assert!(!row.path.exists());
+        let moved = fs::metadata(&destination).unwrap();
+        assert_eq!((moved.dev(), moved.ino()), (expected.dev(), expected.ino()));
+        assert_eq!(
+            fs::read(destination.join("pkg/index.js")).unwrap(),
+            b"scratch fixture"
+        );
+        disk.close();
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn boundary_page_commands_do_not_rescan() {

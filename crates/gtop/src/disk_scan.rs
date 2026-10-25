@@ -937,7 +937,12 @@ impl Confirmation {
     ) -> io::Result<PathBuf> {
         #[cfg(target_os = "macos")]
         {
-            let trash_path = home.join(".Trash");
+            if unsafe { libc::mkdirat(self.home_fd.as_raw_fd(), c".Trash".as_ptr(), 0o700) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(error);
+                }
+            }
             let trash_fd = unsafe {
                 libc::openat(
                     self.home_fd.as_raw_fd(),
@@ -949,26 +954,31 @@ impl Confirmation {
                 return Err(io::Error::last_os_error());
             }
             let trash = unsafe { OwnedFd::from_raw_fd(trash_fd) };
-            if identity(&trash)?.device != self.expected.device {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(trash.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_uid != unsafe { libc::getuid() } {
+                return Err(io::Error::other(
+                    "Your Trash belongs to another user. Move refused.",
+                ));
+            }
+            if stat.st_dev as u64 != self.expected.device {
                 return Err(io::Error::other(
                     "The item and your Trash are on different volumes. Move refused.",
                 ));
             }
+            let name_max = unsafe { libc::fpathconf(trash.as_raw_fd(), libc::_PC_NAME_MAX) };
+            if name_max <= 0 {
+                return Err(io::Error::other(
+                    "Cannot determine the Trash filename limit. Move refused.",
+                ));
+            }
             let mut before_move = Some(before_move);
             let original = Path::new(std::ffi::OsStr::from_bytes(self.name.as_bytes()));
-            for number in 0u64.. {
-                let name = if number == 0 {
-                    original.as_os_str().to_owned()
-                } else {
-                    let mut name = original.file_stem().unwrap().to_os_string();
-                    name.push(format!(" {number}"));
-                    if let Some(extension) = original.extension() {
-                        name.push(".");
-                        name.push(extension);
-                    }
-                    name
-                };
-                let destination = trash_path.join(&name);
+            for number in 0..10_000 {
+                let name = trash_name(original, number, name_max as usize)?;
                 let name = std::ffi::CString::new(name.as_bytes())?;
                 self.validate(home)?;
                 // The final-name check and rename are separate syscalls in one pinned directory.
@@ -993,15 +1003,20 @@ impl Confirmation {
                     return Err(error);
                 }
                 after_move();
+                let destination = descriptor_path(&trash).map_err(|error| io::Error::other(format!(
+                    "Move result unconfirmed. Cannot find the Trash directory: {error}. Check Trash before any retry."
+                )))?.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
                 let moved = entry_identity(&trash, &name).map_err(|error| io::Error::other(format!(
                     "Move result unconfirmed. Cannot check the item in Trash at {}: {error}. Rescan before any retry.", destination.display())))?;
                 if moved != self.expected {
-                    return Err(io::Error::other(format!("A different item replaced the selected one before the move. It is now in Trash at {}. Nothing else moved.", destination.display())));
+                    return Err(io::Error::other(format!("The item now at {} is not the one you selected. Something changed these files during the move. Check Trash.", destination.display())));
                 }
                 // Descriptor-relative rename does not write Finder's Put Back metadata.
                 return Ok(destination);
             }
-            unreachable!()
+            Err(io::Error::other(
+                "Cannot find an unused Trash filename after 10000 attempts. Move refused.",
+            ))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1009,6 +1024,58 @@ impl Confirmation {
             Err(io::Error::other("Move to Trash requires macOS"))
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn descriptor_path(fd: &OwnedFd) -> io::Result<PathBuf> {
+    let mut path = vec![0u8; libc::PATH_MAX as usize];
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let end = path
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| io::Error::other("Trash path is not terminated"))?;
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&path[..end])))
+}
+
+#[cfg(target_os = "macos")]
+fn trash_name(original: &Path, number: usize, limit: usize) -> io::Result<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    let original_bytes = original.as_os_str().as_bytes();
+    if number == 0 && original_bytes.len() <= limit {
+        return Ok(original.as_os_str().to_owned());
+    }
+    let suffix = format!(" {number}");
+    let available = limit
+        .checked_sub(suffix.len())
+        .filter(|available| *available > 0)
+        .ok_or_else(|| io::Error::other("Trash filename limit is too small"))?;
+    let stem = original
+        .file_stem()
+        .unwrap_or(original.as_os_str())
+        .as_bytes();
+    let extension = original.extension().map(|value| value.as_bytes());
+    let extension = extension.filter(|value| value.len() + 1 < available);
+    let stem_limit = available - extension.map_or(0, |value| value.len() + 1);
+    let mut end = stem.len().min(stem_limit);
+    if let Ok(text) = std::str::from_utf8(stem) {
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+    if end == 0 {
+        return Err(io::Error::other(
+            "Trash filename limit cannot hold the filename",
+        ));
+    }
+    let mut name = stem[..end].to_vec();
+    name.extend_from_slice(suffix.as_bytes());
+    if let Some(extension) = extension {
+        name.push(b'.');
+        name.extend_from_slice(extension);
+    }
+    Ok(std::ffi::OsString::from_vec(name))
 }
 
 fn entry_identity(parent: &OwnedFd, name: &std::ffi::CStr) -> io::Result<FileId> {
@@ -1329,7 +1396,7 @@ mod tests {
             )
             .unwrap_err();
         let destination = home.0.join(".Trash/selected");
-        assert_eq!(error.to_string(), format!("A different item replaced the selected one before the move. It is now in Trash at {}. Nothing else moved.", destination.display()));
+        assert_eq!(error.to_string(), format!("The item now at {} is not the one you selected. Something changed these files during the move. Check Trash.", destination.display()));
         assert_eq!(observed(&destination), replacement);
         assert_eq!(observed(&home.0.join("saved-project/saved")), expected);
         assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
@@ -1362,7 +1429,7 @@ mod tests {
                 )
                 .unwrap_err();
             let destination = home.0.join(".Trash/cache");
-            assert_eq!(error.to_string(), format!("A different item replaced the selected one before the move. It is now in Trash at {}. Nothing else moved.", destination.display()));
+            assert_eq!(error.to_string(), format!("The item now at {} is not the one you selected. Something changed these files during the move. Check Trash.", destination.display()));
             assert_eq!(observed(&destination), replacement);
             assert_eq!(fs::read(&destination).unwrap(), b"replacement");
             assert_eq!(observed(&home.0.join("saved")), expected);
@@ -1802,5 +1869,450 @@ mod cleanup_regressions {
         let tree = scan(&home.0, &home.0, &AtomicBool::new(false), |_| {});
         assert_eq!(tree.candidates.len(), 1);
         assert_eq!(tree.candidates[0].cleanable, Some("Cargo build products"));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod mech {
+    use super::tests::Scratch;
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn id(path: &Path) -> FileId {
+        let m = fs::symlink_metadata(path).unwrap();
+        FileId {
+            device: m.dev(),
+            inode: m.ino(),
+        }
+    }
+    fn fixture() -> (Scratch, PathBuf, Confirmation) {
+        let home = Scratch::new();
+        fs::create_dir(home.0.join(".Trash")).unwrap();
+        let path = home.0.join("selected");
+        fs::write(&path, b"confirmed").unwrap();
+        let c = Confirmation::new(&path, 0, id(&path), &home.0).unwrap();
+        (home, path, c)
+    }
+    fn fds() -> usize {
+        (0..4096)
+            .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+            .count()
+    }
+
+    #[test]
+    fn final_name_race_is_detected() {
+        let (home, path, c) = fixture();
+        let expected = id(&path);
+        let replacement = home.0.join("replacement");
+        fs::write(&replacement, b"unconfirmed").unwrap();
+        let replaced = id(&replacement);
+        let error = c
+            .trash_with_hook(
+                &home.0,
+                || {
+                    fs::rename(&path, home.0.join("saved")).unwrap();
+                    fs::rename(&replacement, &path).unwrap();
+                },
+                || {},
+            )
+            .unwrap_err();
+        assert_eq!(id(&home.0.join("saved")), expected);
+        assert_eq!(id(&home.0.join(".Trash/selected")), replaced);
+        assert_eq!(
+            fs::read(home.0.join(".Trash/selected")).unwrap(),
+            b"unconfirmed"
+        );
+        println!("wrong_leaf expected={expected:?} moved={replaced:?} error={error}");
+    }
+
+    #[test]
+    fn renamed_trash_reports_actual_destination() {
+        let (home, path, c) = fixture();
+        let outside = Scratch::new();
+        let expected = id(&path);
+        let moved_trash = outside.0.join("moved-trash");
+        let returned = c
+            .trash_with_hook(
+                &home.0,
+                || {
+                    fs::rename(home.0.join(".Trash"), &moved_trash).unwrap();
+                    fs::create_dir(home.0.join(".Trash")).unwrap();
+                },
+                || {},
+            )
+            .unwrap();
+        assert!(returned.exists());
+        assert!(!path.exists());
+        assert_eq!(returned, moved_trash.join("selected"));
+        assert_eq!(id(&returned), expected);
+        assert_eq!(fs::read_dir(home.0.join(".Trash")).unwrap().count(), 0);
+        println!(
+            "renamed_trash returned={} actual={} identity={expected:?}",
+            returned.display(),
+            moved_trash.join("selected").display()
+        );
+    }
+
+    #[test]
+    fn renamed_home_reports_actual_destination() {
+        let (home, path, c) = fixture();
+        let outside = Scratch::new();
+        let saved = outside.0.join("saved-home");
+        let expected = id(&path);
+        fs::rename(&home.0, &saved).unwrap();
+        fs::create_dir(&home.0).unwrap();
+        fs::create_dir(home.0.join(".Trash")).unwrap();
+        let returned = c.trash(&home.0).unwrap();
+        assert!(returned.exists());
+        assert_eq!(returned, saved.join(".Trash/selected"));
+        assert_eq!(id(&returned), expected);
+        println!(
+            "renamed_home returned={} actual={}",
+            returned.display(),
+            saved.join(".Trash/selected").display()
+        );
+    }
+
+    #[test]
+    fn destination_replacement_reports_neutral_message() {
+        let (home, path, c) = fixture();
+        let expected = id(&path);
+        let destination = home.0.join(".Trash/selected");
+        let error = c
+            .trash_with_hook(
+                &home.0,
+                || {},
+                || {
+                    assert_eq!(id(&destination), expected);
+                    fs::rename(&destination, home.0.join(".Trash/moved-confirmed")).unwrap();
+                    fs::write(&destination, b"post-move replacement").unwrap();
+                },
+            )
+            .unwrap_err();
+        assert_eq!(id(&home.0.join(".Trash/moved-confirmed")), expected);
+        assert_eq!(error.to_string(), format!("The item now at {} is not the one you selected. Something changed these files during the move. Check Trash.", destination.display()));
+        println!(
+            "destination_replacement confirmed={} replacement={} error={error}",
+            home.0.join(".Trash/moved-confirmed").display(),
+            destination.display()
+        );
+    }
+
+    #[test]
+    fn longest_filename_collision_preserves_extension() {
+        let home = Scratch::new();
+        fs::create_dir(home.0.join(".Trash")).unwrap();
+        let name = format!("{}.txt", "a".repeat(251));
+        let path = home.0.join(&name);
+        let existing = home.0.join(".Trash").join(&name);
+        fs::write(&path, b"confirmed").unwrap();
+        fs::write(&existing, b"existing").unwrap();
+        let c = Confirmation::new(&path, 0, id(&path), &home.0).unwrap();
+        let moved = c.trash(&home.0).unwrap();
+        assert_eq!(moved.file_name().unwrap().as_bytes().len(), 255);
+        assert_eq!(moved.extension().unwrap(), "txt");
+        assert_eq!(fs::read(&moved).unwrap(), b"confirmed");
+        assert!(!path.exists());
+        assert_eq!(fs::read(existing).unwrap(), b"existing");
+        println!(
+            "longest_collision bytes={} destination={}",
+            name.len(),
+            moved.display()
+        );
+    }
+
+    #[test]
+    fn symlink_and_regular_trash_fail_without_move() {
+        for kind in ["symlink", "regular"] {
+            let (home, path, c) = fixture();
+            let outside = Scratch::new();
+            let expected = id(&path);
+            fs::remove_dir(home.0.join(".Trash")).unwrap();
+            match kind {
+                "symlink" => symlink(&outside.0, home.0.join(".Trash")).unwrap(),
+                "regular" => fs::write(home.0.join(".Trash"), b"file").unwrap(),
+                _ => (),
+            }
+            let error = c.trash(&home.0).unwrap_err();
+            assert_eq!(id(&path), expected);
+            assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
+            println!("trash_{kind} error={error}");
+        }
+    }
+
+    #[test]
+    fn parent_components_and_symlink_escape_are_refused() {
+        let (home, path, c) = fixture();
+        drop(c);
+        let outside = Scratch::new();
+        fs::write(outside.0.join("external"), b"outside").unwrap();
+        symlink(&outside.0, home.0.join("escape")).unwrap();
+        symlink(&path, home.0.join("leaf-link")).unwrap();
+        assert!(Confirmation::new(
+            &home.0.join("escape/external"),
+            0,
+            id(&outside.0.join("external")),
+            &home.0
+        )
+        .is_err());
+        assert!(Confirmation::new(&home.0.join("leaf-link"), 0, id(&path), &home.0).is_err());
+        assert!(
+            Confirmation::new(&home.0.join("fake/../selected"), 0, id(&path), &home.0).is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"confirmed");
+        assert_eq!(fs::read(outside.0.join("external")).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn unicode_normalization_and_special_names_preserve_identity() {
+        let home = Scratch::new();
+        fs::create_dir(home.0.join(".Trash")).unwrap();
+        for name in [
+            std::ffi::OsString::from("café.txt"),
+            std::ffi::OsString::from("cafe\u{301}.txt"),
+            std::ffi::OsString::from(".hidden"),
+            std::ffi::OsString::from("trailing."),
+        ] {
+            let path = home.0.join(&name);
+            fs::write(&path, b"confirmed").unwrap();
+            let expected = id(&path);
+            let moved = Confirmation::new(&path, 0, expected, &home.0)
+                .unwrap()
+                .trash(&home.0)
+                .unwrap();
+            assert_eq!(id(&moved), expected);
+            println!(
+                "name source={name:?} destination={:?}",
+                moved.file_name().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn no_descriptor_growth_on_success_failure_or_drop() {
+        if std::env::var_os("GTOP_FD_PROBE_CHILD").is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "disk_scan::mech::no_descriptor_growth_on_success_failure_or_drop",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("GTOP_FD_PROBE_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let baseline = fds();
+        for index in 0..300 {
+            let (home, path, c) = fixture();
+            match index % 3 {
+                0 => {
+                    c.trash(&home.0).unwrap();
+                }
+                1 => {
+                    fs::remove_dir(home.0.join(".Trash")).unwrap();
+                    fs::write(home.0.join(".Trash"), b"not a directory").unwrap();
+                    assert!(c.trash(&home.0).is_err());
+                }
+                _ => {
+                    drop(c);
+                }
+            }
+            drop(home);
+            let _ = path;
+        }
+        assert_eq!(fds(), baseline);
+        println!("descriptor_count before={baseline} after={}", fds());
+    }
+
+    #[test]
+    fn many_collisions_preserve_all_existing_files() {
+        let (home, path, c) = fixture();
+        for n in 0..1024 {
+            let name = if n == 0 {
+                "selected".into()
+            } else {
+                format!("selected {n}")
+            };
+            fs::write(home.0.join(".Trash").join(name), b"existing").unwrap();
+        }
+        let expected = id(&path);
+        let moved = c.trash(&home.0).unwrap();
+        assert_eq!(moved, home.0.join(".Trash/selected 1024"));
+        assert_eq!(id(&moved), expected);
+        for n in 0..1024 {
+            let name = if n == 0 {
+                "selected".into()
+            } else {
+                format!("selected {n}")
+            };
+            assert_eq!(
+                fs::read(home.0.join(".Trash").join(name)).unwrap(),
+                b"existing"
+            );
+        }
+    }
+
+    #[test]
+    fn collision_attempt_limit_refuses_without_moving_source() {
+        let (home, path, c) = fixture();
+        let expected = id(&path);
+        for number in 0..10_000 {
+            let name = trash_name(Path::new("selected"), number, 255).unwrap();
+            fs::write(home.0.join(".Trash").join(name), b"existing").unwrap();
+        }
+        let error = c.trash(&home.0).unwrap_err();
+        assert!(error.to_string().contains("after 10000 attempts"));
+        assert_eq!(id(&path), expected);
+        assert_eq!(fs::read(&path).unwrap(), b"confirmed");
+        for entry in fs::read_dir(home.0.join(".Trash")).unwrap() {
+            assert_eq!(fs::read(entry.unwrap().path()).unwrap(), b"existing");
+        }
+        assert_eq!(fs::read_dir(home.0.join(".Trash")).unwrap().count(), 10_000);
+    }
+
+    #[test]
+    fn exclusive_rename_handles_racing_collision_and_rechecks_source() {
+        for replace_source in [false, true] {
+            let (home, path, c) = fixture();
+            let expected = id(&path);
+            let result = c.trash_with_hook(
+                &home.0,
+                || {
+                    fs::write(home.0.join(".Trash/selected"), b"racing occupant").unwrap();
+                    if replace_source {
+                        fs::rename(&path, home.0.join("saved")).unwrap();
+                        fs::write(&path, b"unconfirmed").unwrap();
+                    }
+                },
+                || {},
+            );
+            assert_eq!(
+                fs::read(home.0.join(".Trash/selected")).unwrap(),
+                b"racing occupant"
+            );
+            if replace_source {
+                let error = result.unwrap_err();
+                assert_eq!(error.to_string(), "Item changed after confirmation");
+                assert_eq!(id(&home.0.join("saved")), expected);
+                assert_eq!(fs::read(&path).unwrap(), b"unconfirmed");
+                assert!(!home.0.join(".Trash/selected 1").exists());
+            } else {
+                let moved = result.unwrap();
+                assert_eq!(moved, home.0.join(".Trash/selected 1"));
+                assert_eq!(id(&moved), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn mismatch_with_renamed_trash_reports_actual_destination() {
+        let (home, path, c) = fixture();
+        let outside = Scratch::new();
+        let actual = outside.0.join("relocated-trash");
+        let error = c
+            .trash_with_hook(
+                &home.0,
+                || {
+                    fs::rename(home.0.join(".Trash"), &actual).unwrap();
+                    fs::create_dir(home.0.join(".Trash")).unwrap();
+                    fs::rename(&path, home.0.join("saved")).unwrap();
+                    fs::write(&path, b"unconfirmed").unwrap();
+                },
+                || {},
+            )
+            .unwrap_err();
+        assert!(!home.0.join(".Trash/selected").exists());
+        assert_eq!(fs::read(actual.join("selected")).unwrap(), b"unconfirmed");
+        assert!(error
+            .to_string()
+            .contains(&actual.join("selected").display().to_string()));
+        assert!(!error
+            .to_string()
+            .contains(&home.0.join(".Trash/selected").display().to_string()));
+        println!(
+            "mismatch_relocated actual={} error={error}",
+            actual.join("selected").display()
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod trash_name_regressions {
+    use super::*;
+
+    #[test]
+    fn missing_trash_is_created_private_and_move_preserves_identity() {
+        let home = tests::Scratch::new();
+        let path = home.0.join("selected");
+        fs::write(&path, b"confirmed").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let expected = FileId {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let moved = Confirmation::new(&path, 0, expected, &home.0)
+            .unwrap()
+            .trash(&home.0)
+            .unwrap();
+        assert_eq!(moved, home.0.join(".Trash/selected"));
+        assert_eq!(fs::read(&moved).unwrap(), b"confirmed");
+        assert_eq!(fs::metadata(&moved).unwrap().ino(), expected.inode);
+        let trash = fs::metadata(home.0.join(".Trash")).unwrap();
+        assert_eq!(trash.mode() & 0o777, 0o700);
+        assert_eq!(trash.uid(), unsafe { libc::getuid() });
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn collision_names_fit_byte_limit_and_keep_utf8_boundaries() {
+        for original in [
+            "x".repeat(255),
+            format!("{}.txt", "é".repeat(125)),
+            format!("a.{}", "x".repeat(253)),
+        ] {
+            for number in [1, 99, 9999] {
+                let name = trash_name(Path::new(&original), number, 255).unwrap();
+                let text = name.to_str().unwrap();
+                assert!(text.len() <= 255);
+                assert!(text.contains(&format!(" {number}")));
+                if original.ends_with(".txt") {
+                    assert!(text.ends_with(".txt"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_multibyte_and_extensionless_collisions_preserve_existing_files() {
+        for name in ["x".repeat(255), format!("{}.txt", "é".repeat(125))] {
+            let home = tests::Scratch::new();
+            fs::create_dir(home.0.join(".Trash")).unwrap();
+            let source = home.0.join(&name);
+            let existing = home.0.join(".Trash").join(&name);
+            fs::write(&source, b"selected").unwrap();
+            fs::write(&existing, b"existing").unwrap();
+            let m = fs::metadata(&source).unwrap();
+            let expected = FileId {
+                device: m.dev(),
+                inode: m.ino(),
+            };
+            let moved = Confirmation::new(&source, 0, expected, &home.0)
+                .unwrap()
+                .trash(&home.0)
+                .unwrap();
+            assert!(moved.file_name().unwrap().to_str().is_some());
+            assert!(moved.file_name().unwrap().as_bytes().len() <= 255);
+            assert_eq!(fs::read(&existing).unwrap(), b"existing");
+            assert_eq!(fs::read(&moved).unwrap(), b"selected");
+            assert_eq!(fs::metadata(&moved).unwrap().ino(), expected.inode);
+        }
     }
 }
