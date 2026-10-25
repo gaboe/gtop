@@ -3220,6 +3220,8 @@ dependencies = [
  "gpui-pre-apple",
  "gpui-pre-platform",
  "gtop-core",
+ "libc",
+ "objc2-foundation 0.3.2",
  "regex",
  "serde",
  "serde_json",

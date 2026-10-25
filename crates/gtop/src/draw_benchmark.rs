@@ -147,6 +147,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         table,
         search: cx.new(|cx| InputState::new(window, cx).placeholder("name, pid, command or port")),
         details: None,
+        disk: None,
         paused: false,
         history,
         moment: None,
