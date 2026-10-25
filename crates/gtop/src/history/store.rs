@@ -58,7 +58,7 @@ impl Store {
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 0 && version != 1 {
+        if !(0..=2).contains(&version) {
             return Err(format!("Unsupported history database version {version}").into());
         }
         connection.execute_batch(
@@ -285,9 +285,15 @@ fn system_bucket(row: &Row<'_>) -> rusqlite::Result<Bucket> {
         cpu: row.get(2)?,
         memory: row.get(3)?,
         gpu: row.get(4)?,
-        gpu_seconds: Some(row.get(5)?),
+        gpu_seconds: {
+            let seconds: f64 = row.get(5)?;
+            (seconds >= 0.).then_some(seconds)
+        },
         temperature: row.get(6)?,
-        temperature_seconds: Some(row.get(7)?),
+        temperature_seconds: {
+            let seconds: f64 = row.get(7)?;
+            (seconds >= 0.).then_some(seconds)
+        },
         peak_cpu: row.get(8)?,
         peak_memory: row.get(9)?,
         peak_gpu: row.get(10)?,
@@ -317,10 +323,9 @@ fn write_bucket(tx: &Transaction<'_>, b: &Bucket) -> Result<()> {
             b.cpu,
             b.memory,
             b.gpu,
-            b.gpu.map_or(0., |_| b.gpu_seconds.unwrap_or(b.seconds)),
+            b.gpu_seconds.unwrap_or(-1.),
             b.temperature,
-            b.temperature
-                .map_or(0., |_| b.temperature_seconds.unwrap_or(b.seconds)),
+            b.temperature_seconds.unwrap_or(-1.),
             b.peak_cpu,
             b.peak_memory,
             b.peak_gpu,
@@ -362,7 +367,7 @@ fn compact(tx: &Transaction<'_>, now: u64) -> Result<()> {
     if cutoff <= watermark {
         return Ok(());
     }
-    tx.execute("INSERT OR REPLACE INTO system SELECT 10,minute/10*10,SUM(recorded),SUM(seconds),COALESCE(SUM(cpu*seconds)/NULLIF(SUM(seconds),0),MAX(cpu)),COALESCE(SUM(memory*seconds)/NULLIF(SUM(seconds),0),MAX(memory)),COALESCE(SUM(gpu*gpu_seconds)/NULLIF(SUM(gpu_seconds),0),MAX(gpu)),SUM(gpu_seconds),COALESCE(SUM(temperature*temp_seconds)/NULLIF(SUM(temp_seconds),0),MAX(temperature)),SUM(temp_seconds),MAX(peak_cpu),MAX(peak_memory),MAX(peak_gpu),MAX(peak_temp) FROM system WHERE resolution=1 AND minute<?1 GROUP BY minute/10",[SqlU64(cutoff)])?;
+    tx.execute("INSERT OR REPLACE INTO system SELECT 10,minute/10*10,SUM(recorded),SUM(seconds),COALESCE(SUM(cpu*seconds)/NULLIF(SUM(seconds),0),MAX(cpu)),COALESCE(SUM(memory*seconds)/NULLIF(SUM(seconds),0),MAX(memory)),COALESCE(SUM(gpu*(CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END))/NULLIF(SUM((CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END)),0),MAX(gpu)),SUM((CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END)),COALESCE(SUM(temperature*(CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END))/NULLIF(SUM((CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END)),0),MAX(temperature)),SUM((CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END)),MAX(peak_cpu),MAX(peak_memory),MAX(peak_gpu),MAX(peak_temp) FROM system WHERE resolution=1 AND minute<?1 GROUP BY minute/10",[SqlU64(cutoff)])?;
     tx.execute("INSERT OR REPLACE INTO process SELECT 10,minute/10*10,name_id,SUM(cpu_seconds),SUM(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process WHERE resolution=1 AND minute<?1 GROUP BY minute/10,name_id",[SqlU64(cutoff)])?;
     for table in ["process", "system"] {
         tx.execute(&format!("DELETE FROM {table} WHERE (resolution=1 AND minute<?1) OR (resolution=10 AND minute<?2)"),params![SqlU64(cutoff),SqlU64(expired)])?;
@@ -460,6 +465,59 @@ mod tests {
         s.append([&bucket(100, 20., 30.), &bucket(101, 20., 40.)], 101)
             .unwrap();
         assert_eq!(s.buckets(100..102, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn legacy_missing_sensor_duration_survives_import_and_resume() {
+        let f = Fixture::new();
+        let mut legacy = History::default();
+        let mut b = bucket(100, 60., 20.);
+        b.gpu = Some(80.);
+        b.temperature = Some(80.);
+        legacy.buckets.push_back(b);
+        std::fs::write(
+            f.0.join("history.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let mut h = f.history(100);
+        assert_eq!(h.buckets[0].gpu_seconds, None);
+        assert_eq!(h.buckets[0].temperature_seconds, None);
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.stats.gpus.clear();
+        snapshot.stats.temperatures.clear();
+        h.record(&snapshot, 6005., 3.).unwrap();
+        h.record(&snapshot, 6008., 3.).unwrap();
+        h.persist(6008).unwrap();
+        drop(h);
+        let h = f.history(100);
+        assert_eq!(h.buckets[0].gpu_seconds, None);
+        assert_eq!(h.buckets[0].seconds, 63.);
+    }
+
+    #[test]
+    fn version_one_migration_keeps_explicit_sensor_durations() {
+        let f = Fixture::new();
+        {
+            let mut s = f.open(100);
+            let mut b = bucket(100, 60., 20.);
+            b.gpu = Some(80.);
+            b.gpu_seconds = Some(0.);
+            b.temperature = Some(70.);
+            b.temperature_seconds = Some(7.);
+            s.append([&b], 100).unwrap();
+            s.connection.execute_batch("PRAGMA user_version=1").unwrap();
+        }
+        let s = f.open(100);
+        let b = s.buckets(100..101, None).unwrap().pop_front().unwrap();
+        assert_eq!(b.gpu_seconds, Some(0.));
+        assert_eq!(b.temperature_seconds, Some(7.));
+        assert_eq!(
+            s.connection
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
