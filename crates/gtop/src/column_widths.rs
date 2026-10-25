@@ -1,6 +1,6 @@
 use gpui::{prelude::*, *};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,23 +83,25 @@ pub const HISTORY: [Column; 8] = [
     Column::PeakCpu,
 ];
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Widths {
     columns: BTreeMap<Column, f32>,
-}
-impl Default for Widths {
-    fn default() -> Self {
-        Self {
-            columns: BTreeMap::new(),
-        }
-    }
+    #[serde(default)]
+    reset_columns: BTreeSet<Column>,
 }
 impl Widths {
     pub fn set(&mut self, column: Column, width: f32) {
+        self.reset_columns.remove(&column);
         self.columns.insert(column, column.clamp_width(width));
     }
     pub fn reset(&mut self, column: Column) {
-        self.columns.remove(&column);
+        if column == Column::Name {
+            self.columns.remove(&column);
+            self.reset_columns.remove(&column);
+        } else {
+            self.columns.insert(column, column.default_width());
+            self.reset_columns.insert(column);
+        }
     }
     pub fn compute(&self, columns: &[Column], viewport: f32) -> Vec<f32> {
         let mut widths: Vec<_> = columns
@@ -131,6 +133,12 @@ impl Widths {
                             .iter()
                             .position(|c| *c == Column::Cpu && !self.columns.contains_key(c))
                     })
+                    .or_else(|| {
+                        columns.iter().rposition(|column| {
+                            !matches!(column, Column::Lamp | Column::Name)
+                                && !self.columns.contains_key(column)
+                        })
+                    })
             } else {
                 columns.iter().position(|c| *c == Column::Name)
             };
@@ -140,11 +148,12 @@ impl Widths {
         } else {
             let mut deficit = -spare;
             for (width, column) in widths.iter_mut().zip(columns) {
-                let shrink = if self.columns.contains_key(column) {
-                    0.
-                } else {
-                    deficit.min(*width - column.minimum())
-                };
+                let shrink =
+                    if self.columns.contains_key(column) && !self.reset_columns.contains(column) {
+                        0.
+                    } else {
+                        deficit.min(*width - column.minimum())
+                    };
                 *width -= shrink;
                 deficit -= shrink;
             }
@@ -198,7 +207,7 @@ pub fn handle() -> Stateful<Div> {
 
 pub fn events<T: 'static>(
     cx: &Context<T>,
-    dragging: bool,
+    _dragging: bool,
     measure: impl Fn(&mut T, &f32, &mut Window, &mut Context<T>) + 'static,
     movement: impl Fn(&mut T, &MouseMoveEvent, &mut Window, &mut Context<T>) + 'static,
     finish: impl Fn(&mut T, &MouseUpEvent, &mut Window, &mut Context<T>) + 'static,
@@ -210,16 +219,14 @@ pub fn events<T: 'static>(
         |_, _, _| {},
         move |bounds, _, window, cx| {
             measure(&f32::from(bounds.size.width), window, cx);
-            if dragging {
-                let movement = std::rc::Rc::new(movement);
-                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-                    if phase == DispatchPhase::Capture
-                        && event.pressed_button == Some(MouseButton::Left)
-                    {
-                        movement(event, window, cx);
-                    }
-                });
-            }
+            let movement = std::rc::Rc::new(movement);
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture
+                    && event.pressed_button == Some(MouseButton::Left)
+                {
+                    movement(event, window, cx);
+                }
+            });
             let finish = std::rc::Rc::new(finish);
             window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
                 if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
