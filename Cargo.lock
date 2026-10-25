@@ -3233,6 +3233,8 @@ dependencies = [
  "gpui-pre-platform",
  "gtop-core",
  "image",
+ "libc",
+ "objc2-foundation 0.3.2",
  "regex",
  "resvg 0.46.0",
  "rusqlite",

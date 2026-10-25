@@ -1109,7 +1109,7 @@ impl Monitor {
         panel.child(actions)
     }
 
-    fn tower(&self, t: &Tokens) -> Stateful<Div> {
+    fn tower(&self, t: &Tokens, cx: &mut Context<Self>) -> Stateful<Div> {
         let mut tower = div()
             .relative()
             .id("tower")
@@ -1185,6 +1185,9 @@ impl Monitor {
         );
         tower = tower.child(
             win(t)
+                .id("disk-open")
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, window, cx| this.open_disk(window, cx)))
                 .child(label("SSD GB", t))
                 .child(lit(
                     if stats.disk_total_bytes > 0 {
@@ -1754,6 +1757,7 @@ impl Monitor {
                             ("C M G P", "sort"),
                             ("SPACE", "pause"),
                             ("X", "kill"),
+                            ("D", "disk"),
                             ("TAB", "history"),
                             ("T", "palette"),
                         ]
@@ -1787,6 +1791,9 @@ impl Monitor {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings_open = !this.settings_open;
                                 if this.settings_open {
+                                    if let Some(disk) = &mut this.disk {
+                                        disk.close();
+                                    }
                                     this.moment = None;
                                 }
                                 cx.notify();
@@ -1823,12 +1830,14 @@ impl Monitor {
             .text_color(rgb(t.base.silk))
             .font_family("JetBrains Mono")
             .text_size(px(12.))
-            .child(self.tower(&t))
+            .child(self.tower(&t, cx))
             .child(right);
         if self.settings_open {
             root = root.child(self.palette_panel(&t, cx));
         } else if self.moment.is_some() {
             root = root.child(self.moment_panel(&t, cx));
+        } else if let Some(disk) = self.disk_panel(cx) {
+            root = root.child(disk);
         } else if let Some(details) = self.details(cx) {
             root = root.child(details.w(px(380.)).h_full());
         }
@@ -1968,6 +1977,17 @@ impl Monitor {
         if self.settings_open && !self.focus.is_focused(window) {
             return;
         }
+        if let Some(disk) = self
+            .disk
+            .as_mut()
+            .filter(|d| d.open && !self.settings_open && self.moment.is_none())
+        {
+            if disk.key(k) {
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
         if let Some(selection) = self.moment {
             match k {
                 "left" | "h" | "right" | "l" => {
@@ -2050,6 +2070,7 @@ impl Monitor {
                     self.select_moment(selection, cx);
                 }
             }
+            "d" => self.open_disk(window, cx),
             "/" => window.focus(&self.search.read(cx).focus_handle(cx), cx),
             "space" => {
                 self.paused = !self.paused;
@@ -2068,6 +2089,9 @@ impl Monitor {
             "s" => {
                 self.settings_open = !self.settings_open;
                 if self.settings_open {
+                    if let Some(disk) = &mut self.disk {
+                        disk.close();
+                    }
                     self.moment = None;
                 }
             }
