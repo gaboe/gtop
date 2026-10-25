@@ -150,6 +150,10 @@ pub fn timestamp(seconds: u64, format: &str) -> String {
         .unwrap_or_else(|| "Unavailable".into())
 }
 pub fn now() -> f64 {
+    #[cfg(test)]
+    if crate::draw_benchmark::fixed_clock() {
+        return 1_800_000_000.;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -270,7 +274,9 @@ fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
             |_, _, _| {},
             move |bounds, _, window, _| {
                 #[cfg(test)]
-                UNIT_GLYPH_TEST_BOUNDS.lock().unwrap().push(bounds);
+                if !crate::draw_benchmark::fixed_clock() {
+                    UNIT_GLYPH_TEST_BOUNDS.lock().unwrap().push(bounds);
+                }
                 let (lit, ghost_path) = unit_paths(bounds, unit);
                 window.paint_path(ghost_path, rgb(ghost));
                 window.paint_path(lit, rgb(led));
