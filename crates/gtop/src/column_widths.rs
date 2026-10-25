@@ -99,11 +99,15 @@ impl Default for Widths {
 impl Widths {
     pub fn set(&mut self, column: Column, width: f32) {
         self.columns.insert(column, column.clamp_width(width));
-        self.fill_name = column != Column::Name;
+        if column == Column::Name {
+            self.fill_name = false;
+        }
     }
     pub fn reset(&mut self, column: Column) {
         self.columns.remove(&column);
-        self.fill_name = true;
+        if column == Column::Name {
+            self.fill_name = true;
+        }
     }
     pub fn compute(&self, columns: &[Column], viewport: f32) -> Vec<f32> {
         let mut widths: Vec<_> = columns
@@ -210,17 +214,19 @@ pub fn events<T: 'static>(
             if dragging {
                 let movement = std::rc::Rc::new(movement);
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-                    if phase == DispatchPhase::Capture {
+                    if phase == DispatchPhase::Capture
+                        && event.pressed_button == Some(MouseButton::Left)
+                    {
                         movement(event, window, cx);
                     }
                 });
-                let finish = std::rc::Rc::new(finish);
-                window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-                    if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
-                        finish(event, window, cx);
-                    }
-                });
             }
+            let finish = std::rc::Rc::new(finish);
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                    finish(event, window, cx);
+                }
+            });
         },
     )
     .absolute()
