@@ -83,11 +83,16 @@ impl SystemMonitor {
 
     /// Rebuilds disk entries every 60 seconds to read fresh capacity values.
     pub fn refresh_disks(&mut self, disks: &mut Disks) {
+        self.refresh_disks_with(disks, || {
+            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage())
+        });
+    }
+
+    fn refresh_disks_with(&mut self, disks: &mut Disks, refresh: impl FnOnce() -> Disks) {
         if self.disks_refreshed_at.elapsed() < Duration::from_secs(60) {
             return;
         }
-        *disks =
-            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
+        *disks = refresh();
         self.disks_refreshed_at = Instant::now();
     }
 
@@ -142,7 +147,7 @@ impl SystemMonitor {
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
-    use std::io::Write;
+    use std::{io::Write, os::unix::fs::MetadataExt};
     use sysinfo::System;
 
     #[cfg(target_os = "macos")]
@@ -165,27 +170,40 @@ mod tests {
     }
 
     #[test]
-    fn storage_refresh_waits_sixty_seconds() {
+    fn storage_refresh_reads_a_fresh_disk_list_after_sixty_seconds() {
         let mut monitor = SystemMonitor::new(&Networks::new());
         let mut disks = Disks::new();
         let initial = monitor.disks_refreshed_at;
-        monitor.refresh_disks(&mut disks);
+        let mut reads = 0;
+        monitor.refresh_disks_with(&mut disks, || {
+            reads += 1;
+            Disks::new()
+        });
         assert_eq!(monitor.disks_refreshed_at, initial);
+        assert_eq!(reads, 0);
+
         monitor.disks_refreshed_at = initial - Duration::from_secs(60);
-        monitor.refresh_disks(&mut disks);
+        monitor.refresh_disks_with(&mut disks, || {
+            reads += 1;
+            Disks::new()
+        });
+        assert_eq!(reads, 1);
         assert!(monitor.disks_refreshed_at >= initial);
     }
 
     #[cfg(target_os = "macos")]
+    #[ignore = "manual 512 MiB system-volume capacity probe"]
     #[test]
     fn storage_refresh_reads_new_system_volume_capacity() {
         let mut disks =
             Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
-        let initial_available = disks
-            .iter()
-            .find(|disk| disk.mount_point() == Path::new("/"))
-            .unwrap()
-            .available_space();
+        let system_volume_device = std::fs::metadata("/").unwrap().dev();
+        let temp_dir = std::env::temp_dir();
+        assert_eq!(
+            std::fs::metadata(&temp_dir).unwrap().dev(),
+            system_volume_device,
+            "temporary directory must be on the system volume"
+        );
         let path = std::env::temp_dir().join(format!(
             "gtop-capacity-refresh-{}-{}.bin",
             std::process::id(),
@@ -211,8 +229,18 @@ mod tests {
             .find(|disk| disk.mount_point() == Path::new("/"))
             .unwrap()
             .available_space();
+        let fresh_disks =
+            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
+        let fresh_available = fresh_disks
+            .iter()
+            .find(|disk| disk.mount_point() == Path::new("/"))
+            .unwrap()
+            .available_space();
 
-        assert!(refreshed_available < initial_available);
+        assert!(
+            refreshed_available.abs_diff(fresh_available) <= 8 * 1024 * 1024,
+            "refreshed capacity {refreshed_available} differs from fresh capacity {fresh_available}"
+        );
     }
 
     /// Tests system statistics collection
