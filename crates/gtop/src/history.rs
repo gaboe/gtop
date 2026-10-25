@@ -497,10 +497,14 @@ impl History {
         let mut sampled_processes = BTreeMap::<String, ProcessTotal>::new();
         let mut distinct_names = b.processes.len();
         for process in snapshot.processes.iter() {
+            let process_start = process.start_time as f64;
+            if part.end < process_start {
+                continue;
+            }
             let cpu_seconds = process.cpu_sample_seconds.map_or(0., |span| {
-                (part.end - part.start.max(now - span).max(cpu_start)).max(0.)
+                (part.end - part.start.max(now - span).max(cpu_start).max(process_start)).max(0.)
             });
-            let gpu_seconds = (part.end - part.start.max(gpu_start)).max(0.);
+            let gpu_seconds = (part.end - part.start.max(gpu_start).max(process_start)).max(0.);
             if part.end > part.start && cpu_seconds == 0. && gpu_seconds == 0. {
                 continue;
             }
@@ -865,6 +869,39 @@ mod tests {
         h.suspend();
         h.record(&s, 6100., 3.);
         assert!((h.view(1, 6100).rows[0].1.cpu_seconds - 6.).abs() < 0.00001);
+    }
+
+    #[test]
+    fn recovery_does_not_record_a_process_before_its_start_minute() {
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.processes = vec![crate::test_data::process(1, "old", 0.)].into();
+        let mut history = History::default();
+        for now in [6054., 6057.] {
+            history.record(&snapshot, now, 3.);
+        }
+        snapshot.process_data = gtop_core::ProcessData::Stale {
+            since: std::time::Instant::now(),
+            reason: "failed".into(),
+        };
+        for now in [6060., 6063.] {
+            history.record(&snapshot, now, 3.);
+        }
+
+        let mut born = crate::test_data::process(2, "born-after-minute-boundary", 0.);
+        born.start_time = 6064;
+        born.cpu_sample_seconds = None;
+        born.memory_usage = 16 * 1024 * 1024;
+        born.gpu_usage = Some(50.);
+        std::sync::Arc::make_mut(&mut snapshot.processes).push(born);
+        snapshot.process_data = gtop_core::ProcessData::Fresh;
+        history.record(&snapshot, 6066., 3.);
+
+        assert!(!history.buckets[0]
+            .processes
+            .contains_key("born-after-minute-boundary"));
+        let current = &history.buckets[1].processes["born-after-minute-boundary"];
+        assert_eq!(current.peak_memory, 16 * 1024 * 1024);
+        assert!((current.gpu_seconds - 1.).abs() < 0.00001);
     }
 
     #[test]
