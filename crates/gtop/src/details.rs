@@ -466,18 +466,21 @@ impl Monitor {
                                     )),
                             ),
                     )
-                    .child(detail_line(
-                        "Ports",
-                        if p.ports.is_empty() {
-                            "none".into()
-                        } else {
-                            p.ports
-                                .iter()
-                                .map(u16::to_string)
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        },
-                    ))
+                    .child(
+                        detail_line(
+                            "Ports",
+                            if p.ports.is_empty() {
+                                "none".into()
+                            } else {
+                                p.ports
+                                    .iter()
+                                    .map(u16::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            },
+                        )
+                        .mt(px(14.)),
+                    )
                     .child(detail_line(
                         "Started",
                         crate::rack::timestamp(p.start_time, "%x %X"),
