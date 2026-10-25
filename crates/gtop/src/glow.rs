@@ -1,6 +1,11 @@
 use crate::palette::Tokens;
 use gpui::{prelude::*, *};
-use std::{cell::RefCell, collections::HashMap, fmt::Write, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    fmt::Write,
+    sync::Arc,
+};
 
 pub fn shadow(color: u32, radius: f32, alpha: u8) -> BoxShadow {
     BoxShadow {
@@ -43,6 +48,7 @@ struct GlyphGlow {
 }
 
 thread_local! {
+    static EVICTION_PENDING: Cell<bool> = const { Cell::new(false) };
     static GLYPHS: RefCell<HashMap<GlyphKey, Option<GlyphGlow>>> = RefCell::new(HashMap::new());
 }
 
@@ -188,11 +194,26 @@ pub fn text(text: impl Into<SharedString>, hot: bool, t: &Tokens) -> Div {
                                     };
                                     if !cache.contains_key(&key) {
                                         if cache.len() >= 1024 {
-                                            for (_, glow) in cache.drain() {
-                                                if let Some(glow) = glow {
-                                                    let _ = window.drop_image(glow.image);
+                                            EVICTION_PENDING.with(|pending| {
+                                                if !pending.replace(true) {
+                                                    window.on_next_frame(|window, _| {
+                                                        GLYPHS.with(|cache| {
+                                                            for glow in cache
+                                                                .borrow_mut()
+                                                                .drain()
+                                                                .filter_map(|(_, glow)| glow)
+                                                            {
+                                                                let _ =
+                                                                    window.drop_image(glow.image);
+                                                            }
+                                                        });
+                                                        EVICTION_PENDING
+                                                            .with(|pending| pending.set(false));
+                                                        // Discard cached scenes that still refer to the released atlas tiles.
+                                                        window.refresh();
+                                                    });
                                                 }
-                                            }
+                                            });
                                         }
                                         cache.insert(key, rasterize(key));
                                     }

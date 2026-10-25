@@ -744,7 +744,11 @@ fn core_bank(name: &str, values: &[(usize, f32)], t: &Tokens) -> Div {
                                         palette::mix(t.base.led, t.base.ground, 0.12)
                                     }))
                                     .when(segment < active && !t.light, |bar| {
-                                        bar.shadow(vec![crate::glow::shadow(t.base.led, 4., 128)])
+                                        bar.shadow(vec![if *value > 90. && segment >= 9 {
+                                            crate::glow::shadow(t.base.hot, 4., 153)
+                                        } else {
+                                            crate::glow::shadow(t.base.led, 4., 140)
+                                        }])
                                     })
                             }),
                         ))
@@ -854,7 +858,11 @@ fn tape(
                         },
                     ))
                     .when(!t.light, |bar| {
-                        bar.shadow(vec![crate::glow::shadow(t.base.led, 3., 115)])
+                        bar.shadow(vec![if selected {
+                            crate::glow::shadow(t.base.silk, 8., 153)
+                        } else {
+                            crate::glow::shadow(t.base.led, 3., 115)
+                        }])
                     })
             };
             column
@@ -993,6 +1001,13 @@ impl Monitor {
                     Metric::Gpu => format!("{:.1} min", total.gpu_seconds / 60.),
                     _ => format!("{:.1} min", total.cpu_seconds / 60.),
                 };
+                let row_text = |text: String| {
+                    if index < 3 {
+                        crate::glow::text(text, false, t).into_any_element()
+                    } else {
+                        text.into_any_element()
+                    }
+                };
                 let mut row = div()
                     .id(("moment-process", index))
                     .h(px(26.))
@@ -1014,7 +1029,13 @@ impl Monitor {
                             .flex_shrink_0()
                             .bg(rgb(if index < 3 { t.base.led } else { t.seg_off })),
                     )
-                    .child(div().w(px(142.)).min_w_0().truncate().child(name.clone()))
+                    .child(
+                        div()
+                            .w(px(142.))
+                            .min_w_0()
+                            .truncate()
+                            .child(row_text(name.clone())),
+                    )
                     .child(
                         div()
                             .w(px(92.))
@@ -1025,11 +1046,11 @@ impl Monitor {
                             .w(px(76.))
                             .text_right()
                             .text_size(px(10.))
-                            .child(if exited {
+                            .child(row_text(if exited {
                                 format!("{value_label} · exited")
                             } else {
                                 value_label
-                            }),
+                            })),
                     );
                 if !exited {
                     let process_name = name.clone();
@@ -1477,6 +1498,14 @@ impl Monitor {
                                                 .map(|n| n == name)
                                                 .unwrap_or(row == 0);
                                             let key = name.clone();
+                                            let row_text = |text: String| {
+                                                if selected || row < 3 {
+                                                    crate::glow::text(text, false, &t)
+                                                        .into_any_element()
+                                                } else {
+                                                    text.into_any_element()
+                                                }
+                                            };
                                             Some(
                                                 history_row()
                                                     .id(("history-row", row))
@@ -1491,7 +1520,7 @@ impl Monitor {
                                                     }))
                                                     .border_b_1()
                                                     .border_color(rgb(t.row_rule))
-                                                    .text_color(rgb(if row < 3 {
+                                                    .text_color(rgb(if selected || row < 3 {
                                                         t.base.led
                                                     } else {
                                                         t.ink_row
@@ -1510,11 +1539,12 @@ impl Monitor {
                                                     .child(
                                                         history_cell(28., false)
                                                             .truncate()
-                                                            .child(name.clone()),
+                                                            .child(row_text(name.clone())),
                                                     )
                                                     .child(
-                                                        history_cell(12., true)
-                                                            .child(core_time(p.cpu_seconds)),
+                                                        history_cell(12., true).child(row_text(
+                                                            core_time(p.cpu_seconds),
+                                                        )),
                                                     )
                                                     .child(
                                                         history_cell(20., false).child(
@@ -1534,26 +1564,27 @@ impl Monitor {
                                                             .max_w(px(120.)),
                                                         ),
                                                     )
-                                                    .child(history_cell(10., true).child(format!(
-                                                        "{:.1}%",
-                                                        p.cpu_seconds / h.total_cpu.max(0.001)
-                                                            * 100.
+                                                    .child(history_cell(10., true).child(row_text(
+                                                        format!(
+                                                            "{:.1}%",
+                                                            p.cpu_seconds / h.total_cpu.max(0.001)
+                                                                * 100.
+                                                        ),
                                                     )))
-                                                    .child(history_cell(9., true).child(
+                                                    .child(history_cell(9., true).child(row_text(
                                                         if p.gpu_seconds > 3. {
                                                             core_time(p.gpu_seconds)
                                                         } else {
                                                             "·".into()
                                                         },
-                                                    ))
+                                                    )))
                                                     .child(
                                                         history_cell(12., true)
-                                                            .child(bytes(p.peak_memory)),
+                                                            .child(row_text(bytes(p.peak_memory))),
                                                     )
-                                                    .child(
-                                                        history_cell(10., true)
-                                                            .child(format!("{:.1}", p.peak_cpu)),
-                                                    ),
+                                                    .child(history_cell(10., true).child(
+                                                        row_text(format!("{:.1}", p.peak_cpu)),
+                                                    )),
                                             )
                                         })
                                         .collect::<Vec<_>>()
