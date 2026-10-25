@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Check retained work and hourly values after a production replay."""
 import argparse
 import json
 from pathlib import Path

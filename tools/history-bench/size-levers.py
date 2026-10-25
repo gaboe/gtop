@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Measure lossless storage candidates on copies of review workload databases."""
 import argparse
 import json
 from pathlib import Path
