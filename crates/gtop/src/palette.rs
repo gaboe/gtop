@@ -196,7 +196,18 @@ pub fn random_base(r: [f64; 5]) -> Base {
 pub struct Settings {
     pub active: usize,
     pub saved: Vec<Palette>,
+    #[serde(default, deserialize_with = "read_widths")]
+    pub process_widths: crate::column_widths::Widths,
+    #[serde(default, deserialize_with = "read_widths")]
+    pub history_widths: crate::column_widths::Widths,
 }
+fn read_widths<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<crate::column_widths::Widths, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 pub async fn next_settings(
     receiver: &mut futures::channel::mpsc::UnboundedReceiver<Settings>,
 ) -> Option<Settings> {
@@ -265,6 +276,33 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_width_data_keeps_palette_selection() {
+        let settings: Settings = serde_json::from_str(r#"{"active":3,"saved":[],"process_widths":{"columns":{"name":"bad"},"fill_name":true},"history_widths":null}"#).unwrap();
+        assert_eq!(settings.active, 3);
+        assert_eq!(settings.process_widths, Default::default());
+        assert_eq!(settings.history_widths, Default::default());
+    }
+
+    #[test]
+    fn column_settings_load_old_files_and_round_trip() {
+        use crate::column_widths::Column;
+        let mut settings: Settings = serde_json::from_str(r#"{"active":0,"saved":[]}"#).unwrap();
+        assert_eq!(settings.process_widths, Default::default());
+        assert_eq!(settings.history_widths, Default::default());
+        settings.process_widths.set(Column::Name, 333.);
+        settings.history_widths.set(Column::CoreTime, 177.);
+        let directory =
+            std::env::temp_dir().join(format!("gtop-column-settings-{}", std::process::id()));
+        let path = directory.join("palette.json");
+        settings.save_to(&path).unwrap();
+        let stored: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored.process_widths, settings.process_widths);
+        assert_eq!(stored.history_widths, settings.history_widths);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn queued_settings_keep_latest_state_after_a_pending_write() {
         let (sender, mut receiver) = futures::channel::mpsc::unbounded();

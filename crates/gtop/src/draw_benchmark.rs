@@ -156,6 +156,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         view: None,
         history_selected: None,
         history_scroll: UniformListScrollHandle::new(),
+        history_columns: crate::column_widths::TableState::default(),
         metric: history::Metric::Cpu,
         settings,
         settings_writes: None,
