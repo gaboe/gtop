@@ -165,7 +165,9 @@ fn unavailable_counters_preserve_last_valid_samples_and_startup_baselines() {
     assert_eq!(first.disk_usage.1, 0);
     assert_eq!(first.cpu_usage, 0.);
     child.interval(0, 0);
+    let last_valid_before = std::time::Instant::now();
     let idle = child.row(&state, false);
+    let last_valid_after = std::time::Instant::now();
     assert_eq!(idle.disk_usage.1, 0);
     assert!(idle.cpu_usage < 2.);
     child.interval(BYTES, 200);
@@ -176,11 +178,23 @@ fn unavailable_counters_preserve_last_valid_samples_and_startup_baselines() {
         .fail_next_counter_reads(child.child.id());
     let unavailable = child.row(&state, false);
     assert_eq!(unavailable.disk_usage, (0, 0));
+    assert!(unavailable.disk_sample_seconds.is_none());
     assert_eq!(unavailable.cpu_usage, 0.);
     assert_eq!(unavailable.memory_usage, 0);
     child.interval(BYTES, 0);
+    let recovery_before = std::time::Instant::now();
     let recovery = child.row(&state, false);
+    let recovery_after = std::time::Instant::now();
     assert_eq!(recovery.disk_usage.1, 2 * BYTES as u64);
+    let span = recovery.disk_sample_seconds.unwrap();
+    let shortest = recovery_before
+        .duration_since(last_valid_after)
+        .as_secs_f64();
+    let longest = recovery_after
+        .duration_since(last_valid_before)
+        .as_secs_f64();
+    assert!((shortest..=longest).contains(&span));
+    assert!(span > 1.9);
     assert!(recovery.cpu_usage > 1.);
     child.interval(0, 0);
     let idle = child.row(&state, false);

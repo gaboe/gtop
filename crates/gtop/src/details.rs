@@ -432,7 +432,10 @@ impl Monitor {
                                         "DISK READ",
                                         format!(
                                             "{:.1} MB/s",
-                                            p.disk_usage.0 as f64 / self.sample_seconds / 1e6
+                                            p.disk_usage.0 as f64
+                                                / p.disk_sample_seconds
+                                                    .unwrap_or(self.sample_seconds)
+                                                / 1e6
                                         ),
                                         &t,
                                     ))
@@ -440,7 +443,10 @@ impl Monitor {
                                         "DISK WRITE",
                                         format!(
                                             "{:.1} MB/s",
-                                            p.disk_usage.1 as f64 / self.sample_seconds / 1e6
+                                            p.disk_usage.1 as f64
+                                                / p.disk_sample_seconds
+                                                    .unwrap_or(self.sample_seconds)
+                                                / 1e6
                                         ),
                                         &t,
                                     )),

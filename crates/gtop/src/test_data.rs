@@ -19,6 +19,7 @@ pub fn process(pid: u32, name: &str, cpu: f32) -> ProcessInfo {
         start_time: pid as u64,
         run_time: 0,
         disk_usage: (0, 0),
+        disk_sample_seconds: None,
         session_id: None,
         ports: vec![],
     }

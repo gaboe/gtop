@@ -295,6 +295,7 @@ mod tests {
             start_time: 10,
             run_time: 60,
             disk_usage: (0, 0),
+            disk_sample_seconds: None,
             session_id: None,
             ports,
         }

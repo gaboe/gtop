@@ -39,6 +39,8 @@ pub struct ProcessInfo {
     pub run_time: u64,
     /// Disk I/O statistics (read bytes, written bytes)
     pub disk_usage: (u64, u64),
+    /// Seconds between the valid disk samples, when the collector can report them.
+    pub disk_sample_seconds: Option<f64>,
     /// Session ID of the process
     pub session_id: Option<u32>,
     /// Local bound ports (TCP LISTEN + UDP). Empty when port collection is skipped.

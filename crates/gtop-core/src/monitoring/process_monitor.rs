@@ -317,6 +317,7 @@ pub(super) fn process_row(
             0
         },
         disk_usage: (disk_usage.read_bytes, disk_usage.written_bytes),
+        disk_sample_seconds: None,
         session_id: process.session_id().map(|id| id.as_u32()),
         ports: ports_by_pid.get(&pid).cloned().unwrap_or_default(),
     }

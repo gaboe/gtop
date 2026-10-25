@@ -168,7 +168,7 @@ struct Record {
     identity: (u64, u64),
     row: ProcessInfo,
     cpu_sample: Option<(u64, Instant)>,
-    disk_sample: Option<(u64, u64)>,
+    disk_sample: Option<((u64, u64), Instant)>,
 }
 
 #[derive(Debug)]
@@ -189,20 +189,28 @@ impl Record {
                         / sample.sampled.duration_since(at).as_nanos().max(1) as f64
                         * 100.) as f32
                 });
-        row.disk_usage = sample
-            .disk
-            .zip(self.disk_sample)
-            .map_or((0, 0), |(disk, previous)| {
-                (
-                    disk.0.saturating_sub(previous.0),
-                    disk.1.saturating_sub(previous.1),
-                )
-            });
+        row.disk_sample_seconds = sample.disk.zip(self.disk_sample).map(|(_, (_, at))| {
+            sample
+                .sampled
+                .duration_since(at)
+                .as_secs_f64()
+                .max(0.000001)
+        });
+        row.disk_usage =
+            sample
+                .disk
+                .zip(self.disk_sample)
+                .map_or((0, 0), |(disk, (previous, _))| {
+                    (
+                        disk.0.saturating_sub(previous.0),
+                        disk.1.saturating_sub(previous.1),
+                    )
+                });
         if let Some(cpu) = sample.cpu_nanos {
             self.cpu_sample = Some((cpu, sample.sampled));
         }
         if let Some(disk) = sample.disk {
-            self.disk_sample = Some(disk);
+            self.disk_sample = Some((disk, sample.sampled));
         }
     }
 }
@@ -211,6 +219,7 @@ pub(super) struct Collector {
     pids: Vec<i32>,
     records: HashMap<u32, Record>,
     primed: bool,
+    last_collection: Option<Instant>,
     #[cfg(test)]
     unavailable_counters: Option<u32>,
 }
@@ -338,7 +347,7 @@ impl Collector {
                                 now,
                             ),
                             cpu_sample: None,
-                            disk_sample: self.primed.then_some((0, 0)),
+                            disk_sample: self.last_collection.map(|at| ((0, 0), at)),
                         },
                     );
                 }
@@ -419,6 +428,7 @@ impl Collector {
                 rows.push(row);
             }
             self.primed = true;
+            self.last_collection = Some(Instant::now());
             return Ok(rows);
         }
     }
