@@ -5,6 +5,9 @@ use std::{
     path::PathBuf,
 };
 
+#[path = "history/store.rs"]
+mod store;
+
 const MINUTES: u64 = 1440;
 const MAX_NAMES: usize = 4096;
 
@@ -270,6 +273,12 @@ impl HistoryView {
 pub struct History {
     buckets: VecDeque<Bucket>,
     #[serde(skip)]
+    store: Option<store::Store>,
+    #[serde(skip)]
+    dirty: std::collections::BTreeSet<u64>,
+    #[serde(skip)]
+    error: std::cell::RefCell<Option<String>>,
+    #[serde(skip)]
     last_sample: Option<f64>,
     #[serde(skip)]
     last_process_sample: Option<f64>,
@@ -279,6 +288,66 @@ pub struct History {
     pub touched: std::ops::Range<u64>,
 }
 impl History {
+    pub fn open(path: &std::path::Path, legacy: &std::path::Path, now: u64) -> store::Result<Self> {
+        let store = store::Store::open(path, legacy, now / 60)?;
+        let buckets = store.buckets(now / 60..now / 60 + 1, None)?;
+        Ok(Self {
+            buckets,
+            store: Some(store),
+            ..Default::default()
+        })
+    }
+
+    #[cfg(feature = "history-benchmark")]
+    pub fn benchmark_minute(&mut self, bucket: Bucket) {
+        self.dirty.insert(bucket.minute);
+        self.buckets.retain(|b| b.minute != bucket.minute);
+        self.buckets.push_back(bucket);
+    }
+
+    pub fn take_error(&self) -> Option<String> {
+        self.error.borrow_mut().take()
+    }
+
+    pub fn persist(&mut self, now: u64) -> store::Result<()> {
+        let store = self
+            .store
+            .as_mut()
+            .ok_or("History database is unavailable")?;
+        store.append(
+            self.buckets
+                .iter()
+                .filter(|b| self.dirty.contains(&b.minute)),
+            now / 60,
+        )?;
+        self.dirty.clear();
+        self.buckets.retain(|b| b.minute >= now / 60);
+        Ok(())
+    }
+
+    fn read_buckets(&self, range: std::ops::Range<u64>, name: Option<&str>) -> VecDeque<Bucket> {
+        let mut buckets: BTreeMap<u64, Bucket> = match self
+            .store
+            .as_ref()
+            .map(|s| s.buckets(range.clone(), name))
+            .transpose()
+        {
+            Ok(buckets) => buckets
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| (b.minute, b))
+                .collect(),
+            Err(error) => {
+                *self.error.borrow_mut() = Some(error.to_string());
+                BTreeMap::new()
+            }
+        };
+        for bucket in self.buckets.iter().filter(|b| range.contains(&b.minute)) {
+            buckets.insert(bucket.minute, bucket.clone());
+        }
+        buckets.into_values().collect()
+    }
+
     pub fn analyze_process(
         &self,
         name: &str,
@@ -286,9 +355,12 @@ impl History {
         current_cpu: f32,
         now_minute: u64,
     ) -> crate::analysis::ProcessAnalysis {
-        crate::analysis::analyze(name, command, current_cpu, now_minute, self.buckets.iter())
+        let buckets =
+            self.read_buckets(now_minute.saturating_sub(1439)..now_minute + 1, Some(name));
+        crate::analysis::analyze(name, command, current_cpu, now_minute, &buckets)
     }
 
+    #[cfg(test)]
     pub fn load(path: &std::path::Path, now: u64) -> Self {
         let mut history: Self = std::fs::metadata(path)
             .ok()
@@ -310,6 +382,7 @@ impl History {
         history.prune(now / 60);
         history
     }
+    #[cfg(test)]
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -347,6 +420,10 @@ impl History {
         self.process_recording_since = None;
     }
     pub fn record(&mut self, snapshot: &Snapshot, now: f64, interval: f64) -> bool {
+        if let Err(error) = self.prepare_sample(snapshot, now, interval) {
+            *self.error.borrow_mut() = Some(error.to_string());
+            return false;
+        }
         let previous = self.last_sample.replace(now);
         let elapsed = previous.map(|v| now - v).unwrap_or(0.);
         let minute = now as u64 / 60;
@@ -408,8 +485,56 @@ impl History {
             }
             self.record_processes(snapshot, minute, now..now, now, cpu_start, gpu_start);
         }
+        self.dirty.extend(self.touched.clone());
         changed_minute
     }
+    fn prepare_sample(
+        &mut self,
+        snapshot: &Snapshot,
+        now: f64,
+        interval: f64,
+    ) -> store::Result<()> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let minute = now as u64 / 60;
+        let elapsed = self.last_sample.map_or(0., |at| now - at);
+        let mut start = if elapsed > 0. && elapsed <= interval * 2.5 {
+            now - elapsed
+        } else {
+            now
+        };
+        if elapsed > 0.
+            && elapsed <= interval * 2.5
+            && matches!(snapshot.process_data, gtop_core::ProcessData::Fresh)
+        {
+            let span = snapshot
+                .processes
+                .iter()
+                .filter_map(|p| p.cpu_sample_seconds)
+                .fold(0., f64::max);
+            let oldest = minute.saturating_sub(MINUTES - 1) as f64 * 60.;
+            let cpu_start = self.process_recording_since.unwrap_or(now).max(oldest);
+            let gpu_start = self.last_process_sample.unwrap_or(now).max(oldest);
+            start = start.min((now - span).max(cpu_start).min(gpu_start));
+        }
+        let range = start as u64 / 60..minute + 1;
+        if range
+            .clone()
+            .all(|minute| self.buckets.iter().any(|b| b.minute == minute))
+        {
+            return Ok(());
+        }
+        let buckets = store.buckets(range, None)?;
+        for bucket in buckets {
+            if !self.buckets.iter().any(|b| b.minute == bucket.minute) {
+                let index = self.buckets.partition_point(|b| b.minute < bucket.minute);
+                self.buckets.insert(index, bucket);
+            }
+        }
+        Ok(())
+    }
+
     fn record_part(&mut self, snapshot: &Snapshot, minute: u64, seconds: f64) {
         if self.buckets.back().is_none_or(|b| b.minute != minute) {
             self.buckets.push_back(Bucket {
@@ -539,7 +664,23 @@ impl History {
             ..Default::default()
         };
         let mut totals: BTreeMap<String, ProcessTotal> = BTreeMap::new();
-        let by_minute: BTreeMap<_, _> = self.buckets.iter().map(|b| (b.minute, b)).collect();
+        let mut stored = VecDeque::new();
+        if let Some(store) = &self.store {
+            match store.view_data(start..minute + 1, &self.buckets) {
+                Ok((buckets, rows)) => {
+                    stored = buckets;
+                    totals = rows;
+                }
+                Err(error) => {
+                    *self.error.borrow_mut() = Some(error.to_string());
+                }
+            }
+        }
+        let by_minute: BTreeMap<_, _> = stored
+            .iter()
+            .chain(self.buckets.iter())
+            .map(|b| (b.minute, b))
+            .collect();
         for m in start..=minute {
             let bucket = by_minute.get(&m).copied();
             if let Some(b) = bucket {
@@ -565,11 +706,8 @@ impl History {
         let end = selection
             .start_minute
             .saturating_add(selection.step.max(1) as u64);
-        let span: Vec<_> = self
-            .buckets
-            .iter()
-            .filter(|b| b.minute >= selection.start_minute && b.minute < end)
-            .collect();
+        let buckets = self.read_buckets(selection.start_minute..end, None);
+        let span: Vec<_> = buckets.iter().collect();
         let mut detail = MomentDetail {
             selection,
             recorded_minutes: span.len(),

@@ -219,7 +219,19 @@ impl Monitor {
         let refresh = cx.spawn_in(window, async move |entity, cx| {
             let core = cx.background_executor().spawn(async { Arc::new(AppState::new()) }).await;
             if entity.update_in(cx, |this, _, _| this.core = Some(core.clone())).is_err() { return; }
-            let mut history = cx.background_executor().spawn(async { history::History::load(&history::support_path("history.json"), rack::now() as u64) }).await;
+            let opened = cx.background_executor().spawn(async {
+                history::History::open(&history::support_path("history.sqlite"), &history::support_path("history.json"), rack::now() as u64)
+            }).await;
+            let mut history = match opened {
+                Ok(history) => history,
+                Err(error) => {
+                    let _ = entity.update_in(cx, |this, _, cx| {
+                        this.status = format!("History could not be opened: {error}");
+                        cx.notify();
+                    });
+                    history::History::default()
+                }
+            };
             let mut cached_minute = None;
             let mut cached_moment = None;
             let mut cached_metric = None;
@@ -247,8 +259,14 @@ impl Monitor {
                     history.suspend();
                     if let Some(selection) = moment {
                         if cached_moment != Some(selection) || cached_metric != Some(metric) {
-                            let detail = history.moment(selection);
+                            let (returned_history, detail, error) = cx.background_executor().spawn(async move {
+                                let detail = history.moment(selection);
+                                let error = history.take_error();
+                                (history, detail, error)
+                            }).await;
+                            history = returned_history;
                             let _ = entity.update_in(cx, |this, _, cx| {
+                                if let Some(error) = error { this.status = format!("History could not be read: {error}"); }
                                 if this.moment == Some(selection) {
                                     this.replace_moment_rows(detail.ranked(metric));
                                     this.moment_detail = Some(detail);
@@ -275,13 +293,15 @@ impl Monitor {
                     }
                     if let Some((key, name, command, cpu, needs_analysis)) = selected_detail.as_ref() {
                         if *needs_analysis || cached_analysis_key != Some(*key) {
-                            let analysis = history.analyze_process(
-                                name,
-                                command,
-                                *cpu,
-                                rack::now() as u64 / 60,
-                            );
+                            let (name, command, cpu) = (name.clone(), command.clone(), *cpu);
+                            let (returned_history, analysis, error) = cx.background_executor().spawn(async move {
+                                let analysis = history.analyze_process(&name, &command, cpu, rack::now() as u64 / 60);
+                                let error = history.take_error();
+                                (history, analysis, error)
+                            }).await;
+                            history = returned_history;
                             let _ = entity.update_in(cx, |this, _, cx| {
+                                if let Some(error) = error { this.status = format!("History could not be read: {error}"); }
                                 if let Some(details) = this.details.as_mut().filter(|details| details.key == *key) {
                                     details.analysis = Some(analysis);
                                     cx.notify();
@@ -345,9 +365,10 @@ impl Monitor {
                         if minute_changed {
                             cached_minute = Some(minute);
                             views = Some([1,8,24].map(|hours| history.view(hours, now as u64)));
-                            history_save=Some(history.save(&history::support_path("history.json")).map_err(|e|e.to_string()));
+                            history_save=Some(history.persist(now as u64).map_err(|e|e.to_string()));
                         }
                     }
+                    if let Some(error) = history.take_error() { history_save = Some(Err(error)); }
                     let selected_key = match selected_detail {
                         Some((key, _, _, _, _)) if snapshot.is_ok() || previous_analysis_key == Some(key) => Some(key),
                         _ => None,
@@ -404,6 +425,11 @@ impl Monitor {
                 futures::pin_mut!(timer, event);
                 futures::select! { _ = timer => {}, event = event => { if event.is_none() { break; } } }
             }
+            cx.background_executor().spawn(async move {
+                if let Err(error) = history.persist(rack::now() as u64) {
+                    eprintln!("History could not be saved at shutdown: {error}");
+                }
+            }).await;
         });
         let frames = cx.spawn_in(window, async move |entity, cx| {
             let mut previous = None;
