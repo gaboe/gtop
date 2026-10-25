@@ -469,7 +469,7 @@ impl History {
         let b = &mut self.buckets[index];
         let mut sampled_processes = BTreeMap::<String, ProcessTotal>::new();
         let mut distinct_names = b.processes.len();
-        for process in &snapshot.processes {
+        for process in snapshot.processes.iter() {
             if !b.processes.contains_key(&process.name)
                 && !sampled_processes.contains_key(&process.name)
                 && distinct_names >= MAX_NAMES
@@ -596,12 +596,12 @@ mod tests {
         let mut snapshot = crate::test_data::snapshot();
         snapshot.processes = (1..=MAX_NAMES as u32)
             .map(|pid| crate::test_data::process(pid, &format!("process-{pid}"), 1.))
-            .collect();
-        let rest = snapshot.processes.split_off(2048);
+            .collect::<Vec<_>>()
+            .into();
+        let rest = std::sync::Arc::make_mut(&mut snapshot.processes).split_off(2048);
         history.record(&snapshot, 6000., 3.);
-        snapshot.processes.extend(rest);
-        snapshot
-            .processes
+        std::sync::Arc::make_mut(&mut snapshot.processes).extend(rest);
+        std::sync::Arc::make_mut(&mut snapshot.processes)
             .push(crate::test_data::process(9999, "extra", 1.));
         history.record(&snapshot, 6003., 3.);
         assert_eq!(history.buckets[0].processes.len(), MAX_NAMES);
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn stale_rows_do_not_add_work_or_peaks_and_recovery_spans_missed_samples() {
         let mut s = crate::test_data::snapshot();
-        s.processes = vec![crate::test_data::process(1, "owned", 100.)];
+        s.processes = std::sync::Arc::new(vec![crate::test_data::process(1, "owned", 100.)]);
         let mut h = History::default();
         h.record(&s, 6054., 3.);
         h.record(&s, 6057., 3.);
@@ -805,7 +805,7 @@ mod tests {
             since: std::time::Instant::now(),
             reason: "failed".into(),
         };
-        s.processes[0].memory_usage = 99999;
+        std::sync::Arc::make_mut(&mut s.processes)[0].memory_usage = 99999;
         s.stats.memory_used = 900;
         for now in [6060., 6063.] {
             h.record(&s, now, 3.);
@@ -816,9 +816,9 @@ mod tests {
         }
         assert_eq!(h.buckets.back().unwrap().peak_memory, 900.);
         s.process_data = gtop_core::ProcessData::Fresh;
-        s.processes[0].cpu_usage = 100. / 3.;
-        s.processes[0].gpu_usage = Some(100. / 6.);
-        s.processes[0].memory_usage = 2048;
+        std::sync::Arc::make_mut(&mut s.processes)[0].cpu_usage = 100. / 3.;
+        std::sync::Arc::make_mut(&mut s.processes)[0].gpu_usage = Some(100. / 6.);
+        std::sync::Arc::make_mut(&mut s.processes)[0].memory_usage = 2048;
         h.record(&s, 6066., 3.);
         let total = &h.view(1, 6066).rows[0].1;
         assert!((total.cpu_seconds - 6.).abs() < 0.00001);

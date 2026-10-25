@@ -5,7 +5,7 @@
 
 use crate::monitoring::{collect_ports_by_pid, ProcessMonitor, SystemMonitor};
 use crate::{perf_enabled, CpuTopology, ProcessData, Snapshot};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use sysinfo::{DiskRefreshKind, Disks, Networks, System};
 
@@ -27,7 +27,7 @@ pub struct AppState {
     /// Apple Silicon performance and efficiency core counts, read at startup.
     cpu_topology: CpuTopology,
     #[cfg(target_os = "macos")]
-    process_rows: Mutex<(Vec<crate::ProcessInfo>, ProcessData)>,
+    process_rows: Mutex<(Arc<Vec<crate::ProcessInfo>>, ProcessData)>,
 }
 
 impl AppState {
@@ -66,7 +66,7 @@ impl AppState {
             networks: Mutex::new(networks),
             cpu_topology: CpuTopology::detect(),
             #[cfg(target_os = "macos")]
-            process_rows: Mutex::new((Vec::new(), ProcessData::Fresh)),
+            process_rows: Mutex::new((Arc::new(Vec::new()), ProcessData::Fresh)),
         }
     }
 }
@@ -79,6 +79,23 @@ impl Default for AppState {
 
 impl AppState {
     pub fn snapshot(&self, include_environ: bool, include_ports: bool) -> Result<Snapshot, String> {
+        self.snapshot_inner(include_environ, include_ports, None)
+    }
+
+    pub fn snapshot_with_cached_ports(
+        &self,
+        include_environ: bool,
+        ports: &std::collections::HashMap<u32, Vec<u16>>,
+    ) -> Result<Snapshot, String> {
+        self.snapshot_inner(include_environ, false, Some(ports))
+    }
+
+    fn snapshot_inner(
+        &self,
+        include_environ: bool,
+        include_ports: bool,
+        cached_ports: Option<&std::collections::HashMap<u32, Vec<u16>>>,
+    ) -> Result<Snapshot, String> {
         let mut sys = self.sys.lock().map_err(|e| e.to_string())?;
         let mut disks = self.disks.lock().map_err(|e| e.to_string())?;
         let mut networks = self.networks.lock().map_err(|e| e.to_string())?;
@@ -92,18 +109,26 @@ impl AppState {
         let refreshed = Instant::now();
         let mut process_monitor = self.process_monitor.lock().map_err(|e| e.to_string())?;
         let mut system_monitor = self.system_monitor.lock().map_err(|e| e.to_string())?;
-        let ports_by_pid = if include_ports {
-            collect_ports_by_pid()
+        let collected_ports;
+        let ports_by_pid = if let Some(ports) = cached_ports {
+            ports
         } else {
-            Default::default()
+            collected_ports = if include_ports {
+                collect_ports_by_pid()
+            } else {
+                Default::default()
+            };
+            &collected_ports
         };
         #[cfg(not(target_os = "macos"))]
-        let processes = process_monitor.collect_processes(&sys, include_environ, &ports_by_pid)?;
+        let processes =
+            Arc::new(process_monitor.collect_processes(&sys, include_environ, ports_by_pid)?);
         #[cfg(target_os = "macos")]
         let (processes, process_data) = {
             let mut previous = self.process_rows.lock().map_err(|e| e.to_string())?;
-            match process_monitor.collect_native_processes(include_environ, &ports_by_pid) {
+            match process_monitor.collect_native_processes(include_environ, ports_by_pid) {
                 Ok(rows) => {
+                    let rows = Arc::new(rows);
                     *previous = (rows.clone(), ProcessData::Fresh);
                     (rows, ProcessData::Fresh)
                 }
@@ -245,6 +270,19 @@ mod tests {
     }
 
     #[test]
+    fn cached_ports_are_attached_before_rows_are_shared() {
+        let state = AppState::new();
+        let ports = [(std::process::id(), vec![12345])].into_iter().collect();
+        let snapshot = state.snapshot_with_cached_ports(false, &ports).unwrap();
+        let own = snapshot
+            .processes
+            .iter()
+            .find(|row| row.pid == std::process::id())
+            .unwrap();
+        assert_eq!(own.ports, vec![12345]);
+    }
+
+    #[test]
     fn snapshot_contains_this_process_and_system_stats() {
         let state = AppState::new();
         let snapshot = state.snapshot(false, false).unwrap();
@@ -276,6 +314,7 @@ mod tests {
             .fail_next_native_collection();
 
         let fallback = state.snapshot(false, false).unwrap();
+        assert!(Arc::ptr_eq(&fresh.processes, &fallback.processes));
         assert!(fallback.stats.memory_total > 0);
         assert!(matches!(fallback.process_data, ProcessData::Stale { .. }));
         assert_eq!(
@@ -293,6 +332,7 @@ mod tests {
             .unwrap()
             .fail_next_native_collection();
         let repeated = state.snapshot(false, false).unwrap();
+        assert!(Arc::ptr_eq(&fresh.processes, &repeated.processes));
         assert_eq!(repeated.process_data, fallback.process_data);
         assert_eq!(
             format!("{:?}", repeated.processes),

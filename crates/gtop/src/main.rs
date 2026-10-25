@@ -305,10 +305,14 @@ impl Monitor {
                 let previous_analysis_key = cached_analysis_key;
                 let result = cx.background_executor().spawn(async move {
                     let start = std::time::Instant::now();
-                    let mut snapshot = state.snapshot(false, ports);
-                    if let Ok(ref mut snapshot)=snapshot {
-                        if !ports { if let Ok(cached)=port_cache.lock(){for p in &mut snapshot.processes {if let Some(ports)=cached.get(&p.pid){p.ports=ports.clone();}}} }
-                    }
+                    let snapshot = if !ports {
+                        match port_cache.lock() {
+                            Ok(cached) => state.snapshot_with_cached_ports(false, &cached),
+                            Err(_) => state.snapshot(false, false),
+                        }
+                    } else {
+                        state.snapshot(false, true)
+                    };
                     let tick_ms = start.elapsed().as_secs_f64() * 1000.;
                     let mut views = None;
                     let mut moment_detail = None;
@@ -541,7 +545,7 @@ impl Monitor {
                 details.observe(process, now as u64);
             }
         }
-        for p in &snapshot.processes {
+        for p in snapshot.processes.iter() {
             let trace = self.traces.entry(ProcessKey::from(p)).or_default();
             trace.push_back((now, p.cpu_usage));
             while trace.front().is_some_and(|(t, _)| *t < now - 90.) || trace.len() > 90 {

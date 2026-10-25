@@ -6,7 +6,7 @@ pub use state::AppState;
 
 #[derive(Debug)]
 pub struct Snapshot {
-    pub processes: Vec<ProcessInfo>,
+    pub processes: std::sync::Arc<Vec<ProcessInfo>>,
     pub process_data: ProcessData,
     pub stats: SystemStats,
     pub cpu_topology: CpuTopology,

@@ -27,12 +27,12 @@ pub fn process(pid: u32, name: &str, cpu: f32) -> ProcessInfo {
 pub fn snapshot() -> Snapshot {
     Snapshot {
         process_data: gtop_core::ProcessData::Fresh,
-        processes: vec![
+        processes: std::sync::Arc::new(vec![
             process(1, "rustc", 200.),
             process(2, "rustc", 150.),
             process(3, "cargo", 110.),
             process(4, "quiet", 50.),
-        ],
+        ]),
         stats: SystemStats {
             cpu_usage: vec![50.; 4],
             memory_total: 1000,

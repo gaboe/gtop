@@ -273,8 +273,8 @@ mod tests {
         let mut snapshot = crate::test_data::snapshot();
         assert_eq!(super::current_cpu(&snapshot.processes, "rustc"), 350.);
         assert!(super::now_sentence(350., 350.).contains("about its usual"));
-        snapshot.processes[0].cpu_usage = 0.;
-        snapshot.processes[1].cpu_usage = 0.;
+        std::sync::Arc::make_mut(&mut snapshot.processes)[0].cpu_usage = 0.;
+        std::sync::Arc::make_mut(&mut snapshot.processes)[1].cpu_usage = 0.;
         assert!(
             super::now_sentence(super::current_cpu(&snapshot.processes, "rustc"), 350.)
                 .contains("below its usual")

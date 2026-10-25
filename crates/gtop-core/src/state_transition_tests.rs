@@ -78,9 +78,10 @@ for line in sys.stdin:
         );
         snapshot
             .processes
-            .into_iter()
+            .iter()
             .find(|row| row.pid == self.child.id())
             .unwrap()
+            .clone()
     }
 }
 

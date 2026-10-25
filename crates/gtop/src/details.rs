@@ -790,12 +790,12 @@ mod tests {
         let mut snapshot = crate::test_data::snapshot();
         let key = ProcessKey::from(&snapshot.processes[0]);
         assert!(!kill_completed(key, &snapshot.processes));
-        snapshot.processes[0].status = "Zombie".into();
+        std::sync::Arc::make_mut(&mut snapshot.processes)[0].status = "Zombie".into();
         assert!(kill_completed(key, &snapshot.processes));
-        snapshot.processes[0].status = "Running".into();
-        snapshot.processes[0].start_time += 1;
+        std::sync::Arc::make_mut(&mut snapshot.processes)[0].status = "Running".into();
+        std::sync::Arc::make_mut(&mut snapshot.processes)[0].start_time += 1;
         assert!(kill_completed(key, &snapshot.processes));
-        snapshot.processes.clear();
+        std::sync::Arc::make_mut(&mut snapshot.processes).clear();
         assert!(kill_completed(key, &snapshot.processes));
     }
 
