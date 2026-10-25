@@ -222,6 +222,8 @@ pub(super) struct Collector {
     last_collection: Option<Instant>,
     #[cfg(test)]
     unavailable_counters: Option<u32>,
+    #[cfg(test)]
+    unavailable_identity: Option<u32>,
 }
 impl Collector {
     #[cfg(test)]
@@ -272,10 +274,21 @@ impl Collector {
                 let pid = pid as u32;
                 live.insert(pid);
                 let bsd = info::<proc_bsdinfo>(pid, PROC_PIDTBSDINFO);
+                #[cfg(test)]
+                let bsd = if self.unavailable_identity == Some(pid) {
+                    self.unavailable_identity = None;
+                    None
+                } else {
+                    bsd
+                };
                 let identity = bsd
                     .as_ref()
                     .map(|b| (b.pbi_start_tvsec, b.pbi_start_tvusec));
-                if identity.is_none() || self.records.get(&pid).map(|r| r.identity) != identity {
+                if identity.is_none() {
+                    samples.push((pid, bsd));
+                    continue;
+                }
+                if self.records.get(&pid).map(|r| r.identity) != identity {
                     self.records.remove(&pid);
                     metadata.push(Pid::from_u32(pid));
                 }
@@ -301,6 +314,19 @@ impl Collector {
             }
             let mut rows = Vec::with_capacity(samples.len());
             for (pid, bsd) in samples {
+                let Some(bsd) = bsd else {
+                    if let Some(record) = self.records.get(&pid) {
+                        let mut row = record.row.clone();
+                        row.cpu_usage = 0.;
+                        row.disk_usage = (0, 0);
+                        row.disk_sample_seconds = None;
+                        if !include_environ {
+                            row.environ.clear();
+                        }
+                        rows.push(row);
+                    }
+                    continue;
+                };
                 let sampled = Instant::now();
                 let task = info::<proc_taskinfo>(pid, PROC_PIDTASKINFO);
                 #[cfg(test)]
@@ -333,10 +359,7 @@ impl Collector {
                     self.records.insert(
                         pid,
                         Record {
-                            identity: bsd
-                                .as_ref()
-                                .map(|b| (b.pbi_start_tvsec, b.pbi_start_tvusec))
-                                .unwrap_or_default(),
+                            identity: (bsd.pbi_start_tvsec, bsd.pbi_start_tvusec),
                             row: process_row(
                                 pid,
                                 process,
@@ -381,8 +404,10 @@ impl Collector {
                         }
                     }
                 }
+                record.row.start_time = bsd.pbi_start_tvsec;
+                record.row.ppid = bsd.pbi_ppid;
                 let mut row = record.row.clone();
-                if let Some(bsd) = bsd {
+                {
                     row.ppid = bsd.pbi_ppid;
                     row.start_time = bsd.pbi_start_tvsec;
                     let status = if bsd.pbi_status == 2 {
@@ -474,6 +499,15 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(500));
         let users = sysinfo::Users::new_with_refreshed_list();
+        let mut unseen = Collector {
+            unavailable_identity: Some(child.0.id()),
+            ..Default::default()
+        };
+        assert!(!unseen
+            .collect(&users, false, &HashMap::new())
+            .unwrap()
+            .iter()
+            .any(|p| p.pid == child.0.id()));
         let mut collector = Collector::default();
         let mut ports = HashMap::new();
         ports.insert(child.0.id(), vec![12345]);
@@ -487,6 +521,14 @@ mod tests {
         assert!(first.memory_usage >= 16 * 1024 * 1024);
         assert!(first.virtual_memory >= first.memory_usage);
         assert_eq!(first.ports, [12345]);
+        collector.unavailable_identity = Some(child.0.id());
+        let unavailable = collector.collect(&users, false, &ports).unwrap();
+        let unavailable = unavailable.iter().find(|p| p.pid == child.0.id()).unwrap();
+        assert_eq!(unavailable.start_time, first.start_time);
+        assert_eq!(unavailable.command, first.command);
+        assert_eq!(unavailable.disk_usage, (0, 0));
+        assert_eq!(unavailable.disk_sample_seconds, None);
+        assert_eq!(unavailable.cpu_usage, 0.);
         let identity = collector.records[&child.0.id()].identity;
         let cached = &mut collector.records.get_mut(&child.0.id()).unwrap().row;
         cached.executable.clear();

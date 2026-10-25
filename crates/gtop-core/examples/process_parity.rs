@@ -21,6 +21,7 @@ fn main() {
         let after: HashMap<_, _> = after.into_iter().map(|p| (p.pid, p)).collect();
         let native: HashMap<_, _> = native.into_iter().map(|p| (p.pid, p)).collect();
         let mut missing = 0;
+        let mut identity_unavailable = 0;
         let mut static_errors = 0;
         let mut static_compared = 0;
         let mut static_skipped = 0;
@@ -33,6 +34,10 @@ fn main() {
             let Some(b) = after.get(pid).filter(|b| b.start_time == a.start_time) else {
                 continue;
             };
+            if a.start_time == 0 {
+                identity_unavailable += 1;
+                continue;
+            }
             let Some(n) = native.get(pid) else {
                 eprintln!("missing tick={tick} pid={pid} before={a:?} after={b:?}");
                 missing += 1;
@@ -91,7 +96,7 @@ fn main() {
             }
         }
         failed |= missing > 0 || static_errors > 0 || status_errors > 0;
-        println!("{{\"tick\":{tick},\"before\":{},\"native\":{},\"after\":{},\"missing\":{missing},\"static_errors\":{static_errors},\"static_compared\":{static_compared},\"static_skipped\":{static_skipped},\"status_errors\":{status_errors},\"memory_outside_bracket\":{memory_outside_bracket}}}", before.len(),native.len(),after.len());
+        println!("{{\"tick\":{tick},\"before\":{},\"native\":{},\"after\":{},\"missing\":{missing},\"identity_unavailable\":{identity_unavailable},\"static_errors\":{static_errors},\"static_compared\":{static_compared},\"static_skipped\":{static_skipped},\"status_errors\":{status_errors},\"memory_outside_bracket\":{memory_outside_bracket}}}", before.len(),native.len(),after.len());
         std::thread::sleep(Duration::from_secs(1));
     }
     if failed {
