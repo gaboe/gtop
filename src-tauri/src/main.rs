@@ -5,11 +5,9 @@
 //! application, initializes plugins, and configures window effects.
 
 mod commands;
-mod monitoring;
-mod state;
 mod ui;
 
-use state::AppState;
+use gtop_core::AppState;
 use tauri::Manager;
 
 /// Main entry point for the application

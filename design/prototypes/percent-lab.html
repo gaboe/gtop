@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gtop · Percent readouts</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=JetBrains+Mono:wght@400;600&family=Silkscreen&family=Doto:wght@600;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="rack-base.css">
+<link rel="stylesheet" href="vfd.css">
+<style>
+body { overflow: auto; }
+.lab-page { padding: 20px; display: grid; gap: 16px; }
+.lab-head { display: flex; justify-content: space-between; align-items: baseline; gap: 20px; }
+.lab-head h1 { margin: 0; font-family: Archivo; font-stretch: 62%; font-weight: 800; font-size: 34px; line-height: 34px; text-transform: uppercase; color: var(--silk); }
+.lab-head p { margin: 0; max-width: 70ch; color: var(--silk-dim); font: 12px/18px "JetBrains Mono", monospace; }
+.variants { display: grid; grid-template-columns: repeat(4, minmax(250px, 1fr)); gap: 10px; }
+.variant { display: grid; gap: 8px; align-content: start; padding: 12px; background: var(--plate); border: 1px solid var(--rule); }
+.variant > header { display: grid; gap: 4px; min-height: 64px; }
+.variant > header b { font-family: Archivo; font-stretch: 75%; font-weight: 800; font-size: 15px; letter-spacing: .08em; text-transform: uppercase; color: var(--silk); }
+.variant > header span { color: var(--silk-dim); font: 11px/15px "JetBrains Mono", monospace; }
+.variant .win > * { position: relative; z-index: 1; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; }
+.row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.vfd { white-space: pre; }
+
+/* B · unit plate: a smaller lit unit at cap height, part of the readout */
+.u-plate { font-family: Archivo; font-stretch: 75%; font-weight: 800; font-size: max(9px, .36em); line-height: 1; letter-spacing: .04em; vertical-align: top; margin-left: .18em; color: color-mix(in oklab, var(--led) 70%, var(--ground)); position: relative; top: .2em; }
+.u-plate.hot { color: color-mix(in oklab, var(--hot) 75%, var(--ground)); }
+
+/* F · full-size clear unit: Archivo % at digit height, lit and glowing like the digits */
+.u-full { font-family: Archivo; font-stretch: 75%; font-weight: 700; font-size: .92em; line-height: 1; margin-left: .06em; color: var(--led); text-shadow: 0 0 calc(8px * var(--glow)) color-mix(in srgb, var(--led) 60%, transparent); }
+.u-full.hot { color: var(--hot); text-shadow: 0 0 calc(8px * var(--glow)) color-mix(in srgb, var(--hot) 65%, transparent); }
+
+/* G · pixel unit: Silkscreen % at digit height */
+.u-px { font-family: Silkscreen; font-size: .62em; line-height: 1; margin-left: .1em; color: var(--led); text-shadow: 0 0 calc(8px * var(--glow)) color-mix(in srgb, var(--led) 60%, transparent); }
+.u-px.hot { color: var(--hot); text-shadow: 0 0 calc(8px * var(--glow)) color-mix(in srgb, var(--hot) 65%, transparent); }
+/* H · 5×7 dot-matrix %, the classic VFD/LCD character, with unlit dots behind */
+.u-dm { height: .74em; width: auto; margin-left: .12em; color: var(--led); filter: drop-shadow(0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--led) 60%, transparent)); overflow: visible; align-self: baseline; }
+.u-dm.hot { color: var(--hot); filter: drop-shadow(0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--hot) 65%, transparent)); }
+.u-dm .off { fill: color-mix(in oklab, var(--led) 18%, var(--ground)); }
+.u-dm .on { fill: currentColor; }
+/* I · mono unit: JetBrains Mono semibold % */
+.u-mono { font-family: "JetBrains Mono"; font-weight: 600; font-size: .8em; line-height: 1; margin-left: .06em; color: var(--led); text-shadow: 0 0 calc(8px * var(--glow)) color-mix(in srgb, var(--led) 60%, transparent); }
+.u-mono.hot { color: var(--hot); }
+.unitrow { display: inline-flex; align-items: baseline; }
+
+/* C · annunciator: a small dot-matrix % on the baseline, lit with the digits */
+.u-ann { font-family: Doto; font-weight: 900; font-size: max(11px, .46em); line-height: 1; margin-left: .12em; color: var(--led); text-shadow: 0 0 calc(5px * var(--glow)) color-mix(in srgb, var(--led) 55%, transparent); }
+.u-ann.hot { color: var(--hot); }
+
+/* E · printed legend: the unit is silk-printed on the glass, not lit */
+.legend-wrap { position: relative; display: inline-block; padding-right: max(16px, 1.05em); }
+.legend { position: absolute; right: 0; top: .1em; font-family: Archivo; font-stretch: 75%; font-weight: 700; font-size: max(8px, .26em); letter-spacing: .12em; color: var(--silk-dim); border: 1px solid var(--rule-hi); padding: 1px 3px 0; line-height: 1.25; }
+
+.state { display: grid; gap: 4px; }
+.state > .silk { font-size: 9px; }
+.cores { display: flex; gap: 3px; height: 26px; align-items: flex-end; margin-top: 6px; }
+.cores b { flex: 1; background: var(--led); }
+.cores b.hot { background: var(--hot); }
+.pick { display: flex; gap: 8px; align-items: center; }
+</style>
+</head>
+<body>
+<div class="lab-page" id="app"></div>
+<script>window.UI = { ui: {} };</script>
+<script src="theme.js"></script>
+<script>
+const lit = (txt, cls = "") => `<span class="ghost"><span class="vfd dim ${cls}">${String(txt).replace(/[0-9 ]/g, "8")}</span><span class="vfd ${cls}">${txt}</span></span>`;
+const pad3 = (n) => String(Math.round(n)).padStart(3, " ");
+
+const DM = ["11000", "11001", "00010", "00100", "01000", "10011", "00011"];
+const dmPct = (hot) => `<svg class="u-dm ${hot ? "hot" : ""}" viewBox="0 0 10 14" aria-label="percent">${DM.map((r, y) => [...r].map((b, x) => `<circle class="${b === "1" ? "on" : "off"}" cx="${x * 2 + 1}" cy="${y * 2 + 1}" r=".82"/>`).join("")).join("")}</svg>`;
+// Each variant formats one percent readout and names its label.
+const ALL = [
+  { key: "A", name: "Current", note: "Dot-matrix % at full digit size. The % is as loud as the number and the field width jumps.",
+    pct: (n, hot) => lit(Math.round(n) + "%", hot ? "hot" : ""), label: (l) => l },
+  { key: "B", name: "Unit plate", note: "Fixed 888 field. A small lit % sits at cap height, like the unit cell on a real VFD tube.",
+    pct: (n, hot) => lit(pad3(n), hot ? "hot" : "") + `<span class="u-plate ${hot ? "hot" : ""}">%</span>`, label: (l) => l },
+  { key: "F", name: "Clear unit, full size", note: "Fixed 888 field. A plain Archivo % at digit height, lit and glowing with the digits.",
+    pct: (n, hot) => `<span class="unitrow">` + lit(pad3(n), hot ? "hot" : "") + `<span class="u-full ${hot ? "hot" : ""}">%</span></span>`, label: (l) => l },
+  { key: "G", name: "Pixel %", note: "Fixed 888 field. Silkscreen pixel % at digit height. Square corners, still reads as percent.",
+    pct: (n, hot) => `<span class="unitrow">${lit(pad3(n), hot ? "hot" : "")}<span class="u-px ${hot ? "hot" : ""}">%</span></span>`, label: (l) => l },
+  { key: "H", name: "5×7 dot matrix %", note: "Fixed 888 field. The classic 5×7 VFD character: two dot squares and a clean diagonal, unlit dots behind it like the 888.",
+    pct: (n, hot) => `<span class="unitrow">${lit(pad3(n), hot ? "hot" : "")}${dmPct(hot)}</span>`, label: (l) => l },
+  { key: "I", name: "Mono %", note: "Fixed 888 field. JetBrains Mono semibold %, the same face as the table numbers.",
+    pct: (n, hot) => `<span class="unitrow">${lit(pad3(n), hot ? "hot" : "")}<span class="u-mono ${hot ? "hot" : ""}">%</span></span>`, label: (l) => l },
+  { key: "C", name: "Annunciator", note: "Fixed 888 field. A half-size dot-matrix % on the baseline, lit with the digits.",
+    pct: (n, hot) => lit(pad3(n), hot ? "hot" : "") + `<span class="u-ann ${hot ? "hot" : ""}">%</span>`, label: (l) => l },
+  { key: "D", name: "Unit in label", note: "Digits only in the glass. The label above carries the unit, so the readout is pure number.",
+    pct: (n, hot) => lit(pad3(n), hot ? "hot" : ""), label: (l) => l + " %" },
+  { key: "E", name: "Printed legend", note: "Fixed 888 field. The unit is printed on the glass in silk, boxed, never lit.",
+    pct: (n, hot) => `<span class="legend-wrap">${lit(pad3(n), hot ? "hot" : "")}<span class="legend">%</span></span>`, label: (l) => l },
+];
+
+const V = ALL.filter((v) => ["F", "G", "H", "I"].includes(v.key));
+const states = [
+  { name: "Idle", cpu: 4, gpu: 2, src: 3, cores: [6, 3, 8, 2, 4, 3, 5, 2, 3, 4, 2, 3, 1, 2] },
+  { name: "Build", cpu: 67, gpu: 55, src: 29, cores: [92, 70, 96, 81, 66, 99, 74, 60, 85, 40, 22, 18, 12, 16] },
+  { name: "Full, over limit", cpu: 100, gpu: 97, src: 88, cores: Array(14).fill(100) },
+];
+
+function variant(v) {
+  const blocks = states.map((s) => {
+    const hot = s.cpu > 85;
+    return `<div class="state"><span class="silk">${s.name}</span>
+      <div class="win"><div class="split2"><span class="lab">${v.label("CPU")} · 14 cores</span><span class="lab">Load ${(s.cpu / 7).toFixed(1)}</span></div>
+        <div class="big">${v.pct(s.cpu, hot)}</div>
+        <div class="cores">${s.cores.map((c) => `<b class="${c > 90 ? "hot" : ""}" style="height:${Math.max(3, c)}%"></b>`).join("")}</div></div>
+      <div class="win pair"><div><span class="lab">${v.label("GPU")}</span><div class="mid">${v.pct(s.gpu, s.gpu > 90)}</div></div>
+        <div><span class="lab">Load source</span><div class="mid">${v.pct(s.src, s.src > 50)}</div></div></div></div>`;
+  }).join("");
+  const small = `<div class="win row3"><div><span class="lab">${v.label("Mem")}</span><div class="sm">${v.pct(81, false)}</div></div><div><span class="lab">${v.label("Swap")}</span><div class="sm">${v.pct(7, false)}</div></div><div><span class="lab">${v.label("Bat")}</span><div class="sm">${v.pct(100, false)}</div></div></div>`;
+  return `<section class="variant" aria-label="Variant ${v.key}"><header><b>${v.key} · ${v.name}</b><span>${v.note}</span></header>${blocks}<div class="state"><span class="silk">Small readouts</span>${small}</div></section>`;
+}
+
+document.getElementById("app").innerHTML = `<div class="lab-head"><h1>Percent readouts</h1>
+  <p>Same values in four treatments: idle, a build, and a saturated Mac over the hot limit. Press T to try the other palettes.</p></div>
+  <div class="variants">${V.map(variant).join("")}</div>`;
+document.addEventListener("keydown", (e) => { if (e.key === "t") THEME.hooks.key("t"); });
+</script>
+</body>
+</html>

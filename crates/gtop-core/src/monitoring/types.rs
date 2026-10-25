@@ -23,6 +23,8 @@ pub struct ProcessInfo {
     pub user: String,
     /// Full command string
     pub command: String,
+    pub executable: String,
+    pub argv: Vec<String>,
     /// Number of threads (if available)
     pub threads: Option<u32>,
     /// Environment variables
@@ -90,6 +92,8 @@ pub struct SystemStats {
     pub memory_free: u64,
     /// Cached memory in bytes
     pub memory_cached: u64,
+    /// Swap in use in bytes, from the same memory refresh.
+    pub swap_used: u64,
     /// System uptime in seconds
     pub uptime: u64,
     /// Load averages for 1, 5, and 15 minutes

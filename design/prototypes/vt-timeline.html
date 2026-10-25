@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gtop · VFD tower timeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=JetBrains+Mono:wght@400;600&family=Silkscreen&family=Doto:wght@600;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="rack-base.css">
+<link rel="stylesheet" href="vfd.css">
+<style>
+:root { --tw: 300px; }
+#app { display: grid; grid-template-columns: var(--tw) minmax(0, 1fr); gap: var(--gap); height: 100vh; padding: var(--edge); }
+#app.with-side { grid-template-columns: var(--tw) minmax(0, 1fr) 380px; }
+.right { display: grid; gap: var(--gap); min-height: 0; min-width: 0; }
+.nav { display: flex; gap: 6px; min-width: 0; }
+.right .strip { overflow: hidden; } .right .strip .synth { display: none; }
+.right { grid-template-rows: auto auto 1fr auto; }
+.recent { display: grid; grid-template-columns: 1fr auto; gap: 6px 16px; align-items: end; }
+.recent .vtape { height: 54px; grid-column: 1 / -1; }
+.recent { gap: 8px 16px; }
+.recent .top3 { display: flex; gap: 16px; align-items: baseline; position: relative; z-index: 1; grid-column: 1 / -1; }
+.rhead { grid-column: 1 / -1; display: flex; align-items: center; gap: 14px; position: relative; z-index: 1; }
+.rhead > .lab:last-child { margin-left: auto; }
+.mtabs { display: inline-flex; gap: 2px; }
+.mtab { font-family: Archivo; font-stretch: 75%; font-weight: 700; font-size: 9px; letter-spacing: .16em; text-transform: uppercase; background: transparent; border: 1px solid color-mix(in oklab, var(--led) 25%, var(--ground)); color: color-mix(in oklab, var(--led) 55%, var(--ground)); padding: 3px 8px; cursor: pointer; }
+.mtab:hover { color: var(--led); }
+.mtab[aria-pressed="true"] { background: var(--led); border-color: var(--led); color: var(--on-led); box-shadow: 0 0 calc(8px * var(--glow)) color-mix(in srgb, var(--led) 50%, transparent); }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="data.js"></script>
+<script src="ui.js"></script>
+<script src="theme.js"></script>
+<script src="rack-kit.js"></script>
+<script src="vfd-kit.js"></script>
+<script>
+const app = document.getElementById("app");
+let metric = "cpu";
+const ORDER = ["cpu", "mem", "gpu", "temp"];
+// Top three for the last hour, ranked by what the chosen metric means per process.
+function leaders(h, fmt) {
+  if (metric === "temp") {
+    const live = h.slice.filter((b) => !b.closed);
+    const peak = live.reduce((a, b) => (b.temp > a.temp ? b : a), live[0]);
+    const avg = live.reduce((a, b) => a + b.temp, 0) / live.length;
+    return `<span><span class="lab">Peak at ${fmt.clock(peak.t)}</span> ${KIT.unit(peak.temp.toFixed(0), "°", peak.temp > 90 ? "sm hot" : "sm")}</span><span><span class="lab">Average</span> ${KIT.unit(avg.toFixed(0), "°", "sm")}</span>`;
+  }
+  const key = { cpu: "cpuMin", gpu: "gpuMin", mem: "peakMem" }[metric];
+  const show = { cpu: (r) => fmt.mins(r.cpuMin).replace(" min", "m"), gpu: (r) => fmt.mins(r.gpuMin).replace(" min", "m"), mem: (r) => fmt.mem(r.peakMem) }[metric];
+  return h.rows.slice().sort((a, b) => b[key] - a[key]).slice(0, 3).map((r) => `<span><span class="lab">${r.name}</span> ${KIT.lit(show(r), "sm")}</span>`).join("");
+}
+const hooks = {
+  ...THEME.hooks,
+  key(k) {
+    if (k === "v") { metric = ORDER[(ORDER.indexOf(metric) + 1) % ORDER.length]; return true; }
+    const mo = UI.ui.moment;
+    if (mo && (k === "ArrowLeft" || k === "ArrowRight" || k === "h" || k === "l")) {
+      const at = mo.at + (k === "ArrowLeft" || k === "h" ? -mo.step : mo.step);
+      if (at >= 0 && at + mo.step <= GTOP.history.length) mo.at = at;
+      return true;
+    }
+    return THEME.hooks.key(k);
+  },
+  click(act, val, el) {
+    if (act === "metric") { metric = val; return true; }
+    if (act === "moment") { const [at, step] = val.split("-").map(Number); const ui = UI.ui; ui.moment = ui.moment && ui.moment.at === at && ui.moment.step === step ? null : { at, step }; ui.detailPid = null; ui.settingsOpen = false; return true; }
+    if (act === "momenthist") { UI.ui.view = "history"; UI.ui.hours = 1; return true; }
+    return THEME.hooks.click(act, val, el);
+  },
+};
+UI.start((m) => {
+  const { ui, fmt } = m;
+  const side = ui.settingsOpen ? THEME.panel() : ui.moment ? VFD.momentSide(m, metric) : m.detail ? VFD.detailSide(m) : "";
+  let main;
+  if (ui.view === "live") {
+    const h = GTOP.window(1), c = KIT.columns(h, fmt, { hours: 1, moment: ui.moment }, metric);
+    const tabs = ORDER.map((k) => `<button class="mtab" data-act="metric:${k}" aria-pressed="${k === metric}">${KIT.METRICS[k].label}</button>`).join("");
+    const what = { cpu: "core time", mem: "peak memory", gpu: "GPU time", temp: "" }[metric];
+    const recent = `<section class="win recent" aria-label="Last hour"><div class="rhead"><span class="lab">Last hour</span><span class="mtabs" role="group" aria-label="Metric">${tabs}</span><span class="lab">V switches · click a column for detail</span></div>
+      <span class="top3">${what ? `<span class="lab">Most ${what}</span>` : ""}${leaders(h, fmt)}</span><div class="vtape">${c.cols}</div></section>`;
+    main = recent + `<div class="screen">${KIT.liveTable(m, { noUser: !!side, noCmd: !!side })}</div>`;
+  } else main = `<div></div>` + VFD.histMain(m, 150);
+  app.classList.toggle("with-side", !!side);
+  keepSearch(VFD.tower(m) + `<div class="right"><nav class="nav">${KIT.bank(ui)}</nav>${main}${KIT.strip(m)}</div>` + side, app);
+}, hooks);
+</script>
+</body>
+</html>

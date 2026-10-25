@@ -63,6 +63,7 @@ impl SystemMonitor {
             cpu_usage: sys.cpus().iter().map(|cpu| cpu.cpu_usage()).collect(),
             memory_total: sys.total_memory(),
             memory_used: sys.used_memory(),
+            swap_used: sys.used_swap(),
             memory_free: sys.total_memory() - sys.used_memory(),
             memory_cached: sys.total_memory()
                 - (sys.used_memory() + (sys.total_memory() - sys.used_memory())),
@@ -147,8 +148,8 @@ mod tests {
     fn test_system_monitor_creation() {
         let networks = Networks::new();
         let monitor = SystemMonitor::new(&networks);
-        assert!(monitor.last_network_update.1 >= 0);
-        assert!(monitor.last_network_update.2 >= 0);
+        assert_eq!(monitor.last_network_update.1, 0);
+        assert_eq!(monitor.last_network_update.2, 0);
     }
 
     /// Tests system statistics collection

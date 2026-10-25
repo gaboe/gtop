@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gtop · Per-core load</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=JetBrains+Mono:wght@400;600&family=Silkscreen&family=Doto:wght@600;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="rack-base.css">
+<link rel="stylesheet" href="vfd.css">
+<style>
+body { overflow: auto; }
+.lab-page { padding: 20px; display: grid; gap: 16px; }
+.lab-head { display: flex; justify-content: space-between; align-items: baseline; gap: 20px; }
+.lab-head h1 { margin: 0; font-family: Archivo; font-stretch: 62%; font-weight: 800; font-size: 34px; line-height: 34px; text-transform: uppercase; color: var(--silk); }
+.lab-head p { margin: 0; max-width: 70ch; color: var(--silk-dim); font: 12px/18px "JetBrains Mono", monospace; }
+.variants { display: grid; grid-template-columns: repeat(3, 324px); gap: 14px; }
+.variant { display: grid; gap: 8px; align-content: start; padding: 12px; background: var(--plate); border: 1px solid var(--rule); }
+.variant > header { display: grid; gap: 4px; min-height: 78px; }
+.variant > header b { font-family: Archivo; font-stretch: 75%; font-weight: 800; font-size: 15px; letter-spacing: .08em; text-transform: uppercase; color: var(--silk); }
+.variant > header span { color: var(--silk-dim); font: 11px/15px "JetBrains Mono", monospace; }
+.win > * { position: relative; z-index: 1; }
+.ccount { display: flex; justify-content: space-between; }
+
+/* A · segmented columns: one 12-segment VFD column per core, grouped P and E */
+.cols { display: grid; grid-template-columns: 10fr 4fr; gap: 10px; margin-top: 8px; }
+.cgroup { display: grid; gap: 4px; }
+.cgroup .bank { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 3px; }
+.ccol { display: flex; flex-direction: column-reverse; gap: 2px; height: 66px; }
+.ccol i { flex: 1; background: color-mix(in oklab, var(--led) 12%, var(--ground)); }
+.ccol i.on { background: var(--led); box-shadow: 0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--led) 55%, transparent); }
+.ccol i.hot { background: var(--hot); box-shadow: 0 0 calc(4px * var(--glow)) color-mix(in srgb, var(--hot) 60%, transparent); }
+.cnum { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 3px; text-align: center; }
+.cnum span { font: 8px/10px Silkscreen, monospace; color: color-mix(in oklab, var(--led) 45%, var(--ground)); }
+.gname { white-space: nowrap; display: flex; justify-content: space-between; align-items: baseline; border-top: 1px solid color-mix(in oklab, var(--led) 22%, var(--ground)); padding-top: 3px; }
+
+/* B · core rows: one labeled segment bar per core with its value */
+.rows { display: grid; gap: 3px; margin-top: 8px; }
+.crow { display: grid; grid-template-columns: 24px 1fr 30px; gap: 8px; align-items: center; }
+.crow .id { font: 9px/10px Silkscreen, monospace; color: color-mix(in oklab, var(--led) 55%, var(--ground)); }
+.crow .bar { display: grid; grid-template-columns: repeat(24, 1fr); gap: 1px; height: 7px; }
+.crow .bar i { background: color-mix(in oklab, var(--led) 12%, var(--ground)); }
+.crow .bar i.on { background: var(--led); } .crow .bar i.hot { background: var(--hot); }
+.crow .v { font: 11px/11px Doto, monospace; font-weight: 900; text-align: right; color: var(--led); }
+.crow .v.hot { color: var(--hot); }
+.rsep { height: 1px; background: color-mix(in oklab, var(--led) 22%, var(--ground)); margin: 3px 0; }
+
+/* C · core heat strip: rows are cores, columns are the last 60 s, brightness is load */
+.heat { display: grid; gap: 2px; margin-top: 8px; }
+.hrow { display: grid; grid-template-columns: 22px 1fr 26px; gap: 6px; align-items: center; }
+.hrow .id { font: 8px/9px Silkscreen, monospace; color: color-mix(in oklab, var(--led) 50%, var(--ground)); }
+.hrow .cells { display: grid; grid-template-columns: repeat(60, 1fr); gap: 1px; height: 7px; }
+.hrow .cells i { background: color-mix(in oklab, var(--led) calc(var(--l) * 1%), color-mix(in oklab, var(--ground) 80%, #000)); }
+.hrow .cells i.hot { background: var(--hot); }
+.hrow .v { font: 10px/10px Doto, monospace; font-weight: 900; text-align: right; color: var(--led); }
+.hrow .v.hot { color: var(--hot); }
+.haxis { display: flex; justify-content: space-between; margin: 4px 28px 0 28px; }
+</style>
+</head>
+<body>
+<div class="lab-page" id="app"></div>
+<script>window.UI = { ui: {} };</script>
+<script src="data.js"></script>
+<script src="theme.js"></script>
+<script src="rack-kit.js"></script>
+<script>
+const P = 10, HOT = 90;
+const HIST = GTOP.state.cores.map(() => []);
+const id = (i) => (i < P ? "P" + (i + 1) : "E" + (i - P + 1));
+const segsOf = (n, pct) => { const on = Math.round(pct / 100 * n); return Array.from({ length: n }, (_, k) => `<i class="${k < on ? (pct > HOT && k >= n * 0.75 ? "hot" : "on") : ""}"></i>`).join(""); };
+const head = (s) => `<div class="split2"><span class="lab">CPU · 10 P + 4 E cores</span><span class="lab">Load ${s.load[0].toFixed(1)}</span></div>
+  <div class="big">${KIT.unit(String(Math.round(s.cpuTotal)).padStart(3, " "), "%", s.cpuTotal > 85 ? "hot" : "")}</div>`;
+
+function columns(s) {
+  const grp = (from, to, name) => {
+    const cs = s.cores.slice(from, to);
+    const avg = cs.reduce((a, b) => a + b, 0) / cs.length;
+    return `<div class="cgroup"><div class="bank">${cs.map((c) => `<div class="ccol" title="${id(from)} ${c.toFixed(0)} %">${segsOf(12, c)}</div>`).join("")}</div>
+      <div class="cnum">${cs.map((_, k) => `<span>${k + 1}</span>`).join("")}</div>
+      <div class="gname"><span class="lab">${name}</span><span class="lab">${avg.toFixed(0)} %</span></div></div>`;
+  };
+  return `<div class="win">${head(s)}<div class="cols">${grp(0, P, "P cores")}${grp(P, s.cores.length, "E cores")}</div></div>`;
+}
+
+function rows(s) {
+  const row = (c, i) => `<div class="crow"><span class="id">${id(i)}</span><span class="bar">${segsOf(24, c)}</span><span class="v ${c > HOT ? "hot" : ""}">${c.toFixed(0)}</span></div>`;
+  return `<div class="win">${head(s)}<div class="rows">${s.cores.slice(0, P).map(row).join("")}<div class="rsep"></div>${s.cores.slice(P).map((c, k) => row(c, P + k)).join("")}</div></div>`;
+}
+
+function heat(s) {
+  const row = (i) => {
+    const h = HIST[i], pad = Array(60 - h.length).fill(null).concat(h);
+    return `<div class="hrow"><span class="id">${id(i)}</span><span class="cells">${pad.map((v) => v === null ? `<i style="--l:0"></i>` : `<i class="${v > HOT ? "hot" : ""}" style="--l:${Math.round(8 + v * 0.92)}"></i>`).join("")}</span><span class="v ${s.cores[i] > HOT ? "hot" : ""}">${s.cores[i].toFixed(0)}</span></div>`;
+  };
+  return `<div class="win">${head(s)}<div class="heat">${s.cores.slice(0, P).map((_, i) => row(i)).join("")}<div class="rsep"></div>${s.cores.slice(P).map((_, k) => row(P + k)).join("")}</div>
+    <div class="haxis"><span class="lab">60 s ago</span><span class="lab">now</span></div></div>`;
+}
+
+const V = [
+  { key: "A", name: "Segmented columns", note: "One 12-segment VFD column per core, grouped Performance and Efficiency with each group's average. Same footprint as today's bars.", fn: columns },
+  { key: "B", name: "Core rows", note: "One labeled row per core: P1–P10, E1–E4, a segment bar and the exact value. Easiest to read, adds about 120 px of height.", fn: rows },
+  { key: "C", name: "Core heat strip", note: "One row per core across the last 60 s, brighter is busier. Shows which core was pinned and for how long.", fn: heat },
+];
+
+function draw() {
+  const s = GTOP.state;
+  document.getElementById("app").innerHTML = `<div class="lab-head"><h1>Per-core load</h1><p>Live demo data, one tick per second. Each panel is the tower's CPU window at its real 300 px width. T switches palettes.</p></div>
+    <div class="variants">${V.map((v) => `<section class="variant" aria-label="Variant ${v.key}"><header><b>${v.key} · ${v.name}</b><span>${v.note}</span></header>${v.fn(s)}</section>`).join("")}</div>`;
+}
+function tick() { GTOP.tick(); GTOP.state.cores.forEach((c, i) => { HIST[i].push(c); if (HIST[i].length > 60) HIST[i].shift(); }); draw(); }
+for (let i = 0; i < 60; i++) { GTOP.tick(); GTOP.state.cores.forEach((c, k) => HIST[k].push(c)); }
+draw();
+setInterval(tick, 1000);
+document.addEventListener("keydown", (e) => { if (e.key === "t") { THEME.hooks.key("t"); draw(); } });
+</script>
+</body>
+</html>

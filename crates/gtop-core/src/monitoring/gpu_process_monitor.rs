@@ -29,6 +29,12 @@ pub struct GpuProcessMonitor {
     accelerators: Vec<super::iokit::Accelerator>,
 }
 
+impl Default for GpuProcessMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GpuProcessMonitor {
     /// Creates a monitor, noting whether per-process accounting is possible
     pub fn new() -> Self {

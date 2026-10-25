@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gtop · Blade chassis</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=JetBrains+Mono:wght@400;600&family=Silkscreen&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="rack-base.css">
+<style>
+#app { display: grid; grid-template-rows: auto auto 1fr auto; gap: var(--gap); height: 100vh; padding: var(--edge); }
+.u1 { display: flex; align-items: stretch; overflow: hidden; }
+.u1 > div { min-width: 0; }
+.u1 > div { padding: 9px 16px; border-right: 1px solid var(--rule); display: grid; gap: 4px; align-content: center; }
+.u1 > div:last-child { border-right: 0; margin-left: auto; }
+.u1 .brand { font-family: Archivo; font-stretch: 62%; font-weight: 800; font-size: 32px; line-height: 28px; text-transform: uppercase; color: var(--silk); }
+.u1 .seg { grid-template-columns: repeat(24, 4px); height: 6px; gap: 1px; }
+.u1 .pair { display: flex; justify-content: space-between; gap: 14px; align-items: baseline; }
+.main { display: grid; grid-template-rows: auto 1fr; gap: var(--gap); min-height: 0; }
+.main.with-side { grid-template-columns: 1fr 400px; } .main.with-side > .side { grid-row: 1 / span 2; grid-column: 2; }
+.chassis { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; padding: 22px 22px 16px; }
+.chassis-label { position: absolute; top: 6px; left: 22px; }
+.blade { position: relative; display: grid; grid-template-columns: 1fr 22px; grid-template-rows: auto 1fr auto; gap: 8px 6px; padding: 10px 10px 8px; min-height: 236px; background: var(--ground); border: 1px solid var(--rule); cursor: pointer; text-align: left; color: var(--ink-row); }
+.blade:hover { border-color: var(--rule-hi); }
+.blade.sel { border-color: var(--silk); background: var(--plate-2); color: var(--silk); }
+.blade.open { box-shadow: inset 0 0 0 1px var(--led); }
+.blade .slot { display: flex; justify-content: space-between; align-items: center; grid-column: 1 / -1; }
+.blade .name { writing-mode: vertical-rl; transform: rotate(180deg); grid-row: 2; grid-column: 2; font-family: Archivo; font-stretch: 62%; font-weight: 800; font-size: 20px; line-height: 22px; text-transform: uppercase; color: var(--silk); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; max-height: 150px; }
+.blade .col { grid-row: 2; display: flex; gap: 6px; align-items: stretch; }
+.blade .col .seg { display: flex; flex-direction: column-reverse; gap: 2px; width: 16px; }
+.blade .col .seg i { flex: 1; }
+.blade .col .seg.thin { width: 6px; }
+.blade .nums { grid-column: 1 / -1; display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; }
+.blade .nums span:nth-child(even) { text-align: right; color: var(--silk); font-family: "JetBrains Mono"; letter-spacing: 0; text-transform: none; font-weight: 400; font-size: 11px; }
+.blade .big { font-size: 24px; line-height: 24px; }
+.blade.empty { cursor: default; opacity: .4; }
+.rest { min-height: 0; display: grid; }
+.nav { display: flex; gap: 6px; }
+.hist { display: grid; grid-template-rows: auto 1fr; gap: var(--gap); min-height: 0; }
+.tape { padding: 12px 16px 10px; } .tape h2 { margin: 0 0 8px; display: flex; justify-content: space-between; } .tape .tape-cols { height: 200px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="data.js"></script>
+<script src="ui.js"></script>
+<script src="theme.js"></script>
+<script src="rack-kit.js"></script>
+<script>
+const app = document.getElementById("app");
+UI.start((m) => {
+  const { ui, fmt, rows, s, hist, detail } = m;
+  const { segs, screws } = KIT;
+  const memPct = s.memUsed / s.memTotal * 100;
+  const src = KIT.source(rows);
+  const cell = (l, v, pct, hot) => `<div><div class="pair"><span class="silk">${l}</span><span class="px ${hot ? "hot-t" : ""}">${v}</span></div><div class="seg">${segs(24, pct)}</div></div>`;
+  const u1 = `<section class="u1 panel screws" aria-label="System">${screws}
+    <div><div class="silk">M3 Max</div><div class="brand">gtop</div></div>
+    ${cell("CPU", s.cpuTotal.toFixed(0) + "%", s.cpuTotal)}${cell("GPU", s.gpuUtil.toFixed(0) + "%", s.gpuUtil)}${cell("Mem", s.memUsed.toFixed(1) + "G", memPct, memPct > 90)}
+    ${cell("CPU °C", s.temps.CPU.toFixed(0), s.temps.CPU / 110 * 100, s.temps.CPU > 90)}${cell("GPU °C", s.temps.GPU.toFixed(0), s.temps.GPU / 110 * 100)}
+    <div><div class="silk">Load source</div><div class="pair"><span style="color:var(--silk);font-weight:600">${src ? src.label : "idle"}</span><span class="px ${src && src.share > 50 ? "hot-t" : "led-t"}">${src ? src.share.toFixed(0) + "%" : ""}</span></div></div>
+    <div>${KIT.self(s, "stack")}</div></section>`;
+  const nav = `<nav class="nav">${KIT.bank(ui)}</nav>`;
+  let main;
+  if (ui.view === "live") {
+    const blades = Array.from({ length: 8 }, (_, i) => {
+      const p = rows[i];
+      if (!p) return `<div class="blade empty"><div class="slot silk"><span>Slot ${i + 1}</span></div></div>`;
+      const hot = p.cpu > KIT.LIMIT.hot;
+      return `<button class="blade ${i === ui.selected ? "sel" : ""} ${detail && detail.pid === p.pid ? "open" : ""}" data-act="row:${i}" data-pid="${p.pid}" aria-label="${p.name} ${p.cpu.toFixed(0)} percent CPU">
+        <div class="slot silk"><span>Slot ${i + 1}</span><span class="led ${hot ? "hot" : p.cpu > KIT.LIMIT.culprit ? "on" : ""}"></span></div>
+        <div class="col"><div class="seg">${segs(24, KIT.machine(p.cpu), 0.72)}</div><div class="seg thin">${segs(24, p.rss / 4096 * 100, 0.9)}</div><div class="seg thin">${segs(24, p.gpu, 0.9)}</div></div>
+        <div class="name">${p.name}</div>
+        <div class="nums silk"><span class="px big ${hot ? "hot-t" : ""}" style="grid-column:1/-1">${p.cpu.toFixed(0)}%</span><span>PID</span><span>${p.pid}</span><span>Mem</span><span>${fmt.mem(p.rss)}</span><span>GPU</span><span>${p.gpu.toFixed(1)}</span></div></button>`;
+    }).join("");
+    main = `<section class="chassis panel screws" aria-label="Top processes">${screws}<span class="silk chassis-label">Chassis · top 8 by ${ui.sort.toUpperCase()} · columns: CPU share, memory, GPU</span>${blades}</section><div class="rest">${KIT.liveTable(m, { noUser: false })}</div>`;
+  } else {
+    const c = KIT.columns(hist, fmt, ui);
+    main = `<section class="tape panel"><h2 class="silk"><span>Total CPU · last ${ui.hours} h</span><span>${c.note}</span></h2><div class="tape-cols">${c.cols}</div><div class="axis">${c.ticks}</div></section><div class="rest">${KIT.histTable(m)}</div>`;
+  }
+  const side = KIT.side(m);
+  keepSearch(u1 + nav + `<div class="main ${side ? "with-side" : ""}">${main}${side}</div>` + KIT.strip(m), app);
+}, THEME.hooks);
+</script>
+</body>
+</html>
