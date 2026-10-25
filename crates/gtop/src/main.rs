@@ -498,6 +498,9 @@ impl Monitor {
         if self.moment == Some(selection) {
             self.moment = None;
         } else {
+            if let Some(disk) = &mut self.disk {
+                disk.close();
+            }
             self.moment = Some(selection);
             self.moment_selected = 0;
             if self

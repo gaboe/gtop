@@ -16,13 +16,12 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
     },
-    time::Duration,
 };
 
 enum Command {
     Scan(PathBuf, bool, Arc<AtomicBool>, u64),
     Browse(PathBuf, usize, u64, u64),
-    Trash(Confirmation, Arc<AtomicBool>),
+    Trash(Confirmation, Arc<AtomicBool>, u64, u64, PathBuf, usize),
     Prepare(PathBuf, u64, disk_scan::FileId, u64, u64),
 }
 #[derive(Default)]
@@ -30,6 +29,14 @@ struct Mailbox {
     proposal: Option<(u64, u64, Result<Confirmation, String>)>,
     folder: Option<(u64, u64, Folder)>,
     status: Option<String>,
+    wake: Option<futures::channel::mpsc::Sender<()>>,
+}
+impl Mailbox {
+    fn notify(&mut self) {
+        if let Some(wake) = &mut self.wake {
+            let _ = wake.try_send(());
+        }
+    }
 }
 pub(super) struct Disk {
     pub open: bool,
@@ -38,6 +45,7 @@ pub(super) struct Disk {
     home: PathBuf,
     sender: mpsc::SyncSender<Command>,
     mailbox: Arc<Mutex<Mailbox>>,
+    events: Option<futures::channel::mpsc::Receiver<()>>,
     cancel: Arc<AtomicBool>,
     pub folder: Option<Folder>,
     pub selected: usize,
@@ -59,7 +67,11 @@ impl Disk {
     }
     fn with_home(home: PathBuf) -> Self {
         let (sender, receiver) = mpsc::sync_channel(32);
-        let mailbox = Arc::new(Mutex::new(Mailbox::default()));
+        let (wake, events) = futures::channel::mpsc::channel(1);
+        let mailbox = Arc::new(Mutex::new(Mailbox {
+            wake: Some(wake),
+            ..Mailbox::default()
+        }));
         let output = mailbox.clone();
         let worker_home = home.clone();
         std::thread::Builder::new()
@@ -73,6 +85,7 @@ impl Disk {
             home: home.clone(),
             sender,
             mailbox,
+            events: Some(events),
             cancel: Arc::new(AtomicBool::new(false)),
             folder: None,
             selected: 0,
@@ -85,34 +98,49 @@ impl Disk {
         disk.start(home, false);
         disk
     }
+    pub fn close(&mut self) {
+        self.open = false;
+        self.proposal_id += 1;
+        self.confirmation = None;
+    }
+    fn accepted(&mut self, command: Command) -> bool {
+        match self.sender.try_send(command) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.status = "Disk worker busy. Try again.".into();
+                false
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.status = "Disk worker unavailable. Reopen the application.".into();
+                false
+            }
+        }
+    }
     fn start(&mut self, root: PathBuf, force: bool) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let generation = self.generation + 1;
+        if !self.accepted(Command::Scan(root, force, cancel.clone(), generation)) {
+            return;
+        }
         self.cancel.store(true, Ordering::Relaxed);
-        self.cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = cancel;
         self.confirmation = None;
         self.proposal_id += 1;
-        self.generation += 1;
+        self.generation = generation;
         self.navigation = 0;
         self.selected = 0;
         self.folder = None;
-        let _ = self.sender.try_send(Command::Scan(
-            root,
-            force,
-            self.cancel.clone(),
-            self.generation,
-        ));
     }
     fn browse(&mut self, path: PathBuf, page: usize) {
+        let navigation = self.navigation + 1;
+        if !self.accepted(Command::Browse(path, page, self.generation, navigation)) {
+            return;
+        }
         self.confirmation = None;
         self.proposal_id += 1;
         self.selected = 0;
-        self.navigation += 1;
+        self.navigation = navigation;
         self.scroll.set_offset(point(px(0.), px(0.)));
-        let _ = self.sender.try_send(Command::Browse(
-            path,
-            page,
-            self.generation,
-            self.navigation,
-        ));
     }
     fn enter(&mut self, path: PathBuf) {
         self.browse(path, 0);
@@ -138,35 +166,62 @@ impl Disk {
             self.status = "Finish the scan before cleanup".into();
             return;
         }
-        self.proposal_id += 1;
-        self.confirmation = None;
-        self.status = "Checking cleanup path…".into();
-        let _ = self.sender.try_send(Command::Prepare(
+        let proposal = self.proposal_id + 1;
+        if !self.accepted(Command::Prepare(
             path.into(),
             allocated,
             identity,
             self.generation,
-            self.proposal_id,
-        ));
+            proposal,
+        )) {
+            return;
+        }
+        self.proposal_id = proposal;
+        self.confirmation = None;
+        self.status = "Checking cleanup path…".into();
     }
 
     fn confirm(&mut self, rendered_proposal: u64) {
-        if rendered_proposal != self.proposal_id {
+        if rendered_proposal != self.proposal_id || !self.open || self.sending {
             return;
         }
         if let Some(confirmation) = self.confirmation.take() {
-            self.sending = true;
-            self.cancel = Arc::new(AtomicBool::new(false));
-            if let Some(folder) = &mut self.folder {
-                folder.state = ScanState::Scanning;
+            let token = Arc::new(AtomicBool::new(false));
+            match self.sender.try_send(Command::Trash(
+                confirmation,
+                token.clone(),
+                self.generation,
+                self.navigation,
+                self.folder.as_ref().unwrap().path.clone(),
+                self.folder.as_ref().unwrap().page,
+            )) {
+                Ok(()) => {
+                    self.sending = true;
+                    self.cancel = token;
+                    self.status = "Moving item to Trash…".into();
+                }
+                Err(error) => {
+                    self.status = match &error {
+                        mpsc::TrySendError::Full(_) => "Disk worker busy. Try again.",
+                        mpsc::TrySendError::Disconnected(_) => {
+                            "Disk worker unavailable. Reopen the application."
+                        }
+                    }
+                    .into();
+                    let (mpsc::TrySendError::Full(Command::Trash(confirmation, ..))
+                    | mpsc::TrySendError::Disconnected(Command::Trash(confirmation, ..))) = error
+                    else {
+                        unreachable!()
+                    };
+                    self.confirmation = Some(confirmation);
+                }
             }
-            self.status = "Moving item to Trash…".into();
-            let _ = self
-                .sender
-                .try_send(Command::Trash(confirmation, self.cancel.clone()));
         }
     }
     pub fn key(&mut self, key: &str) -> bool {
+        if !self.open {
+            return false;
+        }
         if self.confirmation.is_some() {
             match key {
                 "y" | "enter" => self.confirm(self.proposal_id),
@@ -177,8 +232,7 @@ impl Disk {
         }
         match key {
             "escape" => {
-                self.open = false;
-                self.proposal_id += 1;
+                self.close();
             }
             "backspace" | "left" => self.up(),
             "down" | "j" => {
@@ -240,9 +294,21 @@ fn publish(
     navigation: u64,
 ) {
     let folder = tree.folder(path, page, cached);
-    output.lock().unwrap().folder = Some((generation, navigation, folder));
+    let mut mailbox = output.lock().unwrap();
+    mailbox.folder = Some((generation, navigation, folder));
+    mailbox.notify();
 }
 fn worker(receiver: mpsc::Receiver<Command>, output: Arc<Mutex<Mailbox>>, home: PathBuf) {
+    worker_with_trash(receiver, output, home, |confirmation, home| {
+        confirmation.trash(home)
+    });
+}
+fn worker_with_trash(
+    receiver: mpsc::Receiver<Command>,
+    output: Arc<Mutex<Mailbox>>,
+    home: PathBuf,
+    mut trash: impl FnMut(Confirmation, &Path) -> std::io::Result<PathBuf>,
+) {
     let mut cache: HashMap<PathBuf, Tree> = HashMap::new();
     let mut active: Option<Tree> = None;
     let mut generation = 0;
@@ -252,7 +318,7 @@ fn worker(receiver: mpsc::Receiver<Command>, output: Arc<Mutex<Mailbox>>, home: 
             Command::Scan(root, force, token, scan_generation) => {
                 generation = scan_generation;
                 if let Some(tree) = active.take().filter(|t| t.state == ScanState::Complete) {
-                    cache.insert(tree.nodes[0].path.clone(), tree);
+                    cache.insert(tree.root.clone(), tree);
                 }
                 let mut browsing = root.clone();
                 let mut page = 0;
@@ -318,27 +384,48 @@ fn worker(receiver: mpsc::Receiver<Command>, output: Arc<Mutex<Mailbox>>, home: 
                 } else {
                     Err("Scan changed. Rescan before cleanup.".into())
                 };
-                output.lock().unwrap().proposal = Some((g, proposal, result));
+                let mut mailbox = output.lock().unwrap();
+                mailbox.proposal = Some((g, proposal, result));
+                mailbox.notify();
             }
-            Command::Trash(confirmation, token) => {
-                let result = confirmation.trash(&home);
-                let succeeded = result.is_ok();
-                output.lock().unwrap().status = Some(match result {
+            Command::Trash(confirmation, token, g, n, path, p) => {
+                let result = trash(confirmation, &home);
+                let mut mailbox = output.lock().unwrap();
+                mailbox.status = Some(match result {
                     Ok(destination) => format!(
                         "Moved to {}. Rescanning to refresh sizes.",
                         destination.display()
                     ),
                     Err(e) => format!("Move to Trash failed: {e}"),
                 });
-                if succeeded {
-                    cache.clear();
+                mailbox.notify();
+                drop(mailbox);
+                cache.clear();
+                if g == generation {
                     if let Some(tree) = active.take() {
-                        queue.push_front(Command::Scan(
-                            tree.nodes[0].path.clone(),
-                            true,
-                            token,
-                            generation,
-                        ));
+                        let root = tree.root.clone();
+                        let mut browsing = path;
+                        let mut page = p;
+                        let mut navigation = n;
+                        let refreshed = disk_scan::scan(&root, &home, &token, |tree| {
+                            while let Ok(command) = receiver.try_recv() {
+                                match command {
+                                    Command::Browse(path, p, g, n) if g == generation => {
+                                        browsing = path;
+                                        page = p;
+                                        navigation = n;
+                                    }
+                                    other => queue.push_back(other),
+                                }
+                            }
+                            publish(
+                                &output, tree, &browsing, page, false, generation, navigation,
+                            );
+                        });
+                        publish(
+                            &output, &refreshed, &browsing, page, false, generation, navigation,
+                        );
+                        active = Some(refreshed);
                     }
                 }
             }
@@ -354,50 +441,51 @@ impl Monitor {
             disk.open = true;
         } else {
             self.disk = Some(Disk::new());
-            cx.spawn(async move |entity, cx| loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-                if entity
-                    .update(cx, |this, cx| {
-                        if let Some(disk) = &mut this.disk {
-                            let mut mailbox = disk.mailbox.lock().unwrap();
-                            let folder = mailbox.folder.take();
-                            let status = mailbox.status.take();
-                            let proposal = mailbox.proposal.take();
-                            drop(mailbox);
-                            if let Some((g, id, result)) = proposal {
-                                if g == disk.generation && id == disk.proposal_id && disk.open {
-                                    match result {
-                                        Ok(proposal) => {
-                                            disk.confirmation = Some(proposal);
-                                            disk.status.clear();
+            let mut events = self.disk.as_mut().unwrap().events.take().unwrap();
+            cx.spawn(async move |entity, cx| {
+                use futures::StreamExt;
+                while events.next().await.is_some() {
+                    if entity
+                        .update(cx, |this, cx| {
+                            if let Some(disk) = &mut this.disk {
+                                let mut mailbox = disk.mailbox.lock().unwrap();
+                                let folder = mailbox.folder.take();
+                                let status = mailbox.status.take();
+                                let proposal = mailbox.proposal.take();
+                                drop(mailbox);
+                                if let Some((g, id, result)) = proposal {
+                                    if g == disk.generation && id == disk.proposal_id && disk.open {
+                                        match result {
+                                            Ok(proposal) => {
+                                                disk.confirmation = Some(proposal);
+                                                disk.status.clear();
+                                            }
+                                            Err(e) => disk.status = e,
                                         }
-                                        Err(e) => disk.status = e,
+                                        cx.notify();
                                     }
+                                }
+                                if let Some(status) = status {
+                                    disk.status = status;
+                                    disk.sending = false;
                                     cx.notify();
                                 }
-                            }
-                            if let Some(status) = status {
-                                disk.status = status;
-                                disk.sending = false;
-                                cx.notify();
-                            }
-                            if let Some((_, _, folder)) = folder
-                                .filter(|(g, n, _)| *g == disk.generation && *n == disk.navigation)
-                            {
-                                disk.selected =
-                                    disk.selected.min(folder.rows.len().saturating_sub(1));
-                                disk.folder = Some(folder);
-                                if disk.open {
-                                    cx.notify();
+                                if let Some((_, _, folder)) = folder.filter(|(g, n, _)| {
+                                    *g == disk.generation && *n == disk.navigation
+                                }) {
+                                    disk.selected =
+                                        disk.selected.min(folder.rows.len().saturating_sub(1));
+                                    disk.folder = Some(folder);
+                                    if disk.open {
+                                        cx.notify();
+                                    }
                                 }
                             }
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             })
             .detach();
@@ -728,7 +816,7 @@ impl Monitor {
                     .rack(&t)
                     .small()
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.disk.as_mut().unwrap().open = false;
+                        this.disk.as_mut().unwrap().close();
                         cx.notify();
                     })),
             );
@@ -740,7 +828,7 @@ impl Monitor {
 impl Monitor {
     pub(super) fn prepare_disk_draw_benchmark(&mut self) {
         let disk = Disk::new();
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(std::time::Duration::from_millis(250));
         let folder = disk
             .mailbox
             .lock()
@@ -775,7 +863,10 @@ impl Monitor {
 mod tests {
     use super::*;
     use std::prelude::v1::test;
-    use std::{fs, time::Instant};
+    use std::{
+        fs,
+        time::{Duration, Instant},
+    };
     fn scratch() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "gtop-disk-service-{}-{:?}",
@@ -801,6 +892,148 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+    #[test]
+    fn full_queue_retains_confirmation_and_last_accepted_identity() {
+        let home = scratch();
+        let path = home.join("cache");
+        fs::write(&path, [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        let folder = receive(&mut disk, ScanState::Complete);
+        let row = folder.rows[0].clone();
+        disk.folder = Some(folder);
+        let (sender, receiver) = mpsc::sync_channel(32);
+        disk.sender = sender;
+        for n in 0..32 {
+            disk.browse(home.clone(), n);
+        }
+        let accepted = (disk.generation, disk.navigation, disk.proposal_id);
+        disk.confirmation =
+            Some(Confirmation::new(&path, row.allocated, row.identity, &home).unwrap());
+        disk.start(home.clone(), true);
+        assert_eq!(
+            (disk.generation, disk.navigation, disk.proposal_id),
+            accepted
+        );
+        assert!(disk.folder.is_some());
+        disk.browse(home.join("unaccepted"), 0);
+        assert_eq!(disk.navigation, accepted.1);
+        disk.request_trash(&path, row.allocated, row.identity);
+        assert_eq!(disk.proposal_id, accepted.2);
+        disk.confirm(disk.proposal_id);
+        assert!(disk.confirmation.is_some());
+        assert!(!disk.sending);
+        assert!(disk.status.contains("busy"));
+        for n in 1..=32 {
+            assert!(
+                matches!(receiver.recv().unwrap(), Command::Browse(_, _, _, navigation) if navigation == n)
+            );
+        }
+        disk.confirm(disk.proposal_id);
+        assert!(disk.confirmation.is_none());
+        assert!(disk.sending);
+        assert_eq!(disk.folder.as_ref().unwrap().state, ScanState::Complete);
+        assert!(matches!(receiver.recv().unwrap(), Command::Trash(..)));
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn close_invalidates_proposals_and_hidden_enter_cannot_cleanup() {
+        let home = scratch();
+        fs::write(home.join("cache"), [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        let folder = receive(&mut disk, ScanState::Complete);
+        let row = folder.rows[0].clone();
+        disk.folder = Some(folder);
+        disk.request_trash(&row.path, row.allocated, row.identity);
+        let pending = disk.proposal_id;
+        disk.close();
+        assert!(disk.proposal_id > pending);
+        assert!(disk.confirmation.is_none());
+        assert!(!disk.key("enter"));
+        disk.open = true;
+        assert_ne!(disk.proposal_id, pending);
+        disk.confirmation =
+            Some(Confirmation::new(&row.path, row.allocated, row.identity, &home).unwrap());
+        disk.close();
+        disk.open = true;
+        assert!(disk.confirmation.is_none());
+        assert!(!disk.sending);
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn cleanup_outcomes_refresh_browsed_folder_with_matching_identity() {
+        for outcome in ["success", "failure", "unknown"] {
+            let home = scratch();
+            fs::create_dir_all(home.join("child")).unwrap();
+            let path = home.join("child/cache");
+            fs::write(&path, [1; 4096]).unwrap();
+            let mut disk = Disk::with_home(home.clone());
+            let _ = receive(&mut disk, ScanState::Complete);
+            let (sender, receiver) = mpsc::sync_channel(32);
+            disk.sender = sender;
+            let output = disk.mailbox.clone();
+            let worker_home = home.clone();
+            let worker = std::thread::spawn(move || {
+                worker_with_trash(receiver, output, worker_home, |confirmation, _| {
+                    let destination = confirmation.path.with_file_name("moved");
+                    if outcome != "failure" {
+                        fs::rename(&confirmation.path, &destination)?;
+                    }
+                    if outcome == "success" {
+                        Ok(destination)
+                    } else {
+                        Err(std::io::Error::other(outcome))
+                    }
+                })
+            });
+            disk.start(home.clone(), true);
+            let _ = receive(&mut disk, ScanState::Complete);
+            disk.browse(home.join("child"), 0);
+            let folder = receive(&mut disk, ScanState::Complete);
+            let row = folder.rows[0].clone();
+            disk.folder = Some(folder);
+            disk.confirmation =
+                Some(Confirmation::new(&row.path, row.allocated, row.identity, &home).unwrap());
+            disk.confirm(disk.proposal_id);
+            assert_eq!(disk.folder.as_ref().unwrap().state, ScanState::Complete);
+            let folder = receive(&mut disk, ScanState::Complete);
+            assert_eq!(folder.path, home.join("child"));
+            assert_eq!(
+                folder.rows[0].path.file_name().unwrap(),
+                if outcome == "failure" {
+                    "cache"
+                } else {
+                    "moved"
+                }
+            );
+            assert!(disk.mailbox.lock().unwrap().status.take().is_some());
+            drop(disk);
+            worker.join().unwrap();
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+    #[test]
+    fn mailbox_notifications_are_bounded_and_idle_has_no_wake() {
+        use futures::{FutureExt, StreamExt};
+        let (wake, mut events) = futures::channel::mpsc::channel(1);
+        let mut mailbox = Mailbox {
+            wake: Some(wake),
+            ..Mailbox::default()
+        };
+        assert!(events.next().now_or_never().is_none());
+        for _ in 0..1000 {
+            mailbox.notify();
+        }
+        let mut count = 0;
+        while events.next().now_or_never().is_some() {
+            count += 1;
+        }
+        assert!(count > 0 && count <= 2);
+        assert!(events.next().now_or_never().is_none());
+        mailbox.notify();
+        assert_eq!(events.next().now_or_never(), Some(Some(())));
     }
     #[test]
     fn completed_scan_is_cached_until_explicit_rescan() {
@@ -850,8 +1083,8 @@ mod tests {
         drop(receiver);
         disk.sender = sender;
         disk.confirm(disk.proposal_id);
-        assert!(disk.confirmation.is_none());
-        assert!(disk.sending);
+        assert!(disk.confirmation.is_some());
+        assert!(!disk.sending);
         disk.sending = false;
         disk.confirm(disk.proposal_id);
         assert!(!disk.sending);

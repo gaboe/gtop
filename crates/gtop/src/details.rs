@@ -129,8 +129,7 @@ impl Monitor {
     pub(super) fn select(&mut self, key: ProcessKey, cx: &mut Context<Self>) {
         self.moment = None;
         if let Some(disk) = &mut self.disk {
-            disk.open = false;
-            disk.confirmation = None;
+            disk.close();
         }
         if self
             .details

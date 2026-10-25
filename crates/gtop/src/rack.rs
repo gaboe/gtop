@@ -1653,6 +1653,9 @@ impl Monitor {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings_open = !this.settings_open;
                                 if this.settings_open {
+                                    if let Some(disk) = &mut this.disk {
+                                        disk.close();
+                                    }
                                     this.moment = None;
                                 }
                                 cx.notify();
@@ -1836,7 +1839,11 @@ impl Monitor {
         if self.settings_open && !self.focus.is_focused(window) {
             return;
         }
-        if let Some(disk) = self.disk.as_mut().filter(|d| d.open) {
+        if let Some(disk) = self
+            .disk
+            .as_mut()
+            .filter(|d| d.open && !self.settings_open && self.moment.is_none())
+        {
             if disk.key(k) {
                 cx.stop_propagation();
                 cx.notify();
@@ -1944,6 +1951,9 @@ impl Monitor {
             "s" => {
                 self.settings_open = !self.settings_open;
                 if self.settings_open {
+                    if let Some(disk) = &mut self.disk {
+                        disk.close();
+                    }
                     self.moment = None;
                 }
             }

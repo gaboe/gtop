@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs, io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -24,7 +24,7 @@ pub enum ScanState {
 }
 #[derive(Clone, Debug)]
 pub struct Node {
-    pub path: PathBuf,
+    pub name: std::ffi::OsString,
     pub identity: FileId,
     pub shared: bool,
     pub parent: Option<usize>,
@@ -39,7 +39,7 @@ pub struct Node {
 #[derive(Debug)]
 pub struct Tree {
     pub nodes: Vec<Node>,
-    index: HashMap<PathBuf, usize>,
+    pub root: PathBuf,
     pub state: ScanState,
     pub observed: SystemTime,
     candidates: Vec<usize>,
@@ -56,21 +56,6 @@ pub struct Row {
     pub shared: bool,
     pub skipped_volume: bool,
     pub cleanable: Option<&'static str>,
-}
-impl From<&Node> for Row {
-    fn from(n: &Node) -> Self {
-        Self {
-            path: n.path.clone(),
-            identity: n.identity,
-            directory: n.directory,
-            allocated: n.allocated,
-            descendants: n.descendants,
-            unreadable: n.unreadable,
-            shared: n.shared,
-            skipped_volume: n.skipped_volume,
-            cleanable: n.cleanable,
-        }
-    }
 }
 #[derive(Clone, Debug)]
 pub struct Folder {
@@ -90,7 +75,7 @@ pub struct Folder {
 impl Tree {
     fn new(root: &Path) -> Self {
         let node = Node {
-            path: root.into(),
+            name: std::ffi::OsString::new(),
             identity: FileId {
                 device: 0,
                 inode: 0,
@@ -107,11 +92,37 @@ impl Tree {
         };
         Self {
             nodes: vec![node],
-            index: [(root.into(), 0)].into(),
+            root: root.into(),
             state: ScanState::Scanning,
             observed: SystemTime::now(),
             candidates: vec![],
-            path_bytes: root.as_os_str().len() * 2,
+            path_bytes: root.as_os_str().len(),
+        }
+    }
+    pub fn path(&self, mut id: usize) -> PathBuf {
+        let mut names = Vec::new();
+        while let Some(parent) = self.nodes[id].parent {
+            names.push(self.nodes[id].name.as_os_str());
+            id = parent;
+        }
+        let mut path = self.root.clone();
+        for name in names.into_iter().rev() {
+            path.push(name);
+        }
+        path
+    }
+    fn row(&self, id: usize) -> Row {
+        let n = &self.nodes[id];
+        Row {
+            path: self.path(id),
+            identity: n.identity,
+            directory: n.directory,
+            allocated: n.allocated,
+            descendants: n.descendants,
+            unreadable: n.unreadable,
+            shared: n.shared,
+            skipped_volume: n.skipped_volume,
+            cleanable: n.cleanable,
         }
     }
     fn add(
@@ -122,7 +133,6 @@ impl Tree {
         device: u64,
         seen: &mut HashSet<(u64, u64)>,
     ) -> usize {
-        let path = self.nodes[parent].path.join(entry.name);
         let skipped_volume = entry.device != device;
         let shared = !skipped_volume && !entry.error && !seen.insert((entry.device, entry.inode));
         let allocated = if skipped_volume || entry.error || shared {
@@ -131,12 +141,18 @@ impl Tree {
             entry.allocated
         };
         let id = self.nodes.len();
-        let cleanable = cleanable_kind(&path, home);
+        let cleanable = match entry.name.as_bytes() {
+            b"Caches" | b"DerivedData" | b".npm" | b"cache" | b"store" | b".Trash"
+            | b"node_modules" | b"target" => {
+                cleanable_kind(&self.path(parent).join(&entry.name), home)
+            }
+            _ => None,
+        };
         if cleanable.is_some() {
             self.candidates.push(id);
         }
         self.nodes.push(Node {
-            path: path.clone(),
+            name: entry.name,
             identity: FileId {
                 device: entry.device,
                 inode: entry.inode,
@@ -151,8 +167,7 @@ impl Tree {
             skipped_volume,
             cleanable,
         });
-        self.path_bytes += path.as_os_str().len() * 2;
-        self.index.insert(path, id);
+        self.path_bytes += self.nodes[id].name.len();
         self.nodes[parent].children.push(id);
         let mut ancestor = Some(parent);
         while let Some(id) = ancestor {
@@ -172,14 +187,28 @@ impl Tree {
         }
     }
     pub fn folder(&self, path: &Path, page: usize, cached: bool) -> Folder {
-        let id = self.index.get(path).copied().unwrap_or(0);
+        let mut id = 0;
+        if let Ok(relative) = path.strip_prefix(&self.root) {
+            for component in relative.components() {
+                let Some(child) = self.nodes[id]
+                    .children
+                    .iter()
+                    .copied()
+                    .find(|&child| self.nodes[child].name == component.as_os_str())
+                else {
+                    id = 0;
+                    break;
+                };
+                id = child;
+            }
+        }
         let node = &self.nodes[id];
         let mut children = node.children.clone();
         children.sort_unstable_by(|&a, &b| {
             self.nodes[b]
                 .allocated
                 .cmp(&self.nodes[a].allocated)
-                .then(self.nodes[a].path.cmp(&self.nodes[b].path))
+                .then(self.nodes[a].name.cmp(&self.nodes[b].name))
         });
         let pages = children.len().div_ceil(PAGE_SIZE).max(1);
         let page = page.min(pages - 1);
@@ -187,17 +216,21 @@ impl Tree {
             .into_iter()
             .skip(page * PAGE_SIZE)
             .take(PAGE_SIZE)
-            .map(|id| Row::from(&self.nodes[id]))
+            .map(|id| self.row(id))
             .collect();
-        let mut cleanable: Vec<_> = self.candidates.iter().map(|&id| &self.nodes[id]).collect();
-        cleanable.sort_unstable_by_key(|n| std::cmp::Reverse(n.allocated));
-        let cleanable = cleanable.into_iter().take(24).map(Row::from).collect();
+        let mut cleanable = self.candidates.clone();
+        cleanable.sort_unstable_by_key(|&id| std::cmp::Reverse(self.nodes[id].allocated));
+        let cleanable = cleanable
+            .into_iter()
+            .take(24)
+            .map(|id| self.row(id))
+            .collect();
         Folder {
-            root: self.nodes[0].path.clone(),
-            path: node.path.clone(),
+            root: self.root.clone(),
+            path: self.path(id),
             state: self.state.clone(),
             allocated: node.allocated,
-            items: self.nodes[0].descendants,
+            items: node.descendants,
             errors: self.nodes[0].unreadable,
             rows,
             cleanable,
@@ -408,7 +441,7 @@ fn open_directory(root: &OwnedFd, tree: &Tree, id: usize) -> io::Result<OwnedFd>
     }
     let mut fd = root.try_clone()?;
     for id in chain.into_iter().rev() {
-        let name = std::ffi::CString::new(tree.nodes[id].path.file_name().unwrap().as_bytes())?;
+        let name = std::ffi::CString::new(tree.nodes[id].name.as_bytes())?;
         let child = unsafe {
             libc::openat(
                 fd.as_raw_fd(),
@@ -433,6 +466,9 @@ pub fn scan(
     cancel: &AtomicBool,
     mut progress: impl FnMut(&Tree),
 ) -> Tree {
+    let scan_home = data_home(home)
+        .filter(|alias| root.starts_with("/System/Volumes/Data") && alias.starts_with(root));
+    let home = scan_home.as_deref().unwrap_or(home);
     let mut tree = Tree::new(root);
     let metadata = match fs::symlink_metadata(root) {
         Ok(m) if m.is_dir() => m,
@@ -482,12 +518,10 @@ pub fn scan(
                 return false;
             }
             if tree.nodes.len() >= MAX_NODES
-                || tree.path_bytes
-                    + (tree.nodes[id].path.as_os_str().len() + entry.name.len() + 1) * 2
-                    > 256 * 1024 * 1024
+                || tree.path_bytes + entry.name.len() > 256 * 1024 * 1024
             {
                 tree.state = ScanState::Failed(format!(
-                    "Scan memory limit reached, at most {MAX_NODES} entries or 256 MiB of paths. Sizes are incomplete."
+                    "Scan memory limit reached, at most {MAX_NODES} entries or 256 MiB of raw names. Sizes are incomplete."
                 ));
                 return false;
             }
@@ -534,6 +568,24 @@ pub struct Confirmation {
     device: u64,
     inode: u64,
 }
+fn data_home(home: &Path) -> Option<PathBuf> {
+    let relative = home.strip_prefix("/").ok()?;
+    let alias = Path::new("/System/Volumes/Data").join(relative);
+    let ordinary = fs::symlink_metadata(home).ok()?;
+    let alternate = fs::symlink_metadata(&alias).ok()?;
+    (ordinary.is_dir()
+        && alternate.is_dir()
+        && (ordinary.dev(), ordinary.ino()) == (alternate.dev(), alternate.ino()))
+        .then_some(alias)
+}
+fn home_spelling(path: &Path, home: &Path) -> PathBuf {
+    if let Some(alias) = data_home(home) {
+        if let Ok(relative) = path.strip_prefix(alias) {
+            return home.join(relative);
+        }
+    }
+    path.into()
+}
 pub fn guarded_path(path: &Path, home: &Path) -> io::Result<PathBuf> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(io::Error::other(
@@ -541,7 +593,7 @@ pub fn guarded_path(path: &Path, home: &Path) -> io::Result<PathBuf> {
         ));
     }
     let home = home.canonicalize()?;
-    let canonical = path.canonicalize()?;
+    let canonical = home_spelling(&path.canonicalize()?, &home);
     if ["/System", "/usr", "/bin", "/sbin"]
         .iter()
         .any(|p| canonical.starts_with(p))
@@ -640,14 +692,18 @@ pub fn headless() -> bool {
     let start = Instant::now();
     let tree = scan(&root, &root, &AtomicBool::new(false), |_| {});
     println!(
-        "disk_scan root={} state={:?} allocated={} items={} errors={} wall_seconds={:.6}",
+        "disk_scan root={} state={:?} allocated={} items={} errors={} wall_seconds={:.6} coverage={}",
         root.display(),
         tree.state,
         tree.nodes[0].allocated,
         tree.nodes[0].descendants,
         tree.nodes[0].unreadable,
-        start.elapsed().as_secs_f64()
+        start.elapsed().as_secs_f64(),
+        if tree.state == ScanState::Complete && tree.nodes[0].unreadable == 0 { "full" } else { "incomplete" }
     );
+    if tree.state != ScanState::Complete {
+        std::process::exit(1);
+    }
     true
 }
 
@@ -697,14 +753,15 @@ mod tests {
         assert_eq!(tree.nodes[0].descendants, 6);
         let mut seen = HashSet::new();
         let mut total = 0;
-        for node in &tree.nodes {
-            let m = fs::symlink_metadata(&node.path).unwrap();
-            assert_eq!(node.identity, observed(&node.path));
+        for (id, node) in tree.nodes.iter().enumerate() {
+            let path = tree.path(id);
+            let m = fs::symlink_metadata(&path).unwrap();
+            assert_eq!(node.identity, observed(&path));
             if seen.insert((m.dev(), m.ino())) {
                 total += m.blocks() * 512;
             }
             if !node.directory && !node.shared {
-                assert_eq!(node.allocated, m.blocks() * 512, "{}", node.path.display());
+                assert_eq!(node.allocated, m.blocks() * 512, "{}", path.display());
             }
         }
         assert_eq!(tree.nodes[0].allocated, total);
@@ -712,7 +769,8 @@ mod tests {
         assert!(!tree
             .nodes
             .iter()
-            .any(|n| n.path == temp.0.join("link/data")));
+            .enumerate()
+            .any(|(id, _)| tree.path(id) == temp.0.join("link/data")));
     }
     #[test]
     fn scan_cancels_after_work_and_keeps_partial_results() {
@@ -848,6 +906,77 @@ mod tests {
             |_| {},
         );
         assert!(matches!(tree.state, ScanState::Failed(_)));
+    }
+    #[test]
+    fn empty_child_reports_its_own_count_and_raw_non_utf8_names_roundtrip() {
+        use std::os::unix::ffi::OsStringExt;
+        let home = Scratch::new();
+        fs::create_dir(home.0.join("empty")).unwrap();
+        let raw = std::ffi::OsString::from_vec(vec![b'f', 0xff]);
+        let mut tree = scan(&home.0, &home.0, &AtomicBool::new(false), |_| {});
+        tree.add(
+            0,
+            Entry {
+                name: raw.clone(),
+                device: 1,
+                inode: 1,
+                directory: false,
+                allocated: 0,
+                error: false,
+            },
+            &home.0,
+            1,
+            &mut HashSet::new(),
+        );
+        assert_eq!(tree.folder(&home.0, 0, false).items, 2);
+        let child = tree.folder(&home.0.join("empty"), 0, false);
+        assert_eq!(child.path, home.0.join("empty"));
+        assert_eq!(child.items, 0);
+        assert!(child.rows.is_empty());
+        assert!(tree
+            .folder(&home.0, 0, false)
+            .rows
+            .iter()
+            .any(|r| r.path.file_name() == Some(raw.as_os_str())));
+        assert_eq!(
+            tree.path_bytes,
+            home.0.as_os_str().len() + "empty".len() + raw.len()
+        );
+    }
+    #[test]
+    fn verified_data_home_alias_has_same_guard_and_categories() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let Some(alias) = data_home(&home) else {
+            return;
+        };
+        for relative in ["Library/Caches", ".cargo", ".npm"] {
+            let ordinary = home.join(relative);
+            let alternate = alias.join(relative);
+            assert_eq!(home_spelling(&alternate, &home), ordinary);
+            assert_eq!(
+                cleanable_kind(&alternate, &alias),
+                cleanable_kind(&ordinary, &home)
+            );
+            if ordinary.exists() {
+                assert_eq!(
+                    guarded_path(&alternate, &home).unwrap(),
+                    guarded_path(&ordinary, &home).unwrap()
+                );
+            }
+        }
+        for path in [
+            alias.clone(),
+            alias.join(".Trash"),
+            PathBuf::from("/System"),
+            PathBuf::from("/usr"),
+        ] {
+            assert!(guarded_path(&path, &home).is_err());
+        }
+        let scratch = Scratch::new();
+        assert_eq!(
+            home_spelling(Path::new("/System/Volumes/Data/Users/other"), &scratch.0),
+            Path::new("/System/Volumes/Data/Users/other")
+        );
     }
     #[test]
     fn pages_are_bounded_and_sorted() {
