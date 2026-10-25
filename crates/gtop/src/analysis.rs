@@ -222,6 +222,32 @@ pub fn identity(name: &str, command: &str) -> ProcessIdentity {
             source: "gtop catalog",
         };
     }
+    if let Some((binary, hash)) = name.rsplit_once('-') {
+        if !binary.is_empty()
+            && hash.len() == 16
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return ProcessIdentity {
+                what: format!("Rust test or build binary of {binary}"),
+                kind: "Developer tool".into(),
+                about: "Cargo adds a hash to test and build binary names.".into(),
+                source: "from its name",
+            };
+        }
+    }
+    if name
+        .strip_suffix(".Tests")
+        .is_some_and(|project| !project.is_empty())
+    {
+        return ProcessIdentity {
+            what: format!(".NET test project {name}"),
+            kind: "Developer tool".into(),
+            about: "Runs tests for this .NET project.".into(),
+            source: "from its name",
+        };
+    }
     if command.starts_with("/System/") || command.starts_with("/usr/libexec/") {
         return ProcessIdentity {
             what: "macOS system process".into(),
@@ -273,6 +299,64 @@ mod tests {
             processes,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn build_and_test_names_resolve_before_path_fallback() {
+        for name in [
+            "mini_speed_reader_firmware-d89a92ccf166f61b",
+            "mini_speed_reader_firmware-796e1d60ea54cad7",
+            "mini_speed_reader_firmware-5d351cac350b054f",
+            "mini_speed_reader_firmware-933c8b697cfdb27a",
+            "mini_speed_reader_firmware-54941cf2cd547ec6",
+            "mini_speed_reader_firmware-aff03edcda2a13be",
+            "account_tests-f7d829b1817a0b4a",
+            "readmaxer-d9b077a1e2074261",
+            "library_routes_tests-f724a15104d2ece7",
+            "acta-ef192c1ed6ad40e5",
+            "acta-568ba7485530c996",
+        ] {
+            let found = identity(name, "/System/fixture");
+            assert_eq!(
+                found.what,
+                format!(
+                    "Rust test or build binary of {}",
+                    name.rsplit_once('-').unwrap().0
+                )
+            );
+            assert_eq!(found.kind, "Developer tool");
+            assert_eq!(found.source, "from its name");
+        }
+        for name in [
+            "SabFx.Cqrs.Wolverine.Tests",
+            "AppFx.Workflows.Tests",
+            "Nexus.Roslyn.DomainLayer.Analyzers.Tests",
+            "Nexus.Roslyn.InfrastructureLayer.Analyzers.Tests",
+            "Nexus.Roslyn.Common.CodeFixes.Tests",
+        ] {
+            let found = identity(name, "/Applications/Runner.app/runner");
+            assert_eq!(found.what, format!(".NET test project {name}"));
+            assert_eq!(found.kind, "Developer tool");
+        }
+        for name in [
+            "-d89a92ccf166f61b",
+            "app-D89a92ccf166f61b",
+            "app-d89a92ccf166f61",
+            "app-d89a92ccf166f61bb",
+            "app-d89a92ccf166f61g",
+            ".Tests",
+            "app.tests",
+            "app.Tests.dll",
+            "acta-final",
+            "base-barrier",
+        ] {
+            assert_eq!(
+                identity(name, "/tmp/fixture").what,
+                "Unknown process",
+                "{name}"
+            );
+        }
+        assert_eq!(identity("rustc", "/System/fixture").source, "gtop catalog");
     }
 
     #[test]
