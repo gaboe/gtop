@@ -81,6 +81,12 @@ impl Details {
         !self.exited(processes)
     }
 
+    pub(super) fn cancel_kill_if_exited(&mut self, processes: &[ProcessInfo]) {
+        if self.exited(processes) {
+            self.cancel_kill(self.key);
+        }
+    }
+
     pub(super) fn request_kill(&mut self, rendered_for: ProcessKey, alive: bool) {
         if alive && self.key == rendered_for && self.kill == KillState::Ready {
             self.kill = KillState::Confirming;
@@ -919,6 +925,26 @@ mod tests {
         }));
         super::close_details(&mut details);
         assert!(details.is_none());
+    }
+
+    #[test]
+    fn pending_kill_confirmation_clears_on_exit_or_pid_reuse() {
+        let key = ProcessKey {
+            pid: 42,
+            start_time: 100,
+        };
+        let mut details = selected(key);
+        details.request_kill(key, true);
+        details.cancel_kill_if_exited(&[details.last_known.clone()]);
+        assert!(details.kill == KillState::Confirming);
+        details.cancel_kill_if_exited(&[]);
+        assert!(details.kill == KillState::Ready);
+        details.request_kill(key, true);
+        let mut replacement = details.last_known.clone();
+        replacement.start_time += 1;
+        details.cancel_kill_if_exited(&[replacement]);
+        assert!(details.kill == KillState::Ready);
+        assert!(details.take_kill_confirmation(key).is_none());
     }
 
     #[test]

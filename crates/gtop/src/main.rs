@@ -537,6 +537,7 @@ impl Monitor {
         self.traces
             .retain(|key, _| keys.contains(key) || Some(*key) == detail_key);
         if let Some(details) = self.details.as_mut() {
+            details.cancel_kill_if_exited(&snapshot.processes);
             if let Some(process) = snapshot
                 .processes
                 .iter()
