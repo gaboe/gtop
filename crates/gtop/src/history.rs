@@ -7,6 +7,7 @@ use std::{
 
 #[path = "history/store.rs"]
 mod store;
+pub use store::Result;
 
 const MINUTES: u64 = 1440;
 const MAX_NAMES: usize = 4096;
@@ -277,8 +278,6 @@ pub struct History {
     #[serde(skip)]
     dirty: std::collections::BTreeSet<u64>,
     #[serde(skip)]
-    error: std::cell::RefCell<Option<String>>,
-    #[serde(skip)]
     last_sample: Option<f64>,
     #[serde(skip)]
     last_process_sample: Option<f64>,
@@ -305,10 +304,6 @@ impl History {
         self.buckets.push_back(bucket);
     }
 
-    pub fn take_error(&self) -> Option<String> {
-        self.error.borrow_mut().take()
-    }
-
     pub fn persist(&mut self, now: u64) -> store::Result<()> {
         let store = self
             .store
@@ -325,27 +320,24 @@ impl History {
         Ok(())
     }
 
-    fn read_buckets(&self, range: std::ops::Range<u64>, name: Option<&str>) -> VecDeque<Bucket> {
-        let mut buckets: BTreeMap<u64, Bucket> = match self
+    fn read_buckets(
+        &self,
+        range: std::ops::Range<u64>,
+        name: Option<&str>,
+    ) -> Result<VecDeque<Bucket>> {
+        let mut buckets: BTreeMap<u64, Bucket> = self
             .store
             .as_ref()
             .map(|s| s.buckets(range.clone(), name))
-            .transpose()
-        {
-            Ok(buckets) => buckets
-                .unwrap_or_default()
-                .into_iter()
-                .map(|b| (b.minute, b))
-                .collect(),
-            Err(error) => {
-                *self.error.borrow_mut() = Some(error.to_string());
-                BTreeMap::new()
-            }
-        };
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| (b.minute, b))
+            .collect();
         for bucket in self.buckets.iter().filter(|b| range.contains(&b.minute)) {
             buckets.insert(bucket.minute, bucket.clone());
         }
-        buckets.into_values().collect()
+        Ok(buckets.into_values().collect())
     }
 
     pub fn analyze_process(
@@ -354,10 +346,16 @@ impl History {
         command: &str,
         current_cpu: f32,
         now_minute: u64,
-    ) -> crate::analysis::ProcessAnalysis {
+    ) -> Result<crate::analysis::ProcessAnalysis> {
         let buckets =
-            self.read_buckets(now_minute.saturating_sub(1439)..now_minute + 1, Some(name));
-        crate::analysis::analyze(name, command, current_cpu, now_minute, &buckets)
+            self.read_buckets(now_minute.saturating_sub(1439)..now_minute + 1, Some(name))?;
+        Ok(crate::analysis::analyze(
+            name,
+            command,
+            current_cpu,
+            now_minute,
+            &buckets,
+        ))
     }
 
     #[cfg(test)]
@@ -408,22 +406,18 @@ impl History {
     }
 
     fn prune(&mut self, minute: u64) {
-        self.buckets
-            .retain(|b| b.minute <= minute && b.minute > minute.saturating_sub(MINUTES));
-        while self.buckets.len() > MINUTES as usize {
-            self.buckets.pop_front();
-        }
+        self.buckets.retain(|b| {
+            (self.store.is_some() && self.dirty.contains(&b.minute))
+                || (b.minute <= minute && b.minute > minute.saturating_sub(MINUTES))
+        });
     }
     pub fn suspend(&mut self) {
         self.last_sample = None;
         self.last_process_sample = None;
         self.process_recording_since = None;
     }
-    pub fn record(&mut self, snapshot: &Snapshot, now: f64, interval: f64) -> bool {
-        if let Err(error) = self.prepare_sample(snapshot, now, interval) {
-            *self.error.borrow_mut() = Some(error.to_string());
-            return false;
-        }
+    pub fn record(&mut self, snapshot: &Snapshot, now: f64, interval: f64) -> Result<bool> {
+        self.prepare_sample(snapshot, now, interval)?;
         let previous = self.last_sample.replace(now);
         let elapsed = previous.map(|v| now - v).unwrap_or(0.);
         let minute = now as u64 / 60;
@@ -486,7 +480,7 @@ impl History {
             self.record_processes(snapshot, minute, now..now, now, cpu_start, gpu_start);
         }
         self.dirty.extend(self.touched.clone());
-        changed_minute
+        Ok(changed_minute)
     }
     fn prepare_sample(
         &mut self,
@@ -656,7 +650,7 @@ impl History {
         }
     }
 
-    pub fn view(&self, hours: usize, now: u64) -> HistoryView {
+    pub fn view(&self, hours: usize, now: u64) -> Result<HistoryView> {
         let minute = now / 60;
         let start = minute.saturating_sub((hours * 60 - 1) as u64);
         let mut result = HistoryView {
@@ -666,15 +660,9 @@ impl History {
         let mut totals: BTreeMap<String, ProcessTotal> = BTreeMap::new();
         let mut stored = VecDeque::new();
         if let Some(store) = &self.store {
-            match store.view_data(start..minute + 1, &self.buckets) {
-                Ok((buckets, rows)) => {
-                    stored = buckets;
-                    totals = rows;
-                }
-                Err(error) => {
-                    *self.error.borrow_mut() = Some(error.to_string());
-                }
-            }
+            let (buckets, rows) = store.view_data(start..minute + 1, &self.buckets)?;
+            stored = buckets;
+            totals = rows;
         }
         let by_minute: BTreeMap<_, _> = stored
             .iter()
@@ -699,14 +687,14 @@ impl History {
         });
         result.total_cpu = result.rows.iter().map(|r| r.1.cpu_seconds).sum();
         result.cached_leaders = Metric::ALL.map(|metric| result.leaders(metric));
-        result
+        Ok(result)
     }
 
-    pub fn moment(&self, selection: MomentSelection) -> MomentDetail {
+    pub fn moment(&self, selection: MomentSelection) -> Result<MomentDetail> {
         let end = selection
             .start_minute
             .saturating_add(selection.step.max(1) as u64);
-        let buckets = self.read_buckets(selection.start_minute..end, None);
+        let buckets = self.read_buckets(selection.start_minute..end, None)?;
         let span: Vec<_> = buckets.iter().collect();
         let mut detail = MomentDetail {
             selection,
@@ -735,7 +723,7 @@ impl History {
             }
         }
         detail.rows = rows.into_iter().collect();
-        detail
+        Ok(detail)
     }
 }
 
@@ -776,11 +764,11 @@ mod tests {
             .collect::<Vec<_>>()
             .into();
         let rest = std::sync::Arc::make_mut(&mut snapshot.processes).split_off(2048);
-        history.record(&snapshot, 6000., 3.);
+        history.record(&snapshot, 6000., 3.).unwrap();
         std::sync::Arc::make_mut(&mut snapshot.processes).extend(rest);
         std::sync::Arc::make_mut(&mut snapshot.processes)
             .push(crate::test_data::process(9999, "extra", 1.));
-        history.record(&snapshot, 6003., 3.);
+        history.record(&snapshot, 6003., 3.).unwrap();
         assert_eq!(history.buckets[0].processes.len(), MAX_NAMES);
         assert_eq!(
             history.buckets[0].processes["process-4096"].cpu_seconds,
@@ -820,10 +808,12 @@ mod tests {
             temperature: Some(0.),
             ..Default::default()
         });
-        let detail = history.moment(MomentSelection {
-            start_minute: 100,
-            step: 5,
-        });
+        let detail = history
+            .moment(MomentSelection {
+                start_minute: 100,
+                step: 5,
+            })
+            .unwrap();
         assert!((detail.cpu_average.unwrap() - 6000. / 61.).abs() < 0.0001);
         assert_eq!(detail.cpu_average, detail.memory_average);
         assert_eq!(detail.gpu_average, detail.cpu_average);
@@ -835,8 +825,8 @@ mod tests {
         let mut snapshot = crate::test_data::snapshot();
         snapshot.stats.temperatures.clear();
         let mut history = History::default();
-        history.record(&snapshot, 6000., 3.);
-        history.record(&snapshot, 6003., 3.);
+        history.record(&snapshot, 6000., 3.).unwrap();
+        history.record(&snapshot, 6003., 3.).unwrap();
         snapshot.stats.temperatures = crate::test_data::snapshot().stats.temperatures;
         snapshot.stats.gpus.push(gtop_core::monitoring::GpuInfo {
             name: "test".into(),
@@ -848,7 +838,7 @@ mod tests {
             power_watts: None,
             core_clock_mhz: None,
         });
-        history.record(&snapshot, 6006., 3.);
+        history.record(&snapshot, 6006., 3.).unwrap();
         assert_eq!(history.buckets[0].gpu, Some(80.));
         assert_eq!(history.buckets[0].gpu_seconds, Some(3.));
         assert_eq!(history.buckets[0].temperature, Some(80.));
@@ -859,8 +849,8 @@ mod tests {
     fn rollover_marks_the_closed_minute_changed() {
         let snapshot = crate::test_data::snapshot();
         let mut history = History::default();
-        history.record(&snapshot, 6057., 3.);
-        history.record(&snapshot, 6060., 3.);
+        history.record(&snapshot, 6057., 3.).unwrap();
+        history.record(&snapshot, 6060., 3.).unwrap();
         assert!(history.touched.contains(&100));
         assert!(history.touched.contains(&101));
         assert_eq!(
@@ -869,6 +859,7 @@ mod tests {
                     start_minute: 100,
                     step: 1
                 })
+                .unwrap()
                 .rows
                 .iter()
                 .find(|row| row.0 == "rustc")
@@ -929,7 +920,7 @@ mod tests {
                 .iter()
                 .any(|p| p.pid == std::process::id()));
             let start = std::time::Instant::now();
-            history.record(&snapshot, crate::rack::now(), 1.);
+            history.record(&snapshot, crate::rack::now(), 1.).unwrap();
             eprintln!(
                 "history record_us={} procs={}",
                 start.elapsed().as_micros(),
@@ -942,9 +933,9 @@ mod tests {
     fn recording_counts_elapsed_seconds_and_leaves_suspended_minutes_empty() {
         let s = crate::test_data::snapshot();
         let mut h = History::default();
-        h.record(&s, 6000., 3.);
-        h.record(&s, 6003., 3.);
-        let v = h.view(1, 6003);
+        h.record(&s, 6000., 3.).unwrap();
+        h.record(&s, 6003., 3.).unwrap();
+        let v = h.view(1, 6003).unwrap();
         assert_eq!(v.covered, 1);
         assert_eq!(v.rows[0].0, "rustc");
         assert_eq!(v.rows[0].1.cpu_seconds, 10.5);
@@ -955,10 +946,10 @@ mod tests {
         );
         assert_eq!(v.leaders(Metric::Temperature)[0], ("Peak".into(), 80.));
         h.suspend();
-        h.record(&s, 6006., 3.);
-        assert_eq!(h.view(1, 6006).rows[0].1.cpu_seconds, 10.5);
-        h.record(&s, 6180., 3.);
-        let v = h.view(1, 6180);
+        h.record(&s, 6006., 3.).unwrap();
+        assert_eq!(h.view(1, 6006).unwrap().rows[0].1.cpu_seconds, 10.5);
+        h.record(&s, 6180., 3.).unwrap();
+        let v = h.view(1, 6180).unwrap();
         assert_eq!(v.covered, 2);
         assert!(v.columns[58].is_none());
         assert_eq!(v.rows[0].1.cpu_seconds, 10.5);
@@ -967,7 +958,7 @@ mod tests {
         h.save(&path).unwrap();
         let loaded = History::load(&path, 6180);
         std::fs::remove_file(path).unwrap();
-        assert_eq!(loaded.view(1, 6180).covered, 2);
+        assert_eq!(loaded.view(1, 6180).unwrap().covered, 2);
         assert!(loaded.last_sample.is_none());
     }
 
@@ -976,8 +967,8 @@ mod tests {
         let mut s = crate::test_data::snapshot();
         s.processes = std::sync::Arc::new(vec![crate::test_data::process(1, "owned", 100.)]);
         let mut h = History::default();
-        h.record(&s, 6054., 3.);
-        h.record(&s, 6057., 3.);
+        h.record(&s, 6054., 3.).unwrap();
+        h.record(&s, 6057., 3.).unwrap();
         s.process_data = gtop_core::ProcessData::Stale {
             since: std::time::Instant::now(),
             reason: "failed".into(),
@@ -985,8 +976,8 @@ mod tests {
         std::sync::Arc::make_mut(&mut s.processes)[0].memory_usage = 99999;
         s.stats.memory_used = 900;
         for now in [6060., 6063.] {
-            h.record(&s, now, 3.);
-            let total = &h.view(1, now as u64).rows[0].1;
+            h.record(&s, now, 3.).unwrap();
+            let total = &h.view(1, now as u64).unwrap().rows[0].1;
             assert_eq!(total.cpu_seconds, 3.);
             assert_eq!(total.gpu_seconds, 1.5);
             assert_eq!(total.peak_memory, 1024);
@@ -997,16 +988,16 @@ mod tests {
         std::sync::Arc::make_mut(&mut s.processes)[0].cpu_sample_seconds = Some(9.);
         std::sync::Arc::make_mut(&mut s.processes)[0].gpu_usage = Some(100. / 6.);
         std::sync::Arc::make_mut(&mut s.processes)[0].memory_usage = 2048;
-        h.record(&s, 6066., 3.);
-        let total = &h.view(1, 6066).rows[0].1;
+        h.record(&s, 6066., 3.).unwrap();
+        let total = &h.view(1, 6066).unwrap().rows[0].1;
         assert!((total.cpu_seconds - 6.).abs() < 0.00001);
         assert!((total.gpu_seconds - 3.).abs() < 0.00001);
         assert_eq!(total.peak_memory, 2048);
         assert!((h.buckets[0].processes["owned"].cpu_seconds - 4.).abs() < 0.00001);
         assert_eq!(h.touched, 100..102);
         h.suspend();
-        h.record(&s, 6100., 3.);
-        assert!((h.view(1, 6100).rows[0].1.cpu_seconds - 6.).abs() < 0.00001);
+        h.record(&s, 6100., 3.).unwrap();
+        assert!((h.view(1, 6100).unwrap().rows[0].1.cpu_seconds - 6.).abs() < 0.00001);
     }
 
     #[test]
@@ -1015,14 +1006,14 @@ mod tests {
         snapshot.processes = vec![crate::test_data::process(1, "old", 0.)].into();
         let mut history = History::default();
         for now in [6054., 6057.] {
-            history.record(&snapshot, now, 3.);
+            history.record(&snapshot, now, 3.).unwrap();
         }
         snapshot.process_data = gtop_core::ProcessData::Stale {
             since: std::time::Instant::now(),
             reason: "failed".into(),
         };
         for now in [6060., 6063.] {
-            history.record(&snapshot, now, 3.);
+            history.record(&snapshot, now, 3.).unwrap();
         }
 
         let mut born = crate::test_data::process(2, "born-after-minute-boundary", 0.);
@@ -1032,7 +1023,7 @@ mod tests {
         born.gpu_usage = Some(50.);
         std::sync::Arc::make_mut(&mut snapshot.processes).push(born);
         snapshot.process_data = gtop_core::ProcessData::Fresh;
-        history.record(&snapshot, 6066., 3.);
+        history.record(&snapshot, 6066., 3.).unwrap();
 
         assert!(!history.buckets[0]
             .processes
@@ -1047,22 +1038,25 @@ mod tests {
         let mut s = crate::test_data::snapshot();
         s.processes = vec![crate::test_data::process(1, "owned", 100.)].into();
         let mut h = History::default();
-        h.record(&s, 6000., 60.);
+        h.record(&s, 6000., 60.).unwrap();
         s.process_data = gtop_core::ProcessData::Stale {
             since: std::time::Instant::now(),
             reason: "failed".into(),
         };
         for tick in 1..=MINUTES + 2 {
-            h.record(&s, (6000 + tick * 60) as f64, 60.);
+            h.record(&s, (6000 + tick * 60) as f64, 60.).unwrap();
         }
         s.process_data = gtop_core::ProcessData::Fresh;
         let now = 6000 + (MINUTES + 3) * 60;
         std::sync::Arc::make_mut(&mut s.processes)[0].cpu_sample_seconds =
             Some((now - 6000) as f64);
-        h.record(&s, now as f64, 60.);
+        h.record(&s, now as f64, 60.).unwrap();
         assert_eq!(h.buckets.len(), MINUTES as usize);
         assert_eq!(h.buckets.front().unwrap().minute, now / 60 - MINUTES + 1);
-        assert_eq!(h.view(24, now).total_cpu, (MINUTES - 1) as f64 * 60.);
+        assert_eq!(
+            h.view(24, now).unwrap().total_cpu,
+            (MINUTES - 1) as f64 * 60.
+        );
     }
 
     #[test]
@@ -1074,35 +1068,35 @@ mod tests {
         ]
         .into();
         let mut history = History::default();
-        history.record(&snapshot, 6054., 3.);
-        history.record(&snapshot, 6057., 3.);
+        history.record(&snapshot, 6054., 3.).unwrap();
+        history.record(&snapshot, 6057., 3.).unwrap();
         for now in [6060., 6063.] {
             std::sync::Arc::make_mut(&mut snapshot.processes)[0].cpu_sample_seconds = None;
-            history.record(&snapshot, now, 3.);
+            history.record(&snapshot, now, 3.).unwrap();
         }
         let row = &mut std::sync::Arc::make_mut(&mut snapshot.processes)[0];
         row.cpu_usage = 100. / 3.;
         row.cpu_sample_seconds = Some(9.);
         std::sync::Arc::make_mut(&mut snapshot.processes)
             .push(crate::test_data::process(3, "new", 0.));
-        history.record(&snapshot, 6066., 3.);
+        history.record(&snapshot, 6066., 3.).unwrap();
         assert!(!history.buckets[0].processes.contains_key("new"));
-        let view = history.view(1, 6066);
+        let view = history.view(1, 6066).unwrap();
         let recovered = view.rows.iter().find(|r| r.0 == "recovering").unwrap();
         assert!((recovered.1.cpu_seconds - 3.).abs() < 0.00001);
         let steady = view.rows.iter().find(|r| r.0 == "steady").unwrap();
         assert_eq!(steady.1.cpu_seconds, 12.);
         assert!((history.buckets[0].processes["recovering"].cpu_seconds - 1.).abs() < 0.00001);
         history.suspend();
-        history.record(&snapshot, 6070., 3.);
-        assert!((history.view(1, 6070).total_cpu - 15.).abs() < 0.00001);
+        history.record(&snapshot, 6070., 3.).unwrap();
+        assert!((history.view(1, 6070).unwrap().total_cpu - 15.).abs() < 0.00001);
     }
 
     #[test]
     fn process_peak_cpu_sums_same_name_processes_in_each_sample() {
         let snapshot = crate::test_data::snapshot();
         let mut history = History::default();
-        history.record(&snapshot, 6000., 3.);
+        history.record(&snapshot, 6000., 3.).unwrap();
         assert_eq!(history.buckets[0].processes["rustc"].peak_cpu, 350.);
         assert_eq!(history.buckets[0].processes["rustc"].peak_memory, 3072);
         assert_eq!(history.buckets[0].processes["cargo"].peak_cpu, 110.);
@@ -1111,9 +1105,9 @@ mod tests {
     fn elapsed_time_splits_at_minute_boundaries() {
         let s = crate::test_data::snapshot();
         let mut h = History::default();
-        h.record(&s, 6059., 3.);
-        h.record(&s, 6062., 3.);
-        let v = h.view(1, 6062);
+        h.record(&s, 6059., 3.).unwrap();
+        h.record(&s, 6062., 3.).unwrap();
+        let v = h.view(1, 6062).unwrap();
         assert_eq!(v.covered, 2);
         let totals: Vec<_> = h
             .buckets
@@ -1136,7 +1130,7 @@ mod tests {
             h.buckets.iter().map(|b| b.minute).collect::<Vec<_>>(),
             [100, 1500]
         );
-        let view = h.view(24, 1500 * 60);
+        let view = h.view(24, 1500 * 60).unwrap();
         assert_eq!(view.columns.len(), 1440);
         assert_eq!(view.covered, 2);
         assert!(view.columns[1438].is_none());
@@ -1266,10 +1260,12 @@ mod tests {
                 ..Default::default()
             });
         }
-        let detail = h.moment(MomentSelection {
-            start_minute: 10,
-            step: 2,
-        });
+        let detail = h
+            .moment(MomentSelection {
+                start_minute: 10,
+                step: 2,
+            })
+            .unwrap();
         assert_eq!(detail.recorded_minutes, 2);
         assert_eq!(detail.cpu_average, Some(50.));
         assert_eq!(detail.cpu_peak, Some(71.));
@@ -1287,10 +1283,12 @@ mod tests {
 
     #[test]
     fn empty_moment_is_a_gap() {
-        let detail = History::default().moment(MomentSelection {
-            start_minute: 42,
-            step: 10,
-        });
+        let detail = History::default()
+            .moment(MomentSelection {
+                start_minute: 42,
+                step: 10,
+            })
+            .unwrap();
         assert_eq!(detail.recorded_minutes, 0);
         assert!(detail.cpu_average.is_none());
         assert!(detail.rows.is_empty());
@@ -1303,10 +1301,12 @@ mod tests {
         std::fs::write(&path, r#"{"buckets":[{"minute":100,"seconds":30,"cpu":42,"memory":2048,"gpu":12,"temperature":70,"peak_temperature":74,"processes":{}}]}"#).unwrap();
         let history = History::load(&path, 100 * 60);
         std::fs::remove_file(path).unwrap();
-        let detail = history.moment(MomentSelection {
-            start_minute: 100,
-            step: 1,
-        });
+        let detail = history
+            .moment(MomentSelection {
+                start_minute: 100,
+                step: 1,
+            })
+            .unwrap();
         assert_eq!(detail.cpu_peak, Some(42.));
         assert_eq!(detail.memory_peak, Some(2048.));
         assert_eq!(detail.gpu_peak, Some(12.));
@@ -1345,12 +1345,12 @@ mod tests {
             minute: 600,
             ..Default::default()
         });
-        let before = history.view(24, 2000 * 60);
+        let before = history.view(24, 2000 * 60).unwrap();
         history.buckets.push_back(Bucket {
             minute: 2001,
             ..Default::default()
         });
-        let after = history.view(24, 2001 * 60);
+        let after = history.view(24, 2001 * 60).unwrap();
         assert_ne!(before.start_minute, after.start_minute);
         assert_eq!(selection.start_minute, 600);
         assert!(selection_in_window(

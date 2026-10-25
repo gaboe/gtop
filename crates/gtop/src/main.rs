@@ -257,24 +257,31 @@ impl Monitor {
                 }
                 if !running {
                     history.suspend();
+                    let mut history_retry = false;
                     if let Some(selection) = moment {
                         if cached_moment != Some(selection) || cached_metric != Some(metric) {
-                            let (returned_history, detail, error) = cx.background_executor().spawn(async move {
+                            let (returned_history, detail) = cx.background_executor().spawn(async move {
                                 let detail = history.moment(selection);
-                                let error = history.take_error();
-                                (history, detail, error)
+                                (history, detail)
                             }).await;
                             history = returned_history;
-                            let _ = entity.update_in(cx, |this, _, cx| {
-                                if let Some(error) = error { this.status = format!("History could not be read: {error}"); }
-                                if this.moment == Some(selection) {
-                                    this.replace_moment_rows(detail.ranked(metric));
-                                    this.moment_detail = Some(detail);
-                                    cx.notify();
+                            match detail {
+                                Ok(detail) => {
+                                    let _ = entity.update_in(cx, |this, _, cx| {
+                                        if this.moment == Some(selection) {
+                                            this.replace_moment_rows(detail.ranked(metric));
+                                            this.moment_detail = Some(detail);
+                                            cx.notify();
+                                        }
+                                    });
+                                    cached_moment = Some(selection);
+                                    cached_metric = Some(metric);
                                 }
-                            });
-                            cached_moment = Some(selection);
-                            cached_metric = Some(metric);
+                                Err(error) => {
+                                    history_retry = true;
+                                    let _ = entity.update_in(cx, |this, _, cx| { this.status = format!("History could not be read: {error}"); cx.notify(); });
+                                }
+                            }
                         }
                     }
                     let pending = entity.update_in(cx, |this, _, _| this.pending_kill).ok().flatten();
@@ -294,25 +301,32 @@ impl Monitor {
                     if let Some((key, name, command, cpu, needs_analysis)) = selected_detail.as_ref() {
                         if *needs_analysis || cached_analysis_key != Some(*key) {
                             let (name, command, cpu) = (name.clone(), command.clone(), *cpu);
-                            let (returned_history, analysis, error) = cx.background_executor().spawn(async move {
+                            let (returned_history, analysis) = cx.background_executor().spawn(async move {
                                 let analysis = history.analyze_process(&name, &command, cpu, rack::now() as u64 / 60);
-                                let error = history.take_error();
-                                (history, analysis, error)
+                                (history, analysis)
                             }).await;
                             history = returned_history;
-                            let _ = entity.update_in(cx, |this, _, cx| {
-                                if let Some(error) = error { this.status = format!("History could not be read: {error}"); }
-                                if let Some(details) = this.details.as_mut().filter(|details| details.key == *key) {
-                                    details.analysis = Some(analysis);
-                                    cx.notify();
+                            match analysis {
+                                Ok(analysis) => {
+                                    let _ = entity.update_in(cx, |this, _, cx| {
+                                        if let Some(details) = this.details.as_mut().filter(|details| details.key == *key) {
+                                            details.analysis = Some(analysis);
+                                            cx.notify();
+                                        }
+                                    });
+                                    cached_analysis_key = Some(*key);
                                 }
-                            });
+                                Err(error) => {
+                                    history_retry = true;
+                                    cached_analysis_key = None;
+                                    let _ = entity.update_in(cx, |this, _, cx| { this.status = format!("History could not be read: {error}"); cx.notify(); });
+                                }
+                            }
                         }
-                        cached_analysis_key = Some(*key);
                     } else {
                         cached_analysis_key = None;
                     }
-                    if pending.is_some() {
+                    if pending.is_some() || history_retry {
                         let timer = cx.background_executor().timer(Duration::from_secs(seconds)).fuse();
                         let event = events.next().fuse();
                         futures::pin_mut!(timer, event);
@@ -343,7 +357,8 @@ impl Monitor {
                     if let Ok(ref snapshot) = snapshot {
                         let now = rack::now();
 
-                        history.record(snapshot, now, seconds as f64);
+                        let update = (|| -> history::Result<()> {
+                        history.record(snapshot, now, seconds as f64)?;
                         let minute = now as u64 / 60;
                         let minute_changed = cached_minute != Some(minute);
                         if let Some((key, name, command, _fallback_cpu, needs_analysis)) = selected_detail.as_ref() {
@@ -351,7 +366,7 @@ impl Monitor {
                                 let current_cpu = crate::analysis::current_cpu(&snapshot.processes, name);
                                 process_analysis = Some((
                                     *key,
-                                    history.analyze_process(name, command, current_cpu, minute),
+                                    history.analyze_process(name, command, current_cpu, minute)?,
                                 ));
                             }
                         }
@@ -359,18 +374,26 @@ impl Monitor {
                             let span_changed = selection.start_minute < history.touched.end
                                 && history.touched.start < selection.start_minute + selection.step as u64;
                             if previous_moment != Some(selection) || previous_metric != Some(metric) || span_changed {
-                                moment_detail = Some(history.moment(selection));
+                                moment_detail = Some(history.moment(selection)?);
                             }
                         }
                         if minute_changed {
+                            views = Some([history.view(1,now as u64)?, history.view(8,now as u64)?, history.view(24,now as u64)?]);
+                            history.persist(now as u64)?;
                             cached_minute = Some(minute);
-                            views = Some([1,8,24].map(|hours| history.view(hours, now as u64)));
-                            history_save=Some(history.persist(now as u64).map_err(|e|e.to_string()));
+                            history_save=Some(Ok(()));
+                        }
+                        Ok(())
+                        })();
+                        if let Err(error) = update {
+                            views = None;
+                            moment_detail = None;
+                            process_analysis = None;
+                            history_save = Some(Err(error.to_string()));
                         }
                     }
-                    if let Some(error) = history.take_error() { history_save = Some(Err(error)); }
                     let selected_key = match selected_detail {
-                        Some((key, _, _, _, _)) if snapshot.is_ok() || previous_analysis_key == Some(key) => Some(key),
+                        Some((key, _, _, _, _)) if !matches!(history_save, Some(Err(_))) && (snapshot.is_ok() || previous_analysis_key == Some(key)) => Some(key),
                         _ => None,
                     };
                     (snapshot, tick_ms, views, moment_detail, process_analysis, history, cached_minute, history_save, moment, metric, selected_key)

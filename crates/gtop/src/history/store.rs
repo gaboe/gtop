@@ -450,8 +450,8 @@ mod tests {
         let f = Fixture::new();
         let mut h = f.history(100);
         let snapshot = crate::test_data::snapshot();
-        h.record(&snapshot, 6054., 3.);
-        h.record(&snapshot, 6057., 3.);
+        h.record(&snapshot, 6054., 3.).unwrap();
+        h.record(&snapshot, 6057., 3.).unwrap();
         h.persist(6057).unwrap();
         let before = serde_json::to_vec(&h).unwrap();
         let last = h.last_sample;
@@ -461,18 +461,17 @@ mod tests {
             .connection
             .execute_batch("ALTER TABLE process RENAME TO unavailable_process")
             .unwrap();
-        assert!(!h.record(&snapshot, 6060., 3.));
+        assert!(h.record(&snapshot, 6060., 3.).is_err());
         assert_eq!(serde_json::to_vec(&h).unwrap(), before);
         assert_eq!(h.last_sample, last);
         assert!(h.dirty.is_empty());
-        assert!(h.take_error().is_some());
         h.store
             .as_ref()
             .unwrap()
             .connection
             .execute_batch("ALTER TABLE unavailable_process RENAME TO process")
             .unwrap();
-        h.record(&snapshot, 6060., 3.);
+        h.record(&snapshot, 6060., 3.).unwrap();
         h.persist(6060).unwrap();
         let loaded = h.store.as_ref().unwrap().buckets(100..102, None).unwrap();
         assert_eq!(
@@ -493,27 +492,139 @@ mod tests {
         let mut h = f.history(101);
         assert!(h.buckets.is_empty());
         let mut snapshot = crate::test_data::snapshot();
-        h.record(&snapshot, 6060., 3.);
-        h.record(&snapshot, 6063., 3.);
+        h.record(&snapshot, 6060., 3.).unwrap();
+        h.record(&snapshot, 6063., 3.).unwrap();
         h.persist(6063).unwrap();
         snapshot.process_data = gtop_core::ProcessData::Stale {
             since: std::time::Instant::now(),
             reason: "probe".into(),
         };
-        h.record(&snapshot, 6120., 60.);
+        h.record(&snapshot, 6120., 60.).unwrap();
         h.persist(6120).unwrap();
         assert!(h.buckets.iter().all(|b| b.minute >= 102));
         snapshot.process_data = gtop_core::ProcessData::Fresh;
         for p in std::sync::Arc::make_mut(&mut snapshot.processes) {
             p.cpu_sample_seconds = Some(60.);
         }
-        h.record(&snapshot, 6123., 60.);
+        h.record(&snapshot, 6123., 60.).unwrap();
         assert!(h.dirty.contains(&101));
         h.persist(6123).unwrap();
         let persisted = h.store.as_ref().unwrap().buckets(101..102, None).unwrap();
         assert!(persisted[0].processes["rustc"].cpu_seconds > 10.5);
-        assert_eq!(h.view(1, 6123).covered, 3);
+        assert_eq!(h.view(1, 6123).unwrap().covered, 3);
     }
+    #[test]
+    fn failed_queries_return_errors_instead_of_historical_gaps() {
+        let f = Fixture::new();
+        let h = f.history(100);
+        h.store
+            .as_ref()
+            .unwrap()
+            .connection
+            .execute_batch("ALTER TABLE process RENAME TO unavailable_process")
+            .unwrap();
+        assert!(h.view(1, 6000).is_err());
+        assert!(h
+            .moment(super::super::MomentSelection {
+                start_minute: 100,
+                step: 1
+            })
+            .is_err());
+        assert!(h.analyze_process("worker", "worker", 0., 100).is_err());
+    }
+
+    #[test]
+    fn failed_writes_pin_dirty_minutes_past_the_cache_horizon() {
+        let f = Fixture::new();
+        let mut h = f.history(100);
+        let snapshot = crate::test_data::snapshot();
+        h.record(&snapshot, 6000., 3.).unwrap();
+        h.store
+            .as_ref()
+            .unwrap()
+            .connection
+            .execute_batch("ALTER TABLE system RENAME TO unavailable_system")
+            .unwrap();
+        assert!(h.persist(6000).is_err());
+        h.store
+            .as_ref()
+            .unwrap()
+            .connection
+            .execute_batch("ALTER TABLE unavailable_system RENAME TO system")
+            .unwrap();
+        let now = (100 + 1442) * 60;
+        h.record(&snapshot, now as f64, 3.).unwrap();
+        assert!(h.buckets.iter().any(|b| b.minute == 100));
+        assert!(h.dirty.contains(&100));
+        h.persist(now).unwrap();
+        assert_eq!(
+            h.store
+                .as_ref()
+                .unwrap()
+                .buckets(100..101, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(h.dirty.is_empty());
+    }
+
+    #[test]
+    fn committed_import_without_marker_retries_before_live_writes() {
+        let f = Fixture::new();
+        let mut legacy = History::default();
+        legacy.buckets.push_back(bucket(100, 30., 42.));
+        std::fs::write(
+            f.0.join("history.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        {
+            let mut connection = Connection::open(f.0.join("history.sqlite")).unwrap();
+            connection
+                .execute_batch(include_str!("schema.sql"))
+                .unwrap();
+            let tx = connection.transaction().unwrap();
+            write_bucket(&tx, &legacy.buckets[0]).unwrap();
+            tx.commit().unwrap();
+        }
+        let store = f.open(100);
+        let buckets = store.buckets(100..101, None).unwrap();
+        assert_eq!(buckets[0].processes["worker"].cpu_seconds, 42.);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM migration", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_import_and_future_schema_are_reported_without_reset() {
+        let f = Fixture::new();
+        std::fs::write(f.0.join("history.json"), b"broken").unwrap();
+        assert!(Store::open(&f.0.join("history.sqlite"), &f.0.join("history.json"), 100).is_err());
+        let connection = Connection::open(f.0.join("history.sqlite")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM migration", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        connection.execute_batch("PRAGMA user_version=99; CREATE TABLE sentinel(value); INSERT INTO sentinel VALUES(42)").unwrap();
+        drop(connection);
+        assert!(Store::open(&f.0.join("history.sqlite"), &f.0.join("history.json"), 100).is_err());
+        let connection = Connection::open(f.0.join("history.sqlite")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM sentinel", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+        assert_eq!(std::fs::read(f.0.join("history.json")).unwrap(), b"broken");
+    }
+
     #[test]
     fn minute_reads_use_bounded_index_searches() {
         let f = Fixture::new();

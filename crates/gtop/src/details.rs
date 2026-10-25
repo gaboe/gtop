@@ -813,9 +813,11 @@ mod tests {
         snapshot.processes =
             std::sync::Arc::new(vec![crate::test_data::process(1, "builder", 140.)]);
         let mut history = crate::history::History::default();
-        history.record(&snapshot, 6000., 3.);
-        history.record(&snapshot, 6003., 3.);
-        let analysis = history.analyze_process("builder", "builder", 814., 100);
+        history.record(&snapshot, 6000., 3.).unwrap();
+        history.record(&snapshot, 6003., 3.).unwrap();
+        let analysis = history
+            .analyze_process("builder", "builder", 814., 100)
+            .unwrap();
         let history = analysis.history.unwrap();
         let processes = vec![process];
         let live = super::analysis_sample(
