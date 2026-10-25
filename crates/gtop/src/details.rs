@@ -48,6 +48,23 @@ pub(super) fn kill_completed(key: ProcessKey, processes: &[ProcessInfo]) -> bool
 }
 
 impl Details {
+    fn new(process: ProcessInfo, observed_at: u64) -> Self {
+        let name = process.name.clone();
+        let executable = process.executable.clone();
+        Self {
+            key: ProcessKey::from(&process),
+            last_known: process,
+            last_seen: observed_at,
+            name,
+            executable,
+            analysis: None,
+            environment: Environment::Unrequested,
+            environment_open: false,
+            body_scroll: ScrollHandle::new(),
+            kill: KillState::Ready,
+        }
+    }
+
     pub(super) fn observe(&mut self, process: &ProcessInfo, last_seen: u64) {
         if ProcessKey::from(process) == self.key {
             self.last_known = process.clone();
@@ -126,20 +143,10 @@ impl Monitor {
                 .cloned()
         });
         let Some(process) = process else { return };
-        let name = process.name.clone();
-        let executable = process.executable.clone();
-        self.details = Some(Details {
-            key,
-            last_known: process,
-            last_seen: crate::rack::now() as u64,
-            name,
-            executable,
-            analysis: None,
-            environment: Environment::Unrequested,
-            environment_open: false,
-            body_scroll: ScrollHandle::new(),
-            kill: KillState::Ready,
-        });
+        self.details = Some(Details::new(
+            process,
+            self.snapshot.as_ref().unwrap().process_observed_at,
+        ));
         self.wake();
         self.table.update(cx, |table, _cx| {
             table.selected = Some(key);
@@ -774,6 +781,22 @@ mod tests {
             body_scroll: ScrollHandle::new(),
             kill: KillState::Ready,
         }
+    }
+
+    #[test]
+    fn stale_selection_uses_the_last_collection_time() {
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.process_observed_at = 6003;
+        snapshot.process_data = gtop_core::ProcessData::Stale {
+            since: std::time::Instant::now(),
+            reason: "unavailable".into(),
+        };
+        let process = snapshot.processes[0].clone();
+        let details = Details::new(process, snapshot.process_observed_at);
+        assert_eq!(details.last_seen, 6003);
+        assert!(details
+            .exit_marker()
+            .ends_with(&crate::rack::timestamp(6003, "%H:%M:%S")));
     }
 
     #[test]

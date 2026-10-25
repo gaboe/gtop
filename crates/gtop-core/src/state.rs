@@ -27,7 +27,7 @@ pub struct AppState {
     /// Apple Silicon performance and efficiency core counts, read at startup.
     cpu_topology: CpuTopology,
     #[cfg(target_os = "macos")]
-    process_rows: Mutex<(Arc<Vec<crate::ProcessInfo>>, ProcessData)>,
+    process_rows: Mutex<(Arc<Vec<crate::ProcessInfo>>, ProcessData, u64)>,
 }
 
 impl AppState {
@@ -66,7 +66,7 @@ impl AppState {
             networks: Mutex::new(networks),
             cpu_topology: CpuTopology::detect(),
             #[cfg(target_os = "macos")]
-            process_rows: Mutex::new((Arc::new(Vec::new()), ProcessData::Fresh)),
+            process_rows: Mutex::new((Arc::new(Vec::new()), ProcessData::Fresh, 0)),
         }
     }
 }
@@ -124,13 +124,14 @@ impl AppState {
         let processes =
             Arc::new(process_monitor.collect_processes(&sys, include_environ, ports_by_pid)?);
         #[cfg(target_os = "macos")]
-        let (processes, process_data) = {
+        let (processes, process_data, process_observed_at) = {
             let mut previous = self.process_rows.lock().map_err(|e| e.to_string())?;
             match process_monitor.collect_native_processes(include_environ, ports_by_pid) {
                 Ok(rows) => {
                     let rows = Arc::new(rows);
-                    *previous = (rows.clone(), ProcessData::Fresh);
-                    (rows, ProcessData::Fresh)
+                    let observed_at = ProcessMonitor::get_current_time()?;
+                    *previous = (rows.clone(), ProcessData::Fresh, observed_at);
+                    (rows, ProcessData::Fresh, observed_at)
                 }
                 Err(reason) => {
                     let since = match &previous.1 {
@@ -144,6 +145,8 @@ impl AppState {
         };
         #[cfg(not(target_os = "macos"))]
         let process_data = ProcessData::Fresh;
+        #[cfg(not(target_os = "macos"))]
+        let process_observed_at = ProcessMonitor::get_current_time()?;
         let stats = system_monitor.collect_stats(&sys, &networks, &disks);
         if perf_enabled() {
             eprintln!(
@@ -156,6 +159,7 @@ impl AppState {
         Ok(Snapshot {
             processes,
             process_data,
+            process_observed_at,
             stats,
             cpu_topology: self.cpu_topology,
         })
@@ -315,6 +319,7 @@ mod tests {
 
         let fallback = state.snapshot(false, false).unwrap();
         assert!(Arc::ptr_eq(&fresh.processes, &fallback.processes));
+        assert_eq!(fresh.process_observed_at, fallback.process_observed_at);
         assert!(fallback.stats.memory_total > 0);
         assert!(matches!(fallback.process_data, ProcessData::Stale { .. }));
         assert_eq!(
@@ -334,6 +339,7 @@ mod tests {
         let repeated = state.snapshot(false, false).unwrap();
         assert!(Arc::ptr_eq(&fresh.processes, &repeated.processes));
         assert_eq!(repeated.process_data, fallback.process_data);
+        assert_eq!(repeated.process_observed_at, fresh.process_observed_at);
         assert_eq!(
             format!("{:?}", repeated.processes),
             format!("{:?}", fresh.processes)

@@ -254,7 +254,7 @@ impl ProcessMonitor {
     }
 
     /// Gets the current system time in seconds since UNIX epoch
-    pub(super) fn get_current_time() -> Result<u64, String> {
+    pub(crate) fn get_current_time() -> Result<u64, String> {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
