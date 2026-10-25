@@ -1838,7 +1838,7 @@ impl Monitor {
                 if self.settings_open {
                     self.settings_open = false;
                 } else {
-                    self.details = None;
+                    crate::details::close_details(&mut self.details);
                 }
             }
             "e" if self.details.is_some() => self.fetch_environment(window, cx),
@@ -1859,7 +1859,8 @@ impl Monitor {
                 if let Some(key) = key {
                     self.select(key, cx);
                     if k == "x" {
-                        self.details.as_mut().unwrap().request_kill(key);
+                        let alive = !self.process_exited();
+                        self.details.as_mut().unwrap().request_kill(key, alive);
                     }
                 }
             }

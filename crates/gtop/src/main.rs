@@ -529,7 +529,18 @@ impl Monitor {
             .unwrap_or(self.interval as f64);
         let keys: std::collections::HashSet<_> =
             snapshot.processes.iter().map(ProcessKey::from).collect();
-        self.traces.retain(|k, _| keys.contains(k));
+        let detail_key = self.details.as_ref().map(|details| details.key);
+        self.traces
+            .retain(|key, _| keys.contains(key) || Some(*key) == detail_key);
+        if let Some(details) = self.details.as_mut() {
+            if let Some(process) = snapshot
+                .processes
+                .iter()
+                .find(|process| ProcessKey::from(*process) == details.key)
+            {
+                details.observe(process, now as u64);
+            }
+        }
         for p in &snapshot.processes {
             let trace = self.traces.entry(ProcessKey::from(p)).or_default();
             trace.push_back((now, p.cpu_usage));
