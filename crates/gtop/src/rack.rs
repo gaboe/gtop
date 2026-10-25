@@ -12,6 +12,7 @@ use gpui_component::{
 };
 use gtop_core::{CpuBanks, CpuTopology};
 use std::{
+    cell::RefCell,
     collections::HashMap,
     sync::{Mutex, OnceLock},
 };
@@ -402,6 +403,191 @@ pub fn screws(t: &Tokens) -> Div {
     }
     d
 }
+
+const WIN_DOT_CACHE_SLOTS: usize = 32;
+const WIN_DOT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const WIN_DOT_CACHE_MAX_VERTICES: usize = 524_288;
+const WIN_DOT_CACHE_MAX_ENTRY_VERTICES: usize = 131_072;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WinDotKey {
+    x_bits: u32,
+    y_bits: u32,
+    width_bits: u32,
+    height_bits: u32,
+}
+
+impl WinDotKey {
+    fn from_bounds(bounds: Bounds<Pixels>) -> Option<Self> {
+        let x = f32::from(bounds.origin.x);
+        let y = f32::from(bounds.origin.y);
+        let width = f32::from(bounds.size.width);
+        let height = f32::from(bounds.size.height);
+        if [x, y, width, height].into_iter().all(f32::is_finite) {
+            Some(Self {
+                x_bits: x.to_bits(),
+                y_bits: y.to_bits(),
+                width_bits: width.to_bits(),
+                height_bits: height.to_bits(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+struct WinDotEntry {
+    key: WinDotKey,
+    path: Path<Pixels>,
+}
+
+struct WinDotCache {
+    entries: [Option<WinDotEntry>; WIN_DOT_CACHE_SLOTS],
+}
+
+enum WinDotAdmission {
+    Retained(Path<Pixels>),
+    Bypassed(Path<Pixels>),
+}
+
+impl WinDotCache {
+    fn new() -> Self {
+        Self {
+            entries: std::array::from_fn(|_| None),
+        }
+    }
+
+    fn get_clone(&mut self, key: WinDotKey) -> Option<Path<Pixels>> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|entry| entry.key == key))?;
+        let entry = self.entries[index].take().expect("located cache entry");
+        let path = entry.path.clone();
+        for position in (1..=index).rev() {
+            self.entries[position] = self.entries[position - 1].take();
+        }
+        self.entries[0] = Some(entry);
+        Some(path)
+    }
+
+    fn retained_usage(&self) -> Option<(usize, usize)> {
+        self.entries.iter().flatten().try_fold(
+            (0usize, std::mem::size_of::<RefCell<Self>>()),
+            |(vertices, bytes), entry| {
+                let capacity = entry.path.vertices.capacity();
+                let next_vertices = vertices.checked_add(capacity)?;
+                let entry_bytes = capacity.checked_mul(std::mem::size_of::<PathVertex<Pixels>>())?;
+                let next_bytes = bytes.checked_add(entry_bytes)?;
+                Some((next_vertices, next_bytes))
+            },
+        )
+    }
+
+    fn evict_lru(&mut self) -> bool {
+        let Some(index) = self.entries.iter().rposition(Option::is_some) else {
+            return false;
+        };
+        self.entries[index] = None;
+        true
+    }
+
+    fn admit_and_clone(
+        &mut self,
+        key: WinDotKey,
+        path: Path<Pixels>,
+        max_bytes: usize,
+        max_vertices: usize,
+        max_entry_vertices: usize,
+    ) -> WinDotAdmission {
+        let capacity = path.vertices.capacity();
+        let Some(entry_bytes) = capacity.checked_mul(std::mem::size_of::<PathVertex<Pixels>>())
+        else {
+            return WinDotAdmission::Bypassed(path);
+        };
+        let Some(entry_bytes_with_metadata) =
+            std::mem::size_of::<RefCell<Self>>().checked_add(entry_bytes)
+        else {
+            return WinDotAdmission::Bypassed(path);
+        };
+        if capacity > max_entry_vertices
+            || capacity > max_vertices
+            || entry_bytes_with_metadata > max_bytes
+        {
+            return WinDotAdmission::Bypassed(path);
+        }
+
+        loop {
+            let Some((retained_vertices, retained_bytes)) = self.retained_usage() else {
+                if !self.evict_lru() {
+                    return WinDotAdmission::Bypassed(path);
+                }
+                continue;
+            };
+            let fits = retained_vertices
+                .checked_add(capacity)
+                .is_some_and(|total| total <= max_vertices)
+                && retained_bytes
+                    .checked_add(entry_bytes)
+                    .is_some_and(|total| total <= max_bytes);
+            let has_slot = self.entries.iter().any(Option::is_none);
+            if fits && has_slot {
+                break;
+            }
+            if !self.evict_lru() {
+                return WinDotAdmission::Bypassed(path);
+            }
+        }
+
+        for position in (1..WIN_DOT_CACHE_SLOTS).rev() {
+            self.entries[position] = self.entries[position - 1].take();
+        }
+        let paint_path = path.clone();
+        self.entries[0] = Some(WinDotEntry { key, path });
+        WinDotAdmission::Retained(paint_path)
+    }
+}
+
+thread_local! {
+    static WIN_DOT_CACHE: RefCell<WinDotCache> = RefCell::new(WinDotCache::new());
+}
+
+fn build_win_dots(bounds: Bounds<Pixels>) -> Option<Path<Pixels>> {
+    let mut path = PathBuilder::fill();
+    for x in (0..f32::from(bounds.size.width) as usize).step_by(3) {
+        for y in (0..f32::from(bounds.size.height) as usize).step_by(3) {
+            let p = bounds.origin + point(px(x as f32), px(y as f32));
+            path.move_to(p);
+            path.line_to(p + point(px(0.8), px(0.)));
+            path.line_to(p + point(px(0.8), px(0.8)));
+            path.line_to(p + point(px(0.), px(0.8)));
+            path.close();
+        }
+    }
+    path.build().ok()
+}
+
+fn cached_win_dots(cache: &RefCell<WinDotCache>, bounds: Bounds<Pixels>) -> Option<Path<Pixels>> {
+    let Some(key) = WinDotKey::from_bounds(bounds) else {
+        return build_win_dots(bounds);
+    };
+
+    if let Some(path) = cache.borrow_mut().get_clone(key) {
+        return Some(path);
+    }
+
+    let path = build_win_dots(bounds)?;
+    match cache.borrow_mut().admit_and_clone(
+        key,
+        path,
+        WIN_DOT_CACHE_MAX_BYTES,
+        WIN_DOT_CACHE_MAX_VERTICES,
+        WIN_DOT_CACHE_MAX_ENTRY_VERTICES,
+    ) {
+        WinDotAdmission::Retained(path) | WinDotAdmission::Bypassed(path) => Some(path),
+    }
+}
+
 pub fn win(t: &Tokens) -> Div {
     let dots = palette::mix(t.base.led, palette::mix(t.base.ground, 0, 0.8), 0.07);
     div()
@@ -420,18 +606,8 @@ pub fn win(t: &Tokens) -> Div {
             canvas(
                 |_, _, _| {},
                 move |bounds, _, window, _| {
-                    let mut path = PathBuilder::fill();
-                    for x in (0..f32::from(bounds.size.width) as usize).step_by(3) {
-                        for y in (0..f32::from(bounds.size.height) as usize).step_by(3) {
-                            let p = bounds.origin + point(px(x as f32), px(y as f32));
-                            path.move_to(p);
-                            path.line_to(p + point(px(0.8), px(0.)));
-                            path.line_to(p + point(px(0.8), px(0.8)));
-                            path.line_to(p + point(px(0.), px(0.8)));
-                            path.close();
-                        }
-                    }
-                    if let Ok(path) = path.build() {
+                    let path = WIN_DOT_CACHE.with(|cache| cached_win_dots(cache, bounds));
+                    if let Some(path) = path {
                         window.paint_path(path, rgb(dots));
                     }
                 },
@@ -2005,8 +2181,9 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::{
-        div, draw_readout_text, lit_unit, vfd_digit_width, DrawMetrics, Tokens, UNIT_GLYPHS,
-        UNIT_GLYPH_TEST_BOUNDS,
+        div, draw_readout_text, lit_unit, vfd_digit_width, Bounds, DrawMetrics, Path, Pixels,
+        Tokens, UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES,
+        WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
     };
     use gpui::{prelude::*, TestAppContext, Window};
 
@@ -2040,6 +2217,416 @@ mod tests {
             size * (baseline - f32::from(ink.y_min) / units_per_em),
         )
     }
+
+    fn original_win_dots(bounds: Bounds<Pixels>) -> Option<Path<Pixels>> {
+        let mut path = gpui::PathBuilder::fill();
+        for x in (0..f32::from(bounds.size.width) as usize).step_by(3) {
+            for y in (0..f32::from(bounds.size.height) as usize).step_by(3) {
+                let p = bounds.origin + gpui::point(gpui::px(x as f32), gpui::px(y as f32));
+                path.move_to(p);
+                path.line_to(p + gpui::point(gpui::px(0.8), gpui::px(0.)));
+                path.line_to(p + gpui::point(gpui::px(0.8), gpui::px(0.8)));
+                path.line_to(p + gpui::point(gpui::px(0.), gpui::px(0.8)));
+                path.close();
+            }
+        }
+        path.build().ok()
+    }
+
+    fn point_bits(point: gpui::Point<Pixels>) -> [u32; 2] {
+        [f32::from(point.x).to_bits(), f32::from(point.y).to_bits()]
+    }
+
+    fn bounds_bits(bounds: Bounds<Pixels>) -> [u32; 4] {
+        [
+            f32::from(bounds.origin.x).to_bits(),
+            f32::from(bounds.origin.y).to_bits(),
+            f32::from(bounds.size.width).to_bits(),
+            f32::from(bounds.size.height).to_bits(),
+        ]
+    }
+
+    fn assert_same_win_dot_path(actual: Option<Path<Pixels>>, expected: Option<Path<Pixels>>) {
+        match (actual, expected) {
+            (None, None) => {}
+            (Some(actual), Some(expected)) => {
+                assert_eq!(actual.id, expected.id);
+                assert_eq!(actual.order, expected.order);
+                assert_eq!(bounds_bits(actual.bounds), bounds_bits(expected.bounds));
+                assert_eq!(
+                    bounds_bits(actual.content_mask.bounds),
+                    bounds_bits(expected.content_mask.bounds)
+                );
+                assert_eq!(actual.vertices.len(), expected.vertices.len());
+                for (actual, expected) in actual.vertices.iter().zip(&expected.vertices) {
+                    assert_eq!(
+                        point_bits(actual.xy_position),
+                        point_bits(expected.xy_position)
+                    );
+                    assert_eq!(
+                        [
+                            actual.st_position.x.to_bits(),
+                            actual.st_position.y.to_bits()
+                        ],
+                        [
+                            expected.st_position.x.to_bits(),
+                            expected.st_position.y.to_bits()
+                        ]
+                    );
+                    assert_eq!(
+                        bounds_bits(actual.content_mask.bounds),
+                        bounds_bits(expected.content_mask.bounds)
+                    );
+                }
+                assert_eq!(actual.color, expected.color);
+                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+            }
+            (actual, expected) => panic!(
+                "builder outcomes differ: actual={}, expected={}",
+                actual.is_some(),
+                expected.is_some()
+            ),
+        }
+    }
+
+    fn dot_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+        Bounds::new(
+            gpui::point(gpui::px(x), gpui::px(y)),
+            gpui::size(gpui::px(width), gpui::px(height)),
+        )
+    }
+
+    fn dot_capacity(path: &Path<Pixels>) -> usize {
+        path.vertices.capacity()
+    }
+
+    #[test]
+    fn win_dot_builder_matches_the_original_geometry_and_outcomes() {
+        let adjacent = f32::from_bits(3.0f32.to_bits() + 1);
+        let bounds = [
+            dot_bounds(11.25, -7.5, 10.5, 7.25),
+            dot_bounds(-0.0, 0.0, 3.0, 3.0),
+            dot_bounds(0.0, 0.0, 0.5, 0.75),
+            dot_bounds(-4.0, 2.0, -3.0, 6.0),
+            dot_bounds(0.25, 0.5, 1.0, adjacent),
+            dot_bounds(1.0, -1.0, 4.0, 6.0),
+            dot_bounds(0.0, 0.0, 500.0, 500.0),
+        ];
+
+        let empty = dot_bounds(0.0, 0.0, 0.5, 0.75);
+        let empty_cache = std::cell::RefCell::new(super::WinDotCache::new());
+        assert_same_win_dot_path(
+            super::cached_win_dots(&empty_cache, empty),
+            original_win_dots(empty),
+        );
+        assert!(empty_cache
+            .borrow()
+            .entries
+            .iter()
+            .flatten()
+            .next()
+            .expect("successful empty paths are retained")
+            .path
+            .vertices
+            .is_empty());
+        let overflow = dot_bounds(0.0, 0.0, 500.0, 500.0);
+        assert!(super::build_win_dots(overflow).is_none());
+        let failed_cache = std::cell::RefCell::new(super::WinDotCache::new());
+        assert!(super::cached_win_dots(&failed_cache, overflow).is_none());
+        assert_eq!(
+            failed_cache.borrow().entries.iter().flatten().count(),
+            0,
+            "failed builds do not enter the cache"
+        );
+
+        for bounds in bounds {
+            assert_same_win_dot_path(super::build_win_dots(bounds), original_win_dots(bounds));
+        }
+    }
+
+    #[test]
+    fn win_dot_cache_uses_exact_bounds_and_promotes_hits() {
+        let a = dot_bounds(0.0, 0.0, 6.0, 6.0);
+        let b = dot_bounds(0.25, 0.0, 6.0, 6.0);
+        let c = dot_bounds(0.0, 0.0, 6.0, 6.25);
+        let a_key = super::WinDotKey::from_bounds(a).unwrap();
+        let b_key = super::WinDotKey::from_bounds(b).unwrap();
+        let c_key = super::WinDotKey::from_bounds(c).unwrap();
+        let a_path = super::build_win_dots(a).unwrap();
+        let capacity = dot_capacity(&a_path);
+        let mut cache = super::WinDotCache::new();
+        let limits = (
+            WIN_DOT_CACHE_MAX_BYTES,
+            capacity * 2,
+            WIN_DOT_CACHE_MAX_ENTRY_VERTICES,
+        );
+
+        let first = cache.admit_and_clone(a_key, a_path, limits.0, limits.1, limits.2);
+        match first {
+            super::WinDotAdmission::Retained(path) => {
+                assert_same_win_dot_path(Some(path), original_win_dots(a));
+            }
+            super::WinDotAdmission::Bypassed(_) => panic!("first path must be retained"),
+        }
+        assert_same_win_dot_path(cache.get_clone(a_key), original_win_dots(a));
+        let b_path = super::build_win_dots(b).unwrap();
+        match cache.admit_and_clone(b_key, b_path, limits.0, limits.1, limits.2) {
+            super::WinDotAdmission::Retained(path) => {
+                assert_same_win_dot_path(Some(path), original_win_dots(b));
+            }
+            super::WinDotAdmission::Bypassed(_) => panic!("second path must be retained"),
+        }
+        assert_same_win_dot_path(cache.get_clone(b_key), original_win_dots(b));
+        let mut changed_a = cache.get_clone(a_key).expect("first path remains cached");
+        changed_a.vertices[1].xy_position = gpui::point(gpui::px(90.), gpui::px(91.));
+        changed_a.content_mask.bounds.origin = gpui::point(gpui::px(80.), gpui::px(81.));
+        changed_a.color = gpui::rgb(0xabcdef).into();
+        assert_same_win_dot_path(cache.get_clone(b_key), original_win_dots(b));
+        assert_same_win_dot_path(cache.get_clone(a_key), original_win_dots(a));
+
+        let c_path = super::build_win_dots(c).unwrap();
+        match cache.admit_and_clone(c_key, c_path, limits.0, limits.1, limits.2) {
+            super::WinDotAdmission::Retained(path) => {
+                assert_same_win_dot_path(Some(path), original_win_dots(c));
+            }
+            super::WinDotAdmission::Bypassed(_) => panic!("third path must be retained"),
+        }
+        assert_same_win_dot_path(cache.get_clone(a_key), original_win_dots(a));
+        assert!(cache.get_clone(b_key).is_none());
+        let rebuilt_b = super::build_win_dots(b).unwrap();
+        match cache.admit_and_clone(b_key, rebuilt_b, limits.0, limits.1, limits.2) {
+            super::WinDotAdmission::Retained(path) => {
+                assert_same_win_dot_path(Some(path), original_win_dots(b));
+            }
+            super::WinDotAdmission::Bypassed(_) => panic!("rebuilt path must be retained"),
+        }
+        assert_same_win_dot_path(cache.get_clone(b_key), original_win_dots(b));
+    }
+
+    #[test]
+    fn win_dot_cache_keeps_clone_changes_out_of_retained_geometry() {
+        let bounds = dot_bounds(2.25, 4.5, 3.0, 3.0);
+        let key = super::WinDotKey::from_bounds(bounds).unwrap();
+        let mut cache = super::WinDotCache::new();
+        let original = super::build_win_dots(bounds).unwrap();
+        let original_vertex = point_bits(original.vertices[0].xy_position);
+        let retained = match cache.admit_and_clone(
+            key,
+            original,
+            WIN_DOT_CACHE_MAX_BYTES,
+            WIN_DOT_CACHE_MAX_VERTICES,
+            WIN_DOT_CACHE_MAX_ENTRY_VERTICES,
+        ) {
+            super::WinDotAdmission::Retained(path) => path,
+            super::WinDotAdmission::Bypassed(_) => panic!("small path must be retained"),
+        };
+        let mut painted = retained;
+        painted.vertices[0].xy_position = gpui::point(gpui::px(90.), gpui::px(91.));
+        painted.content_mask.bounds.origin = gpui::point(gpui::px(80.), gpui::px(81.));
+        painted.color = gpui::rgb(0xabcdef).into();
+
+        let cached = cache.get_clone(key).expect("path remains cached");
+        assert_eq!(point_bits(cached.vertices[0].xy_position), original_vertex);
+        assert_eq!(bounds_bits(cached.content_mask.bounds), [0; 4]);
+        assert_eq!(cached.color, gpui::Background::default());
+    }
+
+    #[test]
+    fn win_dot_cache_bounds_many_small_resizes_and_reports_retained_capacity() {
+        let mut cache = super::WinDotCache::new();
+        for step in 0..128 {
+            let bounds = dot_bounds(step as f32 * 0.25, 0.0, 3.0 + step as f32 * 0.125, 3.0);
+            let key = super::WinDotKey::from_bounds(bounds).unwrap();
+            let path = super::build_win_dots(bounds).unwrap();
+            let result = cache.admit_and_clone(
+                key,
+                path,
+                WIN_DOT_CACHE_MAX_BYTES,
+                WIN_DOT_CACHE_MAX_VERTICES,
+                WIN_DOT_CACHE_MAX_ENTRY_VERTICES,
+            );
+            assert!(matches!(result, super::WinDotAdmission::Retained(_)));
+            let (vertices, bytes) = cache.retained_usage().expect("bounded usage");
+            assert!(vertices <= WIN_DOT_CACHE_MAX_VERTICES);
+            assert!(bytes <= WIN_DOT_CACHE_MAX_BYTES);
+            assert!(cache.entries.iter().flatten().count() <= WIN_DOT_CACHE_SLOTS);
+        }
+        assert_eq!(cache.entries.iter().flatten().count(), WIN_DOT_CACHE_SLOTS);
+        let oldest_bounds = dot_bounds(0.0, 0.0, 3.0, 3.0);
+        let newest_bounds = dot_bounds(127.0 * 0.25, 0.0, 3.0 + 127.0 * 0.125, 3.0);
+        assert!(cache
+            .get_clone(super::WinDotKey::from_bounds(oldest_bounds).unwrap())
+            .is_none());
+        assert!(cache
+            .get_clone(super::WinDotKey::from_bounds(newest_bounds).unwrap())
+            .is_some());
+    }
+
+    #[test]
+    fn win_dot_cache_bypasses_over_budget_paths_without_evicting_entries() {
+        let first_bounds = dot_bounds(0.0, 0.0, 6.0, 6.0);
+        let next_bounds = dot_bounds(5.0, 0.0, 6.0, 6.0);
+        let first_key = super::WinDotKey::from_bounds(first_bounds).unwrap();
+        let next_key = super::WinDotKey::from_bounds(next_bounds).unwrap();
+        let first_path = super::build_win_dots(first_bounds).unwrap();
+        let capacity = dot_capacity(&first_path);
+        let mut cache = super::WinDotCache::new();
+        assert!(matches!(
+            cache.admit_and_clone(
+                first_key,
+                first_path,
+                WIN_DOT_CACHE_MAX_BYTES,
+                capacity,
+                capacity
+            ),
+            super::WinDotAdmission::Retained(_)
+        ));
+
+        let next_path = super::build_win_dots(next_bounds).unwrap();
+        let bypassed = cache.admit_and_clone(
+            next_key,
+            next_path,
+            WIN_DOT_CACHE_MAX_BYTES,
+            capacity,
+            capacity - 1,
+        );
+        match bypassed {
+            super::WinDotAdmission::Bypassed(path) => {
+                assert_same_win_dot_path(Some(path), original_win_dots(next_bounds));
+            }
+            super::WinDotAdmission::Retained(_) => panic!("over-entry-limit path must bypass"),
+        }
+        assert!(cache.get_clone(first_key).is_some());
+        assert!(cache.get_clone(next_key).is_none());
+
+        let next_path = super::build_win_dots(next_bounds).unwrap();
+        let byte_limit = std::mem::size_of::<std::cell::RefCell<super::WinDotCache>>()
+            + capacity * std::mem::size_of::<gpui::PathVertex<Pixels>>()
+            - 1;
+        match cache.admit_and_clone(next_key, next_path, byte_limit, capacity * 2, capacity) {
+            super::WinDotAdmission::Bypassed(path) => {
+                assert_same_win_dot_path(Some(path), original_win_dots(next_bounds));
+            }
+            super::WinDotAdmission::Retained(_) => panic!("over-byte-limit path must bypass"),
+        }
+        assert!(cache.get_clone(first_key).is_some());
+    }
+
+    #[test]
+    fn win_dot_cache_evicts_for_the_reduced_byte_budget() {
+        let a = dot_bounds(0.0, 0.0, 6.0, 6.0);
+        let b = dot_bounds(9.0, 0.0, 6.0, 6.0);
+        let c = dot_bounds(18.0, 0.0, 6.0, 6.0);
+        let a_key = super::WinDotKey::from_bounds(a).unwrap();
+        let b_key = super::WinDotKey::from_bounds(b).unwrap();
+        let c_key = super::WinDotKey::from_bounds(c).unwrap();
+        let a_path = super::build_win_dots(a).unwrap();
+        let entry_capacity = dot_capacity(&a_path);
+        let entry_bytes = entry_capacity * std::mem::size_of::<gpui::PathVertex<Pixels>>();
+        let fixed_bytes = std::mem::size_of::<std::cell::RefCell<super::WinDotCache>>();
+        let byte_limit = fixed_bytes + entry_bytes * 2;
+        let vertex_limit = entry_capacity * 3;
+        let mut cache = super::WinDotCache::new();
+
+        for (key, bounds, path) in [
+            (a_key, a, a_path),
+            (b_key, b, super::build_win_dots(b).unwrap()),
+        ] {
+            assert_eq!(dot_capacity(&path), entry_capacity);
+            match cache.admit_and_clone(key, path, byte_limit, vertex_limit, entry_capacity) {
+                super::WinDotAdmission::Retained(path) => {
+                    assert_same_win_dot_path(Some(path), original_win_dots(bounds));
+                }
+                super::WinDotAdmission::Bypassed(_) => panic!("path fits the byte budget"),
+            }
+        }
+        assert!(cache.get_clone(a_key).is_some());
+        assert_eq!(
+            cache.retained_usage(),
+            Some((entry_capacity * 2, byte_limit))
+        );
+        let c_path = super::build_win_dots(c).unwrap();
+        assert_eq!(dot_capacity(&c_path), entry_capacity);
+        match cache.admit_and_clone(c_key, c_path, byte_limit, vertex_limit, entry_capacity) {
+            super::WinDotAdmission::Retained(path) => {
+                assert_same_win_dot_path(Some(path), original_win_dots(c));
+            }
+            super::WinDotAdmission::Bypassed(_) => panic!("third path evicts one old path"),
+        }
+
+        assert!(cache.get_clone(b_key).is_none());
+        assert_same_win_dot_path(cache.get_clone(a_key), original_win_dots(a));
+        assert_same_win_dot_path(cache.get_clone(c_key), original_win_dots(c));
+        assert_eq!(
+            cache.retained_usage(),
+            Some((entry_capacity * 2, byte_limit))
+        );
+        assert!(cache.entries.iter().flatten().count() < WIN_DOT_CACHE_SLOTS);
+    }
+
+    #[test]
+    fn win_dot_cache_production_byte_limit_retains_only_three_max_capacity_paths() {
+        let mut cache = super::WinDotCache::new();
+        for index in 0..4 {
+            let bounds = dot_bounds(index as f32 * 9.0, 0.0, 3.0, 3.0);
+            let key = super::WinDotKey::from_bounds(bounds).unwrap();
+            let mut path = super::build_win_dots(bounds).unwrap();
+            path.vertices
+                .reserve_exact(WIN_DOT_CACHE_MAX_ENTRY_VERTICES - path.vertices.len());
+            assert_eq!(dot_capacity(&path), WIN_DOT_CACHE_MAX_ENTRY_VERTICES);
+            match cache.admit_and_clone(
+                key,
+                path,
+                WIN_DOT_CACHE_MAX_BYTES,
+                WIN_DOT_CACHE_MAX_VERTICES,
+                WIN_DOT_CACHE_MAX_ENTRY_VERTICES,
+            ) {
+                super::WinDotAdmission::Retained(path) => {
+                    assert_same_win_dot_path(Some(path), original_win_dots(bounds));
+                }
+                super::WinDotAdmission::Bypassed(_) => panic!("three paths fit the byte limit"),
+            }
+        }
+
+        let vertex_bytes =
+            WIN_DOT_CACHE_MAX_ENTRY_VERTICES * std::mem::size_of::<gpui::PathVertex<Pixels>>();
+        let fixed_bytes = std::mem::size_of::<std::cell::RefCell<super::WinDotCache>>();
+        assert!(fixed_bytes + vertex_bytes * 3 <= WIN_DOT_CACHE_MAX_BYTES);
+        assert!(fixed_bytes + vertex_bytes * 4 > WIN_DOT_CACHE_MAX_BYTES);
+        assert_eq!(cache.entries.iter().flatten().count(), 3);
+        let (vertices, bytes) = cache.retained_usage().expect("retained usage is bounded");
+        assert_eq!(vertices, WIN_DOT_CACHE_MAX_ENTRY_VERTICES * 3);
+        assert!(bytes <= WIN_DOT_CACHE_MAX_BYTES);
+        assert!(cache
+            .get_clone(super::WinDotKey::from_bounds(dot_bounds(0.0, 0.0, 3.0, 3.0)).unwrap())
+            .is_none());
+        for index in 1..4 {
+            let bounds = dot_bounds(index as f32 * 9.0, 0.0, 3.0, 3.0);
+            assert_same_win_dot_path(
+                cache.get_clone(super::WinDotKey::from_bounds(bounds).unwrap()),
+                original_win_dots(bounds),
+            );
+        }
+    }
+
+    #[test]
+    fn win_dot_cache_distinguishes_signed_zero_and_adjacent_sizes() {
+        let positive_zero = super::WinDotKey::from_bounds(dot_bounds(0.0, 0.0, 3.0, 3.0)).unwrap();
+        let negative_zero = super::WinDotKey::from_bounds(dot_bounds(-0.0, 0.0, 3.0, 3.0)).unwrap();
+        let one = super::WinDotKey::from_bounds(dot_bounds(0.0, 0.0, 3.0, 3.0)).unwrap();
+        let adjacent = super::WinDotKey::from_bounds(dot_bounds(
+            0.0,
+            0.0,
+            f32::from_bits(3.0f32.to_bits() + 1),
+            3.0,
+        ))
+        .unwrap();
+        assert_ne!(positive_zero, negative_zero);
+        assert_eq!(positive_zero, one);
+        assert_ne!(one, adjacent);
+        assert!(super::WinDotKey::from_bounds(dot_bounds(f32::NAN, 0.0, 3.0, 3.0)).is_none());
+    }
+
     #[gpui::test]
     async fn virtual_history_rows_match_header_columns(cx: &mut TestAppContext) {
         use super::{history_cell, history_row};
