@@ -1,5 +1,7 @@
 mod analysis;
 mod details;
+#[cfg(test)]
+mod draw_benchmark;
 mod history;
 mod model;
 mod palette;
@@ -600,6 +602,8 @@ impl Monitor {
 
 impl Render for Monitor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        draw_benchmark::record_render();
         self.rack(window, cx)
     }
 }
