@@ -71,9 +71,12 @@ for line in sys.stdin:
                 .unwrap()
                 .fail_next_native_collection();
         }
-        state
-            .snapshot(false, false)
-            .unwrap()
+        let snapshot = state.snapshot(false, false).unwrap();
+        assert_eq!(
+            matches!(snapshot.process_data, ProcessData::Stale { .. }),
+            failed
+        );
+        snapshot
             .processes
             .into_iter()
             .find(|row| row.pid == self.child.id())
@@ -90,73 +93,97 @@ impl Drop for OwnedChild {
 }
 
 #[test]
-fn snapshots_share_cpu_and_disk_history_across_collector_transitions() {
+fn snapshots_keep_stale_rows_and_recover_exact_counter_intervals() {
     const BYTES: usize = 8 * 1024 * 1024;
     let mut child = OwnedChild::new();
     child.work(BYTES, 100);
     let state = AppState::new();
-    for (failed, busy) in [
-        (false, true),
-        (true, true),
-        (false, false),
-        (true, true),
-        (true, false),
-        (false, false),
-    ] {
-        child.interval(BYTES, if busy { 200 } else { 0 });
+    child.interval(BYTES, 200);
+    let first = child.row(&state, false);
+    assert_eq!(first.disk_usage.1, BYTES as u64);
+    assert!(first.cpu_usage > 1.);
+    child.interval(BYTES, 200);
+    let stale = child.row(&state, true);
+    assert_eq!(stale.disk_usage, first.disk_usage);
+    assert_eq!(stale.cpu_usage, first.cpu_usage);
+    child.interval(BYTES, 200);
+    let recovered = child.row(&state, false);
+    assert_eq!(recovered.disk_usage.1, 2 * BYTES as u64);
+    assert!(recovered.cpu_usage > 1.);
+    for failed in [true, true, false] {
+        child.interval(0, 0);
         let row = child.row(&state, failed);
-        assert_eq!(row.disk_usage.1, BYTES as u64, "fallback={failed}");
-        assert!(row.cpu_usage.is_finite());
-        if busy {
-            assert!(
-                row.cpu_usage > 1.,
-                "busy CPU={} fallback={failed}",
-                row.cpu_usage
-            );
-        } else {
-            assert!(
-                row.cpu_usage < 2.,
-                "idle CPU={} fallback={failed}",
-                row.cpu_usage
-            );
+        if !failed {
+            assert_eq!(row.disk_usage.1, 0);
+            assert!(row.cpu_usage < 2.);
         }
     }
-    child.interval(0, 0);
-    assert_eq!(child.row(&state, false).disk_usage.1, 0);
     child.child.kill().unwrap();
     child.child.wait().unwrap();
-    for failed in [true, false] {
-        if failed {
-            state
-                .process_monitor
-                .lock()
-                .unwrap()
-                .fail_next_native_collection();
-        }
-        assert!(!state
-            .snapshot(false, false)
-            .unwrap()
-            .processes
-            .iter()
-            .any(|row| row.pid == child.child.id()));
-        assert!(state.sys.lock().unwrap().processes().is_empty());
-    }
+    assert!(!state
+        .snapshot(false, false)
+        .unwrap()
+        .processes
+        .iter()
+        .any(|p| p.pid == child.child.id()));
+    assert!(state.sys.lock().unwrap().processes().is_empty());
 }
 
 #[test]
-fn failed_startup_primes_fallback_and_preserves_new_process_writes() {
+fn failed_startup_primes_first_success_and_preserves_new_process_writes() {
     const BYTES: usize = 8 * 1024 * 1024;
     let mut old = OwnedChild::new();
     old.work(BYTES, 0);
     let mut monitor = ProcessMonitor::new();
     monitor.fail_next_native_collection();
     let state = AppState::with_process_monitor(monitor);
-    assert_eq!(old.row(&state, true).disk_usage.1, 0);
+    state
+        .process_monitor
+        .lock()
+        .unwrap()
+        .fail_next_native_collection();
+    let failed = state.snapshot(false, false).unwrap();
+    assert!(matches!(failed.process_data, ProcessData::Stale { .. }));
+    assert!(failed.processes.is_empty());
+    assert!(failed.stats.memory_total > 0);
     assert_eq!(old.row(&state, false).disk_usage.1, 0);
-    for failed in [true, false] {
-        let mut new = OwnedChild::new();
-        new.work(BYTES, 0);
-        assert_eq!(new.row(&state, failed).disk_usage.1, BYTES as u64);
-        assert_eq!(new.row(&state, !failed).disk_usage.1, 0);
-    }
+    let mut new = OwnedChild::new();
+    new.work(BYTES, 0);
+    assert_eq!(new.row(&state, false).disk_usage.1, BYTES as u64);
+    assert_eq!(new.row(&state, false).disk_usage.1, 0);
+}
+
+#[test]
+fn unavailable_counters_preserve_last_valid_samples_and_startup_baselines() {
+    const BYTES: usize = 8 * 1024 * 1024;
+    let mut child = OwnedChild::new();
+    child.work(BYTES, 500);
+    let mut monitor = ProcessMonitor::new();
+    monitor.fail_next_counter_reads(child.child.id());
+    let state = AppState::with_process_monitor(monitor);
+    let first = child.row(&state, false);
+    assert_eq!(first.disk_usage.1, 0);
+    assert_eq!(first.cpu_usage, 0.);
+    child.interval(0, 0);
+    let idle = child.row(&state, false);
+    assert_eq!(idle.disk_usage.1, 0);
+    assert!(idle.cpu_usage < 2.);
+    child.interval(BYTES, 200);
+    state
+        .process_monitor
+        .lock()
+        .unwrap()
+        .fail_next_counter_reads(child.child.id());
+    let unavailable = child.row(&state, false);
+    assert_eq!(unavailable.disk_usage, (0, 0));
+    assert_eq!(unavailable.cpu_usage, 0.);
+    assert_eq!(unavailable.memory_usage, 0);
+    child.interval(BYTES, 0);
+    let recovery = child.row(&state, false);
+    assert_eq!(recovery.disk_usage.1, 2 * BYTES as u64);
+    assert!(recovery.cpu_usage > 1.);
+    child.interval(0, 0);
+    let idle = child.row(&state, false);
+    assert_eq!(idle.disk_usage.1, 0);
+    assert!(idle.cpu_usage < 2.);
 }

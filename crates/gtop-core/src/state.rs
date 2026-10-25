@@ -4,7 +4,7 @@
 //! and process tracking capabilities.
 
 use crate::monitoring::{collect_ports_by_pid, ProcessMonitor, SystemMonitor};
-use crate::{perf_enabled, CpuTopology, Snapshot};
+use crate::{perf_enabled, CpuTopology, ProcessData, Snapshot};
 use std::sync::Mutex;
 use std::time::Instant;
 use sysinfo::{DiskRefreshKind, Disks, Networks, System};
@@ -26,6 +26,8 @@ pub struct AppState {
     system_monitor: Mutex<SystemMonitor>,
     /// Apple Silicon performance and efficiency core counts, read at startup.
     cpu_topology: CpuTopology,
+    #[cfg(target_os = "macos")]
+    process_rows: Mutex<(Vec<crate::ProcessInfo>, ProcessData)>,
 }
 
 impl AppState {
@@ -53,7 +55,7 @@ impl AppState {
         #[cfg(target_os = "macos")]
         let process_monitor = {
             let mut monitor = process_monitor;
-            let _ = monitor.collect_with_fallback(false, &Default::default());
+            let _ = monitor.collect_native_processes(false, &Default::default());
             monitor
         };
         Self {
@@ -63,6 +65,8 @@ impl AppState {
             disks: Mutex::new(disks),
             networks: Mutex::new(networks),
             cpu_topology: CpuTopology::detect(),
+            #[cfg(target_os = "macos")]
+            process_rows: Mutex::new((Vec::new(), ProcessData::Fresh)),
         }
     }
 }
@@ -96,7 +100,25 @@ impl AppState {
         #[cfg(not(target_os = "macos"))]
         let processes = process_monitor.collect_processes(&sys, include_environ, &ports_by_pid)?;
         #[cfg(target_os = "macos")]
-        let processes = process_monitor.collect_with_fallback(include_environ, &ports_by_pid)?;
+        let (processes, process_data) = {
+            let mut previous = self.process_rows.lock().map_err(|e| e.to_string())?;
+            match process_monitor.collect_native_processes(include_environ, &ports_by_pid) {
+                Ok(rows) => {
+                    *previous = (rows.clone(), ProcessData::Fresh);
+                    (rows, ProcessData::Fresh)
+                }
+                Err(reason) => {
+                    let since = match &previous.1 {
+                        ProcessData::Fresh => Instant::now(),
+                        ProcessData::Stale { since, .. } => *since,
+                    };
+                    previous.1 = ProcessData::Stale { since, reason };
+                    previous.clone()
+                }
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let process_data = ProcessData::Fresh;
         let stats = system_monitor.collect_stats(&sys, &networks, &disks);
         if perf_enabled() {
             eprintln!(
@@ -108,6 +130,7 @@ impl AppState {
         }
         Ok(Snapshot {
             processes,
+            process_data,
             stats,
             cpu_topology: self.cpu_topology,
         })
@@ -239,12 +262,13 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn native_failure_falls_back_to_sysinfo_and_retries_native_next_tick() {
+    fn native_failure_retains_rows_and_retries_native_next_tick() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
         let state = AppState::new();
+        let fresh = state.snapshot(false, false).unwrap();
         state
             .process_monitor
             .lock()
@@ -253,12 +277,29 @@ mod tests {
 
         let fallback = state.snapshot(false, false).unwrap();
         assert!(fallback.stats.memory_total > 0);
+        assert!(matches!(fallback.process_data, ProcessData::Stale { .. }));
+        assert_eq!(
+            format!("{:?}", fallback.processes),
+            format!("{:?}", fresh.processes)
+        );
         assert!(fallback
             .processes
             .iter()
             .any(|process| process.pid == child.id()));
 
+        state
+            .process_monitor
+            .lock()
+            .unwrap()
+            .fail_next_native_collection();
+        let repeated = state.snapshot(false, false).unwrap();
+        assert_eq!(repeated.process_data, fallback.process_data);
+        assert_eq!(
+            format!("{:?}", repeated.processes),
+            format!("{:?}", fresh.processes)
+        );
         let retry = state.snapshot(false, false).unwrap();
+        assert_eq!(retry.process_data, ProcessData::Fresh);
         assert!(retry
             .processes
             .iter()

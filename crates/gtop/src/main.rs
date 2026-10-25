@@ -511,6 +511,9 @@ impl Monitor {
     }
 
     fn observe_sample(&mut self, snapshot: &Snapshot) {
+        if matches!(snapshot.process_data, gtop_core::ProcessData::Stale { .. }) {
+            return;
+        }
         if let Some(key) = self
             .pending_kill
             .filter(|key| crate::details::kill_completed(*key, &snapshot.processes))
@@ -565,10 +568,8 @@ impl Monitor {
 
             cx.notify();
         });
+        update_process_status(&mut self.status, &snapshot.process_data);
         self.snapshot = Some(snapshot);
-        if self.status.starts_with("Reading") || self.status.starts_with("Refresh failed") {
-            self.status = "Select a process for details".into();
-        }
         if gtop_core::perf_enabled() {
             eprintln!(
                 "perf ui tick visible=true active={} rows={} total={}",
@@ -710,5 +711,42 @@ mod wake_tests {
         }
         assert_eq!(sent, drained);
         assert!(send.try_send(()).is_ok());
+    }
+}
+
+fn update_process_status(status: &mut String, data: &gtop_core::ProcessData) {
+    match data {
+        gtop_core::ProcessData::Stale { since, reason } => {
+            *status = format!(
+                "Process data stale for {}s: {reason}",
+                since.elapsed().as_secs()
+            );
+        }
+        gtop_core::ProcessData::Fresh => {
+            if status.starts_with("Reading")
+                || status.starts_with("Refresh failed")
+                || status.starts_with("Process data stale")
+            {
+                *status = "Select a process for details".into();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod process_status_tests {
+    #[test]
+    fn stale_status_shows_reason_and_age_then_clears_on_fresh_data() {
+        let mut status = "Reading system information".to_string();
+        super::update_process_status(
+            &mut status,
+            &gtop_core::ProcessData::Stale {
+                since: std::time::Instant::now() - std::time::Duration::from_secs(7),
+                reason: "enumeration failed".into(),
+            },
+        );
+        assert_eq!(status, "Process data stale for 7s: enumeration failed");
+        super::update_process_status(&mut status, &gtop_core::ProcessData::Fresh);
+        assert_eq!(status, "Select a process for details");
     }
 }

@@ -167,50 +167,59 @@ fn info<T>(pid: u32, flavor: i32) -> Option<T> {
 struct Record {
     identity: (u64, u64),
     row: ProcessInfo,
-    sample: Option<Sample>,
+    cpu_sample: Option<(u64, Instant)>,
+    disk_sample: Option<(u64, u64)>,
 }
 
 #[derive(Debug)]
 struct Sample {
-    cpu_nanos: u64,
+    cpu_nanos: Option<u64>,
     disk: Option<(u64, u64)>,
     sampled: Instant,
 }
 
 impl Record {
-    fn emit(&mut self, row: &mut ProcessInfo, mut sample: Sample) {
-        row.cpu_usage = self.sample.as_ref().map_or(0., |previous| {
-            (sample.cpu_nanos.saturating_sub(previous.cpu_nanos) as f64
-                / sample
-                    .sampled
-                    .duration_since(previous.sampled)
-                    .as_nanos()
-                    .max(1) as f64
-                * 100.) as f32
-        });
-        row.disk_usage = sample.disk.map_or((0, 0), |disk| {
-            let previous = self
-                .sample
-                .as_ref()
-                .and_then(|s| s.disk)
-                .unwrap_or_default();
-            (
-                disk.0.saturating_sub(previous.0),
-                disk.1.saturating_sub(previous.1),
-            )
-        });
-        if sample.disk.is_none() {
-            sample.disk = self.sample.as_ref().and_then(|s| s.disk);
+    fn emit(&mut self, row: &mut ProcessInfo, sample: Sample) {
+        row.cpu_usage =
+            sample
+                .cpu_nanos
+                .zip(self.cpu_sample)
+                .map_or(0., |(cpu, (previous, at))| {
+                    (cpu.saturating_sub(previous) as f64
+                        / sample.sampled.duration_since(at).as_nanos().max(1) as f64
+                        * 100.) as f32
+                });
+        row.disk_usage = sample
+            .disk
+            .zip(self.disk_sample)
+            .map_or((0, 0), |(disk, previous)| {
+                (
+                    disk.0.saturating_sub(previous.0),
+                    disk.1.saturating_sub(previous.1),
+                )
+            });
+        if let Some(cpu) = sample.cpu_nanos {
+            self.cpu_sample = Some((cpu, sample.sampled));
         }
-        self.sample = Some(sample);
+        if let Some(disk) = sample.disk {
+            self.disk_sample = Some(disk);
+        }
     }
 }
 #[derive(Debug, Default)]
 pub(super) struct Collector {
     pids: Vec<i32>,
     records: HashMap<u32, Record>,
+    primed: bool,
+    #[cfg(test)]
+    unavailable_counters: Option<u32>,
 }
 impl Collector {
+    #[cfg(test)]
+    pub(super) fn fail_next_counter_reads(&mut self, pid: u32) {
+        self.unavailable_counters = Some(pid);
+    }
+
     pub fn collect(
         &mut self,
         users: &sysinfo::Users,
@@ -272,9 +281,6 @@ impl Collector {
             let mut sys = System::new();
             if !metadata.is_empty() {
                 let mut kind = ProcessRefreshKind::nothing()
-                    .with_cpu()
-                    .with_memory()
-                    .with_disk_usage()
                     .with_user(UpdateKind::OnlyIfNotSet)
                     .with_cmd(UpdateKind::OnlyIfNotSet)
                     .with_exe(UpdateKind::OnlyIfNotSet)
@@ -287,8 +293,13 @@ impl Collector {
             let mut rows = Vec::with_capacity(samples.len());
             for (pid, bsd) in samples {
                 let sampled = Instant::now();
-                let task = info::<proc_taskinfo>(pid, PROC_PIDTASKINFO).unwrap_or_default();
-                let cpu = task.pti_total_user.saturating_add(task.pti_total_system);
+                let task = info::<proc_taskinfo>(pid, PROC_PIDTASKINFO);
+                #[cfg(test)]
+                let task = task.filter(|_| self.unavailable_counters != Some(pid));
+                let cpu = task.as_ref().map(|task| {
+                    (task.pti_total_user.saturating_add(task.pti_total_system) as f64
+                        * nanos_per_unit) as u64
+                });
                 let mut usage = rusage_info_v2::default();
                 let disk = (unsafe {
                     proc_pid_rusage(
@@ -298,6 +309,13 @@ impl Collector {
                     )
                 } == 0)
                     .then_some((usage.ri_diskio_bytesread, usage.ri_diskio_byteswritten));
+                #[cfg(test)]
+                let disk = if self.unavailable_counters == Some(pid) {
+                    self.unavailable_counters = None;
+                    None
+                } else {
+                    disk
+                };
                 let existing = self.records.contains_key(&pid);
                 if !existing {
                     let Some(process) = sys.process(Pid::from_u32(pid)) else {
@@ -319,7 +337,8 @@ impl Collector {
                                 None,
                                 now,
                             ),
-                            sample: None,
+                            cpu_sample: None,
+                            disk_sample: self.primed.then_some((0, 0)),
                         },
                     );
                 }
@@ -370,8 +389,8 @@ impl Collector {
                     };
                     row.status = ProcessMonitor::format_status(status);
                 }
-                row.memory_usage = task.pti_resident_size;
-                row.virtual_memory = task.pti_virtual_size;
+                row.memory_usage = task.as_ref().map_or(0, |task| task.pti_resident_size);
+                row.virtual_memory = task.as_ref().map_or(0, |task| task.pti_virtual_size);
                 row.run_time = if row.start_time > 0 {
                     now.saturating_sub(row.start_time)
                 } else {
@@ -388,60 +407,20 @@ impl Collector {
                 record.emit(
                     &mut row,
                     Sample {
-                        cpu_nanos: (cpu as f64 * nanos_per_unit) as u64,
+                        cpu_nanos: cpu,
                         disk,
                         sampled,
                     },
                 );
+                if !self.primed {
+                    row.cpu_usage = 0.;
+                    row.disk_usage = (0, 0);
+                }
                 rows.push(row);
             }
+            self.primed = true;
             return Ok(rows);
         }
-    }
-
-    pub fn collect_fallback(
-        &mut self,
-        users: &sysinfo::Users,
-        include_environ: bool,
-        ports: &HashMap<u32, Vec<u16>>,
-    ) -> Result<Vec<ProcessInfo>, String> {
-        let now = ProcessMonitor::get_current_time()?;
-        let mut sys = System::new();
-        ProcessMonitor::refresh(&mut sys, include_environ);
-        let sampled = Instant::now();
-        let mut rows = Vec::with_capacity(sys.processes().len());
-        self.records
-            .retain(|pid, _| sys.process(Pid::from_u32(*pid)).is_some());
-        for (pid, process) in sys.processes() {
-            let pid = pid.as_u32();
-            let identity = info::<proc_bsdinfo>(pid, PROC_PIDTBSDINFO)
-                .map(|bsd| (bsd.pbi_start_tvsec, bsd.pbi_start_tvusec))
-                .unwrap_or((process.start_time(), 0));
-            let mut row = process_row(pid, process, users, include_environ, ports, None, now);
-            let record = self.records.entry(pid).or_insert_with(|| Record {
-                identity,
-                row: row.clone(),
-                sample: None,
-            });
-            if record.identity != identity {
-                *record = Record {
-                    identity,
-                    row: row.clone(),
-                    sample: None,
-                };
-            }
-            let disk = process.disk_usage();
-            record.emit(
-                &mut row,
-                Sample {
-                    cpu_nanos: process.accumulated_cpu_time().saturating_mul(1_000_000),
-                    disk: Some((disk.total_read_bytes, disk.total_written_bytes)),
-                    sampled,
-                },
-            );
-            rows.push(row);
-        }
-        Ok(rows)
     }
 }
 

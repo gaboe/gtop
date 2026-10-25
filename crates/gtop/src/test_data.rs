@@ -25,6 +25,7 @@ pub fn process(pid: u32, name: &str, cpu: f32) -> ProcessInfo {
 }
 pub fn snapshot() -> Snapshot {
     Snapshot {
+        process_data: gtop_core::ProcessData::Fresh,
         processes: vec![
             process(1, "rustc", 200.),
             process(2, "rustc", 150.),
