@@ -269,6 +269,33 @@ mod tests {
     }
 
     #[test]
+    fn catalog_identifies_dotnet_compiler_and_development_tools() {
+        let compiler = super::identity("csc", "/sdk/Roslyn/csc");
+        assert_eq!(compiler.what, "C# compiler");
+        assert_eq!(compiler.source, "gtop catalog");
+        for name in [
+            "VBCSCompiler",
+            "dotnet",
+            "MSBuild",
+            "msbuild",
+            "testhost",
+            "vstest.console",
+            "Rider",
+            "ReSharperHost",
+            "OrbStack",
+            "docker",
+            "csharp-ls",
+            "deno",
+            "gradle",
+            "Python",
+            "esbuild",
+            "zed",
+        ] {
+            assert_eq!(super::identity(name, name).source, "gtop catalog", "{name}");
+        }
+    }
+
+    #[test]
     fn now_uses_live_name_total_and_includes_zero() {
         let mut snapshot = crate::test_data::snapshot();
         assert_eq!(super::current_cpu(&snapshot.processes, "rustc"), 350.);
