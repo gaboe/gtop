@@ -415,7 +415,11 @@ fn disk_keyboard_scroll_reveals_selected_row_after_summary() {
         include_bytes!("../assets/fonts/JetBrainsMono.ttf").as_slice(),
         include_bytes!("../assets/fonts/ArchivoLabels.ttf").as_slice(),
         include_bytes!("../assets/fonts/Silkscreen.ttf").as_slice(),
-    ] { cx.text_system().add_fonts(vec![std::borrow::Cow::Borrowed(bytes)]).unwrap(); }
+    ] {
+        cx.text_system()
+            .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
+            .unwrap();
+    }
     let mut monitor = None;
     let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
         let entity = cx.new(|cx| fixture(window, cx));

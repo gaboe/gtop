@@ -819,8 +819,11 @@ pub fn background_priority() {
 pub struct Confirmation {
     pub path: PathBuf,
     pub allocated: u64,
-    device: u64,
-    inode: u64,
+    expected: FileId,
+    parent: OwnedFd,
+    home_fd: OwnedFd,
+    name: std::ffi::CString,
+    home: PathBuf,
 }
 fn data_home(home: &Path) -> Option<PathBuf> {
     let relative = home.strip_prefix("/").ok()?;
@@ -879,57 +882,153 @@ impl Confirmation {
         if metadata.dev() != fs::metadata(home)?.dev() {
             return Err(io::Error::other("Cleanup cannot cross volumes"));
         }
-        Ok(Self {
+        let home = home.canonicalize()?;
+        let home_fd = open_root(&home)?;
+        let mut parent = home_fd.try_clone()?;
+        let relative = path
+            .parent()
+            .unwrap()
+            .strip_prefix(&home)
+            .map_err(io::Error::other)?;
+        for component in relative.components() {
+            let name = std::ffi::CString::new(component.as_os_str().as_bytes())?;
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            parent = unsafe { OwnedFd::from_raw_fd(fd) };
+        }
+        let name = std::ffi::CString::new(path.file_name().unwrap().as_bytes())?;
+        let confirmation = Self {
             path,
             allocated,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
+            expected: observed,
+            parent,
+            home_fd,
+            name,
+            home,
+        };
+        confirmation.validate(&confirmation.home)?;
+        Ok(confirmation)
     }
     fn validate(&self, home: &Path) -> io::Result<()> {
-        if guarded_path(&self.path, home)? != self.path {
-            return Err(io::Error::other("Path changed after confirmation"));
+        if home != self.home && home.canonicalize()? != self.home {
+            return Err(io::Error::other("Home changed after confirmation"));
         }
-        let metadata = fs::symlink_metadata(&self.path)?;
-        if (metadata.dev(), metadata.ino()) != (self.device, self.inode) {
+        if entry_identity(&self.parent, &self.name)? != self.expected {
             return Err(io::Error::other("Item changed after confirmation"));
         }
         Ok(())
     }
     pub fn trash(self, home: &Path) -> io::Result<PathBuf> {
-        self.validate(home)?;
+        self.trash_with_hook(home, || {}, || {})
+    }
+    fn trash_with_hook(
+        self,
+        home: &Path,
+        before_move: impl FnOnce(),
+        after_move: impl FnOnce(),
+    ) -> io::Result<PathBuf> {
         #[cfg(target_os = "macos")]
         {
-            use objc2_foundation::{NSFileManager, NSString, NSURL};
-            let path = self
-                .path
-                .to_str()
-                .ok_or_else(|| io::Error::other("Path is not valid UTF-8"))?;
-            let mut destination = None;
-            NSFileManager::defaultManager()
-                .trashItemAtURL_resultingItemURL_error(
-                    &NSURL::fileURLWithPath(&NSString::from_str(path)),
-                    Some(&mut destination),
+            let trash_path = home.join(".Trash");
+            let trash_fd = unsafe {
+                libc::openat(
+                    self.home_fd.as_raw_fd(),
+                    c".Trash".as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let destination = destination.and_then(|url| url.path()).map(|path| PathBuf::from(path.to_string()))
-                .ok_or_else(|| io::Error::other("Move result unconfirmed. Destination URL was not returned. Rescan before any retry."))?;
-            let metadata = fs::symlink_metadata(&destination)?;
-            if (metadata.dev(), metadata.ino()) != (self.device, self.inode) {
-                let from = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
-                let to = std::ffi::CString::new(self.path.as_os_str().as_bytes())?;
-                if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
-                    return Err(io::Error::other(
-                        "A different item was at this path; it was put back; nothing was trashed.",
-                    ));
-                }
-                return Err(io::Error::other(format!("Move result unconfirmed. A different item moved to {}. It could not be put back at {}: {}. Rescan before any retry.", destination.display(), self.path.display(), io::Error::last_os_error())));
+            };
+            if trash_fd < 0 {
+                return Err(io::Error::last_os_error());
             }
-            Ok(destination)
+            let trash = unsafe { OwnedFd::from_raw_fd(trash_fd) };
+            if identity(&trash)?.device != self.expected.device {
+                return Err(io::Error::other(
+                    "The item and your Trash are on different volumes. Move refused.",
+                ));
+            }
+            let mut before_move = Some(before_move);
+            let original = Path::new(std::ffi::OsStr::from_bytes(self.name.as_bytes()));
+            for number in 0u64.. {
+                let name = if number == 0 {
+                    original.as_os_str().to_owned()
+                } else {
+                    let mut name = original.file_stem().unwrap().to_os_string();
+                    name.push(format!(" {number}"));
+                    if let Some(extension) = original.extension() {
+                        name.push(".");
+                        name.push(extension);
+                    }
+                    name
+                };
+                let destination = trash_path.join(&name);
+                let name = std::ffi::CString::new(name.as_bytes())?;
+                self.validate(home)?;
+                // The final-name check and rename are separate syscalls in one pinned directory.
+                // A same-user writer there can win this race. The destination check detects it.
+                if let Some(hook) = before_move.take() {
+                    hook();
+                }
+                let result = unsafe {
+                    libc::renameatx_np(
+                        self.parent.as_raw_fd(),
+                        self.name.as_ptr(),
+                        trash.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::RENAME_EXCL,
+                    )
+                };
+                if result != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EEXIST) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                after_move();
+                let moved = entry_identity(&trash, &name).map_err(|error| io::Error::other(format!(
+                    "Move result unconfirmed. Cannot check the item in Trash at {}: {error}. Rescan before any retry.", destination.display())))?;
+                if moved != self.expected {
+                    return Err(io::Error::other(format!("A different item replaced the selected one before the move. It is now in Trash at {}. Nothing else moved.", destination.display())));
+                }
+                // Descriptor-relative rename does not write Finder's Put Back metadata.
+                return Ok(destination);
+            }
+            unreachable!()
         }
         #[cfg(not(target_os = "macos"))]
-        Err(io::Error::other("Move to Trash requires macOS"))
+        {
+            let _ = (home, before_move, after_move);
+            Err(io::Error::other("Move to Trash requires macOS"))
+        }
     }
+}
+
+fn entry_identity(parent: &OwnedFd, name: &std::ffi::CStr) -> io::Result<FileId> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(FileId {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino,
+    })
 }
 
 pub fn system_root() -> PathBuf {
@@ -1140,9 +1239,10 @@ mod tests {
         assert!(open_directory(&open_root(&home.0).unwrap(), &tree, id).is_err());
     }
     #[test]
-    #[ignore = "moves a newly created scratch file using the native macOS Trash API"]
+    #[cfg(target_os = "macos")]
     fn native_trash_moves_only_the_created_scratch_file() {
         let home = Scratch::new();
+        fs::create_dir(home.0.join(".Trash")).unwrap();
         let path = home
             .0
             .join(format!("gtop-native-trash-fixture-{}", std::process::id()));
@@ -1169,6 +1269,154 @@ mod tests {
             destination.display()
         );
         fs::remove_file(destination).unwrap();
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn trash_ancestor_swap_stays_in_pinned_tree() {
+        let home = Scratch::new();
+        let outside = Scratch::new();
+        fs::create_dir(home.0.join(".Trash")).unwrap();
+        fs::create_dir_all(home.0.join("project/nested")).unwrap();
+        fs::create_dir(outside.0.join("nested")).unwrap();
+        let path = home.0.join("project/nested/cache");
+        fs::write(&path, b"confirmed").unwrap();
+        let expected = observed(&path);
+        let proposal = Confirmation::new(&path, 0, expected, &home.0).unwrap();
+        let destination = proposal
+            .trash_with_hook(
+                &home.0,
+                || {
+                    fs::rename(home.0.join("project"), home.0.join("saved")).unwrap();
+                    symlink(&outside.0, home.0.join("project")).unwrap();
+                    fs::write(outside.0.join("nested/cache"), b"outside").unwrap();
+                },
+                || {},
+            )
+            .unwrap();
+        assert_eq!(observed(&destination), expected);
+        assert_eq!(fs::read(&destination).unwrap(), b"confirmed");
+        assert_eq!(
+            fs::read(outside.0.join("nested/cache")).unwrap(),
+            b"outside"
+        );
+        assert!(!home.0.join("saved/nested/cache").exists());
+        assert_eq!(fs::read_dir(outside.0.join("nested")).unwrap().count(), 1);
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn trash_name_and_ancestor_swap_never_recovers_outside_home() {
+        let home = Scratch::new();
+        let outside = Scratch::new();
+        fs::create_dir(home.0.join(".Trash")).unwrap();
+        fs::create_dir(home.0.join("project")).unwrap();
+        let path = home.0.join("project/selected");
+        fs::write(&path, b"confirmed").unwrap();
+        fs::write(home.0.join("project/replacement"), b"replacement").unwrap();
+        let expected = observed(&path);
+        let replacement = observed(&home.0.join("project/replacement"));
+        let proposal = Confirmation::new(&path, 0, expected, &home.0).unwrap();
+        let error = proposal
+            .trash_with_hook(
+                &home.0,
+                || {
+                    fs::rename(&path, home.0.join("project/saved")).unwrap();
+                    fs::rename(home.0.join("project/replacement"), &path).unwrap();
+                },
+                || {
+                    fs::rename(home.0.join("project"), home.0.join("saved-project")).unwrap();
+                    symlink(&outside.0, home.0.join("project")).unwrap();
+                },
+            )
+            .unwrap_err();
+        let destination = home.0.join(".Trash/selected");
+        assert_eq!(error.to_string(), format!("A different item replaced the selected one before the move. It is now in Trash at {}. Nothing else moved.", destination.display()));
+        assert_eq!(observed(&destination), replacement);
+        assert_eq!(observed(&home.0.join("saved-project/saved")), expected);
+        assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
+        assert!(!home.0.join("saved-project/selected").exists());
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn trash_name_swap_reports_exact_destination_without_recovery() {
+        for occupied in [false, true] {
+            let home = Scratch::new();
+            fs::create_dir(home.0.join(".Trash")).unwrap();
+            let path = home.0.join("cache");
+            fs::write(&path, b"confirmed").unwrap();
+            fs::write(home.0.join("replacement"), b"replacement").unwrap();
+            let replacement = observed(&home.0.join("replacement"));
+            let expected = observed(&path);
+            let proposal = Confirmation::new(&path, 0, expected, &home.0).unwrap();
+            let error = proposal
+                .trash_with_hook(
+                    &home.0,
+                    || {
+                        fs::rename(&path, home.0.join("saved")).unwrap();
+                        fs::rename(home.0.join("replacement"), &path).unwrap();
+                    },
+                    || {
+                        if occupied {
+                            fs::write(&path, b"new occupant").unwrap();
+                        }
+                    },
+                )
+                .unwrap_err();
+            let destination = home.0.join(".Trash/cache");
+            assert_eq!(error.to_string(), format!("A different item replaced the selected one before the move. It is now in Trash at {}. Nothing else moved.", destination.display()));
+            assert_eq!(observed(&destination), replacement);
+            assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+            assert_eq!(observed(&home.0.join("saved")), expected);
+            if occupied {
+                assert_eq!(fs::read(&path).unwrap(), b"new occupant");
+            } else {
+                assert!(!path.exists());
+            }
+        }
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn trash_collision_preserves_existing_items_and_extension() {
+        let home = Scratch::new();
+        fs::create_dir(home.0.join(".Trash")).unwrap();
+        for name in ["cache.txt", "cache 1.txt"] {
+            fs::write(home.0.join(".Trash").join(name), b"existing").unwrap();
+        }
+        let path = home.0.join("cache.txt");
+        fs::write(&path, b"confirmed").unwrap();
+        let expected = observed(&path);
+        let destination = Confirmation::new(&path, 0, expected, &home.0)
+            .unwrap()
+            .trash(&home.0)
+            .unwrap();
+        assert_eq!(destination, home.0.join(".Trash/cache 2.txt"));
+        assert_eq!(observed(&destination), expected);
+        for name in ["cache.txt", "cache 1.txt"] {
+            assert_eq!(
+                fs::read(home.0.join(".Trash").join(name)).unwrap(),
+                b"existing"
+            );
+        }
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn trash_refuses_other_device_before_moving() {
+        let home = Scratch::new();
+        fs::create_dir(home.0.join(".Trash")).unwrap();
+        let path = home.0.join("cache");
+        fs::write(&path, b"confirmed").unwrap();
+        let mut proposal = Confirmation::new(&path, 0, observed(&path), &home.0).unwrap();
+        // Exercise the production device gate without mounting a volume.
+        proposal.expected.device ^= 1;
+        let error = proposal
+            .trash_with_hook(
+                &home.0,
+                || panic!("move reached"),
+                || panic!("move reached"),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("different volumes"));
+        assert_eq!(fs::read(&path).unwrap(), b"confirmed");
+        assert_eq!(fs::read_dir(home.0.join(".Trash")).unwrap().count(), 0);
     }
     #[test]
     fn missing_root_is_failed_not_empty_complete() {
