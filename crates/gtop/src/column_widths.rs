@@ -257,6 +257,29 @@ mod tests {
     }
 
     #[test]
+    fn non_name_changes_preserve_explicit_name_width_in_live_and_history_tables() {
+        let live = crate::model::ProcessColumn::ALL.map(Column::from);
+        for (columns, other) in [
+            (live.as_slice(), Column::Cpu),
+            (HISTORY.as_slice(), Column::CoreTime),
+        ] {
+            let mut widths = Widths::default();
+            widths.set(Column::Name, 150.);
+            let name_index = columns
+                .iter()
+                .position(|column| *column == Column::Name)
+                .unwrap();
+            assert_eq!(widths.compute(columns, 1400.)[name_index], 150.);
+
+            widths.set(other, other.default_width() + 20.);
+            assert_eq!(widths.compute(columns, 1400.)[name_index], 150.);
+
+            widths.reset(other);
+            assert_eq!(widths.compute(columns, 1400.)[name_index], 150.);
+        }
+    }
+
+    #[test]
     fn clamp_reset_fill_and_narrow_viewport() {
         let columns = [Column::Name, Column::Command];
         let mut widths = Widths::default();
