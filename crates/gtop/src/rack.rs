@@ -1242,15 +1242,18 @@ impl Monitor {
                     ),
             )
             .child(div().flex_1())
-            .child(label(
-                format!(
-                    "UP {} · NET ↓ {} ↑ {}/s",
-                    duration(stats.uptime),
-                    bytes(stats.network_rx_bytes),
-                    bytes(stats.network_tx_bytes)
-                ),
-                t,
-            ))
+            .child(label(format!("UP {}", duration(stats.uptime)), t).whitespace_nowrap())
+            .child(
+                label(
+                    format!(
+                        "NET ↓ {}/s ↑ {}/s",
+                        bytes(stats.network_rx_bytes),
+                        bytes(stats.network_tx_bytes)
+                    ),
+                    t,
+                )
+                .whitespace_nowrap(),
+            )
     }
     pub fn rack(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
