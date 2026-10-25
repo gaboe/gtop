@@ -13,6 +13,8 @@ pub struct ProcessInfo {
     pub name: String,
     /// CPU usage as percentage (0-100)
     pub cpu_usage: f32,
+    /// Seconds covered by this CPU sample; None when no counter delta is available.
+    pub cpu_sample_seconds: Option<f64>,
     /// GPU usage as percentage, or `None` where the platform cannot report it
     pub gpu_usage: Option<f32>,
     /// Physical memory usage in bytes

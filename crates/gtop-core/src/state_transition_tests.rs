@@ -180,6 +180,7 @@ fn unavailable_counters_preserve_last_valid_samples_and_startup_baselines() {
     let unavailable = child.row(&state, false);
     assert_eq!(unavailable.disk_usage, (0, 0));
     assert!(unavailable.disk_sample_seconds.is_none());
+    assert!(unavailable.cpu_sample_seconds.is_none());
     assert_eq!(unavailable.cpu_usage, 0.);
     assert_eq!(unavailable.memory_usage, 0);
     child.interval(BYTES, 0);
@@ -188,6 +189,7 @@ fn unavailable_counters_preserve_last_valid_samples_and_startup_baselines() {
     let recovery_after = std::time::Instant::now();
     assert_eq!(recovery.disk_usage.1, 2 * BYTES as u64);
     let span = recovery.disk_sample_seconds.unwrap();
+    assert!(recovery.cpu_sample_seconds.unwrap() >= span * 0.95);
     let shortest = recovery_before
         .duration_since(last_valid_after)
         .as_secs_f64();

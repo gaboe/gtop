@@ -5,6 +5,7 @@ pub fn process(pid: u32, name: &str, cpu: f32) -> ProcessInfo {
         ppid: 0,
         name: name.into(),
         cpu_usage: cpu,
+        cpu_sample_seconds: Some(3.),
         gpu_usage: Some(cpu / 2.),
         memory_usage: pid as u64 * 1024,
         status: "Running".into(),

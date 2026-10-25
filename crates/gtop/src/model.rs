@@ -281,6 +281,7 @@ mod tests {
             ppid: 0,
             name: name.into(),
             cpu_usage: cpu,
+            cpu_sample_seconds: Some(3.),
             gpu_usage: None,
             memory_usage: 0,
             status: "Running".into(),

@@ -93,6 +93,7 @@ pub struct ProcessMonitor {
     /// Tracks per-process GPU engine usage between refreshes
     gpu_process_monitor: GpuProcessMonitor,
     users: sysinfo::Users,
+    last_sample: Option<std::time::Instant>,
     #[cfg(target_os = "macos")]
     native: super::native_processes::Collector,
     #[cfg(all(test, target_os = "macos"))]
@@ -111,6 +112,7 @@ impl ProcessMonitor {
         Self {
             gpu_process_monitor: GpuProcessMonitor::new(),
             users: sysinfo::Users::new_with_refreshed_list(),
+            last_sample: None,
             #[cfg(target_os = "macos")]
             native: super::native_processes::Collector::default(),
             #[cfg(all(test, target_os = "macos"))]
@@ -153,6 +155,11 @@ impl ProcessMonitor {
         ports_by_pid: &HashMap<u32, Vec<u16>>,
     ) -> Result<Vec<ProcessInfo>, String> {
         let current_time = Self::get_current_time()?;
+        let sampled = std::time::Instant::now();
+        let cpu_sample_seconds = self
+            .last_sample
+            .replace(sampled)
+            .map(|at| sampled.duration_since(at).as_secs_f64());
         let gpu_usage = self.gpu_process_monitor.collect();
         // Processes that hold no GPU client are idle rather than unknown, so
         // they report zero wherever the platform supports the accounting
@@ -161,7 +168,7 @@ impl ProcessMonitor {
             .processes()
             .iter()
             .map(|(pid, process)| {
-                process_row(
+                let mut row = process_row(
                     pid.as_u32(),
                     process,
                     &self.users,
@@ -169,7 +176,9 @@ impl ProcessMonitor {
                     ports_by_pid,
                     gpu_supported.then(|| gpu_usage.get(&pid.as_u32()).copied().unwrap_or(0.0)),
                     current_time,
-                )
+                );
+                row.cpu_sample_seconds = cpu_sample_seconds;
+                row
             })
             .collect())
     }
@@ -281,6 +290,7 @@ pub(super) fn process_row(
         ppid: process.parent().map(|p| p.as_u32()).unwrap_or(0),
         name: process.name().to_string_lossy().into_owned(),
         cpu_usage: process.cpu_usage(),
+        cpu_sample_seconds: None,
         gpu_usage,
         memory_usage: process.memory(),
         status: ProcessMonitor::format_status(process.status()),

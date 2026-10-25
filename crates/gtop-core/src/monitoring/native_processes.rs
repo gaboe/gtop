@@ -180,6 +180,10 @@ struct Sample {
 
 impl Record {
     fn emit(&mut self, row: &mut ProcessInfo, sample: Sample) {
+        row.cpu_sample_seconds = sample
+            .cpu_nanos
+            .zip(self.cpu_sample)
+            .map(|(_, (_, at))| sample.sampled.duration_since(at).as_secs_f64());
         row.cpu_usage =
             sample
                 .cpu_nanos
@@ -318,6 +322,7 @@ impl Collector {
                     if let Some(record) = self.records.get(&pid) {
                         let mut row = record.row.clone();
                         row.cpu_usage = 0.;
+                        row.cpu_sample_seconds = None;
                         row.disk_usage = (0, 0);
                         row.disk_sample_seconds = None;
                         if !include_environ {
@@ -448,6 +453,7 @@ impl Collector {
                 );
                 if !self.primed {
                     row.cpu_usage = 0.;
+                    row.cpu_sample_seconds = None;
                     row.disk_usage = (0, 0);
                 }
                 rows.push(row);
