@@ -309,13 +309,13 @@ impl History {
             .store
             .as_mut()
             .ok_or("History database is unavailable")?;
-        store.append(
+        store.write_minutes(
             self.buckets
                 .iter()
                 .filter(|b| self.dirty.contains(&b.minute)),
-            now / 60,
         )?;
         self.dirty.clear();
+        store.append(std::iter::empty(), now / 60)?;
         self.buckets.retain(|b| b.minute >= now / 60);
         Ok(())
     }
@@ -417,6 +417,14 @@ impl History {
         self.process_recording_since = None;
     }
     pub fn record(&mut self, snapshot: &Snapshot, now: f64, interval: f64) -> Result<bool> {
+        if self.last_sample.is_none_or(|at| now < at) {
+            let minute = now as u64 / 60;
+            if let Some(store) = &mut self.store {
+                store.discard_future(minute)?;
+            }
+            self.buckets.retain(|b| b.minute <= minute);
+            self.dirty.retain(|m| *m <= minute);
+        }
         self.prepare_sample(snapshot, now, interval)?;
         let previous = self.last_sample.replace(now);
         let elapsed = previous.map(|v| now - v).unwrap_or(0.);

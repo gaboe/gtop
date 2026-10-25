@@ -144,6 +144,7 @@ impl Store {
             connection,
             _lock: WriterLock(lock),
         };
+        store.discard_future(minute)?;
         store.append(std::iter::empty(), minute)?;
         Ok(store)
     }
@@ -152,6 +153,19 @@ impl Store {
         &mut self,
         buckets: impl IntoIterator<Item = &'a Bucket>,
         minute: u64,
+    ) -> Result<()> {
+        self.write_minutes(buckets)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        compact(&tx, minute)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn write_minutes<'a>(
+        &mut self,
+        buckets: impl IntoIterator<Item = &'a Bucket>,
     ) -> Result<()> {
         let watermark: u64 =
             self.connection
@@ -167,10 +181,21 @@ impl Store {
             rebuild_hour(&tx, bucket.minute / 60 * 60)?;
             tx.commit()?;
         }
+        Ok(())
+    }
+
+    pub fn discard_future(&mut self, minute: u64) -> Result<()> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        compact(&tx, minute)?;
+        for table in ["system", "process"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE (resolution=1 AND minute>?1) OR (resolution=10 AND minute+9>?1)"), [SqlU64(minute)])?;
+        }
+        tx.execute(
+            "DELETE FROM process WHERE resolution=60 AND minute>=?1",
+            [SqlU64(minute / 60 * 60)],
+        )?;
+        rebuild_hour(&tx, minute / 60 * 60)?;
         tx.commit()?;
         Ok(())
     }
@@ -518,6 +543,107 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn backward_clock_deletes_durable_future_and_propagates_failure() {
+        let f = Fixture::new();
+        let mut h = f.history(100);
+        let snapshot = crate::test_data::snapshot();
+        h.record(&snapshot, 6000., 3.).unwrap();
+        h.record(&snapshot, 6003., 3.).unwrap();
+        h.persist(6003).unwrap();
+        h.store.as_ref().unwrap().connection.execute_batch("CREATE TRIGGER reject_delete BEFORE DELETE ON system BEGIN SELECT RAISE(FAIL,'delete failed'); END;").unwrap();
+        assert!(h.record(&snapshot, 5700., 3.).is_err());
+        assert_eq!(h.last_sample, Some(6003.));
+        h.store
+            .as_ref()
+            .unwrap()
+            .connection
+            .execute_batch("DROP TRIGGER reject_delete")
+            .unwrap();
+        h.record(&snapshot, 5700., 3.).unwrap();
+        h.persist(5700).unwrap();
+        drop(h);
+        let s = f.open(95);
+        assert!(s.buckets(100..101, None).unwrap().is_empty());
+        let count: i64 = s
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM process WHERE resolution=60 AND minute=60",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+        let cpu: f64 = s
+            .connection
+            .query_row(
+                "SELECT SUM(cpu_seconds) FROM process WHERE resolution=60",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cpu, 0.);
+    }
+
+    #[test]
+    fn retention_failure_keeps_acknowledged_minutes_retryable() {
+        let f = Fixture::new();
+        let mut h = f.history(101);
+        h.buckets
+            .extend([bucket(100, 20., 30.), bucket(101, 20., 40.)]);
+        h.dirty.extend([100, 101]);
+        h.store.as_ref().unwrap().connection.execute_batch("CREATE TRIGGER reject_retention BEFORE UPDATE ON meta BEGIN SELECT RAISE(FAIL,'retention failed'); END;").unwrap();
+        assert!(h.persist(20000 * 60).is_err());
+        assert!(h.dirty.is_empty());
+        assert_eq!(
+            h.store
+                .as_ref()
+                .unwrap()
+                .buckets(100..102, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        h.store
+            .as_ref()
+            .unwrap()
+            .connection
+            .execute_batch("DROP TRIGGER reject_retention")
+            .unwrap();
+        h.persist(20000 * 60).unwrap();
+        drop(h);
+        let s = f.open(20000);
+        let cpu: f64 = s
+            .connection
+            .query_row(
+                "SELECT SUM(cpu_seconds) FROM process WHERE resolution=10",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cpu, 70.);
+    }
+
+    #[test]
+    fn backward_clock_matches_memory_views_after_time_recovers() {
+        let f = Fixture::new();
+        let mut h = f.history(10000);
+        let mut baseline = History::default();
+        let snapshot = crate::test_data::snapshot();
+        for offset in [0., 3., 60., 63., 120., 123., -300., -297., 180.] {
+            let now = 600000. + offset;
+            h.record(&snapshot, now, 3.).unwrap();
+            baseline.record(&snapshot, now, 3.).unwrap();
+            h.persist(now as u64).unwrap();
+        }
+        for hours in [1, 8, 24] {
+            assert_view_equal(
+                h.view(hours, 600180).unwrap(),
+                baseline.view(hours, 600180).unwrap(),
+            );
+        }
     }
 
     #[test]
