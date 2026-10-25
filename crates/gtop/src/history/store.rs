@@ -153,22 +153,23 @@ impl Store {
         buckets: impl IntoIterator<Item = &'a Bucket>,
         minute: u64,
     ) -> Result<()> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let watermark: u64 =
-            tx.query_row("SELECT compacted_before FROM meta", [], |r| unsigned(r, 0))?;
-        let mut hours = BTreeSet::new();
+            self.connection
+                .query_row("SELECT compacted_before FROM meta", [], |r| unsigned(r, 0))?;
         for bucket in buckets {
             if bucket.minute < watermark {
                 return Err("History minute has already been compacted".into());
             }
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
             write_bucket(&tx, bucket)?;
-            hours.insert(bucket.minute / 60 * 60);
+            rebuild_hour(&tx, bucket.minute / 60 * 60)?;
+            tx.commit()?;
         }
-        for hour in hours {
-            rebuild_hour(&tx, hour)?;
-        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         compact(&tx, minute)?;
         tx.commit()?;
         Ok(())
@@ -442,6 +443,25 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn batch_failure_keeps_committed_minute_and_does_not_advance_retention() {
+        let f = Fixture::new();
+        let mut s = f.open(101);
+        s.connection.execute_batch("CREATE TRIGGER reject_second BEFORE INSERT ON system WHEN NEW.minute=101 BEGIN SELECT RAISE(FAIL,'second minute'); END;").unwrap();
+        assert!(s
+            .append([&bucket(100, 20., 30.), &bucket(101, 20., 40.)], 20000)
+            .is_err());
+        drop(s);
+        let mut s = f.open(101);
+        assert_eq!(s.buckets(100..102, None).unwrap().len(), 1);
+        s.connection
+            .execute_batch("DROP TRIGGER reject_second")
+            .unwrap();
+        s.append([&bucket(100, 20., 30.), &bucket(101, 20., 40.)], 101)
+            .unwrap();
+        assert_eq!(s.buckets(100..102, None).unwrap().len(), 2);
+    }
+
     #[test]
     fn append_replaces_atomically_and_keeps_zero_process_presence() {
         let f = Fixture::new();
