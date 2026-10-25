@@ -212,7 +212,7 @@ pub fn lit(text: String, size: f32, hot: bool, t: &Tokens) -> Div {
                 .text_color(rgb(palette::mix(t.base.led, t.base.ground, 0.18)))
                 .child(ghost),
         )
-        .child(div().relative().child(text))
+        .child(crate::glow::text(text, hot, t))
 }
 
 fn unit_paths(bounds: Bounds<Pixels>, unit: char) -> UnitPaths {
@@ -272,6 +272,7 @@ fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
     let led = if hot { t.base.hot } else { t.base.led };
     let ghost = palette::mix(t.base.led, t.base.ground, 0.18);
     let bounds = unit_glyph_bounds(size);
+    let glow = !t.light;
     div().ml(px(size * 0.12)).flex_shrink_0().child(
         canvas(
             |_, _, _| {},
@@ -282,6 +283,34 @@ fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
                 }
                 let (lit, ghost_path) = unit_paths(bounds, unit);
                 window.paint_path(ghost_path, rgb(ghost));
+                if glow {
+                    let scale = f32::from(bounds.size.height) / 14.;
+                    let rows = UNIT_GLYPHS
+                        .iter()
+                        .find(|(glyph, _)| *glyph == unit)
+                        .unwrap()
+                        .1;
+                    for (y, row) in rows.iter().enumerate() {
+                        for (x, bit) in row.bytes().enumerate() {
+                            if bit == b'1' {
+                                let radius = px(scale * 0.82);
+                                let center = bounds.origin
+                                    + point(
+                                        px((x as f32 * 2. + 1.) * scale),
+                                        px((y as f32 * 2. + 1.) * scale),
+                                    );
+                                window.paint_drop_shadows(
+                                    Bounds::new(
+                                        center - point(radius, radius),
+                                        gpui::size(radius * 2., radius * 2.),
+                                    ),
+                                    Corners::all(radius),
+                                    &[crate::glow::shadow(led, 8., if hot { 166 } else { 153 })],
+                                );
+                            }
+                        }
+                    }
+                }
                 window.paint_path(lit, rgb(led));
             },
         )
@@ -330,7 +359,7 @@ pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> 
                         .whitespace_nowrap()
                         .child(ghost),
                 )
-                .child(div().relative().whitespace_nowrap().child(value)),
+                .child(crate::glow::text(value, hot, t).whitespace_nowrap()),
         )
         .child(unit_glyph(unit, size, hot, t))
 }
@@ -655,23 +684,29 @@ pub fn hatch(color: u32) -> Div {
 }
 
 pub fn segments(value: f32, n: usize, t: &Tokens) -> Div {
+    let active = (value.clamp(0., 100.) / 100. * n as f32).round() as usize;
     div()
         .flex()
         .gap(px(2.))
         .h(px(8.))
         .w_full()
         .children((0..n).map(|i| {
-            div().flex_1().h_full().bg(rgb(
-                if i < (value.clamp(0., 100.) / 100. * n as f32).round() as usize {
-                    if i as f32 >= n as f32 * 0.85 {
-                        t.base.hot
-                    } else {
-                        t.base.led
-                    }
+            let color = if i as f32 >= n as f32 * 0.85 {
+                t.base.hot
+            } else {
+                t.base.led
+            };
+            div()
+                .flex_1()
+                .h_full()
+                .bg(rgb(if i < active {
+                    color
                 } else {
                     palette::mix(t.base.led, t.base.ground, 0.12)
-                },
-            ))
+                }))
+                .when(i < active && !t.light, |bar| {
+                    bar.shadow(vec![crate::glow::shadow(t.base.led, 4., 153)])
+                })
         }))
 }
 
@@ -699,13 +734,18 @@ fn core_bank(name: &str, values: &[(usize, f32)], t: &Tokens) -> Div {
                         .min_w_0()
                         .child(div().flex().flex_col().gap(px(1.)).h(px(36.)).children(
                             (0..12).rev().map(|segment| {
-                                div().flex_1().bg(rgb(if *value > 90. && segment >= 9 {
-                                    t.base.hot
-                                } else if segment < active {
-                                    t.base.led
-                                } else {
-                                    palette::mix(t.base.led, t.base.ground, 0.12)
-                                }))
+                                div()
+                                    .flex_1()
+                                    .bg(rgb(if *value > 90. && segment >= 9 {
+                                        t.base.hot
+                                    } else if segment < active {
+                                        t.base.led
+                                    } else {
+                                        palette::mix(t.base.led, t.base.ground, 0.12)
+                                    }))
+                                    .when(segment < active && !t.light, |bar| {
+                                        bar.shadow(vec![crate::glow::shadow(t.base.led, 4., 128)])
+                                    })
                             }),
                         ))
                         .child(
@@ -813,6 +853,9 @@ fn tape(
                             t.base.led
                         },
                     ))
+                    .when(!t.light, |bar| {
+                        bar.shadow(vec![crate::glow::shadow(t.base.led, 3., 115)])
+                    })
             };
             column
                 .id(("moment-column", index))

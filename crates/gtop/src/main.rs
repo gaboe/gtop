@@ -2,6 +2,7 @@ mod analysis;
 mod details;
 #[cfg(test)]
 mod draw_benchmark;
+mod glow;
 mod history;
 mod model;
 mod palette;

@@ -388,6 +388,9 @@ impl Monitor {
                         .bg(rgb(v
                             .map(|v| if v > 400. { t.base.hot } else { t.base.led })
                             .unwrap_or(t.led_off)))
+                        .when(v.is_some() && !t.light, |bar| {
+                            bar.shadow(vec![crate::glow::shadow(t.base.led, 3., 115)])
+                        })
                 }));
             panel = panel.child(
                 div().p(px(18.)).child(
