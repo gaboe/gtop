@@ -54,6 +54,34 @@ impl DrawMetrics {
     }
 }
 
+#[derive(Clone, Copy)]
+enum HistoryRead {
+    Moment,
+    Process,
+}
+
+#[derive(Default)]
+struct HistoryReadErrors([Option<String>; 2]);
+
+impl HistoryReadErrors {
+    fn update(&mut self, status: &mut String, read: HistoryRead, error: Option<String>) {
+        let owns_status = self.0.iter().flatten().any(|message| message == status);
+        let message = error.map(|error| format!("History could not be read: {error}"));
+        self.0[read as usize] = message.clone();
+        if let Some(message) = message {
+            *status = message;
+        } else if owns_status {
+            *status = self
+                .0
+                .iter()
+                .flatten()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "Select a process for details".into());
+        }
+    }
+}
+
 type ShutdownFuture = futures::future::Shared<futures::future::LocalBoxFuture<'static, ()>>;
 
 struct ShutdownDrains {
@@ -270,6 +298,7 @@ impl Monitor {
             let mut cached_moment = None;
             let mut cached_metric = None;
             let mut cached_analysis_key = None;
+            let mut read_errors = HistoryReadErrors::default();
             loop {
                 if history_stopping.get() || refresh_stopped(&mut events) { break; }
                 let Ok((running, ports, seconds, moment, metric, selected_detail)) = entity.update_in(cx, |this, window, cx| {
@@ -303,6 +332,8 @@ impl Monitor {
                             match detail {
                                 Ok(detail) => {
                                     let _ = entity.update_in(cx, |this, _, cx| {
+                                        read_errors.update(&mut this.status, HistoryRead::Moment, None);
+                                        cx.notify();
                                         if this.moment == Some(selection) {
                                             this.replace_moment_rows(detail.ranked(metric));
                                             this.moment_detail = Some(detail);
@@ -314,7 +345,7 @@ impl Monitor {
                                 }
                                 Err(error) => {
                                     history_retry = true;
-                                    let _ = entity.update_in(cx, |this, _, cx| { this.status = format!("History could not be read: {error}"); cx.notify(); });
+                                    let _ = entity.update_in(cx, |this, _, cx| { read_errors.update(&mut this.status, HistoryRead::Moment, Some(error.to_string())); cx.notify(); });
                                 }
                             }
                         }
@@ -346,6 +377,8 @@ impl Monitor {
                             match analysis {
                                 Ok(analysis) => {
                                     let _ = entity.update_in(cx, |this, _, cx| {
+                                        read_errors.update(&mut this.status, HistoryRead::Process, None);
+                                        cx.notify();
                                         if let Some(details) = this.details.as_mut().filter(|details| details.key == *key) {
                                             details.analysis = Some(analysis);
                                             cx.notify();
@@ -356,7 +389,7 @@ impl Monitor {
                                 Err(error) => {
                                     history_retry = true;
                                     cached_analysis_key = None;
-                                    let _ = entity.update_in(cx, |this, _, cx| { this.status = format!("History could not be read: {error}"); cx.notify(); });
+                                    let _ = entity.update_in(cx, |this, _, cx| { read_errors.update(&mut this.status, HistoryRead::Process, Some(error.to_string())); cx.notify(); });
                                 }
                             }
                         }
@@ -893,6 +926,52 @@ mod wake_tests {
         sender.try_send(()).unwrap();
         sender.close_channel();
         assert!(super::refresh_stopped(&mut receiver));
+    }
+
+    #[test]
+    fn recovered_history_read_clears_its_warning() {
+        for read in [super::HistoryRead::Moment, super::HistoryRead::Process] {
+            let mut errors = super::HistoryReadErrors::default();
+            let mut status = "Select a process for details".into();
+            errors.update(&mut status, read, Some("database busy".into()));
+            assert_eq!(status, "History could not be read: database busy");
+            errors.update(&mut status, read, None);
+            assert_eq!(status, "Select a process for details");
+        }
+    }
+
+    #[test]
+    fn recovered_history_read_preserves_other_read_failure() {
+        let mut errors = super::HistoryReadErrors::default();
+        let mut status = String::new();
+        errors.update(
+            &mut status,
+            super::HistoryRead::Moment,
+            Some("moment busy".into()),
+        );
+        errors.update(
+            &mut status,
+            super::HistoryRead::Process,
+            Some("process busy".into()),
+        );
+        errors.update(&mut status, super::HistoryRead::Process, None);
+        assert_eq!(status, "History could not be read: moment busy");
+        errors.update(&mut status, super::HistoryRead::Moment, None);
+        assert_eq!(status, "Select a process for details");
+    }
+
+    #[test]
+    fn recovered_history_read_preserves_unrelated_status() {
+        let mut errors = super::HistoryReadErrors::default();
+        let mut status = String::new();
+        errors.update(
+            &mut status,
+            super::HistoryRead::Moment,
+            Some("database busy".into()),
+        );
+        status = "Palette could not be saved: disk full".into();
+        errors.update(&mut status, super::HistoryRead::Moment, None);
+        assert_eq!(status, "Palette could not be saved: disk full");
     }
 
     #[test]
