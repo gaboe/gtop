@@ -1055,14 +1055,23 @@ fn trash_name(original: &Path, number: usize, limit: usize) -> io::Result<std::f
         .file_stem()
         .unwrap_or(original.as_os_str())
         .as_bytes();
-    let extension = original.extension().map(|value| value.as_bytes());
-    let extension = extension.filter(|value| value.len() + 1 < available);
-    let stem_limit = available - extension.map_or(0, |value| value.len() + 1);
-    let mut end = stem.len().min(stem_limit);
-    if let Ok(text) = std::str::from_utf8(stem) {
-        while !text.is_char_boundary(end) {
-            end -= 1;
+    let mut extension = original.extension().map(|value| value.as_bytes());
+    extension = extension.filter(|value| value.len() + 1 < available);
+    let stem_end = |stem_limit| {
+        let mut end = stem.len().min(stem_limit);
+        if let Ok(text) = std::str::from_utf8(stem) {
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
         }
+        end
+    };
+    let mut stem_limit = available - extension.map_or(0, |value| value.len() + 1);
+    let mut end = stem_end(stem_limit);
+    if end == 0 && extension.is_some() {
+        extension = None;
+        stem_limit = available;
+        end = stem_end(stem_limit);
     }
     if end == 0 {
         return Err(io::Error::other(
