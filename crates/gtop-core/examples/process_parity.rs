@@ -21,7 +21,7 @@ fn main() {
         let after: HashMap<_, _> = after.into_iter().map(|p| (p.pid, p)).collect();
         let native: HashMap<_, _> = native.into_iter().map(|p| (p.pid, p)).collect();
         let mut missing = 0;
-        let mut identity_unavailable = 0;
+        let identity_unavailable = native.values().filter(|p| p.start_time == 0).count();
         let mut static_errors = 0;
         let mut static_compared = 0;
         let mut static_skipped = 0;
@@ -34,15 +34,15 @@ fn main() {
             let Some(b) = after.get(pid).filter(|b| b.start_time == a.start_time) else {
                 continue;
             };
-            if a.start_time == 0 {
-                identity_unavailable += 1;
-                continue;
-            }
             let Some(n) = native.get(pid) else {
                 eprintln!("missing tick={tick} pid={pid} before={a:?} after={b:?}");
                 missing += 1;
                 continue;
             };
+            // sysinfo can emit a placeholder when its BSD read is denied.
+            if a.start_time == 0 {
+                continue;
+            }
             let fields = [
                 ("ppid", a.ppid == b.ppid, n.ppid == a.ppid),
                 ("name", a.name == b.name, n.name == a.name),

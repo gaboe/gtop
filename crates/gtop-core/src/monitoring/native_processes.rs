@@ -163,6 +163,98 @@ fn info<T>(pid: u32, flavor: i32) -> Option<T> {
         .then(|| unsafe { data.assume_init() })
 }
 
+// Darwin's public 64-bit kinfo_proc ABI. libc does not expose this type on macOS.
+#[repr(C, align(8))]
+#[derive(Clone)]
+struct KernelProcess([u8; 648]);
+
+impl KernelProcess {
+    fn bsd(&self) -> proc_bsdinfo {
+        let bytes = &self.0;
+        let mut bsd = proc_bsdinfo {
+            pbi_start_tvsec: u64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
+            pbi_start_tvusec: u32::from_ne_bytes(bytes[8..12].try_into().unwrap()) as u64,
+            pbi_status: bytes[36] as u32,
+            pbi_pid: u32::from_ne_bytes(bytes[40..44].try_into().unwrap()),
+            pbi_uid: u32::from_ne_bytes(bytes[420..424].try_into().unwrap()),
+            pbi_ppid: u32::from_ne_bytes(bytes[560..564].try_into().unwrap()),
+            ..Default::default()
+        };
+        for (to, from) in bsd.pbi_name.iter_mut().zip(&bytes[243..260]) {
+            *to = *from as i8;
+        }
+        bsd
+    }
+}
+
+unsafe extern "C" {
+    fn __error() -> *mut i32;
+    fn sysctl(
+        name: *mut i32,
+        namelen: u32,
+        old: *mut c_void,
+        oldlen: *mut usize,
+        new: *mut c_void,
+        newlen: usize,
+    ) -> i32;
+}
+
+fn kernel_processes() -> Option<HashMap<u32, proc_bsdinfo>> {
+    let mut mib = [1, 14, 0]; // CTL_KERN, KERN_PROC, KERN_PROC_ALL.
+    let mut bytes = 0;
+    if unsafe {
+        sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut bytes,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    for _ in 0..3 {
+        let mut buffer = vec![KernelProcess([0; 648]); bytes / 648 + 128];
+        bytes = std::mem::size_of_val(buffer.as_slice());
+        if unsafe {
+            sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buffer.as_mut_ptr().cast(),
+                &mut bytes,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0
+        {
+            if bytes > std::mem::size_of_val(buffer.as_slice()) || bytes % 648 != 0 {
+                return None;
+            }
+            return Some(
+                buffer[..bytes / 648]
+                    .iter()
+                    .map(|p| {
+                        let bsd = p.bsd();
+                        (bsd.pbi_pid, bsd)
+                    })
+                    .collect(),
+            );
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(12) {
+            return None;
+        }
+        bytes = bytes.max(std::mem::size_of_val(buffer.as_slice())) * 2;
+    }
+    None
+}
+
+fn bsd_info(pid: u32) -> Result<proc_bsdinfo, std::io::Error> {
+    unsafe { *__error() = 0 };
+    info(pid, PROC_PIDTBSDINFO).ok_or_else(std::io::Error::last_os_error)
+}
+
 #[derive(Debug)]
 struct Record {
     identity: (u64, u64),
@@ -228,6 +320,8 @@ pub(super) struct Collector {
     unavailable_counters: Option<u32>,
     #[cfg(test)]
     unavailable_identity: Option<u32>,
+    #[cfg(test)]
+    denied_identity: Option<u32>,
 }
 impl Collector {
     #[cfg(test)]
@@ -268,6 +362,7 @@ impl Collector {
                 self.pids.resize(self.pids.len() * 2, 0);
                 continue;
             }
+            let mut kernel = None;
             let mut live = HashSet::new();
             let mut metadata = Vec::new();
             let mut samples = Vec::new();
@@ -277,7 +372,21 @@ impl Collector {
                 }
                 let pid = pid as u32;
                 live.insert(pid);
-                let bsd = info::<proc_bsdinfo>(pid, PROC_PIDTBSDINFO);
+                let bsd = bsd_info(pid);
+                #[cfg(test)]
+                let bsd = if self.denied_identity == Some(pid) {
+                    Err(std::io::Error::from_raw_os_error(1))
+                } else {
+                    bsd
+                };
+                let bsd = match bsd {
+                    Ok(bsd) => Some(bsd),
+                    Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => kernel
+                        .get_or_insert_with(kernel_processes)
+                        .as_mut()
+                        .and_then(|processes| processes.remove(&pid)),
+                    Err(_) => None,
+                };
                 #[cfg(test)]
                 let bsd = if self.unavailable_identity == Some(pid) {
                     self.unavailable_identity = None;
@@ -409,6 +518,22 @@ impl Collector {
                         }
                     }
                 }
+                if record.row.name.is_empty() {
+                    let bytes: Vec<u8> = bsd
+                        .pbi_name
+                        .iter()
+                        .map(|b| *b as u8)
+                        .take_while(|b| *b != 0)
+                        .collect();
+                    record.row.name = String::from_utf8_lossy(&bytes).into_owned();
+                }
+                if record.row.user.is_empty() || record.row.user == "-" {
+                    record.row.user = users
+                        .iter()
+                        .find(|user| **user.id() == bsd.pbi_uid)
+                        .map(|user| user.name().to_owned())
+                        .unwrap_or_else(|| bsd.pbi_uid.to_string());
+                }
                 record.row.start_time = bsd.pbi_start_tvsec;
                 record.row.ppid = bsd.pbi_ppid;
                 let mut row = record.row.clone();
@@ -483,6 +608,8 @@ mod tests {
 
     #[test]
     fn darwin_process_layouts_match_sdk() {
+        assert_eq!(std::mem::size_of::<KernelProcess>(), 648);
+        assert_eq!(std::mem::align_of::<KernelProcess>(), 8);
         assert_eq!(std::mem::size_of::<proc_bsdinfo>(), 136);
         assert_eq!(std::mem::size_of::<proc_taskinfo>(), 96);
         assert_eq!(std::mem::size_of::<proc_threadinfo>(), 112);
@@ -560,6 +687,44 @@ mod tests {
         let rows = collector.collect(&users, false, &ports).unwrap();
         assert!(!rows.iter().any(|p| p.pid == child.0.id()));
         assert!(!collector.records.contains_key(&child.0.id()));
+    }
+
+    #[test]
+    fn permission_denial_uses_kernel_identity_for_new_and_existing_rows() {
+        let child = OwnedChild(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        let pid = child.0.id();
+        let users = sysinfo::Users::new_with_refreshed_list();
+        let expected = bsd_info(pid).unwrap();
+        let kernel = kernel_processes().expect("KERN_PROC_ALL requires native host visibility");
+        let fallback = &kernel[&pid];
+        assert_eq!(fallback.pbi_pid, pid);
+        assert_eq!(fallback.pbi_ppid, expected.pbi_ppid);
+        assert_eq!(fallback.pbi_uid, expected.pbi_uid);
+        assert_eq!(fallback.pbi_start_tvsec, expected.pbi_start_tvsec);
+        assert_eq!(fallback.pbi_start_tvusec, expected.pbi_start_tvusec);
+        assert!((1..=5).contains(&fallback.pbi_status));
+        assert!(fallback.pbi_name.iter().any(|byte| *byte != 0));
+
+        let mut collector = Collector {
+            denied_identity: Some(pid),
+            unavailable_counters: Some(pid),
+            ..Default::default()
+        };
+        let first = collector.collect(&users, false, &HashMap::new()).unwrap();
+        let first = first.iter().find(|row| row.pid == pid).unwrap();
+        assert_eq!(first.start_time, expected.pbi_start_tvsec);
+        assert_eq!(first.ppid, std::process::id());
+        assert!(!first.name.is_empty());
+        assert_ne!(first.user, "-");
+        assert_eq!(first.memory_usage, 0);
+        assert_eq!(first.cpu_sample_seconds, None);
+        assert_eq!(first.disk_sample_seconds, None);
+        let identity = collector.records[&pid].identity;
+        let next = collector.collect(&users, false, &HashMap::new()).unwrap();
+        let next = next.iter().find(|row| row.pid == pid).unwrap();
+        assert_eq!(next.start_time, first.start_time);
+        assert_eq!(collector.records[&pid].identity, identity);
+        assert!(next.memory_usage > 0);
     }
 
     #[test]
