@@ -433,7 +433,7 @@ impl Collector {
                 let bsd = self.read_bsd_info(pid);
                 let bsd = match bsd {
                     Ok(bsd) => Some(bsd),
-                    Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => kernel
+                    Err(error) if matches!(error.raw_os_error(), Some(1 | 3 | 13)) => kernel
                         .get_or_insert_with(kernel_processes)
                         .as_mut()
                         .and_then(|processes| processes.remove(&pid)),
@@ -777,6 +777,45 @@ mod tests {
         assert_eq!(next.start_time, first.start_time);
         assert_eq!(collector.records[&pid].identity, identity);
         assert!(next.memory_usage > 0);
+    }
+
+    #[test]
+    fn reports_unreaped_child_as_zombie_then_removes_it_after_reaping() {
+        let mut child = OwnedChild(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        let pid = child.0.id();
+        let users = sysinfo::Users::new_with_refreshed_list();
+        let mut collector = Collector::default();
+
+        let running = collector.collect(&users, false, &HashMap::new()).unwrap();
+        assert_eq!(
+            running.iter().find(|row| row.pid == pid).unwrap().status,
+            "Running"
+        );
+
+        child.0.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let zombie = loop {
+            let zombie = kernel_processes()
+                .and_then(|mut processes| processes.remove(&pid))
+                .filter(|process| process.pbi_status == 5);
+            if let Some(zombie) = zombie {
+                break zombie;
+            }
+            assert!(Instant::now() < deadline, "child did not become a zombie");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(zombie.pbi_pid, pid);
+
+        let rows = collector.collect(&users, false, &HashMap::new()).unwrap();
+        assert_eq!(
+            rows.iter().find(|row| row.pid == pid).unwrap().status,
+            "Zombie"
+        );
+
+        child.0.wait().unwrap();
+        let rows = collector.collect(&users, false, &HashMap::new()).unwrap();
+        assert!(!rows.iter().any(|row| row.pid == pid));
+        assert!(!collector.records.contains_key(&pid));
     }
 
     #[test]
