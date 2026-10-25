@@ -250,6 +250,38 @@ fn kernel_processes() -> Option<HashMap<u32, proc_bsdinfo>> {
     None
 }
 
+fn kernel_process(pid: u32) -> Option<proc_bsdinfo> {
+    let pid = i32::try_from(pid).ok()?;
+    let mut mib = [1, 14, 1, pid]; // CTL_KERN, KERN_PROC, KERN_PROC_PID.
+    let mut buffer = vec![KernelProcess([0; 648]); 8];
+    for _ in 0..3 {
+        let capacity = std::mem::size_of_val(buffer.as_slice());
+        let mut bytes = capacity;
+        if unsafe {
+            sysctl(
+                mib.as_mut_ptr(),
+                4,
+                buffer.as_mut_ptr().cast(),
+                &mut bytes,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0
+        {
+            if bytes != 648 {
+                return None;
+            }
+            let bsd = buffer[0].bsd();
+            return (bsd.pbi_pid == pid as u32).then_some(bsd);
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(12) {
+            return None;
+        }
+        buffer.resize(buffer.len() * 2, KernelProcess([0; 648]));
+    }
+    None
+}
+
 fn bsd_info(pid: u32) -> Result<proc_bsdinfo, std::io::Error> {
     unsafe { *__error() = 0 };
     info(pid, PROC_PIDTBSDINFO).ok_or_else(std::io::Error::last_os_error)
@@ -329,6 +361,32 @@ impl Collector {
         self.unavailable_counters = Some(pid);
     }
 
+    fn read_bsd_info(&self, pid: u32) -> Result<proc_bsdinfo, std::io::Error> {
+        let bsd = bsd_info(pid);
+        #[cfg(test)]
+        if self.denied_identity == Some(pid) {
+            return Err(std::io::Error::from_raw_os_error(1));
+        }
+        bsd
+    }
+
+    pub(super) fn identity_matches(&self, pid: u32, start_time: u64) -> bool {
+        if pid == 0 || pid > i32::MAX as u32 || start_time == 0 {
+            return false;
+        }
+        let bsd = match self.read_bsd_info(pid) {
+            Ok(bsd) => Some(bsd),
+            Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => kernel_process(pid),
+            Err(_) => None,
+        };
+        bsd.is_some_and(|bsd| bsd.pbi_pid == pid && bsd.pbi_start_tvsec == start_time)
+    }
+
+    #[cfg(test)]
+    pub(super) fn deny_identity(&mut self, pid: u32) {
+        self.denied_identity = Some(pid);
+    }
+
     pub fn collect(
         &mut self,
         users: &sysinfo::Users,
@@ -372,13 +430,7 @@ impl Collector {
                 }
                 let pid = pid as u32;
                 live.insert(pid);
-                let bsd = bsd_info(pid);
-                #[cfg(test)]
-                let bsd = if self.denied_identity == Some(pid) {
-                    Err(std::io::Error::from_raw_os_error(1))
-                } else {
-                    bsd
-                };
+                let bsd = self.read_bsd_info(pid);
                 let bsd = match bsd {
                     Ok(bsd) => Some(bsd),
                     Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => kernel

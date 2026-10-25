@@ -186,16 +186,13 @@ impl AppState {
         start_time: u64,
     ) -> Result<Vec<String>, String> {
         let mut sys = System::new();
-        let id = sysinfo::Pid::from_u32(pid);
         sys.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&[id]),
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
             true,
             sysinfo::ProcessRefreshKind::nothing(),
         );
-        if !sys
-            .process(id)
-            .is_some_and(|process| process.start_time() == start_time)
-        {
+        let process_monitor = self.process_monitor.lock().map_err(|e| e.to_string())?;
+        if !process_monitor.identity_matches(&sys, pid, start_time) {
             return Err("The process exited or its PID changed".into());
         }
         ProcessMonitor::read_environment(&mut sys, pid)
@@ -216,15 +213,16 @@ impl AppState {
 
     pub fn kill_process_if_matches(&self, pid: u32, start_time: u64) -> Result<bool, String> {
         let mut sys = System::new();
-        let id = sysinfo::Pid::from_u32(pid);
         sys.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::Some(&[id]),
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
             true,
             sysinfo::ProcessRefreshKind::nothing(),
         );
-        Ok(sys
-            .process(id)
-            .is_some_and(|process| process.start_time() == start_time && process.kill()))
+        let process_monitor = self.process_monitor.lock().map_err(|e| e.to_string())?;
+        if !process_monitor.identity_matches(&sys, pid, start_time) {
+            return Ok(false);
+        }
+        Ok(ProcessMonitor::kill_process(&sys, pid))
     }
 }
 
@@ -414,6 +412,52 @@ mod tests {
         assert!(state
             .process_stopped(child.id(), process.start_time)
             .unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn guarded_actions_use_kernel_identity_when_bsd_info_is_denied() {
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .args(["-c", "import time; time.sleep(30)", ""])
+            .env("GTOP_ENV_MARKER", "kernel-identity-fallback")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let state = AppState::new();
+        let snapshot = state.snapshot(false, false).unwrap();
+        let process = snapshot
+            .processes
+            .iter()
+            .find(|process| process.pid == child.id())
+            .unwrap();
+        assert!(process.start_time > 0);
+        state
+            .process_monitor
+            .lock()
+            .unwrap()
+            .deny_identity(child.id());
+
+        assert!(!state.kill_process_if_matches(child.id(), 0).unwrap());
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(!state
+            .kill_process_if_matches(child.id(), process.start_time + 1)
+            .unwrap());
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(state
+            .process_environ_if_matches(child.id(), process.start_time + 1)
+            .is_err());
+        assert!(child.try_wait().unwrap().is_none());
+
+        let environment = state
+            .process_environ_if_matches(child.id(), process.start_time)
+            .unwrap();
+        assert!(environment
+            .iter()
+            .any(|value| value == "GTOP_ENV_MARKER=kernel-identity-fallback"));
+        assert!(state
+            .kill_process_if_matches(child.id(), process.start_time)
+            .unwrap());
+        assert!(!child.wait().unwrap().success());
     }
 
     #[test]

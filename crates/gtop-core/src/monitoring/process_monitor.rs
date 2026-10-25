@@ -212,6 +212,27 @@ impl ProcessMonitor {
         self.native.fail_next_counter_reads(pid);
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn deny_identity(&mut self, pid: u32) {
+        self.native.deny_identity(pid);
+    }
+
+    pub(crate) fn identity_matches(&self, sys: &System, pid: u32, start_time: u64) -> bool {
+        if start_time == 0 {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = sys;
+            self.native.identity_matches(pid, start_time)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            sys.process(Pid::from_u32(pid))
+                .is_some_and(|process| process.start_time() == start_time)
+        }
+    }
+
     /// Reads the environment variables of one process
     pub fn process_environ(sys: &mut System, pid: u32) -> Vec<String> {
         let pid = Pid::from_u32(pid);
