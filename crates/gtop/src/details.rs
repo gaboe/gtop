@@ -398,6 +398,7 @@ impl Monitor {
             panel = panel.child(analysis_panel(
                 details.analysis.as_ref(),
                 &details.name,
+                self.process_exited().then_some(p.cpu_usage),
                 self.snapshot
                     .as_ref()
                     .map(|snapshot| snapshot.stats.cpu_usage.len())
@@ -580,9 +581,23 @@ fn detail_body(content: Div, scroll: &ScrollHandle) -> Stateful<Div> {
         .child(content)
 }
 
+fn analysis_sample(
+    history: &crate::analysis::ProcessHistory,
+    last_seen_cpu: Option<f32>,
+) -> (&'static str, String) {
+    match last_seen_cpu {
+        Some(cpu) => (
+            "LAST SEEN",
+            crate::analysis::sample_sentence("Last seen", cpu, history.busy_average),
+        ),
+        None => ("NOW", history.now.clone()),
+    }
+}
+
 fn analysis_panel(
     analysis: Option<&crate::analysis::ProcessAnalysis>,
     name: &str,
+    last_seen_cpu: Option<f32>,
     cores: usize,
     t: &crate::palette::Tokens,
 ) -> Div {
@@ -630,6 +645,7 @@ fn analysis_panel(
             }),
     );
     if let Some(history) = &analysis.history {
+        let (sample_label, sample_text) = analysis_sample(history, last_seen_cpu);
         history_panel =
             history_panel.child(div().flex().items_end().gap(px(1.)).h(px(40.)).children(
                 history.columns.iter().map(|value| match value {
@@ -653,13 +669,13 @@ fn analysis_panel(
                 .flex()
                 .justify_between()
                 .child(crate::rack::label("24 H AGO", t))
-                .child(crate::rack::label("NOW", t)),
+                .child(crate::rack::label(sample_label, t)),
         );
         history_panel = history_panel.child(
             div()
                 .text_size(px(11.))
                 .text_color(rgb(t.ink_row))
-                .child(format!("{} {}", history.pattern, history.now)),
+                .child(format!("{} {}", history.pattern, sample_text)),
         );
         history_panel = history_panel
             .child(detail_line(
@@ -752,6 +768,44 @@ mod tests {
             body_scroll: ScrollHandle::new(),
             kill: KillState::Ready,
         }
+    }
+
+    #[test]
+    fn analysis_uses_last_sample_wording_after_exit() {
+        let key = ProcessKey {
+            pid: 1,
+            start_time: 1,
+        };
+        let mut details = selected(key);
+        let mut process = crate::test_data::process(1, "builder", 814.);
+        process.start_time = 1;
+        details.observe(&process, 6003);
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.processes =
+            std::sync::Arc::new(vec![crate::test_data::process(1, "builder", 140.)]);
+        let mut history = crate::history::History::default();
+        history.record(&snapshot, 6000., 3.);
+        history.record(&snapshot, 6003., 3.);
+        let analysis = history.analyze_process("builder", "builder", 814., 100);
+        let history = analysis.history.unwrap();
+        let processes = vec![process];
+        let live = super::analysis_sample(
+            &history,
+            details
+                .exited(&processes)
+                .then_some(details.process(&processes).cpu_usage),
+        );
+        assert_eq!(live.0, "NOW");
+        assert_eq!(live.1, "Now 814 %, 5.8× its usual busy load.");
+        let exited = super::analysis_sample(
+            &history,
+            details
+                .exited(&[])
+                .then_some(details.process(&[]).cpu_usage),
+        );
+        assert_eq!(exited.0, "LAST SEEN");
+        assert_eq!(exited.1, "Last seen 814 %, 5.8× its usual busy load.");
+        assert!(!exited.1.contains("Now"));
     }
 
     #[gpui::test]

@@ -170,6 +170,10 @@ pub fn current_cpu(processes: &[gtop_core::ProcessInfo], name: &str) -> f32 {
 }
 
 pub fn now_sentence(current_cpu: f32, busy_average: f64) -> String {
+    sample_sentence("Now", current_cpu, busy_average)
+}
+
+pub fn sample_sentence(when: &str, current_cpu: f32, busy_average: f64) -> String {
     let ratio = if busy_average > 0. {
         current_cpu as f64 / busy_average
     } else {
@@ -177,13 +181,16 @@ pub fn now_sentence(current_cpu: f32, busy_average: f64) -> String {
     };
     if ratio > 1.5 {
         format!(
-            "Now {:.0} %, {:.1}× its usual busy load.",
+            "{when} {:.0} %, {:.1}× its usual busy load.",
             current_cpu, ratio
         )
     } else if busy_average > 0. && ratio < 0.5 {
-        format!("Now {:.0} %, well below its usual busy load.", current_cpu)
+        format!(
+            "{when} {:.0} %, well below its usual busy load.",
+            current_cpu
+        )
     } else {
-        format!("Now {:.0} %, about its usual busy load.", current_cpu)
+        format!("{when} {:.0} %, about its usual busy load.", current_cpu)
     }
 }
 
