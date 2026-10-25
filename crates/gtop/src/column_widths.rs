@@ -286,6 +286,56 @@ mod tests {
     }
 
     #[test]
+    fn resized_fill_column_keeps_its_explicit_width_in_live_and_history_tables() {
+        let live = crate::model::ProcessColumn::ALL.map(Column::from);
+        for (columns, fill) in [
+            (live.as_slice(), Column::Command),
+            (HISTORY.as_slice(), Column::Share),
+        ] {
+            let mut widths = Widths::default();
+            widths.set(Column::Name, 150.);
+            let name_index = columns
+                .iter()
+                .position(|column| *column == Column::Name)
+                .unwrap();
+            let fill_index = columns.iter().position(|column| *column == fill).unwrap();
+            let requested_width = fill.default_width() + 30.;
+
+            widths.set(fill, requested_width);
+            let resized = widths.compute(columns, 1400.);
+            assert_eq!(resized[name_index], 150.);
+            assert_eq!(resized[fill_index], requested_width);
+
+            widths.reset(fill);
+            let reset = widths.compute(columns, 1400.);
+            assert_eq!(reset[name_index], 150.);
+            assert!(reset[fill_index] > fill.default_width());
+
+            widths.reset(Column::Name);
+            assert!(widths.compute(columns, 1400.)[name_index] > Column::Name.default_width());
+        }
+    }
+
+    #[test]
+    fn old_saved_name_width_ignores_stale_name_fill_flag() {
+        let mut widths: Widths = serde_json::from_str(
+            r#"{"columns":{"name":150.0},"fill_name":true}"#,
+        )
+        .unwrap();
+        let live = crate::model::ProcessColumn::ALL.map(Column::from);
+        let name_index = live
+            .iter()
+            .position(|column| *column == Column::Name)
+            .unwrap();
+        assert_eq!(widths.compute(&live, 1400.)[name_index], 150.);
+
+        widths.set(Column::Cpu, 200.);
+        assert_eq!(widths.compute(&live, 1400.)[name_index], 150.);
+        widths.reset(Column::Cpu);
+        assert_eq!(widths.compute(&live, 1400.)[name_index], 150.);
+    }
+
+    #[test]
     fn clamp_reset_fill_and_narrow_viewport() {
         let columns = [Column::Name, Column::Command];
         let mut widths = Widths::default();
@@ -300,7 +350,7 @@ mod tests {
         widths.set(Column::Name, 600.);
         assert_eq!(widths.compute(&columns, 800.), vec![600., 200.]);
         widths.set(Column::Command, 150.);
-        assert_eq!(widths.compute(&columns, 800.), vec![650., 150.]);
+        assert_eq!(widths.compute(&columns, 800.), vec![600., 150.]);
         widths.reset(Column::Name);
         widths.reset(Column::Command);
         widths.set(Column::Command, f32::NAN);
