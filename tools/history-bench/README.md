@@ -43,7 +43,7 @@ rtk proxy tools/history-bench/target/release/gtop-history-bench replay-sparse co
 rtk proxy python3 tools/history-bench/audit-replay.py sparse copied-history.json /private/tmp/history-sparse 60
 ```
 
-The dense replay uses every process from the first source minute in every minute. It keeps source work and peaks and sets system coverage to 60 seconds. The sparse replay repeats all source minutes and gaps. Both start at minute 100800. These integer widths can produce smaller files than current timestamps. The auditor checks retained work, recorded time, hourly values, zero-row presence, and representative process rows. Each replay is one file-size observation, not a speed benchmark. An existing replay directory continues after its last stored minute. The auditor expects a fresh directory and the stated total day count.
+The dense replay uses every process from the first source minute in every minute. It keeps source work and peaks and sets system coverage to 60 seconds. The sparse replay repeats all source minutes and gaps. Both start at minute 100800. These integer widths can produce smaller files than current timestamps. The auditor checks retained work, recorded time, hourly values, zero-row presence, and representative process rows. Each replay is one file-size observation, not a speed benchmark. An existing replay directory continues after its last stored minute. For a fresh directory, the auditor uses the stated total day count. For a continuation, pass `--seed <original-seed.sqlite>` and the number of advancing days. The seed must stay unchanged.
 
 Compare storage candidates on copies of a completed workload database.
 

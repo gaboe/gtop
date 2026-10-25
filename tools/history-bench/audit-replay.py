@@ -10,10 +10,15 @@ parser.add_argument("mode", choices=["dense", "sparse"])
 parser.add_argument("input", type=Path)
 parser.add_argument("directory", type=Path)
 parser.add_argument("days", type=int)
+parser.add_argument("--seed", type=Path)
 args = parser.parse_args()
 source = json.loads(args.input.read_text())["buckets"]
 first = source[0]["minute"]
 anchor = 100800
+seed = None
+if args.seed:
+    seed = sqlite3.connect(f"file:{args.seed.resolve()}?mode=ro", uri=True)
+    anchor = seed.execute("SELECT MAX(minute) FROM system WHERE resolution=1").fetchone()[0] + 1
 now = anchor + (args.days - 1) * 1440 + (1439 if args.mode == "dense" else source[-1]["minute"] - first)
 cutoff = (now - 7 * 1440) // 10 * 10
 expired = (now - 30 * 1440) // 10 * 10
@@ -23,6 +28,12 @@ if args.mode == "dense":
 expected = [0, 0., 0., 0.]
 fine = 0
 coarse = set()
+if seed:
+    system = seed.execute("SELECT COALESCE(SUM(recorded),0),COALESCE(SUM(seconds),0) FROM system WHERE resolution IN (1,10) AND minute>=?", [expired]).fetchone()
+    work = seed.execute("SELECT TOTAL(cpu_seconds),TOTAL(gpu_seconds) FROM process WHERE resolution IN (1,10) AND minute>=?", [expired]).fetchone()
+    expected = list(system) + list(work)
+    fine = seed.execute("SELECT COUNT(*) FROM system WHERE resolution=1 AND minute>=?", [cutoff]).fetchone()[0]
+    coarse.update(row[0] for row in seed.execute("SELECT DISTINCT minute/10*10 FROM system WHERE resolution IN (1,10) AND minute>=? AND minute<?", [expired,cutoff]))
 for day in range(args.days):
     for offset, seconds, cpu, gpu in weights:
         minute = anchor + day * 1440 + offset
@@ -82,7 +93,7 @@ for (minute,name) in hours:
 actual_hourly = {minute:ids for (resolution,minute),ids in presence.items() if resolution == 60 and ids}
 assert {m:ids for m,ids in expected_hourly.items() if ids} == actual_hourly
 name_ids = dict(c.execute("SELECT name,id FROM names"))
-for minute, in c.execute("SELECT minute FROM system WHERE resolution=1 ORDER BY minute LIMIT 3"):
+for minute, in c.execute("SELECT minute FROM system WHERE resolution=1 AND minute>=? ORDER BY minute LIMIT 3", [anchor]):
     original = source[0] if args.mode == "dense" else next(b for b in source if (b["minute"]-first) == (minute-anchor)%1440)
     rows = {name:(cpu,gpu,memory,peak) for name,cpu,gpu,memory,peak in c.execute("SELECT n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM process p JOIN names n ON n.id=p.name_id WHERE p.resolution=1 AND p.minute=?",[minute])}
     for name in original["processes"]:
@@ -92,6 +103,6 @@ for minute, in c.execute("SELECT minute FROM system WHERE resolution=1 ORDER BY 
     for name,p in original["processes"].items():
         values = (p["cpu_seconds"],p["gpu_seconds"],p["peak_memory"],p["peak_cpu"])
         assert all(abs(a-b) <= 1e-6*max(abs(b),1) for a,b in zip(rows[name],values))
-report = dict(mode=args.mode,days=args.days,n=1,bytes=path.stat().st_size,wal_bytes=Path(str(path)+"-wal").stat().st_size if Path(str(path)+"-wal").exists() else 0,free_pages=c.execute("PRAGMA freelist_count").fetchone()[0],recorded_minutes=actual[0],seconds=actual[1],cpu_work=actual[2],gpu_work=actual[3],fine_minutes=fine,coarse_bins=len(coarse),hourly_nonzero_rows=len(hours),hourly_presence_bins=len(actual_hourly),errors=0,integrity="ok")
+report = dict(mode=args.mode,days=args.days,seed=str(args.seed) if args.seed else None,n=1,bytes=path.stat().st_size,wal_bytes=Path(str(path)+"-wal").stat().st_size if Path(str(path)+"-wal").exists() else 0,free_pages=c.execute("PRAGMA freelist_count").fetchone()[0],recorded_minutes=actual[0],seconds=actual[1],cpu_work=actual[2],gpu_work=actual[3],fine_minutes=fine,coarse_bins=len(coarse),hourly_nonzero_rows=len(hours),hourly_presence_bins=len(actual_hourly),errors=0,integrity="ok")
 (args.directory / "audit.json").write_text(json.dumps(report,indent=2)+"\n")
 print(json.dumps(report,indent=2))
