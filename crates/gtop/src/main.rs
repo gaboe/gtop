@@ -489,11 +489,13 @@ impl Monitor {
                         this.history = views;
                     }
                     if let Some(detail) = moment_detail.filter(|_| this.moment == selection) {
+                        read_errors.update(&mut this.status, HistoryRead::Moment, None);
                         this.replace_moment_rows(detail.ranked(metric));
                         this.moment_detail = Some(detail);
                     }
                     if let Some((key, analysis)) = process_analysis {
                         if let Some(details) = this.details.as_mut().filter(|details| details.key == key) {
+                            read_errors.update(&mut this.status, HistoryRead::Process, None);
                             details.analysis = Some(analysis);
                         }
                     }
