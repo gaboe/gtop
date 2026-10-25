@@ -737,6 +737,41 @@ impl Monitor {
 }
 
 #[cfg(test)]
+impl Monitor {
+    pub(super) fn prepare_disk_draw_benchmark(&mut self) {
+        let disk = Disk::new();
+        std::thread::sleep(Duration::from_millis(250));
+        let folder = disk
+            .mailbox
+            .lock()
+            .unwrap()
+            .folder
+            .take()
+            .expect("scan must publish progress")
+            .2;
+        assert_eq!(
+            folder.state,
+            ScanState::Scanning,
+            "benchmark requires a pending real scan"
+        );
+        assert!(folder.items > 0);
+        let mut disk = disk;
+        disk.folder = Some(folder);
+        self.disk = Some(disk);
+    }
+    pub(super) fn assert_disk_scan_pending(&self) {
+        let disk = self.disk.as_ref().unwrap();
+        if let Some((_, _, folder)) = &disk.mailbox.lock().unwrap().folder {
+            assert_eq!(
+                folder.state,
+                ScanState::Scanning,
+                "scan finished during benchmark"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::prelude::v1::test;

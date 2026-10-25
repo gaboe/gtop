@@ -254,7 +254,7 @@ fn full_monitor_draw_benchmark() {
         assert!(
             views
                 .split(',')
-                .all(|name| ["live", "history1h", "history24h", "detail"].contains(&name)),
+                .all(|name| ["live", "history1h", "history24h", "detail", "disk"].contains(&name)),
             "unknown benchmark view"
         );
     }
@@ -270,6 +270,7 @@ fn full_monitor_draw_benchmark() {
             ("history1h", Some(0), false),
             ("history24h", Some(2), false),
             ("detail", None, true),
+            ("disk", None, false),
         ] {
             if selected_views
                 .as_ref()
@@ -281,6 +282,10 @@ fn full_monitor_draw_benchmark() {
                 monitor.update(cx, |m, cx| {
                     m.view = view;
                     m.details = None;
+                    m.disk = None;
+                    if name == "disk" {
+                        m.prepare_disk_draw_benchmark();
+                    }
                     if detail {
                         m.select(
                             ProcessKey::from(&m.snapshot.as_ref().unwrap().processes[0]),
@@ -356,6 +361,9 @@ fn full_monitor_draw_benchmark() {
                 println!("scene view={name} scale={scale} paths={} vertices={} primitives={} elements={} glyph_sprites={} hash={:016x} equal={n}/{n}", scenes[0].0, scenes[0].1, scenes[0].2, scenes[0].3, scenes[0].4, scenes[0].5);
             }
             println!("samples view={name} scale={scale} thread_cpu_ms={samples:?}");
+            if name == "disk" {
+                cx.read(|cx| monitor.read(cx).assert_disk_scan_pending());
+            }
             samples.sort_by(f64::total_cmp);
             println!("draw view={name} scale={scale} median_ms={:.6} min_ms={:.6} max_ms={:.6} n={n} errors=0 draws={} fixture_processes={} cores={} size={width}x{height} text=platform", (samples[(n-1)/2] + samples[n/2]) / 2., samples[0], samples[n-1], n+5, cx.read(|cx| monitor.read(cx).snapshot.as_ref().unwrap().processes.len()), cx.read(|cx| monitor.read(cx).snapshot.as_ref().unwrap().stats.cpu_usage.len()));
         }
