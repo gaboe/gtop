@@ -14,6 +14,8 @@ mod iokit;
 mod native_processes;
 mod port_monitor;
 mod process_monitor;
+#[cfg(target_os = "macos")]
+mod smc;
 mod system_monitor;
 mod temperature_monitor;
 mod types;
