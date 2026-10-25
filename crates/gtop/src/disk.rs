@@ -103,6 +103,29 @@ impl Disk {
         self.proposal_id += 1;
         self.confirmation = None;
     }
+    fn select(&mut self, index: usize) {
+        self.confirmation = None;
+        self.proposal_id += 1;
+        self.selected = index;
+    }
+    fn apply_proposal(
+        &mut self,
+        generation: u64,
+        proposal_id: u64,
+        result: Result<Confirmation, String>,
+    ) -> bool {
+        if generation != self.generation || proposal_id != self.proposal_id || !self.open {
+            return false;
+        }
+        match result {
+            Ok(proposal) => {
+                self.confirmation = Some(proposal);
+                self.status.clear();
+            }
+            Err(error) => self.status = error,
+        }
+        true
+    }
     fn accepted(&mut self, command: Command) -> bool {
         match self.sender.try_send(command) {
             Ok(()) => true,
@@ -236,13 +259,21 @@ impl Disk {
             }
             "backspace" | "left" => self.up(),
             "down" | "j" => {
-                self.selected = (self.selected + 1).min(
+                let selected = (self.selected + 1).min(
                     self.folder
                         .as_ref()
                         .map_or(0, |f| f.rows.len().saturating_sub(1)),
-                )
+                );
+                if selected != self.selected {
+                    self.select(selected);
+                }
             }
-            "up" | "k" => self.selected = self.selected.saturating_sub(1),
+            "up" | "k" => {
+                let selected = self.selected.saturating_sub(1);
+                if selected != self.selected {
+                    self.select(selected);
+                }
+            }
             "enter" | "right" => {
                 if let Some(row) = self
                     .folder
@@ -454,14 +485,7 @@ impl Monitor {
                                 let proposal = mailbox.proposal.take();
                                 drop(mailbox);
                                 if let Some((g, id, result)) = proposal {
-                                    if g == disk.generation && id == disk.proposal_id && disk.open {
-                                        match result {
-                                            Ok(proposal) => {
-                                                disk.confirmation = Some(proposal);
-                                                disk.status.clear();
-                                            }
-                                            Err(e) => disk.status = e,
-                                        }
+                                    if disk.apply_proposal(g, id, result) {
                                         cx.notify();
                                     }
                                 }
@@ -618,8 +642,7 @@ impl Monitor {
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let disk = this.disk.as_mut().unwrap();
-                            disk.confirmation = None;
-                            disk.selected = index;
+                            disk.select(index);
                             if directory {
                                 disk.enter(path.clone());
                             }
@@ -893,6 +916,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    fn receive_proposal(disk: &Disk) -> (u64, u64, Result<Confirmation, String>) {
+        let start = Instant::now();
+        loop {
+            if let Some(proposal) = disk.mailbox.lock().unwrap().proposal.take() {
+                return proposal;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "worker timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     #[test]
     fn full_queue_retains_confirmation_and_last_accepted_identity() {
         let home = scratch();
@@ -957,6 +993,45 @@ mod tests {
             Some(Confirmation::new(&row.path, row.allocated, row.identity, &home).unwrap());
         disk.close();
         disk.open = true;
+        assert!(disk.confirmation.is_none());
+        assert!(!disk.sending);
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn row_click_rejects_pending_cleanup_reply() {
+        let home = scratch();
+        fs::write(home.join("a"), [1; 4096]).unwrap();
+        fs::write(home.join("b"), [2; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        let folder = receive(&mut disk, ScanState::Complete);
+        let row = folder.rows[0].clone();
+        let other_index = 1;
+        disk.folder = Some(folder);
+        disk.request_trash(&row.path, row.allocated, row.identity);
+        let (generation, proposal_id, result) = receive_proposal(&disk);
+        disk.select(other_index);
+        assert!(!disk.apply_proposal(generation, proposal_id, result));
+        assert_eq!(disk.selected, other_index);
+        assert!(disk.confirmation.is_none());
+        assert!(!disk.sending);
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn keyboard_selection_rejects_pending_cleanup_reply() {
+        let home = scratch();
+        fs::write(home.join("a"), [1; 4096]).unwrap();
+        fs::write(home.join("b"), [2; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        let folder = receive(&mut disk, ScanState::Complete);
+        let row = folder.rows[0].clone();
+        disk.folder = Some(folder);
+        disk.request_trash(&row.path, row.allocated, row.identity);
+        let (generation, proposal_id, result) = receive_proposal(&disk);
+        disk.key("down");
+        assert!(!disk.apply_proposal(generation, proposal_id, result));
+        assert_eq!(disk.selected, 1);
         assert!(disk.confirmation.is_none());
         assert!(!disk.sending);
         drop(disk);

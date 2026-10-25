@@ -9,7 +9,7 @@ use std::{
 };
 
 pub const PAGE_SIZE: usize = 128;
-const MAX_NODES: usize = 2_000_000;
+const MAX_NODES: usize = 8_000_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileId {
     pub device: u64,

@@ -15,6 +15,29 @@ pub(super) fn record_render() {
     RENDERS.with(|count| count.set(count.get() + 1));
 }
 
+fn view_selected(name: &str, selected_views: Option<&str>) -> bool {
+    match selected_views {
+        Some(views) => views.split(',').any(|view| view == name),
+        None => name != "disk",
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::view_selected;
+    use std::prelude::v1::test;
+
+    #[test]
+    fn disk_draw_view_is_opt_in() {
+        for view in ["live", "history1h", "history24h", "detail"] {
+            assert!(view_selected(view, None), "default excludes {view}");
+        }
+        assert!(!view_selected("disk", None));
+        assert!(view_selected("disk", Some("disk")));
+        assert!(!view_selected("live", Some("disk")));
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn dimension(name: &str, default: usize) -> usize {
     let maximum = match name {
@@ -272,10 +295,7 @@ fn full_monitor_draw_benchmark() {
             ("detail", None, true),
             ("disk", None, false),
         ] {
-            if selected_views
-                .as_ref()
-                .is_some_and(|views| !views.split(',').any(|v| v == name))
-            {
+            if !view_selected(name, selected_views.as_deref()) {
                 continue;
             }
             cx.update(|cx| {
