@@ -272,6 +272,10 @@ pub struct History {
     #[serde(skip)]
     last_sample: Option<f64>,
     #[serde(skip)]
+    last_process_sample: Option<f64>,
+    #[serde(skip)]
+    process_recording_since: Option<f64>,
+    #[serde(skip)]
     pub touched: std::ops::Range<u64>,
 }
 impl History {
@@ -339,6 +343,8 @@ impl History {
     }
     pub fn suspend(&mut self) {
         self.last_sample = None;
+        self.last_process_sample = None;
+        self.process_recording_since = None;
     }
     pub fn record(&mut self, snapshot: &Snapshot, now: f64, interval: f64) -> bool {
         let previous = self.last_sample.replace(now);
@@ -352,6 +358,10 @@ impl History {
         } else {
             0.
         };
+        if seconds == 0. {
+            self.last_process_sample = None;
+            self.process_recording_since = None;
+        }
         self.touched = ((now - seconds) as u64 / 60)..minute + 1;
         if seconds == 0. {
             self.record_part(snapshot, minute, 0.);
@@ -366,6 +376,37 @@ impl History {
             if self.buckets.back().is_none_or(|b| b.minute != minute) {
                 self.record_part(snapshot, minute, 0.);
             }
+        }
+        if matches!(snapshot.process_data, gtop_core::ProcessData::Fresh) {
+            let process_seconds = self
+                .last_process_sample
+                .replace(now)
+                .map_or(0., |at| now - at);
+            let recording_since = *self.process_recording_since.get_or_insert(now);
+            let oldest = minute.saturating_sub(MINUTES - 1) as f64 * 60.;
+            let cpu_start = recording_since.max(oldest);
+            let gpu_start = (now - process_seconds).max(oldest);
+            let cpu_seconds = snapshot
+                .processes
+                .iter()
+                .filter_map(|p| p.cpu_sample_seconds)
+                .fold(0., f64::max);
+            let mut cursor = (now - cpu_seconds).max(cpu_start).min(gpu_start);
+            self.touched.start = self.touched.start.min(cursor as u64 / 60);
+            while cursor < now {
+                let part_minute = cursor as u64 / 60;
+                let end = now.min((part_minute + 1) as f64 * 60.);
+                self.record_processes(
+                    snapshot,
+                    part_minute,
+                    cursor..end,
+                    now,
+                    cpu_start,
+                    gpu_start,
+                );
+                cursor = end;
+            }
+            self.record_processes(snapshot, minute, now..now, now, cpu_start, gpu_start);
         }
         changed_minute
     }
@@ -427,9 +468,47 @@ impl History {
             b.temperature_seconds = Some(total);
             b.peak_temperature = Some(b.peak_temperature.unwrap_or(v).max(v));
         }
+    }
+
+    fn record_processes(
+        &mut self,
+        snapshot: &Snapshot,
+        minute: u64,
+        part: std::ops::Range<f64>,
+        now: f64,
+        cpu_start: f64,
+        gpu_start: f64,
+    ) {
+        let index = self
+            .buckets
+            .iter()
+            .position(|b| b.minute >= minute)
+            .unwrap_or(self.buckets.len());
+        if self.buckets.get(index).is_none_or(|b| b.minute != minute) {
+            self.buckets.insert(
+                index,
+                Bucket {
+                    minute,
+                    ..Default::default()
+                },
+            );
+        }
+        let b = &mut self.buckets[index];
         let mut sampled_processes = BTreeMap::<String, ProcessTotal>::new();
         let mut distinct_names = b.processes.len();
-        for process in &snapshot.processes {
+        for process in snapshot.processes.iter() {
+            let process_start = process.start_time as f64;
+            if part.end < process_start {
+                continue;
+            }
+            let cpu_seconds = process.cpu_sample_seconds.map_or(0., |span| {
+                (part.end - part.start.max(now - span).max(cpu_start).max(process_start)).max(0.)
+            });
+            let gpu_seconds = (part.end - part.start.max(gpu_start).max(process_start)).max(0.);
+            if part.end > part.start && cpu_seconds == 0. && gpu_seconds == 0. {
+                continue;
+            }
+
             if !b.processes.contains_key(&process.name)
                 && !sampled_processes.contains_key(&process.name)
                 && distinct_names >= MAX_NAMES
@@ -442,8 +521,8 @@ impl History {
                 distinct_names += 1;
             }
             let total = sampled_processes.entry(process.name.clone()).or_default();
-            total.cpu_seconds += process.cpu_usage as f64 / 100. * seconds;
-            total.gpu_seconds += process.gpu_usage.unwrap_or(0.) as f64 / 100. * seconds;
+            total.cpu_seconds += process.cpu_usage as f64 / 100. * cpu_seconds;
+            total.gpu_seconds += process.gpu_usage.unwrap_or(0.) as f64 / 100. * gpu_seconds;
             total.peak_memory += process.memory_usage;
             total.peak_cpu += process.cpu_usage;
         }
@@ -556,12 +635,12 @@ mod tests {
         let mut snapshot = crate::test_data::snapshot();
         snapshot.processes = (1..=MAX_NAMES as u32)
             .map(|pid| crate::test_data::process(pid, &format!("process-{pid}"), 1.))
-            .collect();
-        let rest = snapshot.processes.split_off(2048);
+            .collect::<Vec<_>>()
+            .into();
+        let rest = std::sync::Arc::make_mut(&mut snapshot.processes).split_off(2048);
         history.record(&snapshot, 6000., 3.);
-        snapshot.processes.extend(rest);
-        snapshot
-            .processes
+        std::sync::Arc::make_mut(&mut snapshot.processes).extend(rest);
+        std::sync::Arc::make_mut(&mut snapshot.processes)
             .push(crate::test_data::process(9999, "extra", 1.));
         history.record(&snapshot, 6003., 3.);
         assert_eq!(history.buckets[0].processes.len(), MAX_NAMES);
@@ -752,6 +831,133 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert_eq!(loaded.view(1, 6180).covered, 2);
         assert!(loaded.last_sample.is_none());
+    }
+
+    #[test]
+    fn stale_rows_do_not_add_work_or_peaks_and_recovery_spans_missed_samples() {
+        let mut s = crate::test_data::snapshot();
+        s.processes = std::sync::Arc::new(vec![crate::test_data::process(1, "owned", 100.)]);
+        let mut h = History::default();
+        h.record(&s, 6054., 3.);
+        h.record(&s, 6057., 3.);
+        s.process_data = gtop_core::ProcessData::Stale {
+            since: std::time::Instant::now(),
+            reason: "failed".into(),
+        };
+        std::sync::Arc::make_mut(&mut s.processes)[0].memory_usage = 99999;
+        s.stats.memory_used = 900;
+        for now in [6060., 6063.] {
+            h.record(&s, now, 3.);
+            let total = &h.view(1, now as u64).rows[0].1;
+            assert_eq!(total.cpu_seconds, 3.);
+            assert_eq!(total.gpu_seconds, 1.5);
+            assert_eq!(total.peak_memory, 1024);
+        }
+        assert_eq!(h.buckets.back().unwrap().peak_memory, 900.);
+        s.process_data = gtop_core::ProcessData::Fresh;
+        std::sync::Arc::make_mut(&mut s.processes)[0].cpu_usage = 100. / 3.;
+        std::sync::Arc::make_mut(&mut s.processes)[0].cpu_sample_seconds = Some(9.);
+        std::sync::Arc::make_mut(&mut s.processes)[0].gpu_usage = Some(100. / 6.);
+        std::sync::Arc::make_mut(&mut s.processes)[0].memory_usage = 2048;
+        h.record(&s, 6066., 3.);
+        let total = &h.view(1, 6066).rows[0].1;
+        assert!((total.cpu_seconds - 6.).abs() < 0.00001);
+        assert!((total.gpu_seconds - 3.).abs() < 0.00001);
+        assert_eq!(total.peak_memory, 2048);
+        assert!((h.buckets[0].processes["owned"].cpu_seconds - 4.).abs() < 0.00001);
+        assert_eq!(h.touched, 100..102);
+        h.suspend();
+        h.record(&s, 6100., 3.);
+        assert!((h.view(1, 6100).rows[0].1.cpu_seconds - 6.).abs() < 0.00001);
+    }
+
+    #[test]
+    fn recovery_does_not_record_a_process_before_its_start_minute() {
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.processes = vec![crate::test_data::process(1, "old", 0.)].into();
+        let mut history = History::default();
+        for now in [6054., 6057.] {
+            history.record(&snapshot, now, 3.);
+        }
+        snapshot.process_data = gtop_core::ProcessData::Stale {
+            since: std::time::Instant::now(),
+            reason: "failed".into(),
+        };
+        for now in [6060., 6063.] {
+            history.record(&snapshot, now, 3.);
+        }
+
+        let mut born = crate::test_data::process(2, "born-after-minute-boundary", 0.);
+        born.start_time = 6064;
+        born.cpu_sample_seconds = None;
+        born.memory_usage = 16 * 1024 * 1024;
+        born.gpu_usage = Some(50.);
+        std::sync::Arc::make_mut(&mut snapshot.processes).push(born);
+        snapshot.process_data = gtop_core::ProcessData::Fresh;
+        history.record(&snapshot, 6066., 3.);
+
+        assert!(!history.buckets[0]
+            .processes
+            .contains_key("born-after-minute-boundary"));
+        let current = &history.buckets[1].processes["born-after-minute-boundary"];
+        assert_eq!(current.peak_memory, 16 * 1024 * 1024);
+        assert!((current.gpu_seconds - 1.).abs() < 0.00001);
+    }
+
+    #[test]
+    fn recovery_does_not_restore_process_buckets_outside_retained_history() {
+        let mut s = crate::test_data::snapshot();
+        s.processes = vec![crate::test_data::process(1, "owned", 100.)].into();
+        let mut h = History::default();
+        h.record(&s, 6000., 60.);
+        s.process_data = gtop_core::ProcessData::Stale {
+            since: std::time::Instant::now(),
+            reason: "failed".into(),
+        };
+        for tick in 1..=MINUTES + 2 {
+            h.record(&s, (6000 + tick * 60) as f64, 60.);
+        }
+        s.process_data = gtop_core::ProcessData::Fresh;
+        let now = 6000 + (MINUTES + 3) * 60;
+        std::sync::Arc::make_mut(&mut s.processes)[0].cpu_sample_seconds =
+            Some((now - 6000) as f64);
+        h.record(&s, now as f64, 60.);
+        assert_eq!(h.buckets.len(), MINUTES as usize);
+        assert_eq!(h.buckets.front().unwrap().minute, now / 60 - MINUTES + 1);
+        assert_eq!(h.view(24, now).total_cpu, (MINUTES - 1) as f64 * 60.);
+    }
+
+    #[test]
+    fn partial_cpu_recovery_charges_each_rows_valid_span() {
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.processes = vec![
+            crate::test_data::process(1, "recovering", 0.),
+            crate::test_data::process(2, "steady", 100.),
+        ]
+        .into();
+        let mut history = History::default();
+        history.record(&snapshot, 6054., 3.);
+        history.record(&snapshot, 6057., 3.);
+        for now in [6060., 6063.] {
+            std::sync::Arc::make_mut(&mut snapshot.processes)[0].cpu_sample_seconds = None;
+            history.record(&snapshot, now, 3.);
+        }
+        let row = &mut std::sync::Arc::make_mut(&mut snapshot.processes)[0];
+        row.cpu_usage = 100. / 3.;
+        row.cpu_sample_seconds = Some(9.);
+        std::sync::Arc::make_mut(&mut snapshot.processes)
+            .push(crate::test_data::process(3, "new", 0.));
+        history.record(&snapshot, 6066., 3.);
+        assert!(!history.buckets[0].processes.contains_key("new"));
+        let view = history.view(1, 6066);
+        let recovered = view.rows.iter().find(|r| r.0 == "recovering").unwrap();
+        assert!((recovered.1.cpu_seconds - 3.).abs() < 0.00001);
+        let steady = view.rows.iter().find(|r| r.0 == "steady").unwrap();
+        assert_eq!(steady.1.cpu_seconds, 12.);
+        assert!((history.buckets[0].processes["recovering"].cpu_seconds - 1.).abs() < 0.00001);
+        history.suspend();
+        history.record(&snapshot, 6070., 3.);
+        assert!((history.view(1, 6070).total_cpu - 15.).abs() < 0.00001);
     }
 
     #[test]

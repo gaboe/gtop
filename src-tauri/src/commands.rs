@@ -6,7 +6,7 @@ pub async fn get_processes(
     include_environ: bool,
     include_ports: bool,
     state: State<'_, AppState>,
-) -> Result<(Vec<ProcessInfo>, SystemStats), String> {
+) -> Result<(std::sync::Arc<Vec<ProcessInfo>>, SystemStats), String> {
     let snapshot = state.snapshot(include_environ, include_ports)?;
     Ok((snapshot.processes, snapshot.stats))
 }

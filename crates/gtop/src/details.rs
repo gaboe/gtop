@@ -19,6 +19,8 @@ enum Environment {
 
 pub(super) struct Details {
     pub(super) key: ProcessKey,
+    last_known: ProcessInfo,
+    last_seen: u64,
     pub(super) name: String,
     pub(super) executable: String,
     pub(super) analysis: Option<crate::analysis::ProcessAnalysis>,
@@ -35,6 +37,10 @@ pub(super) enum KillState {
     Sending,
 }
 
+pub(super) fn close_details(details: &mut Option<Details>) {
+    *details = None;
+}
+
 pub(super) fn kill_completed(key: ProcessKey, processes: &[ProcessInfo]) -> bool {
     !processes
         .iter()
@@ -42,8 +48,64 @@ pub(super) fn kill_completed(key: ProcessKey, processes: &[ProcessInfo]) -> bool
 }
 
 impl Details {
-    pub(super) fn request_kill(&mut self, rendered_for: ProcessKey) {
-        if self.key == rendered_for && self.kill == KillState::Ready {
+    fn new(process: ProcessInfo, observed_at: u64) -> Self {
+        let name = process.name.clone();
+        let executable = process.executable.clone();
+        Self {
+            key: ProcessKey::from(&process),
+            last_known: process,
+            last_seen: observed_at,
+            name,
+            executable,
+            analysis: None,
+            environment: Environment::Unrequested,
+            environment_open: false,
+            body_scroll: ScrollHandle::new(),
+            kill: KillState::Ready,
+        }
+    }
+
+    pub(super) fn observe(&mut self, process: &ProcessInfo, last_seen: u64) {
+        if ProcessKey::from(process) == self.key {
+            self.last_known = process.clone();
+            self.last_seen = last_seen;
+            self.name.clone_from(&process.name);
+            self.executable.clone_from(&process.executable);
+        }
+    }
+
+    fn process<'a>(&'a self, processes: &'a [ProcessInfo]) -> &'a ProcessInfo {
+        processes
+            .iter()
+            .find(|process| ProcessKey::from(*process) == self.key)
+            .unwrap_or(&self.last_known)
+    }
+
+    fn exited(&self, processes: &[ProcessInfo]) -> bool {
+        !processes
+            .iter()
+            .any(|process| ProcessKey::from(process) == self.key)
+    }
+
+    fn exit_marker(&self) -> String {
+        format!(
+            "EXITED · last seen {}",
+            crate::rack::timestamp(self.last_seen, "%H:%M:%S")
+        )
+    }
+
+    fn can_load_environment(&self, processes: &[ProcessInfo]) -> bool {
+        !self.exited(processes)
+    }
+
+    pub(super) fn cancel_kill_if_exited(&mut self, processes: &[ProcessInfo]) {
+        if self.exited(processes) {
+            self.cancel_kill(self.key);
+        }
+    }
+
+    pub(super) fn request_kill(&mut self, rendered_for: ProcessKey, alive: bool) {
+        if alive && self.key == rendered_for && self.kill == KillState::Ready {
             self.kill = KillState::Confirming;
         }
     }
@@ -73,27 +135,18 @@ impl Monitor {
         {
             return;
         }
-        let (name, executable) = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                snapshot
-                    .processes
-                    .iter()
-                    .find(|process| ProcessKey::from(*process) == key)
-                    .map(|process| (process.name.clone(), process.executable.clone()))
-            })
-            .unwrap_or_default();
-        self.details = Some(Details {
-            key,
-            name,
-            executable,
-            analysis: None,
-            environment: Environment::Unrequested,
-            environment_open: false,
-            body_scroll: ScrollHandle::new(),
-            kill: KillState::Ready,
+        let process = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .processes
+                .iter()
+                .find(|process| ProcessKey::from(*process) == key)
+                .cloned()
         });
+        let Some(process) = process else { return };
+        self.details = Some(Details::new(
+            process,
+            self.snapshot.as_ref().unwrap().process_observed_at,
+        ));
         self.wake();
         self.table.update(cx, |table, _cx| {
             table.selected = Some(key);
@@ -105,15 +158,30 @@ impl Monitor {
     }
 
     fn selected_process(&self) -> Option<&ProcessInfo> {
-        let key = self.details.as_ref()?.key;
-        self.snapshot
-            .as_ref()?
-            .processes
-            .iter()
-            .find(|process| ProcessKey::from(*process) == key)
+        let details = self.details.as_ref()?;
+        Some(details.process(&self.snapshot.as_ref()?.processes))
+    }
+
+    pub(super) fn process_exited(&self) -> bool {
+        self.details.as_ref().is_some_and(|details| {
+            self.snapshot
+                .as_ref()
+                .is_none_or(|snapshot| details.exited(&snapshot.processes))
+        })
+    }
+
+    fn environment_enabled(&self) -> bool {
+        self.details.as_ref().is_some_and(|details| {
+            self.snapshot
+                .as_ref()
+                .is_some_and(|snapshot| details.can_load_environment(&snapshot.processes))
+        })
     }
 
     pub(super) fn fetch_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.process_exited() {
+            return;
+        }
         let Some(core) = self.core.clone() else {
             return;
         };
@@ -161,6 +229,9 @@ impl Monitor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.process_exited() {
+            return;
+        }
         let Some(core) = self.core.clone() else {
             return;
         };
@@ -265,6 +336,9 @@ impl Monitor {
             .border_color(rgb(t.rule_hi));
         let mut panel = div().flex().flex_col().flex_shrink_0();
         if let Some(p) = self.selected_process() {
+            if self.process_exited() {
+                frame = frame.child(crate::rack::label(details.exit_marker(), &t));
+            }
             frame = frame.child(
                 div()
                     .flex_shrink_0()
@@ -285,13 +359,20 @@ impl Monitor {
             );
             let trace = self.traces.get(&key);
             let top = self.snapshot.as_ref().unwrap().stats.cpu_usage.len() as f32 * 50.;
+            let trace_now = if self.process_exited() {
+                trace
+                    .and_then(|points| points.back().map(|(time, _)| *time))
+                    .unwrap_or_else(crate::rack::now)
+            } else {
+                crate::rack::now()
+            };
             let bars = div()
                 .h(px(64.))
                 .flex()
                 .items_end()
                 .gap(px(1.))
                 .children((0..60).map(|i| {
-                    let at = crate::rack::now() - 90. + i as f64 * 1.5;
+                    let at = trace_now - 90. + i as f64 * 1.5;
                     let v = trace
                         .and_then(|t| {
                             t.iter()
@@ -330,6 +411,7 @@ impl Monitor {
             panel = panel.child(analysis_panel(
                 details.analysis.as_ref(),
                 &details.name,
+                self.process_exited().then_some(p.cpu_usage),
                 self.snapshot
                     .as_ref()
                     .map(|snapshot| snapshot.stats.cpu_usage.len())
@@ -364,7 +446,10 @@ impl Monitor {
                                         "DISK READ",
                                         format!(
                                             "{:.1} MB/s",
-                                            p.disk_usage.0 as f64 / self.sample_seconds / 1e6
+                                            p.disk_usage.0 as f64
+                                                / p.disk_sample_seconds
+                                                    .unwrap_or(self.sample_seconds)
+                                                / 1e6
                                         ),
                                         &t,
                                     ))
@@ -372,7 +457,10 @@ impl Monitor {
                                         "DISK WRITE",
                                         format!(
                                             "{:.1} MB/s",
-                                            p.disk_usage.1 as f64 / self.sample_seconds / 1e6
+                                            p.disk_usage.1 as f64
+                                                / p.disk_sample_seconds
+                                                    .unwrap_or(self.sample_seconds)
+                                                / 1e6
                                         ),
                                         &t,
                                     )),
@@ -396,6 +484,9 @@ impl Monitor {
                     ))
                     .child(detail_line("Running for", duration(p.run_time))),
             );
+            panel = panel
+                .child(detail_line("Executable", p.executable.clone()))
+                .child(detail_line("Arguments", p.argv.join(" ")));
             panel = panel.child(
                 div()
                     .p(px(18.))
@@ -412,18 +503,6 @@ impl Monitor {
                             .child(selectable("command-text", &p.command)),
                     ),
             );
-        } else {
-            panel = panel
-                .child(format!("PID {} has exited", key.pid))
-                .child(analysis_panel(
-                    details.analysis.as_ref(),
-                    &details.name,
-                    self.snapshot
-                        .as_ref()
-                        .map(|snapshot| snapshot.stats.cpu_usage.len())
-                        .unwrap_or(1),
-                    &t,
-                ));
         }
         let environment = match &details.environment {
             Environment::Unrequested => div(),
@@ -460,6 +539,7 @@ impl Monitor {
                                 })
                                 .rack(&t)
                                 .small()
+                                .disabled(!self.environment_enabled())
                                 .on_click(
                                     cx.listener(|this, _, w, cx| this.fetch_environment(w, cx)),
                                 ),
@@ -480,7 +560,7 @@ impl Monitor {
                             .label("Close · Esc")
                             .rack(&t)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.details = None;
+                                close_details(&mut this.details);
                                 cx.notify();
                             })),
                     )
@@ -490,10 +570,11 @@ impl Monitor {
                             .label("Kill · X")
                             .rack(&t)
                             .danger()
-                            .disabled(self.selected_process().is_none())
+                            .disabled(self.process_exited())
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                let alive = !this.process_exited();
                                 if let Some(d) = this.details.as_mut() {
-                                    d.request_kill(key);
+                                    d.request_kill(key, alive);
                                 }
                                 cx.notify();
                             })),
@@ -513,9 +594,23 @@ fn detail_body(content: Div, scroll: &ScrollHandle) -> Stateful<Div> {
         .child(content)
 }
 
+fn analysis_sample(
+    history: &crate::analysis::ProcessHistory,
+    last_seen_cpu: Option<f32>,
+) -> (&'static str, String) {
+    match last_seen_cpu {
+        Some(cpu) => (
+            "LAST SEEN",
+            crate::analysis::sample_sentence("Last seen", cpu, history.busy_average),
+        ),
+        None => ("NOW", history.now.clone()),
+    }
+}
+
 fn analysis_panel(
     analysis: Option<&crate::analysis::ProcessAnalysis>,
     name: &str,
+    last_seen_cpu: Option<f32>,
     cores: usize,
     t: &crate::palette::Tokens,
 ) -> Div {
@@ -563,6 +658,7 @@ fn analysis_panel(
             }),
     );
     if let Some(history) = &analysis.history {
+        let (sample_label, sample_text) = analysis_sample(history, last_seen_cpu);
         history_panel =
             history_panel.child(div().flex().items_end().gap(px(1.)).h(px(40.)).children(
                 history.columns.iter().map(|value| match value {
@@ -586,13 +682,13 @@ fn analysis_panel(
                 .flex()
                 .justify_between()
                 .child(crate::rack::label("24 H AGO", t))
-                .child(crate::rack::label("NOW", t)),
+                .child(crate::rack::label(sample_label, t)),
         );
         history_panel = history_panel.child(
             div()
                 .text_size(px(11.))
                 .text_color(rgb(t.ink_row))
-                .child(format!("{} {}", history.pattern, history.now)),
+                .child(format!("{} {}", history.pattern, sample_text)),
         );
         history_panel = history_panel
             .child(detail_line(
@@ -670,8 +766,13 @@ mod tests {
     use gpui::ScrollHandle;
 
     fn selected(key: ProcessKey) -> Details {
+        let process = crate::test_data::process(key.pid, "builder", 42.);
+        let mut process = process;
+        process.start_time = key.start_time;
         Details {
             key,
+            last_known: process,
+            last_seen: 1_800_000_000,
             name: "builder".into(),
             executable: "/bin/builder".into(),
             analysis: None,
@@ -680,6 +781,60 @@ mod tests {
             body_scroll: ScrollHandle::new(),
             kill: KillState::Ready,
         }
+    }
+
+    #[test]
+    fn stale_selection_uses_the_last_collection_time() {
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.process_observed_at = 6003;
+        snapshot.process_data = gtop_core::ProcessData::Stale {
+            since: std::time::Instant::now(),
+            reason: "unavailable".into(),
+        };
+        let process = snapshot.processes[0].clone();
+        let details = Details::new(process, snapshot.process_observed_at);
+        assert_eq!(details.last_seen, 6003);
+        assert!(details
+            .exit_marker()
+            .ends_with(&crate::rack::timestamp(6003, "%H:%M:%S")));
+    }
+
+    #[test]
+    fn analysis_uses_last_sample_wording_after_exit() {
+        let key = ProcessKey {
+            pid: 1,
+            start_time: 1,
+        };
+        let mut details = selected(key);
+        let mut process = crate::test_data::process(1, "builder", 814.);
+        process.start_time = 1;
+        details.observe(&process, 6003);
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.processes =
+            std::sync::Arc::new(vec![crate::test_data::process(1, "builder", 140.)]);
+        let mut history = crate::history::History::default();
+        history.record(&snapshot, 6000., 3.);
+        history.record(&snapshot, 6003., 3.);
+        let analysis = history.analyze_process("builder", "builder", 814., 100);
+        let history = analysis.history.unwrap();
+        let processes = vec![process];
+        let live = super::analysis_sample(
+            &history,
+            details
+                .exited(&processes)
+                .then_some(details.process(&processes).cpu_usage),
+        );
+        assert_eq!(live.0, "NOW");
+        assert_eq!(live.1, "Now 814 %, 5.8× its usual busy load.");
+        let exited = super::analysis_sample(
+            &history,
+            details
+                .exited(&[])
+                .then_some(details.process(&[]).cpu_usage),
+        );
+        assert_eq!(exited.0, "LAST SEEN");
+        assert_eq!(exited.1, "Last seen 814 %, 5.8× its usual busy load.");
+        assert!(!exited.1.contains("Now"));
     }
 
     #[gpui::test]
@@ -718,13 +873,111 @@ mod tests {
         let mut snapshot = crate::test_data::snapshot();
         let key = ProcessKey::from(&snapshot.processes[0]);
         assert!(!kill_completed(key, &snapshot.processes));
-        snapshot.processes[0].status = "Zombie".into();
+        std::sync::Arc::make_mut(&mut snapshot.processes)[0].status = "Zombie".into();
         assert!(kill_completed(key, &snapshot.processes));
-        snapshot.processes[0].status = "Running".into();
-        snapshot.processes[0].start_time += 1;
+        std::sync::Arc::make_mut(&mut snapshot.processes)[0].status = "Running".into();
+        std::sync::Arc::make_mut(&mut snapshot.processes)[0].start_time += 1;
         assert!(kill_completed(key, &snapshot.processes));
-        snapshot.processes.clear();
+        std::sync::Arc::make_mut(&mut snapshot.processes).clear();
         assert!(kill_completed(key, &snapshot.processes));
+    }
+
+    #[test]
+    fn detail_keeps_its_last_sample_after_exit_and_pid_reuse() {
+        let mut process = crate::test_data::process(42, "builder", 42.);
+        process.start_time = 100;
+        process.command = "builder --release".into();
+        process.argv = vec!["builder".into(), "--release".into()];
+        process.ports = vec![8080];
+        process.environ = vec!["MODE=release".into()];
+        let key = ProcessKey::from(&process);
+        let mut details = selected(key);
+        details.observe(&process, 1_800_000_123);
+        details.environment = Environment::Loaded(process.environ.clone());
+
+        let mut replacement = process.clone();
+        replacement.start_time = 200;
+        replacement.name = "replacement".into();
+        replacement.cpu_usage = 99.;
+
+        assert_eq!(details.process(&[]).name, "builder");
+        assert_eq!(details.process(&[]).command, "builder --release");
+        assert_eq!(details.process(&[]).argv, ["builder", "--release"]);
+        assert_eq!(details.process(&[]).ports, [8080]);
+        assert_eq!(details.process(&[]).user, "test");
+        assert!(matches!(
+            &details.environment,
+            Environment::Loaded(values) if values == &["MODE=release"]
+        ));
+        let replacement_snapshot = [replacement];
+        assert_eq!(details.process(&replacement_snapshot).name, "builder");
+        assert!(details.exited(&[]));
+        assert!(details.exited(&replacement_snapshot));
+        let marker = details.exit_marker();
+        let time = marker.strip_prefix("EXITED · last seen ").unwrap();
+        assert_eq!(time.len(), 8);
+        assert_eq!(
+            time.chars().filter(|character| *character == ':').count(),
+            2
+        );
+        assert!(!details.can_load_environment(&[]));
+        assert!(details.can_load_environment(&[process]));
+    }
+
+    #[test]
+    fn matching_process_updates_the_last_known_values() {
+        let key = ProcessKey {
+            pid: 42,
+            start_time: 100,
+        };
+        let mut details = selected(key);
+        let mut latest = crate::test_data::process(key.pid, "builder", 88.);
+        latest.start_time = key.start_time;
+        latest.memory_usage = 4096;
+        details.observe(&latest, 1_800_000_321);
+        assert_eq!(details.process(&[]).cpu_usage, 88.);
+        assert_eq!(details.process(&[]).memory_usage, 4096);
+        assert_eq!(details.last_seen, 1_800_000_321);
+    }
+
+    #[test]
+    fn close_clears_the_open_detail() {
+        let mut details = Some(selected(ProcessKey {
+            pid: 42,
+            start_time: 100,
+        }));
+        super::close_details(&mut details);
+        assert!(details.is_none());
+    }
+
+    #[test]
+    fn pending_kill_confirmation_clears_on_exit_or_pid_reuse() {
+        let key = ProcessKey {
+            pid: 42,
+            start_time: 100,
+        };
+        let mut details = selected(key);
+        details.request_kill(key, true);
+        details.cancel_kill_if_exited(&[details.last_known.clone()]);
+        assert!(details.kill == KillState::Confirming);
+        details.cancel_kill_if_exited(&[]);
+        assert!(details.kill == KillState::Ready);
+        details.request_kill(key, true);
+        let mut replacement = details.last_known.clone();
+        replacement.start_time += 1;
+        details.cancel_kill_if_exited(&[replacement]);
+        assert!(details.kill == KillState::Ready);
+        assert!(details.take_kill_confirmation(key).is_none());
+    }
+
+    #[test]
+    fn exited_process_cannot_request_kill() {
+        let mut details = selected(ProcessKey {
+            pid: 42,
+            start_time: 100,
+        });
+        details.request_kill(details.key, false);
+        assert!(matches!(details.kill, KillState::Ready));
     }
 
     #[test]
@@ -744,7 +997,7 @@ mod tests {
             },
         ] {
             let mut details = selected(current);
-            details.request_kill(current);
+            details.request_kill(current, true);
             assert_eq!(details.take_kill_confirmation(drawn), None);
         }
     }
@@ -757,7 +1010,7 @@ mod tests {
         };
         let mut details = selected(key);
         assert_eq!(details.take_kill_confirmation(key), None);
-        details.request_kill(key);
+        details.request_kill(key, true);
         assert_eq!(details.take_kill_confirmation(key), Some(key));
         assert_eq!(details.take_kill_confirmation(key), None);
     }
@@ -773,12 +1026,12 @@ mod tests {
             start_time: 100,
         };
         let mut details = selected(key);
-        details.request_kill(stale);
+        details.request_kill(stale, true);
         assert_eq!(details.take_kill_confirmation(key), None);
-        details.request_kill(key);
+        details.request_kill(key, true);
         details.cancel_kill(key);
         assert_eq!(details.take_kill_confirmation(key), None);
-        details.request_kill(key);
+        details.request_kill(key, true);
         details.cancel_kill(stale);
         assert_eq!(details.take_kill_confirmation(key), Some(key));
     }

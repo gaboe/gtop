@@ -305,10 +305,14 @@ impl Monitor {
                 let previous_analysis_key = cached_analysis_key;
                 let result = cx.background_executor().spawn(async move {
                     let start = std::time::Instant::now();
-                    let mut snapshot = state.snapshot(false, ports);
-                    if let Ok(ref mut snapshot)=snapshot {
-                        if !ports { if let Ok(cached)=port_cache.lock(){for p in &mut snapshot.processes {if let Some(ports)=cached.get(&p.pid){p.ports=ports.clone();}}} }
-                    }
+                    let snapshot = if !ports {
+                        match port_cache.lock() {
+                            Ok(cached) => state.snapshot_with_cached_ports(false, &cached),
+                            Err(_) => state.snapshot(false, false),
+                        }
+                    } else {
+                        state.snapshot(false, true)
+                    };
                     let tick_ms = start.elapsed().as_secs_f64() * 1000.;
                     let mut views = None;
                     let mut moment_detail = None;
@@ -511,6 +515,9 @@ impl Monitor {
     }
 
     fn observe_sample(&mut self, snapshot: &Snapshot) {
+        if matches!(snapshot.process_data, gtop_core::ProcessData::Stale { .. }) {
+            return;
+        }
         if let Some(key) = self
             .pending_kill
             .filter(|key| crate::details::kill_completed(*key, &snapshot.processes))
@@ -526,8 +533,20 @@ impl Monitor {
             .unwrap_or(self.interval as f64);
         let keys: std::collections::HashSet<_> =
             snapshot.processes.iter().map(ProcessKey::from).collect();
-        self.traces.retain(|k, _| keys.contains(k));
-        for p in &snapshot.processes {
+        let detail_key = self.details.as_ref().map(|details| details.key);
+        self.traces
+            .retain(|key, _| keys.contains(key) || Some(*key) == detail_key);
+        if let Some(details) = self.details.as_mut() {
+            details.cancel_kill_if_exited(&snapshot.processes);
+            if let Some(process) = snapshot
+                .processes
+                .iter()
+                .find(|process| ProcessKey::from(*process) == details.key)
+            {
+                details.observe(process, now as u64);
+            }
+        }
+        for p in snapshot.processes.iter() {
             let trace = self.traces.entry(ProcessKey::from(p)).or_default();
             trace.push_back((now, p.cpu_usage));
             while trace.front().is_some_and(|(t, _)| *t < now - 90.) || trace.len() > 90 {
@@ -565,10 +584,8 @@ impl Monitor {
 
             cx.notify();
         });
+        update_process_status(&mut self.status, &snapshot.process_data);
         self.snapshot = Some(snapshot);
-        if self.status.starts_with("Reading") || self.status.starts_with("Refresh failed") {
-            self.status = "Select a process for details".into();
-        }
         if gtop_core::perf_enabled() {
             eprintln!(
                 "perf ui tick visible=true active={} rows={} total={}",
@@ -710,5 +727,42 @@ mod wake_tests {
         }
         assert_eq!(sent, drained);
         assert!(send.try_send(()).is_ok());
+    }
+}
+
+fn update_process_status(status: &mut String, data: &gtop_core::ProcessData) {
+    match data {
+        gtop_core::ProcessData::Stale { since, reason } => {
+            *status = format!(
+                "Process data stale for {}s: {reason}",
+                since.elapsed().as_secs()
+            );
+        }
+        gtop_core::ProcessData::Fresh => {
+            if status.starts_with("Reading")
+                || status.starts_with("Refresh failed")
+                || status.starts_with("Process data stale")
+            {
+                *status = "Select a process for details".into();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod process_status_tests {
+    #[test]
+    fn stale_status_shows_reason_and_age_then_clears_on_fresh_data() {
+        let mut status = "Reading system information".to_string();
+        super::update_process_status(
+            &mut status,
+            &gtop_core::ProcessData::Stale {
+                since: std::time::Instant::now() - std::time::Duration::from_secs(7),
+                reason: "enumeration failed".into(),
+            },
+        );
+        assert_eq!(status, "Process data stale for 7s: enumeration failed");
+        super::update_process_status(&mut status, &gtop_core::ProcessData::Fresh);
+        assert_eq!(status, "Select a process for details");
     }
 }

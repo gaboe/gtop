@@ -6,9 +6,22 @@ pub use state::AppState;
 
 #[derive(Debug)]
 pub struct Snapshot {
-    pub processes: Vec<ProcessInfo>,
+    pub processes: std::sync::Arc<Vec<ProcessInfo>>,
+    pub process_data: ProcessData,
+    /// Unix time of the last valid process collection.
+    pub process_observed_at: u64,
     pub stats: SystemStats,
     pub cpu_topology: CpuTopology,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessData {
+    Fresh,
+    /// Rows repeat the last emitted collection. Age starts at the first failure.
+    Stale {
+        since: std::time::Instant,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

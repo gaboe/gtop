@@ -3,7 +3,7 @@ use std::fmt::Debug;
 
 /// Process information exposed to the frontend via Tauri
 /// Contains formatted and filtered process data for UI consumption
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct ProcessInfo {
     /// Process ID
     pub pid: u32,
@@ -13,6 +13,8 @@ pub struct ProcessInfo {
     pub name: String,
     /// CPU usage as percentage (0-100)
     pub cpu_usage: f32,
+    /// Seconds covered by this CPU sample; None when no counter delta is available.
+    pub cpu_sample_seconds: Option<f64>,
     /// GPU usage as percentage, or `None` where the platform cannot report it
     pub gpu_usage: Option<f32>,
     /// Physical memory usage in bytes
@@ -39,6 +41,8 @@ pub struct ProcessInfo {
     pub run_time: u64,
     /// Disk I/O statistics (read bytes, written bytes)
     pub disk_usage: (u64, u64),
+    /// Seconds between the valid disk samples, when the collector can report them.
+    pub disk_sample_seconds: Option<f64>,
     /// Session ID of the process
     pub session_id: Option<u32>,
     /// Local bound ports (TCP LISTEN + UDP). Empty when port collection is skipped.

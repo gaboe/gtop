@@ -170,6 +170,10 @@ pub fn current_cpu(processes: &[gtop_core::ProcessInfo], name: &str) -> f32 {
 }
 
 pub fn now_sentence(current_cpu: f32, busy_average: f64) -> String {
+    sample_sentence("Now", current_cpu, busy_average)
+}
+
+pub fn sample_sentence(when: &str, current_cpu: f32, busy_average: f64) -> String {
     let ratio = if busy_average > 0. {
         current_cpu as f64 / busy_average
     } else {
@@ -177,13 +181,16 @@ pub fn now_sentence(current_cpu: f32, busy_average: f64) -> String {
     };
     if ratio > 1.5 {
         format!(
-            "Now {:.0} %, {:.1}× its usual busy load.",
+            "{when} {:.0} %, {:.1}× its usual busy load.",
             current_cpu, ratio
         )
     } else if busy_average > 0. && ratio < 0.5 {
-        format!("Now {:.0} %, well below its usual busy load.", current_cpu)
+        format!(
+            "{when} {:.0} %, well below its usual busy load.",
+            current_cpu
+        )
     } else {
-        format!("Now {:.0} %, about its usual busy load.", current_cpu)
+        format!("{when} {:.0} %, about its usual busy load.", current_cpu)
     }
 }
 
@@ -213,6 +220,32 @@ pub fn identity(name: &str, command: &str) -> ProcessIdentity {
             kind: entry.kind.clone(),
             about: entry.about.clone(),
             source: "gtop catalog",
+        };
+    }
+    if let Some((binary, hash)) = name.rsplit_once('-') {
+        if !binary.is_empty()
+            && hash.len() == 16
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return ProcessIdentity {
+                what: format!("Rust test or build binary of {binary}"),
+                kind: "Developer tool".into(),
+                about: "Cargo adds a hash to test and build binary names.".into(),
+                source: "from its name",
+            };
+        }
+    }
+    if name
+        .strip_suffix(".Tests")
+        .is_some_and(|project| !project.is_empty())
+    {
+        return ProcessIdentity {
+            what: format!(".NET test project {name}"),
+            kind: "Developer tool".into(),
+            about: "Runs tests for this .NET project.".into(),
+            source: "from its name",
         };
     }
     if command.starts_with("/System/") || command.starts_with("/usr/libexec/") {
@@ -269,12 +302,97 @@ mod tests {
     }
 
     #[test]
+    fn build_and_test_names_resolve_before_path_fallback() {
+        for name in [
+            "mini_speed_reader_firmware-d89a92ccf166f61b",
+            "mini_speed_reader_firmware-796e1d60ea54cad7",
+            "mini_speed_reader_firmware-5d351cac350b054f",
+            "mini_speed_reader_firmware-933c8b697cfdb27a",
+            "mini_speed_reader_firmware-54941cf2cd547ec6",
+            "mini_speed_reader_firmware-aff03edcda2a13be",
+            "account_tests-f7d829b1817a0b4a",
+            "readmaxer-d9b077a1e2074261",
+            "library_routes_tests-f724a15104d2ece7",
+            "acta-ef192c1ed6ad40e5",
+            "acta-568ba7485530c996",
+        ] {
+            let found = identity(name, "/System/fixture");
+            assert_eq!(
+                found.what,
+                format!(
+                    "Rust test or build binary of {}",
+                    name.rsplit_once('-').unwrap().0
+                )
+            );
+            assert_eq!(found.kind, "Developer tool");
+            assert_eq!(found.source, "from its name");
+        }
+        for name in [
+            "SabFx.Cqrs.Wolverine.Tests",
+            "AppFx.Workflows.Tests",
+            "Nexus.Roslyn.DomainLayer.Analyzers.Tests",
+            "Nexus.Roslyn.InfrastructureLayer.Analyzers.Tests",
+            "Nexus.Roslyn.Common.CodeFixes.Tests",
+        ] {
+            let found = identity(name, "/Applications/Runner.app/runner");
+            assert_eq!(found.what, format!(".NET test project {name}"));
+            assert_eq!(found.kind, "Developer tool");
+        }
+        for name in [
+            "-d89a92ccf166f61b",
+            "app-D89a92ccf166f61b",
+            "app-d89a92ccf166f61",
+            "app-d89a92ccf166f61bb",
+            "app-d89a92ccf166f61g",
+            ".Tests",
+            "app.tests",
+            "app.Tests.dll",
+            "acta-final",
+            "base-barrier",
+        ] {
+            assert_eq!(
+                identity(name, "/tmp/fixture").what,
+                "Unknown process",
+                "{name}"
+            );
+        }
+        assert_eq!(identity("rustc", "/System/fixture").source, "gtop catalog");
+    }
+
+    #[test]
+    fn catalog_identifies_dotnet_compiler_and_development_tools() {
+        let compiler = super::identity("csc", "/sdk/Roslyn/csc");
+        assert_eq!(compiler.what, "C# compiler");
+        assert_eq!(compiler.source, "gtop catalog");
+        for name in [
+            "VBCSCompiler",
+            "dotnet",
+            "MSBuild",
+            "msbuild",
+            "testhost",
+            "vstest.console",
+            "Rider",
+            "ReSharperHost",
+            "OrbStack",
+            "docker",
+            "csharp-ls",
+            "deno",
+            "gradle",
+            "Python",
+            "esbuild",
+            "zed",
+        ] {
+            assert_eq!(super::identity(name, name).source, "gtop catalog", "{name}");
+        }
+    }
+
+    #[test]
     fn now_uses_live_name_total_and_includes_zero() {
         let mut snapshot = crate::test_data::snapshot();
         assert_eq!(super::current_cpu(&snapshot.processes, "rustc"), 350.);
         assert!(super::now_sentence(350., 350.).contains("about its usual"));
-        snapshot.processes[0].cpu_usage = 0.;
-        snapshot.processes[1].cpu_usage = 0.;
+        std::sync::Arc::make_mut(&mut snapshot.processes)[0].cpu_usage = 0.;
+        std::sync::Arc::make_mut(&mut snapshot.processes)[1].cpu_usage = 0.;
         assert!(
             super::now_sentence(super::current_cpu(&snapshot.processes, "rustc"), 350.)
                 .contains("below its usual")

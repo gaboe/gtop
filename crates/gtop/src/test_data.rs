@@ -5,6 +5,7 @@ pub fn process(pid: u32, name: &str, cpu: f32) -> ProcessInfo {
         ppid: 0,
         name: name.into(),
         cpu_usage: cpu,
+        cpu_sample_seconds: Some(3.),
         gpu_usage: Some(cpu / 2.),
         memory_usage: pid as u64 * 1024,
         status: "Running".into(),
@@ -19,18 +20,21 @@ pub fn process(pid: u32, name: &str, cpu: f32) -> ProcessInfo {
         start_time: pid as u64,
         run_time: 0,
         disk_usage: (0, 0),
+        disk_sample_seconds: None,
         session_id: None,
         ports: vec![],
     }
 }
 pub fn snapshot() -> Snapshot {
     Snapshot {
-        processes: vec![
+        process_data: gtop_core::ProcessData::Fresh,
+        process_observed_at: 6000,
+        processes: std::sync::Arc::new(vec![
             process(1, "rustc", 200.),
             process(2, "rustc", 150.),
             process(3, "cargo", 110.),
             process(4, "quiet", 50.),
-        ],
+        ]),
         stats: SystemStats {
             cpu_usage: vec![50.; 4],
             memory_total: 1000,
