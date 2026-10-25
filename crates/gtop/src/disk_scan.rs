@@ -2324,4 +2324,46 @@ mod trash_name_regressions {
             assert_eq!(fs::metadata(&moved).unwrap().ino(), expected.inode);
         }
     }
+
+    #[test]
+    fn multibyte_stems_with_long_extensions_resolve_trash_collisions() {
+        for (name, expected_name) in [
+            (format!("😀.{}", "x".repeat(250)), "😀 1"),
+            (format!("界.{}", "x".repeat(251)), "界 1"),
+        ] {
+            assert_eq!(name.len(), 255);
+            let home = tests::Scratch::new();
+            fs::create_dir(home.0.join(".Trash")).unwrap();
+            let source = home.0.join(&name);
+            let existing = home.0.join(".Trash").join(&name);
+            fs::write(&source, b"selected").unwrap();
+            fs::write(&existing, b"existing").unwrap();
+            let source_metadata = fs::metadata(&source).unwrap();
+            let expected = FileId {
+                device: source_metadata.dev(),
+                inode: source_metadata.ino(),
+            };
+            let existing_metadata = fs::metadata(&existing).unwrap();
+            let existing_id = FileId {
+                device: existing_metadata.dev(),
+                inode: existing_metadata.ino(),
+            };
+
+            let moved = Confirmation::new(&source, 0, expected, &home.0)
+                .unwrap()
+                .trash(&home.0)
+                .unwrap();
+
+            assert_eq!(moved, home.0.join(".Trash").join(expected_name));
+            assert_eq!(fs::read(&moved).unwrap(), b"selected");
+            let moved_metadata = fs::metadata(&moved).unwrap();
+            assert_eq!(moved_metadata.dev(), expected.device);
+            assert_eq!(moved_metadata.ino(), expected.inode);
+            assert!(!source.exists());
+            assert_eq!(fs::read(&existing).unwrap(), b"existing");
+            let existing_after = fs::metadata(&existing).unwrap();
+            assert_eq!(existing_after.dev(), existing_id.device);
+            assert_eq!(existing_after.ino(), existing_id.inode);
+        }
+    }
 }
