@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn resized_fill_column_keeps_its_explicit_width_in_live_and_history_tables() {
+    fn explicit_fill_columns_preserve_full_width_in_live_and_history_tables() {
         let live = crate::model::ProcessColumn::ALL.map(Column::from);
         for (columns, fill) in [
             (live.as_slice(), Column::Command),
@@ -304,15 +304,37 @@ mod tests {
             let resized = widths.compute(columns, 1400.);
             assert_eq!(resized[name_index], 150.);
             assert_eq!(resized[fill_index], requested_width);
-
-            widths.reset(fill);
-            let reset = widths.compute(columns, 1400.);
-            assert_eq!(reset[name_index], 150.);
-            assert!(reset[fill_index] > fill.default_width());
-
-            widths.reset(Column::Name);
-            assert!(widths.compute(columns, 1400.)[name_index] > Column::Name.default_width());
+            assert_eq!(resized.iter().sum::<f32>(), 1400.);
         }
+    }
+
+    #[test]
+    fn resetting_live_fill_column_restores_its_default_width() {
+        let live = crate::model::ProcessColumn::ALL.map(Column::from);
+        let mut widths = Widths::default();
+        widths.set(Column::Name, 150.);
+        widths.set(Column::Command, 350.);
+        widths.reset(Column::Command);
+        let reset = widths.compute(&live, 1400.);
+        assert_eq!(reset[1], 150.);
+        assert_eq!(reset[8], Column::Command.default_width());
+        assert_eq!(reset.iter().sum::<f32>(), 1400.);
+        widths.reset(Column::Name);
+        assert!(widths.compute(&live, 1400.)[1] > Column::Name.default_width());
+    }
+
+    #[test]
+    fn resetting_history_fill_column_restores_its_default_width() {
+        let mut widths = Widths::default();
+        widths.set(Column::Name, 150.);
+        widths.set(Column::Share, 190.);
+        widths.reset(Column::Share);
+        let reset = widths.compute(&HISTORY, 1400.);
+        assert_eq!(reset[1], 150.);
+        assert_eq!(reset[3], Column::Share.default_width());
+        assert_eq!(reset.iter().sum::<f32>(), 1400.);
+        widths.reset(Column::Name);
+        assert!(widths.compute(&HISTORY, 1400.)[1] > Column::Name.default_width());
     }
 
     #[test]

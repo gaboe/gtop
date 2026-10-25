@@ -514,6 +514,65 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn quick_drag_before_repaint_resizes_and_ends_drag(cx: &mut gpui::TestAppContext) {
+        use gpui::{
+            point, px, InputEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+            MouseUpEvent,
+        };
+        let (table, cx) = cx.add_window_view(|_, _| Processes::default());
+        cx.simulate_resize(gpui::size(px(1500.), px(600.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (x, before) = cx.update(|_, cx| {
+            let table = table.read(cx);
+            (
+                22. + table.width(ProcessColumn::Name) - 2.,
+                table.width(ProcessColumn::Name),
+            )
+        });
+        let start = point(px(x), px(15.));
+        let end = point(px(x - 40.), px(100.));
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: start,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: end,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: end,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            let table = table.read(cx);
+            assert_eq!(table.width(ProcessColumn::Name), before - 40.);
+            assert!(table.sizing.drag.is_none());
+        });
+    }
+
+    #[gpui::test]
     async fn unpressed_mouse_move_does_not_resize_a_drag(cx: &mut gpui::TestAppContext) {
         use gpui::{point, px, Modifiers, MouseButton, MouseMoveEvent};
         let (table, cx) = cx.add_window_view(|_, _| Processes::default());
