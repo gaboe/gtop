@@ -388,6 +388,9 @@ impl Monitor {
                         .bg(rgb(v
                             .map(|v| if v > 400. { t.base.hot } else { t.base.led })
                             .unwrap_or(t.led_off)))
+                        .when(v.is_some() && !t.light, |bar| {
+                            bar.shadow(vec![crate::glow::shadow(t.base.led, 3., 115)])
+                        })
                 }));
             panel = panel.child(
                 div().p(px(18.)).child(
@@ -677,11 +680,17 @@ fn analysis_panel(
                     Some(value) => {
                         let height = (value / (cores.max(1) as f32 * 50.) * 40.).clamp(2., 40.);
                         div().flex_1().min_w_0().h_full().flex().items_end().child(
-                            div().w_full().h(px(height)).bg(rgb(if *value > 400. {
-                                t.base.hot
-                            } else {
-                                t.base.led
-                            })),
+                            div()
+                                .w_full()
+                                .h(px(height))
+                                .bg(rgb(if *value > 400. {
+                                    t.base.hot
+                                } else {
+                                    t.base.led
+                                }))
+                                .when(!t.light, |bar| {
+                                    bar.shadow(vec![crate::glow::shadow(t.base.led, 3., 115)])
+                                }),
                         )
                     }
                 }),
