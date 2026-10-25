@@ -140,9 +140,11 @@ fn history_cell(weight: f32, right: bool) -> Div {
     div()
         .flex_grow(weight)
         .flex_basis(px(0.))
-        .min_w_0()
         .px(px(10.))
-        .when(right, |cell| cell.text_right())
+        .when(right, |cell| {
+            cell.flex_shrink_0().whitespace_nowrap().text_right()
+        })
+        .when(!right, |cell| cell.min_w_0())
 }
 
 pub fn timestamp(seconds: u64, format: &str) -> String {
