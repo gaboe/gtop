@@ -55,6 +55,7 @@ pub(super) struct Disk {
     proposal_id: u64,
     sending: bool,
     scroll: ScrollHandle,
+    row_children: std::cell::RefCell<Vec<(PathBuf, usize)>>,
     status: String,
 }
 impl Drop for Disk {
@@ -98,6 +99,7 @@ impl Disk {
             proposal_id: 0,
             sending: false,
             scroll: ScrollHandle::new(),
+            row_children: Default::default(),
             status: String::new(),
         };
         disk.start(home, false);
@@ -111,12 +113,17 @@ impl Disk {
         self.navigation += 1;
         let _ = self.sender.try_send(Command::DropCache);
         self.folder = None;
-        self.proposal_id += 1;
+        self.invalidate_proposal();
+    }
+    fn invalidate_proposal(&mut self) {
+        if self.status == "Checking cleanup path…" {
+            self.status.clear();
+        }
         self.confirmation = None;
+        self.proposal_id += 1;
     }
     fn select(&mut self, index: usize) {
-        self.confirmation = None;
-        self.proposal_id += 1;
+        self.invalidate_proposal();
         self.selected = index;
     }
     fn apply_proposal(
@@ -158,8 +165,7 @@ impl Disk {
         }
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = cancel;
-        self.confirmation = None;
-        self.proposal_id += 1;
+        self.invalidate_proposal();
         self.generation = generation;
         self.navigation = 0;
         self.selected = 0;
@@ -177,13 +183,24 @@ impl Disk {
         )) {
             return;
         }
-        self.confirmation = None;
-        self.proposal_id += 1;
+        self.invalidate_proposal();
         self.selected = 0;
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = token;
         self.navigation = navigation;
         self.scroll.set_offset(point(px(0.), px(0.)));
+    }
+    fn change_page(&mut self, forward: bool) {
+        if let Some(folder) = &self.folder {
+            let page = if forward {
+                (folder.page + 1).min(folder.pages.saturating_sub(1))
+            } else {
+                folder.page.saturating_sub(1)
+            };
+            if page != folder.page {
+                self.browse(folder.path.clone(), page);
+            }
+        }
     }
     fn enter(&mut self, path: PathBuf) {
         self.browse(path, 0);
@@ -325,23 +342,19 @@ impl Disk {
                     self.start(f.root.clone(), true);
                 }
             }
-            "pagedown" | "pageup" => {
-                if let Some(f) = &self.folder {
-                    self.browse(
-                        f.path.clone(),
-                        if key == "pagedown" {
-                            (f.page + 1).min(f.pages - 1)
-                        } else {
-                            f.page.saturating_sub(1)
-                        },
-                    );
-                }
-            }
+            "pagedown" | "pageup" => self.change_page(key == "pagedown"),
             _ => return false,
         }
-        self.scroll.scroll_to_item(
-            self.selected + 6 + usize::from(self.folder.as_ref().is_some_and(|f| f.errors > 0)),
-        );
+        if let Some(row) = self.folder.as_ref().and_then(|f| f.rows.get(self.selected)) {
+            if let Some((_, child)) = self
+                .row_children
+                .borrow()
+                .iter()
+                .find(|(path, _)| *path == row.path)
+            {
+                self.scroll.scroll_to_item(*child);
+            }
+        }
         true
     }
 }
@@ -508,13 +521,11 @@ fn worker_with_trash(
             Command::Trash(confirmation, token, g, n, path, p) => {
                 let result = trash(confirmation, &home);
                 let mut mailbox = output.lock().unwrap();
-                mailbox.status = Some(match result {
-                    Ok(destination) => format!(
-                        "Moved to {}. Rescanning to refresh sizes.",
-                        destination.display()
-                    ),
+                let final_status = match result {
+                    Ok(destination) => format!("Moved to {}.", destination.display()),
                     Err(e) => format!("Move to Trash failed: {e}"),
-                });
+                };
+                mailbox.status = Some(format!("{final_status} Rescanning to refresh sizes."));
                 mailbox.notify();
                 drop(mailbox);
                 cache.clear();
@@ -545,6 +556,9 @@ fn worker_with_trash(
                         )
                         .then_some((generation, navigation));
                         active = Some(refreshed);
+                        let mut mailbox = output.lock().unwrap();
+                        mailbox.status = Some(final_status);
+                        mailbox.notify();
                     }
                 }
             }
@@ -625,23 +639,24 @@ impl Monitor {
                 ScanState::Cancelled => "Cancelled · partial sizes".into(),
                 ScanState::Failed(e) => format!("Scan failed: {e}"),
             };
-            body = body
-                .child(crate::rack::label(state, &t))
-                .child(format!(
-                    "{} · {} items",
-                    bytes(folder.allocated),
-                    folder.items
-                ))
-                .child(
-                    div()
-                        .text_size(px(10.))
-                        .child("Attributed blocks · hard links counted once · one volume"),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.))
-                        .child(folder.path.display().to_string()),
-                );
+            let mut header = vec![
+                crate::rack::label(state, &t).into_any_element(),
+                div()
+                    .child(format!(
+                        "{} · {} items",
+                        bytes(folder.allocated),
+                        folder.items
+                    ))
+                    .into_any_element(),
+                div()
+                    .text_size(px(10.))
+                    .child("Attributed blocks · hard links counted once · one volume")
+                    .into_any_element(),
+                div()
+                    .text_size(px(10.))
+                    .child(folder.path.display().to_string())
+                    .into_any_element(),
+            ];
             let mut crumbs = div().flex().flex_wrap().gap(px(4.));
             let mut ancestors: Vec<_> = folder
                 .path
@@ -670,23 +685,37 @@ impl Monitor {
                         })),
                 );
             }
-            body = body
-                .child(crumbs)
-                .child(div().text_size(px(10.)).child(format!(
-                    "Observed {}s ago. Moving to Trash does not free space immediately.",
-                    folder.observed.elapsed().unwrap_or_default().as_secs()
-                )));
+            header.push(crumbs.into_any_element());
+            header.push(
+                div()
+                    .text_size(px(10.))
+                    .child(format!(
+                        "Observed {}s ago. Moving to Trash does not free space immediately.",
+                        folder.observed.elapsed().unwrap_or_default().as_secs()
+                    ))
+                    .into_any_element(),
+            );
             if folder.errors > 0 {
-                body = body.child(div().text_color(rgb(t.base.hot)).text_size(px(11.)).child(format!("{} unreadable entries. Sizes are incomplete. Full Disk Access may allow more folders.",folder.errors)));
+                header.push(div().text_color(rgb(t.base.hot)).text_size(px(11.)).child(format!("{} unreadable entries. Sizes are incomplete. Full Disk Access may allow more folders.", folder.errors)).into_any_element());
             }
             if folder.smaller_items > 0 {
-                body = body.child(format!(
-                    "{} smaller items · {}. Open a folder to scan its contents.",
-                    folder.smaller_items,
-                    bytes(folder.smaller_bytes)
-                ));
+                header.push(
+                    div()
+                        .child(format!(
+                            "{} smaller items · {}. Open a folder to scan its contents.",
+                            folder.smaller_items,
+                            bytes(folder.smaller_bytes)
+                        ))
+                        .into_any_element(),
+                );
             }
+            let row_start = header.len();
+            body = body.children(header);
+            disk.row_children.borrow_mut().clear();
             for (index, row) in folder.rows.iter().enumerate() {
+                disk.row_children
+                    .borrow_mut()
+                    .push((row.path.clone(), row_start + index));
                 let path = row.path.clone();
                 let directory = row.directory && !row.skipped_volume && !row.in_cloud;
                 let share = row.allocated as f64 / folder.allocated.max(1) as f64;
@@ -706,6 +735,7 @@ impl Monitor {
                 body = body.child(
                     div()
                         .id(("disk-row", index))
+                        .debug_selector(move || format!("disk-row-{index}"))
                         .cursor_pointer()
                         .p(px(6.))
                         .border_b_1()
@@ -756,28 +786,26 @@ impl Monitor {
                     .gap(px(6.))
                     .child(
                         Button::new("disk-previous")
+                            .disabled(folder.page == 0)
                             .label("Prev")
                             .rack(&t)
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let d = this.disk.as_mut().unwrap();
-                                if let Some(f) = &d.folder {
-                                    d.browse(f.path.clone(), f.page.saturating_sub(1));
-                                }
+                                d.change_page(false);
                                 cx.notify();
                             })),
                     )
                     .child(format!("{} / {}", folder.page + 1, folder.pages))
                     .child(
                         Button::new("disk-next")
+                            .disabled(folder.page + 1 >= folder.pages)
                             .label("Next")
                             .rack(&t)
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let d = this.disk.as_mut().unwrap();
-                                if let Some(f) = &d.folder {
-                                    d.browse(f.path.clone(), (f.page + 1).min(f.pages - 1));
-                                }
+                                d.change_page(true);
                                 cx.notify();
                             })),
                     ),
@@ -906,6 +934,7 @@ impl Monitor {
             )
             .child(
                 body.id("disk-body")
+                    .debug_selector(|| "disk-body".into())
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -944,6 +973,28 @@ impl Monitor {
 
 #[cfg(test)]
 impl Monitor {
+    pub(super) fn prepare_disk_scroll_test(&mut self, home: PathBuf) {
+        let mut disk = Disk::with_home(home);
+        let start = std::time::Instant::now();
+        loop {
+            let value = disk.mailbox.lock().unwrap().folder.take();
+            if let Some((_, _, folder)) = value {
+                if folder.state == ScanState::Complete {
+                    assert_eq!(folder.rows.len(), 128);
+                    assert_eq!(folder.smaller_items, 32);
+                    disk.folder = Some(folder);
+                    break;
+                }
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        disk.selected = 126;
+        self.disk = Some(disk);
+    }
+    pub(super) fn disk_selected_for_test(&self) -> usize {
+        self.disk.as_ref().unwrap().selected
+    }
     pub(super) fn prepare_disk_draw_benchmark(&mut self) {
         let disk = Disk::new();
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -1022,6 +1073,27 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+    #[test]
+    fn boundary_page_commands_do_not_rescan() {
+        let home = scratch();
+        let child = home.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("one"), [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        disk.folder = Some(receive(&mut disk, ScanState::Complete));
+        disk.enter(child.clone());
+        disk.folder = Some(receive(&mut disk, ScanState::Complete));
+        let navigation = disk.navigation;
+        fs::write(child.join("two"), [2; 4096]).unwrap();
+        for key in ["pagedown", "pageup"] {
+            disk.key(key);
+            assert_eq!(disk.navigation, navigation);
+            assert_eq!(disk.folder.as_ref().unwrap().items, 1);
+        }
+        assert!(disk.mailbox.lock().unwrap().folder.is_none());
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn completed_subtree_can_prepare_after_root_cancellation() {
@@ -1247,6 +1319,7 @@ mod tests {
         assert_eq!(disk.selected, other_index);
         assert!(disk.confirmation.is_none());
         assert!(!disk.sending);
+        assert!(disk.status.is_empty());
         drop(disk);
         fs::remove_dir_all(home).unwrap();
     }
@@ -1321,7 +1394,8 @@ mod tests {
                     "moved"
                 }
             );
-            assert!(disk.mailbox.lock().unwrap().status.take().is_some());
+            let status = disk.mailbox.lock().unwrap().status.take().unwrap();
+            assert!(!status.contains("Rescanning"), "{status}");
             drop(disk);
             worker.join().unwrap();
             fs::remove_dir_all(home).unwrap();

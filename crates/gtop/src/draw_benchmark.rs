@@ -390,3 +390,61 @@ fn full_monitor_draw_benchmark() {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "full Monitor draws share glyph instrumentation; run this test in isolation"]
+fn disk_keyboard_scroll_reveals_selected_row_after_summary() {
+    let home = std::env::temp_dir().join(format!("gtop-scroll-regression-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    for i in 0..160 {
+        std::fs::write(home.join(format!("file-{i:03}")), [1u8; 4096]).unwrap();
+    }
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("review-ui"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    for bytes in [
+        include_bytes!("../assets/fonts/DotoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/JetBrainsMono.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoLabels.ttf").as_slice(),
+        include_bytes!("../assets/fonts/Silkscreen.ttf").as_slice(),
+    ] { cx.text_system().add_fonts(vec![std::borrow::Cow::Borrowed(bytes)]).unwrap(); }
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |m, cx| {
+            m.prepare_disk_scroll_test(home.clone());
+            window.focus(&m.focus, cx);
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let m = monitor.unwrap();
+    let mut visual = VisualTestContext::from_window(handle.into(), &cx);
+    cx.update_window(handle.into(), |_, w, cx| {
+        w.refresh();
+        w.draw(cx).clear(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(handle.into(), "down");
+    cx.update_window(handle.into(), |_, w, cx| {
+        w.refresh();
+        w.draw(cx).clear(cx);
+    })
+    .unwrap();
+    assert_eq!(cx.update(|cx| m.read(cx).disk_selected_for_test()), 127);
+    let body = visual.debug_bounds("disk-body").unwrap();
+    let selected = visual.debug_bounds("disk-row-127").unwrap();
+    println!("selected={selected:?} viewport={body:?}");
+    assert!(selected.top() >= body.top());
+    assert!(selected.bottom() <= body.bottom());
+    cx.update(|cx| m.update(cx, |m, _| m.disk.as_mut().unwrap().close()));
+    std::fs::remove_dir_all(home).unwrap();
+}

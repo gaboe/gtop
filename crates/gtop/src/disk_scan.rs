@@ -253,7 +253,7 @@ impl Tree {
     }
 }
 
-pub fn cleanable_kind(path: &Path, home: &Path) -> Option<&'static str> {
+fn cleanable_kind(path: &Path, home: &Path) -> Option<&'static str> {
     let relative = path.strip_prefix(home).ok()?;
     let known = [
         ("Library/Caches", "App caches, recreated by apps"),
@@ -273,13 +273,15 @@ pub fn cleanable_kind(path: &Path, home: &Path) -> Option<&'static str> {
     }
     match path.file_name()?.as_bytes() {
         b"node_modules" => Some("Installed JavaScript dependencies"),
-        b"target" if local_manifest(path.parent()?) => Some("Cargo build products"),
         _ => None,
     }
 }
 
-fn local_manifest(parent: &Path) -> bool {
-    let Ok(fd) = open_root(parent) else {
+fn local_manifest(parent: &OwnedFd) -> bool {
+    let Ok(expected) = identity(parent) else {
+        return false;
+    };
+    let Ok(fd) = open_child(parent, std::ffi::OsStr::new("."), expected) else {
         return false;
     };
     let mut found = false;
@@ -739,10 +741,13 @@ impl<F: FnMut(&Tree)> Walker<'_, F> {
                 }
             }
         }
-        row.cleanable = if row.in_cloud {
+        row.cleanable = if !row.directory || row.in_cloud || skipped_volume || entry.error {
             None
         } else {
-            cleanable_kind(&child_path, self.home)
+            cleanable_kind(&child_path, self.home).or_else(|| {
+                (entry.name == "target" && child_path.starts_with(self.home) && local_manifest(fd))
+                    .then_some("Cargo build products")
+            })
         };
         if row.cleanable.is_some() {
             self.tree.candidates.push(row.clone());
@@ -911,7 +916,14 @@ impl Confirmation {
                 .ok_or_else(|| io::Error::other("Move result unconfirmed. Destination URL was not returned. Rescan before any retry."))?;
             let metadata = fs::symlink_metadata(&destination)?;
             if (metadata.dev(), metadata.ino()) != (self.device, self.inode) {
-                return Err(io::Error::other("Move result unconfirmed. Destination identity differs. Rescan before any retry."));
+                let from = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
+                let to = std::ffi::CString::new(self.path.as_os_str().as_bytes())?;
+                if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+                    return Err(io::Error::other(
+                        "A different item was at this path; it was put back; nothing was trashed.",
+                    ));
+                }
+                return Err(io::Error::other(format!("Move result unconfirmed. A different item moved to {}. It could not be put back at {}: {}. Rescan before any retry.", destination.display(), self.path.display(), io::Error::last_os_error())));
             }
             Ok(destination)
         }
@@ -1461,5 +1473,86 @@ mod tests {
             .windows(2)
             .all(|p| p[0].allocated >= p[1].allocated));
         assert_eq!(tree.folder(Path::new("/fixture"), 2, false).rows.len(), 44);
+    }
+}
+
+#[cfg(test)]
+mod cleanup_regressions {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    #[test]
+    fn cleanup_manifest_stays_in_pinned_parent() {
+        let home = tests::Scratch::new();
+        let outside = tests::Scratch::new();
+        fs::create_dir_all(home.0.join("project/nested")).unwrap();
+        fs::create_dir(home.0.join("project/nested/target")).unwrap();
+        fs::create_dir(outside.0.join("nested")).unwrap();
+        fs::write(outside.0.join("nested/Cargo.toml"), "outside manifest").unwrap();
+        let pinned = open_root(&home.0.join("project/nested")).unwrap();
+        let metadata = fs::metadata(home.0.join("project/nested/target")).unwrap();
+        fs::rename(home.0.join("project"), home.0.join("saved-project")).unwrap();
+        symlink(&outside.0, home.0.join("project")).unwrap();
+        assert!(!home.0.join("saved-project/nested/Cargo.toml").exists());
+        let mut tree = Tree::new(&home.0);
+        let cancel = AtomicBool::new(false);
+        let mut progress = |_: &Tree| {};
+        let mut walker = Walker {
+            tree: &mut tree,
+            home: &home.0,
+            device: metadata.dev(),
+            cancel: &cancel,
+            progress: &mut progress,
+            last: Instant::now(),
+            links: HashSet::new(),
+        };
+        let mut total = (0, 0, 0);
+        assert!(walker.visit(
+            &pinned,
+            &home.0.join("project/nested"),
+            0,
+            Entry {
+                name: "target".into(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                directory: true,
+                allocated: metadata.blocks() * 512,
+                error: false,
+                in_cloud: false,
+                links: 1
+            },
+            &mut total
+        ));
+        println!(
+            "manifest_probe outside_only_manifest=true candidates={:?}",
+            tree.candidates
+        );
+        assert!(tree.candidates.is_empty());
+        fs::write(
+            home.0.join("saved-project/nested/Cargo.toml"),
+            "pinned manifest",
+        )
+        .unwrap();
+        assert!(local_manifest(&pinned));
+    }
+
+    #[test]
+    fn ordinary_files_with_cache_names_are_not_cleanable() {
+        let home = tests::Scratch::new();
+        fs::write(home.0.join("node_modules"), "personal scratch notes").unwrap();
+        fs::create_dir(home.0.join("project")).unwrap();
+        fs::write(
+            home.0.join("project/Cargo.toml"),
+            "[package]\nname=\"fixture\"\nversion=\"0.1.0\"",
+        )
+        .unwrap();
+        fs::write(home.0.join("project/target"), "personal scratch notes").unwrap();
+        let tree = scan(&home.0, &home.0, &AtomicBool::new(false), |_| {});
+        println!("ordinary_files candidates={:?}", tree.candidates);
+        assert!(tree.candidates.is_empty());
+        fs::remove_file(home.0.join("project/target")).unwrap();
+        fs::create_dir(home.0.join("project/target")).unwrap();
+        let tree = scan(&home.0, &home.0, &AtomicBool::new(false), |_| {});
+        assert_eq!(tree.candidates.len(), 1);
+        assert_eq!(tree.candidates[0].cleanable, Some("Cargo build products"));
     }
 }
