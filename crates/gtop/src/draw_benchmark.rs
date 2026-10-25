@@ -182,6 +182,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         wake: mpsc::channel(1).0,
         _subscriptions: vec![],
         _refresh: Some(Task::ready(())),
+        shutdown: None,
         _ports: Task::ready(()),
         _frames: Task::ready(()),
     }

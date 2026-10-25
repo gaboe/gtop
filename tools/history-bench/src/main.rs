@@ -94,6 +94,68 @@ fn run() -> Result<()> {
     let directory = Path::new(&args[3]);
     let minute: u64 = args[4].parse()?;
     let now = minute * 60;
+    if mode == "replay-sparse" || mode == "replay-dense" {
+        let days = minute;
+        let source: baseline::History = serde_json::from_reader(std::fs::File::open(input)?)?;
+        let dense = mode == "replay-dense";
+        let path = directory.join("history.sqlite");
+        std::fs::create_dir_all(directory)?;
+        let anchor = if path.exists() {
+            let connection = rusqlite::Connection::open(&path)?;
+            connection.query_row(
+                "SELECT MAX(minute) FROM system WHERE resolution=1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )? as u64
+                + 1
+        } else {
+            100800
+        };
+        let mut history =
+            history::History::open(&path, &directory.join("absent.json"), anchor * 60)?;
+        let first = source.buckets.front().ok_or("Empty replay fixture")?;
+        let mut commits = 0;
+        for day in 0..days {
+            if dense {
+                for offset in 0..1440 {
+                    let mut bucket = first.clone();
+                    bucket.minute = anchor + day * 1440 + offset;
+                    bucket.seconds = 60.;
+                    let now = bucket.minute * 60;
+                    history.benchmark_minute(bucket);
+                    history.persist(now)?;
+                    commits += 1;
+                }
+            } else {
+                for original in &source.buckets {
+                    let mut bucket = original.clone();
+                    bucket.minute = anchor + day * 1440 + original.minute - first.minute;
+                    let now = bucket.minute * 60;
+                    history.benchmark_minute(bucket);
+                    history.persist(now)?;
+                    commits += 1;
+                }
+            }
+            println!(
+                "{}",
+                json!({"day":day+1,"commits":commits,"bytes":std::fs::metadata(&path)?.len()})
+            );
+        }
+        drop(history);
+        let connection = rusqlite::Connection::open(&path)?;
+        let integrity: String = connection.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        assert_eq!(integrity, "ok");
+        let rows: i64 =
+            connection.query_row("SELECT COUNT(*) FROM system WHERE resolution=1", [], |r| {
+                r.get(0)
+            })?;
+        assert!(rows > 0);
+        println!(
+            "{}",
+            json!({"verified":true,"commits":commits,"integrity":integrity,"bytes":std::fs::metadata(&path)?.len()})
+        );
+        return Ok(());
+    }
     if mode == "prepare" {
         std::fs::create_dir_all(directory)?;
         let store = history::History::open(&directory.join("history.sqlite"), input, now)?;

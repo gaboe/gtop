@@ -22,16 +22,19 @@ with sqlite3.connect(path) as db:
     db.execute("PRAGMA synchronous=FULL")
     db.execute("CREATE TEMP TABLE seed_system AS SELECT * FROM system WHERE resolution=1")
     db.execute("CREATE TEMP TABLE seed_process AS SELECT * FROM process WHERE resolution=1")
+    db.execute("CREATE TEMP TABLE seed_presence AS SELECT * FROM presence WHERE resolution=1")
     original_system = db.execute("SELECT COUNT(*),SUM(seconds) FROM seed_system").fetchone()
     original_process = db.execute("SELECT COUNT(*),SUM(cpu_seconds),SUM(gpu_seconds) FROM seed_process").fetchone()
     db.execute("DELETE FROM process WHERE resolution<>1")
     db.execute("DELETE FROM system WHERE resolution<>1")
+    db.execute("DELETE FROM presence WHERE resolution<>1")
     db.execute("DELETE FROM rollup_meta")
     db.execute("UPDATE meta SET compacted_before=0")
     for day in range(1, 30):
         shift = day * 1440
         db.execute("INSERT INTO system SELECT resolution,minute-?,recorded,seconds,cpu,memory,gpu,gpu_seconds,temperature,temp_seconds,peak_cpu,peak_memory,peak_gpu,peak_temp FROM seed_system", [shift])
         db.execute("INSERT INTO process SELECT resolution,minute-?,name_id,cpu_seconds,gpu_seconds,peak_memory,peak_cpu FROM seed_process", [shift])
+        db.execute("INSERT INTO presence SELECT resolution,minute-?,ids FROM seed_presence", [shift])
         db.commit()
         print(f"synthesized day {day + 1}", flush=True)
     anchor = db.execute("SELECT MAX(minute) FROM system").fetchone()[0]
