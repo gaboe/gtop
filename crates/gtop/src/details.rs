@@ -391,6 +391,9 @@ impl Monitor {
                         .bg(rgb(v
                             .map(|v| if v > 400. { t.base.hot } else { t.base.led })
                             .unwrap_or(t.led_off)))
+                        .when(v.is_some() && !t.light, |bar| {
+                            bar.shadow(vec![crate::glow::shadow(t.base.led, 3., 115)])
+                        })
                 }));
             panel = panel.child(
                 div().p(px(18.)).child(
@@ -680,11 +683,17 @@ fn analysis_panel(
                     Some(value) => {
                         let height = (value / (cores.max(1) as f32 * 50.) * 40.).clamp(2., 40.);
                         div().flex_1().min_w_0().h_full().flex().items_end().child(
-                            div().w_full().h(px(height)).bg(rgb(if *value > 400. {
-                                t.base.hot
-                            } else {
-                                t.base.led
-                            })),
+                            div()
+                                .w_full()
+                                .h(px(height))
+                                .bg(rgb(if *value > 400. {
+                                    t.base.hot
+                                } else {
+                                    t.base.led
+                                }))
+                                .when(!t.light, |bar| {
+                                    bar.shadow(vec![crate::glow::shadow(t.base.led, 3., 115)])
+                                }),
                         )
                     }
                 }),
@@ -825,9 +834,11 @@ mod tests {
         snapshot.processes =
             std::sync::Arc::new(vec![crate::test_data::process(1, "builder", 140.)]);
         let mut history = crate::history::History::default();
-        history.record(&snapshot, 6000., 3.);
-        history.record(&snapshot, 6003., 3.);
-        let analysis = history.analyze_process("builder", "builder", 814., 100);
+        history.record(&snapshot, 6000., 3.).unwrap();
+        history.record(&snapshot, 6003., 3.).unwrap();
+        let analysis = history
+            .analyze_process("builder", "builder", 814., 100)
+            .unwrap();
         let history = analysis.history.unwrap();
         let processes = vec![process];
         let live = super::analysis_sample(

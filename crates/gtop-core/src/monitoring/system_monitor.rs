@@ -81,19 +81,18 @@ impl SystemMonitor {
         }
     }
 
-    /// Refreshes storage of the shown disks only. Listing all volumes again
-    /// costs tens of milliseconds on macOS.
+    /// Rebuilds disk entries every 60 seconds to read fresh capacity values.
     pub fn refresh_disks(&mut self, disks: &mut Disks) {
+        self.refresh_disks_with(disks, || {
+            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage())
+        });
+    }
+
+    fn refresh_disks_with(&mut self, disks: &mut Disks, refresh: impl FnOnce() -> Disks) {
         if self.disks_refreshed_at.elapsed() < Duration::from_secs(60) {
             return;
         }
-        for disk in disks
-            .list_mut()
-            .iter_mut()
-            .filter(|disk| Self::is_shown(disk))
-        {
-            disk.refresh_specifics(DiskRefreshKind::nothing().with_storage());
-        }
+        *disks = refresh();
         self.disks_refreshed_at = Instant::now();
     }
 
@@ -147,7 +146,19 @@ impl SystemMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use std::{io::Write, os::unix::fs::MetadataExt};
     use sysinfo::System;
+
+    #[cfg(target_os = "macos")]
+    struct ScratchFile(std::path::PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     /// Tests creation of system monitor
     #[test]
@@ -159,15 +170,77 @@ mod tests {
     }
 
     #[test]
-    fn storage_refresh_waits_sixty_seconds() {
+    fn storage_refresh_reads_a_fresh_disk_list_after_sixty_seconds() {
         let mut monitor = SystemMonitor::new(&Networks::new());
         let mut disks = Disks::new();
         let initial = monitor.disks_refreshed_at;
-        monitor.refresh_disks(&mut disks);
+        let mut reads = 0;
+        monitor.refresh_disks_with(&mut disks, || {
+            reads += 1;
+            Disks::new()
+        });
         assert_eq!(monitor.disks_refreshed_at, initial);
+        assert_eq!(reads, 0);
+
         monitor.disks_refreshed_at = initial - Duration::from_secs(60);
-        monitor.refresh_disks(&mut disks);
+        monitor.refresh_disks_with(&mut disks, || {
+            reads += 1;
+            Disks::new()
+        });
+        assert_eq!(reads, 1);
         assert!(monitor.disks_refreshed_at >= initial);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[ignore = "manual 512 MiB system-volume capacity probe"]
+    #[test]
+    fn storage_refresh_reads_new_system_volume_capacity() {
+        let mut disks =
+            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
+        let system_volume_device = std::fs::metadata("/").unwrap().dev();
+        let temp_dir = std::env::temp_dir();
+        assert_eq!(
+            std::fs::metadata(&temp_dir).unwrap().dev(),
+            system_volume_device,
+            "temporary directory must be on the system volume"
+        );
+        let path = std::env::temp_dir().join(format!(
+            "gtop-capacity-refresh-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _scratch_file = ScratchFile(path.clone());
+        let mut file = std::fs::File::create(&path).unwrap();
+        let block = vec![0x6b; 1024 * 1024];
+        for _ in 0..512 {
+            file.write_all(&block).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut monitor = SystemMonitor::new(&Networks::new());
+        monitor.disks_refreshed_at = Instant::now() - Duration::from_secs(60);
+        monitor.refresh_disks(&mut disks);
+        let refreshed_available = disks
+            .iter()
+            .find(|disk| disk.mount_point() == Path::new("/"))
+            .unwrap()
+            .available_space();
+        let fresh_disks =
+            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
+        let fresh_available = fresh_disks
+            .iter()
+            .find(|disk| disk.mount_point() == Path::new("/"))
+            .unwrap()
+            .available_space();
+
+        assert!(
+            refreshed_available.abs_diff(fresh_available) <= 8 * 1024 * 1024,
+            "refreshed capacity {refreshed_available} differs from fresh capacity {fresh_available}"
+        );
     }
 
     /// Tests system statistics collection

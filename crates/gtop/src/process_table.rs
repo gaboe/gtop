@@ -203,7 +203,15 @@ impl Processes {
                             .h(px(if priority { 12. } else { 8. })),
                         )
                     })
-                    .child(kind.text(p))
+                    .child(
+                        if (selected || priority && culprit)
+                            && !(culprit && kind == ProcessColumn::Command)
+                        {
+                            crate::glow::text(kind.text(p), false, t).into_any_element()
+                        } else {
+                            kind.text(p).into_any_element()
+                        },
+                    )
                 }))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.selected = Some(key);

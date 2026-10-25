@@ -4,6 +4,7 @@ mod disk;
 mod disk_scan;
 #[cfg(test)]
 mod draw_benchmark;
+mod glow;
 mod history;
 mod model;
 mod palette;
@@ -25,6 +26,16 @@ use model::{ProcessKey, Search};
 use process_table::Processes;
 use std::{rc::Rc, sync::Arc, time::Duration};
 
+fn refresh_stopped(events: &mut mpsc::Receiver<()>) -> bool {
+    loop {
+        match events.try_recv() {
+            Ok(()) => {}
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Closed) => return true,
+        }
+    }
+}
+
 fn clamp_moment_row(selected: usize, row_count: usize) -> usize {
     selected.min(row_count.saturating_sub(1))
 }
@@ -44,6 +55,42 @@ impl DrawMetrics {
             self.fps = Some(draw_count as f64 / elapsed_seconds);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum HistoryRead {
+    Moment,
+    Process,
+}
+
+#[derive(Default)]
+struct HistoryReadErrors([Option<String>; 2]);
+
+impl HistoryReadErrors {
+    fn update(&mut self, status: &mut String, read: HistoryRead, error: Option<String>) {
+        let owns_status = self.0.iter().flatten().any(|message| message == status);
+        let message = error.map(|error| format!("History could not be read: {error}"));
+        self.0[read as usize] = message.clone();
+        if let Some(message) = message {
+            *status = message;
+        } else if owns_status {
+            *status = self
+                .0
+                .iter()
+                .flatten()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "Select a process for details".into());
+        }
+    }
+}
+
+type ShutdownFuture = futures::future::Shared<futures::future::LocalBoxFuture<'static, ()>>;
+
+struct ShutdownDrains {
+    stopping: Rc<std::cell::Cell<bool>>,
+    history: ShutdownFuture,
+    settings: ShutdownFuture,
 }
 
 struct Monitor {
@@ -81,7 +128,8 @@ struct Monitor {
     pending_kill: Option<ProcessKey>,
     wake: mpsc::Sender<()>,
     _subscriptions: Vec<Subscription>,
-    _refresh: Task<()>,
+    _refresh: Option<Task<()>>,
+    shutdown: Option<ShutdownDrains>,
     _ports: Task<()>,
     _frames: Task<()>,
 }
@@ -111,14 +159,23 @@ impl Monitor {
             p.base = settings.base();
             p
         });
+        let stopping = Rc::new(std::cell::Cell::new(false));
+        let settings_stopping = stopping.clone();
+        let history_stopping = stopping.clone();
         let (wake, mut events) = mpsc::channel(1);
         let (settings_writes, mut settings_events) = mpsc::unbounded();
-        let settings_writer = cx.spawn_in(window, async move |entity, cx| {
+        let entity = cx.entity().downgrade();
+        let mut settings_cx = window.to_async(cx);
+        let settings_drain = async move {
+            let cx = &mut settings_cx;
             while let Some(settings) = palette::next_settings(&mut settings_events).await {
                 let result = cx
                     .background_executor()
                     .spawn(async move { settings.save() })
                     .await;
+                if settings_stopping.get() {
+                    continue;
+                }
                 if let Err(error) = result {
                     let _ = entity.update_in(cx, |this, _, cx| {
                         this.status = format!("Palette could not be saved: {error}");
@@ -126,7 +183,10 @@ impl Monitor {
                     });
                 }
             }
-        });
+        }
+        .boxed_local()
+        .shared();
+        let settings_writer = cx.foreground_executor().spawn(settings_drain.clone());
         let mut subscriptions = vec![
             cx.subscribe_in(&search, window, |this, input, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -219,16 +279,32 @@ impl Monitor {
                 .timer(Duration::from_secs(10))
                 .await;
         });
-        let refresh = cx.spawn_in(window, async move |entity, cx| {
+        let entity = cx.entity().downgrade();
+        let mut refresh_cx = window.to_async(cx);
+        let history_drain = async move {
+            let cx = &mut refresh_cx;
             let core = cx.background_executor().spawn(async { Arc::new(AppState::new()) }).await;
-            if entity.update_in(cx, |this, _, _| this.core = Some(core.clone())).is_err() { return; }
-            let mut history = cx.background_executor().spawn(async { history::History::load(&history::support_path("history.json"), rack::now() as u64) }).await;
+            if history_stopping.get() || entity.update_in(cx, |this, _, _| this.core = Some(core.clone())).is_err() { return; }
+            let opened = cx.background_executor().spawn(async {
+                history::History::open(&history::support_path("history.sqlite"), &history::support_path("history.json"), rack::now() as u64)
+            }).await;
+            let mut history = match opened {
+                Ok(history) => history,
+                Err(error) => {
+                    if !history_stopping.get() { let _ = entity.update_in(cx, |this, _, cx| {
+                        this.status = format!("History could not be opened: {error}");
+                        cx.notify();
+                    }); }
+                    history::History::default()
+                }
+            };
             let mut cached_minute = None;
             let mut cached_moment = None;
             let mut cached_metric = None;
             let mut cached_analysis_key = None;
+            let mut read_errors = HistoryReadErrors::default();
             loop {
-                while events.try_recv().is_ok() {}
+                if history_stopping.get() || refresh_stopped(&mut events) { break; }
                 let Ok((running, ports, seconds, moment, metric, selected_detail)) = entity.update_in(cx, |this, window, cx| {
                     let selected_detail = this.details.as_ref().map(|details| {
                         let current_cpu = this.snapshot.as_ref().map(|snapshot| crate::analysis::current_cpu(&snapshot.processes, &details.name)).unwrap_or(0.);
@@ -248,18 +324,34 @@ impl Monitor {
                 }
                 if !running {
                     history.suspend();
+                    let mut history_retry = false;
                     if let Some(selection) = moment {
                         if cached_moment != Some(selection) || cached_metric != Some(metric) {
-                            let detail = history.moment(selection);
-                            let _ = entity.update_in(cx, |this, _, cx| {
-                                if this.moment == Some(selection) {
-                                    this.replace_moment_rows(detail.ranked(metric));
-                                    this.moment_detail = Some(detail);
-                                    cx.notify();
+                            let (returned_history, detail) = cx.background_executor().spawn(async move {
+                                let detail = history.moment(selection);
+                                (history, detail)
+                            }).await;
+                            history = returned_history;
+                            if history_stopping.get() { break; }
+                            match detail {
+                                Ok(detail) => {
+                                    let _ = entity.update_in(cx, |this, _, cx| {
+                                        read_errors.update(&mut this.status, HistoryRead::Moment, None);
+                                        cx.notify();
+                                        if this.moment == Some(selection) {
+                                            this.replace_moment_rows(detail.ranked(metric));
+                                            this.moment_detail = Some(detail);
+                                            cx.notify();
+                                        }
+                                    });
+                                    cached_moment = Some(selection);
+                                    cached_metric = Some(metric);
                                 }
-                            });
-                            cached_moment = Some(selection);
-                            cached_metric = Some(metric);
+                                Err(error) => {
+                                    history_retry = true;
+                                    let _ = entity.update_in(cx, |this, _, cx| { read_errors.update(&mut this.status, HistoryRead::Moment, Some(error.to_string())); cx.notify(); });
+                                }
+                            }
                         }
                     }
                     let pending = entity.update_in(cx, |this, _, _| this.pending_kill).ok().flatten();
@@ -268,6 +360,7 @@ impl Monitor {
                         let stopped = cx.background_executor().spawn(async move {
                             state.process_stopped(key.pid, key.start_time)
                         }).await;
+                        if history_stopping.get() { break; }
                         let _ = entity.update_in(cx, |this, _, cx| {
                             if this.pending_kill == Some(key) && matches!(stopped, Ok(true)) {
                                 this.pending_kill = None;
@@ -278,24 +371,36 @@ impl Monitor {
                     }
                     if let Some((key, name, command, cpu, needs_analysis)) = selected_detail.as_ref() {
                         if *needs_analysis || cached_analysis_key != Some(*key) {
-                            let analysis = history.analyze_process(
-                                name,
-                                command,
-                                *cpu,
-                                rack::now() as u64 / 60,
-                            );
-                            let _ = entity.update_in(cx, |this, _, cx| {
-                                if let Some(details) = this.details.as_mut().filter(|details| details.key == *key) {
-                                    details.analysis = Some(analysis);
-                                    cx.notify();
+                            let (name, command, cpu) = (name.clone(), command.clone(), *cpu);
+                            let (returned_history, analysis) = cx.background_executor().spawn(async move {
+                                let analysis = history.analyze_process(&name, &command, cpu, rack::now() as u64 / 60);
+                                (history, analysis)
+                            }).await;
+                            history = returned_history;
+                            if history_stopping.get() { break; }
+                            match analysis {
+                                Ok(analysis) => {
+                                    let _ = entity.update_in(cx, |this, _, cx| {
+                                        read_errors.update(&mut this.status, HistoryRead::Process, None);
+                                        cx.notify();
+                                        if let Some(details) = this.details.as_mut().filter(|details| details.key == *key) {
+                                            details.analysis = Some(analysis);
+                                            cx.notify();
+                                        }
+                                    });
+                                    cached_analysis_key = Some(*key);
                                 }
-                            });
+                                Err(error) => {
+                                    history_retry = true;
+                                    cached_analysis_key = None;
+                                    let _ = entity.update_in(cx, |this, _, cx| { read_errors.update(&mut this.status, HistoryRead::Process, Some(error.to_string())); cx.notify(); });
+                                }
+                            }
                         }
-                        cached_analysis_key = Some(*key);
                     } else {
                         cached_analysis_key = None;
                     }
-                    if pending.is_some() {
+                    if pending.is_some() || history_retry {
                         let timer = cx.background_executor().timer(Duration::from_secs(seconds)).fuse();
                         let event = events.next().fuse();
                         futures::pin_mut!(timer, event);
@@ -326,7 +431,8 @@ impl Monitor {
                     if let Ok(ref snapshot) = snapshot {
                         let now = rack::now();
 
-                        history.record(snapshot, now, seconds as f64);
+                        let update = (|| -> history::Result<()> {
+                        history.record(snapshot, now, seconds as f64)?;
                         let minute = now as u64 / 60;
                         let minute_changed = cached_minute != Some(minute);
                         if let Some((key, name, command, _fallback_cpu, needs_analysis)) = selected_detail.as_ref() {
@@ -334,7 +440,7 @@ impl Monitor {
                                 let current_cpu = crate::analysis::current_cpu(&snapshot.processes, name);
                                 process_analysis = Some((
                                     *key,
-                                    history.analyze_process(name, command, current_cpu, minute),
+                                    history.analyze_process(name, command, current_cpu, minute)?,
                                 ));
                             }
                         }
@@ -342,17 +448,26 @@ impl Monitor {
                             let span_changed = selection.start_minute < history.touched.end
                                 && history.touched.start < selection.start_minute + selection.step as u64;
                             if previous_moment != Some(selection) || previous_metric != Some(metric) || span_changed {
-                                moment_detail = Some(history.moment(selection));
+                                moment_detail = Some(history.moment(selection)?);
                             }
                         }
                         if minute_changed {
+                            views = Some([history.view(1,now as u64)?, history.view(8,now as u64)?, history.view(24,now as u64)?]);
+                            history.persist(now as u64)?;
                             cached_minute = Some(minute);
-                            views = Some([1,8,24].map(|hours| history.view(hours, now as u64)));
-                            history_save=Some(history.save(&history::support_path("history.json")).map_err(|e|e.to_string()));
+                            history_save=Some(Ok(()));
+                        }
+                        Ok(())
+                        })();
+                        if let Err(error) = update {
+                            views = None;
+                            moment_detail = None;
+                            process_analysis = None;
+                            history_save = Some(Err(error.to_string()));
                         }
                     }
                     let selected_key = match selected_detail {
-                        Some((key, _, _, _, _)) if snapshot.is_ok() || previous_analysis_key == Some(key) => Some(key),
+                        Some((key, _, _, _, _)) if !matches!(history_save, Some(Err(_))) && (snapshot.is_ok() || previous_analysis_key == Some(key)) => Some(key),
                         _ => None,
                     };
                     (snapshot, tick_ms, views, moment_detail, process_analysis, history, cached_minute, history_save, moment, metric, selected_key)
@@ -361,6 +476,7 @@ impl Monitor {
                 cached_minute=returned_minute;
                 cached_analysis_key = selected_key;
                 history = returned_history;
+                if history_stopping.get() { break; }
                 if moment_detail.is_some() {
                     cached_moment = selection;
                     cached_metric = selection.map(|_| metric);
@@ -377,11 +493,13 @@ impl Monitor {
                         this.history = views;
                     }
                     if let Some(detail) = moment_detail.filter(|_| this.moment == selection) {
+                        read_errors.update(&mut this.status, HistoryRead::Moment, None);
                         this.replace_moment_rows(detail.ranked(metric));
                         this.moment_detail = Some(detail);
                     }
                     if let Some((key, analysis)) = process_analysis {
                         if let Some(details) = this.details.as_mut().filter(|details| details.key == key) {
+                            read_errors.update(&mut this.status, HistoryRead::Process, None);
                             details.analysis = Some(analysis);
                         }
                     }
@@ -407,7 +525,13 @@ impl Monitor {
                 futures::pin_mut!(timer, event);
                 futures::select! { _ = timer => {}, event = event => { if event.is_none() { break; } } }
             }
-        });
+            cx.background_executor().spawn(async move {
+                if let Err(error) = history.persist(rack::now() as u64) {
+                    eprintln!("History could not be saved at shutdown: {error}");
+                }
+            }).await;
+        }.boxed_local().shared();
+        let refresh = cx.foreground_executor().spawn(history_drain.clone());
         let frames = cx.spawn_in(window, async move |entity, cx| {
             let mut previous = None;
             let mut sampled_at = std::time::Instant::now();
@@ -484,7 +608,12 @@ impl Monitor {
             pending_kill: None,
             wake,
             _subscriptions: subscriptions,
-            _refresh: refresh,
+            _refresh: Some(refresh),
+            shutdown: Some(ShutdownDrains {
+                stopping,
+                history: history_drain,
+                settings: settings_drain,
+            }),
             _frames: frames,
             _ports: ports_task,
         }
@@ -634,7 +763,13 @@ fn main() {
                     .cloned()
                     .map(|monitor| {
                         cx.update_entity(&monitor, |monitor, _| {
+                            if let Some(drains) = &monitor.shutdown {
+                                drains.stopping.set(true);
+                            }
+                            monitor.wake.close_channel();
                             (
+                                monitor._refresh.take(),
+                                monitor.shutdown.take(),
                                 monitor.settings_writes.take(),
                                 monitor.settings_writer.take(),
                                 monitor.settings.clone(),
@@ -642,9 +777,22 @@ fn main() {
                         })
                     });
                 async move {
-                    if let Some((sender, writer, settings)) = state {
-                        if let (Some(sender), Some(writer)) = (sender, writer) {
-                            palette::finish_writer(sender, settings, writer).await;
+                    if let Some((refresh, drains, sender, writer, settings)) = state {
+                        // Shutdown blocks foreground tasks. Poll their shared futures here.
+                        drop(refresh);
+                        drop(writer);
+                        if let Some(ShutdownDrains {
+                            history,
+                            settings: settings_drain,
+                            ..
+                        }) = drains
+                        {
+                            // GPUI gives both drains the same 200 ms deadline.
+                            futures::join!(history, async {
+                                if let Some(sender) = sender {
+                                    palette::finish_writer(sender, settings, settings_drain).await;
+                                }
+                            });
                         }
                     }
                 }
@@ -707,6 +855,143 @@ fn main() {
 #[cfg(test)]
 mod wake_tests {
     use super::DrawMetrics;
+
+    #[test]
+    fn quit_drains_partial_history_with_queued_wakes() {
+        use futures::{channel::mpsc, FutureExt, StreamExt};
+        use gpui::{AppContext, Task, TestAppContext};
+        use std::{cell::RefCell, rc::Rc};
+
+        struct Holder {
+            wake: mpsc::Sender<()>,
+            refresh: Option<Task<()>>,
+            drain: Option<super::ShutdownFuture>,
+        }
+        let directory = std::env::temp_dir().join(format!("gtop-quit-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("history.sqlite");
+        let mut history =
+            crate::history::History::open(&path, &directory.join("absent.json"), 6000).unwrap();
+        let snapshot = crate::test_data::snapshot();
+        history.record(&snapshot, 6000., 3.).unwrap();
+        history.persist(6000).unwrap();
+        history.record(&snapshot, 6003., 3.).unwrap();
+        let mut cx = TestAppContext::single();
+        let (wake, mut events) = mpsc::channel(1);
+        let background = cx.background_executor.clone();
+        let drain = async move {
+            while !super::refresh_stopped(&mut events) {
+                if events.next().await.is_none() {
+                    break;
+                }
+            }
+            background
+                .spawn(async move {
+                    history.persist(6003).unwrap();
+                })
+                .await;
+        }
+        .boxed_local()
+        .shared();
+        let refresh = cx.foreground_executor().spawn(drain.clone());
+        let holder = cx.new(|_| Holder {
+            wake,
+            refresh: Some(refresh),
+            drain: Some(drain),
+        });
+        let keep = Rc::new(RefCell::new(holder.clone()));
+        cx.run_until_parked();
+        holder.update(&mut cx, |holder, _| {
+            holder.wake.try_send(()).unwrap();
+        });
+        cx.update(|app| {
+            app.on_app_quit(move |cx| {
+                let refresh = keep.borrow().update(cx, |holder, _| {
+                    holder.wake.close_channel();
+                    drop(holder.refresh.take());
+                    holder.drain.take()
+                });
+                async move {
+                    if let Some(refresh) = refresh {
+                        refresh.await;
+                    }
+                }
+            })
+            .detach()
+        });
+        cx.quit();
+        cx.run_until_parked();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let seconds: f64 = connection
+            .query_row(
+                "SELECT seconds FROM system WHERE resolution=1 AND minute=100",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            (seconds - 3.001).abs() < 1e-9,
+            "durable seconds after quit: {seconds}"
+        );
+        drop(connection);
+        drop(holder);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn closed_wake_channel_stops_before_another_refresh() {
+        let (mut sender, mut receiver) = futures::channel::mpsc::channel(1);
+        assert!(!super::refresh_stopped(&mut receiver));
+        sender.try_send(()).unwrap();
+        sender.close_channel();
+        assert!(super::refresh_stopped(&mut receiver));
+    }
+
+    #[test]
+    fn recovered_history_read_clears_its_warning() {
+        for read in [super::HistoryRead::Moment, super::HistoryRead::Process] {
+            let mut errors = super::HistoryReadErrors::default();
+            let mut status = "Select a process for details".into();
+            errors.update(&mut status, read, Some("database busy".into()));
+            assert_eq!(status, "History could not be read: database busy");
+            errors.update(&mut status, read, None);
+            assert_eq!(status, "Select a process for details");
+        }
+    }
+
+    #[test]
+    fn recovered_history_read_preserves_other_read_failure() {
+        let mut errors = super::HistoryReadErrors::default();
+        let mut status = String::new();
+        errors.update(
+            &mut status,
+            super::HistoryRead::Moment,
+            Some("moment busy".into()),
+        );
+        errors.update(
+            &mut status,
+            super::HistoryRead::Process,
+            Some("process busy".into()),
+        );
+        errors.update(&mut status, super::HistoryRead::Process, None);
+        assert_eq!(status, "History could not be read: moment busy");
+        errors.update(&mut status, super::HistoryRead::Moment, None);
+        assert_eq!(status, "Select a process for details");
+    }
+
+    #[test]
+    fn recovered_history_read_preserves_unrelated_status() {
+        let mut errors = super::HistoryReadErrors::default();
+        let mut status = String::new();
+        errors.update(
+            &mut status,
+            super::HistoryRead::Moment,
+            Some("database busy".into()),
+        );
+        status = "Palette could not be saved: disk full".into();
+        errors.update(&mut status, super::HistoryRead::Moment, None);
+        assert_eq!(status, "Palette could not be saved: disk full");
+    }
 
     #[test]
     fn draw_metrics_are_unavailable_until_the_first_completed_draw() {
