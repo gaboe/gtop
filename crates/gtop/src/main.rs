@@ -23,6 +23,16 @@ use model::{ProcessKey, Search};
 use process_table::Processes;
 use std::{rc::Rc, sync::Arc, time::Duration};
 
+fn refresh_stopped(events: &mut mpsc::Receiver<()>) -> bool {
+    loop {
+        match events.try_recv() {
+            Ok(()) => {}
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Closed) => return true,
+        }
+    }
+}
+
 fn clamp_moment_row(selected: usize, row_count: usize) -> usize {
     selected.min(row_count.saturating_sub(1))
 }
@@ -42,6 +52,14 @@ impl DrawMetrics {
             self.fps = Some(draw_count as f64 / elapsed_seconds);
         }
     }
+}
+
+type ShutdownFuture = futures::future::Shared<futures::future::LocalBoxFuture<'static, ()>>;
+
+struct ShutdownDrains {
+    stopping: Rc<std::cell::Cell<bool>>,
+    history: ShutdownFuture,
+    settings: ShutdownFuture,
 }
 
 struct Monitor {
@@ -78,7 +96,8 @@ struct Monitor {
     pending_kill: Option<ProcessKey>,
     wake: mpsc::Sender<()>,
     _subscriptions: Vec<Subscription>,
-    _refresh: Task<()>,
+    _refresh: Option<Task<()>>,
+    shutdown: Option<ShutdownDrains>,
     _ports: Task<()>,
     _frames: Task<()>,
 }
@@ -108,14 +127,23 @@ impl Monitor {
             p.base = settings.base();
             p
         });
+        let stopping = Rc::new(std::cell::Cell::new(false));
+        let settings_stopping = stopping.clone();
+        let history_stopping = stopping.clone();
         let (wake, mut events) = mpsc::channel(1);
         let (settings_writes, mut settings_events) = mpsc::unbounded();
-        let settings_writer = cx.spawn_in(window, async move |entity, cx| {
+        let entity = cx.entity().downgrade();
+        let mut settings_cx = window.to_async(cx);
+        let settings_drain = async move {
+            let cx = &mut settings_cx;
             while let Some(settings) = palette::next_settings(&mut settings_events).await {
                 let result = cx
                     .background_executor()
                     .spawn(async move { settings.save() })
                     .await;
+                if settings_stopping.get() {
+                    continue;
+                }
                 if let Err(error) = result {
                     let _ = entity.update_in(cx, |this, _, cx| {
                         this.status = format!("Palette could not be saved: {error}");
@@ -123,7 +151,10 @@ impl Monitor {
                     });
                 }
             }
-        });
+        }
+        .boxed_local()
+        .shared();
+        let settings_writer = cx.foreground_executor().spawn(settings_drain.clone());
         let mut subscriptions = vec![
             cx.subscribe_in(&search, window, |this, input, event, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -216,19 +247,22 @@ impl Monitor {
                 .timer(Duration::from_secs(10))
                 .await;
         });
-        let refresh = cx.spawn_in(window, async move |entity, cx| {
+        let entity = cx.entity().downgrade();
+        let mut refresh_cx = window.to_async(cx);
+        let history_drain = async move {
+            let cx = &mut refresh_cx;
             let core = cx.background_executor().spawn(async { Arc::new(AppState::new()) }).await;
-            if entity.update_in(cx, |this, _, _| this.core = Some(core.clone())).is_err() { return; }
+            if history_stopping.get() || entity.update_in(cx, |this, _, _| this.core = Some(core.clone())).is_err() { return; }
             let opened = cx.background_executor().spawn(async {
                 history::History::open(&history::support_path("history.sqlite"), &history::support_path("history.json"), rack::now() as u64)
             }).await;
             let mut history = match opened {
                 Ok(history) => history,
                 Err(error) => {
-                    let _ = entity.update_in(cx, |this, _, cx| {
+                    if !history_stopping.get() { let _ = entity.update_in(cx, |this, _, cx| {
                         this.status = format!("History could not be opened: {error}");
                         cx.notify();
-                    });
+                    }); }
                     history::History::default()
                 }
             };
@@ -237,7 +271,7 @@ impl Monitor {
             let mut cached_metric = None;
             let mut cached_analysis_key = None;
             loop {
-                while events.try_recv().is_ok() {}
+                if history_stopping.get() || refresh_stopped(&mut events) { break; }
                 let Ok((running, ports, seconds, moment, metric, selected_detail)) = entity.update_in(cx, |this, window, cx| {
                     let selected_detail = this.details.as_ref().map(|details| {
                         let current_cpu = this.snapshot.as_ref().map(|snapshot| crate::analysis::current_cpu(&snapshot.processes, &details.name)).unwrap_or(0.);
@@ -265,6 +299,7 @@ impl Monitor {
                                 (history, detail)
                             }).await;
                             history = returned_history;
+                            if history_stopping.get() { break; }
                             match detail {
                                 Ok(detail) => {
                                     let _ = entity.update_in(cx, |this, _, cx| {
@@ -290,6 +325,7 @@ impl Monitor {
                         let stopped = cx.background_executor().spawn(async move {
                             state.process_stopped(key.pid, key.start_time)
                         }).await;
+                        if history_stopping.get() { break; }
                         let _ = entity.update_in(cx, |this, _, cx| {
                             if this.pending_kill == Some(key) && matches!(stopped, Ok(true)) {
                                 this.pending_kill = None;
@@ -306,6 +342,7 @@ impl Monitor {
                                 (history, analysis)
                             }).await;
                             history = returned_history;
+                            if history_stopping.get() { break; }
                             match analysis {
                                 Ok(analysis) => {
                                     let _ = entity.update_in(cx, |this, _, cx| {
@@ -402,6 +439,7 @@ impl Monitor {
                 cached_minute=returned_minute;
                 cached_analysis_key = selected_key;
                 history = returned_history;
+                if history_stopping.get() { break; }
                 if moment_detail.is_some() {
                     cached_moment = selection;
                     cached_metric = selection.map(|_| metric);
@@ -453,7 +491,8 @@ impl Monitor {
                     eprintln!("History could not be saved at shutdown: {error}");
                 }
             }).await;
-        });
+        }.boxed_local().shared();
+        let refresh = cx.foreground_executor().spawn(history_drain.clone());
         let frames = cx.spawn_in(window, async move |entity, cx| {
             let mut previous = None;
             let mut sampled_at = std::time::Instant::now();
@@ -529,7 +568,12 @@ impl Monitor {
             pending_kill: None,
             wake,
             _subscriptions: subscriptions,
-            _refresh: refresh,
+            _refresh: Some(refresh),
+            shutdown: Some(ShutdownDrains {
+                stopping,
+                history: history_drain,
+                settings: settings_drain,
+            }),
             _frames: frames,
             _ports: ports_task,
         }
@@ -673,7 +717,13 @@ fn main() {
                     .cloned()
                     .map(|monitor| {
                         cx.update_entity(&monitor, |monitor, _| {
+                            if let Some(drains) = &monitor.shutdown {
+                                drains.stopping.set(true);
+                            }
+                            monitor.wake.close_channel();
                             (
+                                monitor._refresh.take(),
+                                monitor.shutdown.take(),
                                 monitor.settings_writes.take(),
                                 monitor.settings_writer.take(),
                                 monitor.settings.clone(),
@@ -681,9 +731,22 @@ fn main() {
                         })
                     });
                 async move {
-                    if let Some((sender, writer, settings)) = state {
-                        if let (Some(sender), Some(writer)) = (sender, writer) {
-                            palette::finish_writer(sender, settings, writer).await;
+                    if let Some((refresh, drains, sender, writer, settings)) = state {
+                        // Shutdown blocks foreground tasks. Poll their shared futures here.
+                        drop(refresh);
+                        drop(writer);
+                        if let Some(ShutdownDrains {
+                            history,
+                            settings: settings_drain,
+                            ..
+                        }) = drains
+                        {
+                            // GPUI gives both drains the same 200 ms deadline.
+                            futures::join!(history, async {
+                                if let Some(sender) = sender {
+                                    palette::finish_writer(sender, settings, settings_drain).await;
+                                }
+                            });
                         }
                     }
                 }
@@ -740,6 +803,97 @@ fn main() {
 #[cfg(test)]
 mod wake_tests {
     use super::DrawMetrics;
+
+    #[test]
+    fn quit_drains_partial_history_with_queued_wakes() {
+        use futures::{channel::mpsc, FutureExt, StreamExt};
+        use gpui::{AppContext, Task, TestAppContext};
+        use std::{cell::RefCell, rc::Rc};
+
+        struct Holder {
+            wake: mpsc::Sender<()>,
+            refresh: Option<Task<()>>,
+            drain: Option<super::ShutdownFuture>,
+        }
+        let directory = std::env::temp_dir().join(format!("gtop-quit-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("history.sqlite");
+        let mut history =
+            crate::history::History::open(&path, &directory.join("absent.json"), 6000).unwrap();
+        let snapshot = crate::test_data::snapshot();
+        history.record(&snapshot, 6000., 3.).unwrap();
+        history.persist(6000).unwrap();
+        history.record(&snapshot, 6003., 3.).unwrap();
+        let mut cx = TestAppContext::single();
+        let (wake, mut events) = mpsc::channel(1);
+        let background = cx.background_executor.clone();
+        let drain = async move {
+            while !super::refresh_stopped(&mut events) {
+                if events.next().await.is_none() {
+                    break;
+                }
+            }
+            background
+                .spawn(async move {
+                    history.persist(6003).unwrap();
+                })
+                .await;
+        }
+        .boxed_local()
+        .shared();
+        let refresh = cx.foreground_executor().spawn(drain.clone());
+        let holder = cx.new(|_| Holder {
+            wake,
+            refresh: Some(refresh),
+            drain: Some(drain),
+        });
+        let keep = Rc::new(RefCell::new(holder.clone()));
+        cx.run_until_parked();
+        holder.update(&mut cx, |holder, _| {
+            holder.wake.try_send(()).unwrap();
+        });
+        cx.update(|app| {
+            app.on_app_quit(move |cx| {
+                let refresh = keep.borrow().update(cx, |holder, _| {
+                    holder.wake.close_channel();
+                    drop(holder.refresh.take());
+                    holder.drain.take()
+                });
+                async move {
+                    if let Some(refresh) = refresh {
+                        refresh.await;
+                    }
+                }
+            })
+            .detach()
+        });
+        cx.quit();
+        cx.run_until_parked();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let seconds: f64 = connection
+            .query_row(
+                "SELECT seconds FROM system WHERE resolution=1 AND minute=100",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            (seconds - 3.001).abs() < 1e-9,
+            "durable seconds after quit: {seconds}"
+        );
+        drop(connection);
+        drop(holder);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn closed_wake_channel_stops_before_another_refresh() {
+        let (mut sender, mut receiver) = futures::channel::mpsc::channel(1);
+        assert!(!super::refresh_stopped(&mut receiver));
+        sender.try_send(()).unwrap();
+        sender.close_channel();
+        assert!(super::refresh_stopped(&mut receiver));
+    }
 
     #[test]
     fn draw_metrics_are_unavailable_until_the_first_completed_draw() {

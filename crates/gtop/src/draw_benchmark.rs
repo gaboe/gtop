@@ -181,7 +181,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         pending_kill: None,
         wake: mpsc::channel(1).0,
         _subscriptions: vec![],
-        _refresh: Task::ready(()),
+        _refresh: Some(Task::ready(())),
         _ports: Task::ready(()),
         _frames: Task::ready(()),
     }
