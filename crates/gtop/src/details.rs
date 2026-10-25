@@ -484,9 +484,15 @@ impl Monitor {
                     ))
                     .child(detail_line("Running for", duration(p.run_time))),
             );
-            panel = panel
-                .child(detail_line("Executable", p.executable.clone()))
-                .child(detail_line("Arguments", p.argv.join(" ")));
+            panel = panel.child(
+                div()
+                    .px(px(18.))
+                    .py(px(12.))
+                    .border_b_1()
+                    .border_color(rgb(t.rule))
+                    .child(detail_line("Executable", p.executable.clone()))
+                    .child(detail_line("Arguments", p.argv.join(" "))),
+            );
             panel = panel.child(
                 div()
                     .p(px(18.))
