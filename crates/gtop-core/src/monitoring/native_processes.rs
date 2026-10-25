@@ -302,6 +302,12 @@ struct Sample {
     sampled: Instant,
 }
 
+enum IdentityRead {
+    Available(proc_bsdinfo),
+    Unavailable,
+    ConfirmedAbsent,
+}
+
 impl Record {
     fn emit(&mut self, row: &mut ProcessInfo, sample: Sample) {
         row.cpu_sample_seconds = sample
@@ -352,6 +358,8 @@ pub(super) struct Collector {
     unavailable_counters: Option<u32>,
     #[cfg(test)]
     unavailable_identity: Option<u32>,
+    #[cfg(test)]
+    confirmed_absent_identity: Option<u32>,
     #[cfg(test)]
     denied_identity: Option<u32>,
 }
@@ -429,23 +437,39 @@ impl Collector {
                     continue;
                 }
                 let pid = pid as u32;
-                live.insert(pid);
-                let bsd = self.read_bsd_info(pid);
-                let bsd = match bsd {
-                    Ok(bsd) => Some(bsd),
-                    Err(error) if matches!(error.raw_os_error(), Some(1 | 3 | 13)) => kernel
+                let identity = match self.read_bsd_info(pid) {
+                    Ok(bsd) => IdentityRead::Available(bsd),
+                    Err(error) if error.raw_os_error() == Some(3) => {
+                        match kernel.get_or_insert_with(kernel_processes) {
+                            Some(processes) => processes
+                                .remove(&pid)
+                                .map_or(IdentityRead::ConfirmedAbsent, IdentityRead::Available),
+                            None => IdentityRead::Unavailable,
+                        }
+                    }
+                    Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => kernel
                         .get_or_insert_with(kernel_processes)
                         .as_mut()
-                        .and_then(|processes| processes.remove(&pid)),
-                    Err(_) => None,
+                        .and_then(|processes| processes.remove(&pid))
+                        .map_or(IdentityRead::Unavailable, IdentityRead::Available),
+                    Err(_) => IdentityRead::Unavailable,
                 };
                 #[cfg(test)]
-                let bsd = if self.unavailable_identity == Some(pid) {
+                let identity = if self.confirmed_absent_identity == Some(pid) {
+                    self.confirmed_absent_identity = None;
+                    IdentityRead::ConfirmedAbsent
+                } else if self.unavailable_identity == Some(pid) {
                     self.unavailable_identity = None;
-                    None
+                    IdentityRead::Unavailable
                 } else {
-                    bsd
+                    identity
                 };
+                let bsd = match identity {
+                    IdentityRead::Available(bsd) => Some(bsd),
+                    IdentityRead::Unavailable => None,
+                    IdentityRead::ConfirmedAbsent => continue,
+                };
+                live.insert(pid);
                 let identity = bsd
                     .as_ref()
                     .map(|b| (b.pbi_start_tvsec, b.pbi_start_tvusec));
@@ -739,6 +763,28 @@ mod tests {
         let rows = collector.collect(&users, false, &ports).unwrap();
         assert!(!rows.iter().any(|p| p.pid == child.0.id()));
         assert!(!collector.records.contains_key(&child.0.id()));
+    }
+
+    #[test]
+    fn confirmed_absence_drops_record_while_unavailable_identity_keeps_row() {
+        let child = OwnedChild(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        let pid = child.0.id();
+        let users = sysinfo::Users::new_with_refreshed_list();
+        let mut collector = Collector::default();
+
+        let rows = collector.collect(&users, false, &HashMap::new()).unwrap();
+        assert!(rows.iter().any(|row| row.pid == pid));
+        assert!(collector.records.contains_key(&pid));
+
+        collector.unavailable_identity = Some(pid);
+        let rows = collector.collect(&users, false, &HashMap::new()).unwrap();
+        assert!(rows.iter().any(|row| row.pid == pid));
+        assert!(collector.records.contains_key(&pid));
+
+        collector.confirmed_absent_identity = Some(pid);
+        let rows = collector.collect(&users, false, &HashMap::new()).unwrap();
+        assert!(!rows.iter().any(|row| row.pid == pid));
+        assert!(!collector.records.contains_key(&pid));
     }
 
     #[test]
