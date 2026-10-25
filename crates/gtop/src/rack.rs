@@ -1126,6 +1126,29 @@ impl Monitor {
                     t,
                 )),
         );
+        tower = tower.child(
+            win(t)
+                .child(label("SSD GB", t))
+                .child(lit(
+                    if stats.disk_total_bytes > 0 {
+                        format!(
+                            "{:.0} / {:.0}",
+                            stats.disk_used_bytes as f64 / 1e9,
+                            stats.disk_total_bytes as f64 / 1e9
+                        )
+                    } else {
+                        "N/A".into()
+                    },
+                    22.,
+                    stats.disk_used_bytes as f64 / stats.disk_total_bytes.max(1) as f64 > 0.92,
+                    t,
+                ))
+                .child(segments(
+                    stats.disk_used_bytes as f32 / stats.disk_total_bytes.max(1) as f32 * 100.,
+                    40,
+                    t,
+                )),
+        );
         let gpu = stats.gpus.first();
         let util = gpu.and_then(|g| g.utilization);
         tower = tower.child(

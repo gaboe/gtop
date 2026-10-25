@@ -6,7 +6,7 @@
 use super::{GpuMonitor, SystemStats, TemperatureMonitor};
 use std::fmt::Debug;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use sysinfo::{Disk, DiskRefreshKind, Disks, Networks, System};
 
 /// Monitors system-wide statistics
@@ -18,6 +18,7 @@ pub struct SystemMonitor {
     gpu_monitor: GpuMonitor,
     /// Reads the temperature sensors
     temperature_monitor: TemperatureMonitor,
+    disks_refreshed_at: Instant,
 }
 
 impl SystemMonitor {
@@ -41,6 +42,7 @@ impl SystemMonitor {
             last_network_update: (Instant::now(), initial_rx, initial_tx),
             gpu_monitor: GpuMonitor::new(),
             temperature_monitor: TemperatureMonitor::new(),
+            disks_refreshed_at: Instant::now(),
         }
     }
 
@@ -81,7 +83,10 @@ impl SystemMonitor {
 
     /// Refreshes storage of the shown disks only. Listing all volumes again
     /// costs tens of milliseconds on macOS.
-    pub fn refresh_disks(disks: &mut Disks) {
+    pub fn refresh_disks(&mut self, disks: &mut Disks) {
+        if self.disks_refreshed_at.elapsed() < Duration::from_secs(60) {
+            return;
+        }
         for disk in disks
             .list_mut()
             .iter_mut()
@@ -89,6 +94,7 @@ impl SystemMonitor {
         {
             disk.refresh_specifics(DiskRefreshKind::nothing().with_storage());
         }
+        self.disks_refreshed_at = Instant::now();
     }
 
     /// Whether a disk counts toward the storage panel
@@ -150,6 +156,18 @@ mod tests {
         let monitor = SystemMonitor::new(&networks);
         assert_eq!(monitor.last_network_update.1, 0);
         assert_eq!(monitor.last_network_update.2, 0);
+    }
+
+    #[test]
+    fn storage_refresh_waits_sixty_seconds() {
+        let mut monitor = SystemMonitor::new(&Networks::new());
+        let mut disks = Disks::new();
+        let initial = monitor.disks_refreshed_at;
+        monitor.refresh_disks(&mut disks);
+        assert_eq!(monitor.disks_refreshed_at, initial);
+        monitor.disks_refreshed_at = initial - Duration::from_secs(60);
+        monitor.refresh_disks(&mut disks);
+        assert!(monitor.disks_refreshed_at >= initial);
     }
 
     /// Tests system statistics collection
