@@ -15,6 +15,29 @@ pub(super) fn record_render() {
     RENDERS.with(|count| count.set(count.get() + 1));
 }
 
+fn view_selected(name: &str, selected_views: Option<&str>) -> bool {
+    match selected_views {
+        Some(views) => views.split(',').any(|view| view == name),
+        None => name != "disk",
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::view_selected;
+    use std::prelude::v1::test;
+
+    #[test]
+    fn disk_draw_view_is_opt_in() {
+        for view in ["live", "history1h", "history24h", "detail"] {
+            assert!(view_selected(view, None), "default excludes {view}");
+        }
+        assert!(!view_selected("disk", None));
+        assert!(view_selected("disk", Some("disk")));
+        assert!(!view_selected("live", Some("disk")));
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn dimension(name: &str, default: usize) -> usize {
     let maximum = match name {
@@ -147,6 +170,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         table,
         search: cx.new(|cx| InputState::new(window, cx).placeholder("name, pid, command or port")),
         details: None,
+        disk: None,
         paused: false,
         history,
         moment: None,
@@ -254,7 +278,7 @@ fn full_monitor_draw_benchmark() {
         assert!(
             views
                 .split(',')
-                .all(|name| ["live", "history1h", "history24h", "detail"].contains(&name)),
+                .all(|name| ["live", "history1h", "history24h", "detail", "disk"].contains(&name)),
             "unknown benchmark view"
         );
     }
@@ -270,17 +294,19 @@ fn full_monitor_draw_benchmark() {
             ("history1h", Some(0), false),
             ("history24h", Some(2), false),
             ("detail", None, true),
+            ("disk", None, false),
         ] {
-            if selected_views
-                .as_ref()
-                .is_some_and(|views| !views.split(',').any(|v| v == name))
-            {
+            if !view_selected(name, selected_views.as_deref()) {
                 continue;
             }
             cx.update(|cx| {
                 monitor.update(cx, |m, cx| {
                     m.view = view;
                     m.details = None;
+                    m.disk = None;
+                    if name == "disk" {
+                        m.prepare_disk_draw_benchmark();
+                    }
                     if detail {
                         m.select(
                             ProcessKey::from(&m.snapshot.as_ref().unwrap().processes[0]),
@@ -356,8 +382,73 @@ fn full_monitor_draw_benchmark() {
                 println!("scene view={name} scale={scale} paths={} vertices={} primitives={} elements={} glyph_sprites={} hash={:016x} equal={n}/{n}", scenes[0].0, scenes[0].1, scenes[0].2, scenes[0].3, scenes[0].4, scenes[0].5);
             }
             println!("samples view={name} scale={scale} thread_cpu_ms={samples:?}");
+            if name == "disk" {
+                cx.read(|cx| monitor.read(cx).assert_disk_scan_pending());
+            }
             samples.sort_by(f64::total_cmp);
             println!("draw view={name} scale={scale} median_ms={:.6} min_ms={:.6} max_ms={:.6} n={n} errors=0 draws={} fixture_processes={} cores={} size={width}x{height} text=platform", (samples[(n-1)/2] + samples[n/2]) / 2., samples[0], samples[n-1], n+5, cx.read(|cx| monitor.read(cx).snapshot.as_ref().unwrap().processes.len()), cx.read(|cx| monitor.read(cx).snapshot.as_ref().unwrap().stats.cpu_usage.len()));
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "full Monitor draws share glyph instrumentation; run this test in isolation"]
+fn disk_keyboard_scroll_reveals_selected_row_after_summary() {
+    let home = std::env::temp_dir().join(format!("gtop-scroll-regression-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    for i in 0..160 {
+        std::fs::write(home.join(format!("file-{i:03}")), [1u8; 4096]).unwrap();
+    }
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("review-ui"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    for bytes in [
+        include_bytes!("../assets/fonts/DotoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/JetBrainsMono.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoLabels.ttf").as_slice(),
+        include_bytes!("../assets/fonts/Silkscreen.ttf").as_slice(),
+    ] {
+        cx.text_system()
+            .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
+            .unwrap();
+    }
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |m, cx| {
+            m.prepare_disk_scroll_test(home.clone());
+            window.focus(&m.focus, cx);
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let m = monitor.unwrap();
+    let mut visual = VisualTestContext::from_window(handle.into(), &cx);
+    cx.update_window(handle.into(), |_, w, cx| {
+        w.refresh();
+        w.draw(cx).clear(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(handle.into(), "down");
+    cx.update_window(handle.into(), |_, w, cx| {
+        w.refresh();
+        w.draw(cx).clear(cx);
+    })
+    .unwrap();
+    assert_eq!(cx.update(|cx| m.read(cx).disk_selected_for_test()), 127);
+    let body = visual.debug_bounds("disk-body").unwrap();
+    let selected = visual.debug_bounds("disk-row-127").unwrap();
+    println!("selected={selected:?} viewport={body:?}");
+    assert!(selected.top() >= body.top());
+    assert!(selected.bottom() <= body.bottom());
+    cx.update(|cx| m.update(cx, |m, _| m.disk.as_mut().unwrap().close()));
+    std::fs::remove_dir_all(home).unwrap();
 }

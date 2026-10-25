@@ -1,5 +1,7 @@
 mod analysis;
 mod details;
+mod disk;
+mod disk_scan;
 #[cfg(test)]
 mod draw_benchmark;
 mod glow;
@@ -97,6 +99,7 @@ struct Monitor {
     table: Entity<Processes>,
     search: Entity<InputState>,
     details: Option<Details>,
+    disk: Option<disk::Disk>,
     paused: bool,
     history: [history::HistoryView; 3],
     moment: Option<history::MomentSelection>,
@@ -576,6 +579,7 @@ impl Monitor {
             table,
             search,
             details: None,
+            disk: None,
             paused: false,
             history: std::array::from_fn(|_| history::HistoryView::default()),
             moment: None,
@@ -623,6 +627,9 @@ impl Monitor {
         if self.moment == Some(selection) {
             self.moment = None;
         } else {
+            if let Some(disk) = &mut self.disk {
+                disk.close();
+            }
             self.moment = Some(selection);
             self.moment_selected = 0;
             if self
@@ -740,6 +747,9 @@ impl Render for Monitor {
 actions!(gtop, [Quit, ToggleView, PreviousView]);
 
 fn main() {
+    if disk_scan::headless() {
+        return;
+    }
     gpui_platform::application()
         .with_assets(gpui_kit_assets::Assets)
         .run(|cx| {
@@ -826,7 +836,13 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let monitor = cx.new(|cx| Monitor::new(window, cx));
+                    let monitor = cx.new(|cx| {
+                        let mut monitor = Monitor::new(window, cx);
+                        if std::env::args().any(|arg| arg == "--disk") {
+                            monitor.open_disk(window, cx);
+                        }
+                        monitor
+                    });
                     *quit_monitor.borrow_mut() = Some(monitor.clone());
                     cx.new(|cx| Root::new(monitor, window, cx))
                 },

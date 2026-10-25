@@ -128,6 +128,9 @@ impl Details {
 impl Monitor {
     pub(super) fn select(&mut self, key: ProcessKey, cx: &mut Context<Self>) {
         self.moment = None;
+        if let Some(disk) = &mut self.disk {
+            disk.close();
+        }
         if self
             .details
             .as_ref()
