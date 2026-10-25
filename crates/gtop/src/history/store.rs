@@ -1,5 +1,5 @@
 use super::{Bucket, History, ProcessTotal};
-use rusqlite::{params, Connection, Row, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
@@ -27,6 +27,8 @@ impl rusqlite::types::FromSql for SqlU64 {
 fn unsigned(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
     Ok(row.get::<_, SqlU64>(index)?.0)
 }
+
+const NAMED_BUCKETS_SQL: &str = "SELECT p.minute,?3,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM system s CROSS JOIN process p WHERE s.resolution=1 AND s.minute>=?1 AND s.minute<?2 AND p.resolution=1 AND p.minute=s.minute AND p.name_id=(SELECT id FROM names WHERE name=?3)";
 
 type Totals = BTreeMap<String, ProcessTotal>;
 
@@ -58,13 +60,29 @@ impl Store {
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !(0..=2).contains(&version) {
+        if !(0..=3).contains(&version) {
             return Err(format!("Unsupported history database version {version}").into());
+        }
+        if version == 0 {
+            connection.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
         }
         connection.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-16384;",
         )?;
-        connection.execute_batch(include_str!("schema.sql"))?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if version == 1 || version == 2 {
+            tx.execute_batch("DROP INDEX IF EXISTS process_name_minute; ALTER TABLE process RENAME TO old_process;")?;
+        }
+        tx.execute_batch(include_str!("schema.sql"))?;
+        if version == 1 || version == 2 {
+            tx.execute_batch(
+                "INSERT INTO process SELECT * FROM old_process; DROP TABLE old_process;",
+            )?;
+            for resolution in [1, 10, 60] {
+                pack_zero_rows(&tx, resolution, 0..i64::MAX as u64)?;
+            }
+        }
+        tx.commit()?;
         let migrated: bool =
             connection.query_row("SELECT EXISTS(SELECT 1 FROM migration)", [], |r| r.get(0))?;
         if !migrated {
@@ -111,7 +129,17 @@ impl Store {
                 .map(|p| p.gpu_seconds)
                 .sum();
             let expected_seconds: f64 = buckets.iter().map(|b| b.seconds).sum();
-            let (processes,cpu,gpu): (i64,f64,f64) = verify.query_row("SELECT COUNT(*),COALESCE(SUM(cpu_seconds),0),COALESCE(SUM(gpu_seconds),0) FROM process WHERE resolution=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            let (mut processes,cpu,gpu): (i64,f64,f64) = verify.query_row("SELECT COUNT(*),COALESCE(TOTAL(cpu_seconds),0),COALESCE(TOTAL(gpu_seconds),0) FROM process WHERE resolution=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            let presence = presence_rows(&verify, 1, 0..i64::MAX as u64, &[])?;
+            let ids = presence
+                .iter()
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .collect();
+            presence_names(&verify, &ids)?;
+            processes += presence
+                .iter()
+                .map(|(_, ids)| ids.len() as i64)
+                .sum::<i64>();
             let seconds: f64 = verify.query_row(
                 "SELECT COALESCE(SUM(seconds),0) FROM system WHERE resolution=1",
                 [],
@@ -136,7 +164,8 @@ impl Store {
         if !ready {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute("DELETE FROM process WHERE resolution=60", [])?;
-            tx.execute("INSERT INTO process SELECT 60,minute/60*60,name_id,SUM(cpu_seconds),SUM(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 GROUP BY minute/60,name_id",[])?;
+            tx.execute("INSERT INTO process SELECT 60,minute/60*60,name_id,TOTAL(cpu_seconds),TOTAL(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 GROUP BY minute/60,name_id",[])?;
+            rebuild_presence(&tx, 60, 0..i64::MAX as u64, 60)?;
             tx.execute("INSERT INTO rollup_meta VALUES(1)", [])?;
             tx.commit()?;
         }
@@ -158,8 +187,15 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        compact(&tx, minute)?;
+        let compacted = compact(&tx, minute)?;
         tx.commit()?;
+        if compacted {
+            let mut vacuum = self
+                .connection
+                .prepare_cached("PRAGMA incremental_vacuum(256)")?;
+            let mut pages = vacuum.query([])?;
+            while pages.next()?.is_some() {}
+        }
         Ok(())
     }
 
@@ -188,11 +224,15 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for table in ["system", "process"] {
+        for table in ["system", "process", "presence"] {
             tx.execute(&format!("DELETE FROM {table} WHERE (resolution=1 AND minute>?1) OR (resolution=10 AND minute+9>?1)"), [SqlU64(minute)])?;
         }
         tx.execute(
             "DELETE FROM process WHERE resolution=60 AND minute>=?1",
+            [SqlU64(minute / 60 * 60)],
+        )?;
+        tx.execute(
+            "DELETE FROM presence WHERE resolution=60 AND minute>=?1",
             [SqlU64(minute / 60 * 60)],
         )?;
         rebuild_hour(&tx, minute / 60 * 60)?;
@@ -219,7 +259,7 @@ impl Store {
             .map(|(i, b)| (b.minute, i))
             .collect();
         let sql = if name.is_some() {
-            "SELECT p.minute,n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM names n JOIN process p INDEXED BY process_name_minute ON p.name_id=n.id WHERE n.name=?3 AND p.resolution=1 AND p.minute>=?1 AND p.minute<?2"
+            NAMED_BUCKETS_SQL
         } else {
             "SELECT p.minute,n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM process p INDEXED BY sqlite_autoindex_process_1 JOIN names n ON n.id=p.name_id WHERE p.resolution=1 AND p.minute>=?1 AND p.minute<?2 AND ?3 IS NULL"
         };
@@ -231,6 +271,25 @@ impl Store {
                 buckets[*index]
                     .processes
                     .insert(row.get(1)?, process_total(row, 2)?);
+            }
+        }
+        let presence = presence_rows(&self.connection, 1, range, &[])?;
+        let ids = presence
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        let names = presence_names(&self.connection, &ids)?;
+        for (minute, ids) in presence {
+            if let Some(index) = indexes.get(&minute) {
+                for id in ids {
+                    let present = &names[&id];
+                    if name.is_none_or(|name| name == present) {
+                        buckets[*index]
+                            .processes
+                            .entry(present.clone())
+                            .or_default();
+                    }
+                }
             }
         }
         Ok(buckets)
@@ -278,8 +337,16 @@ impl Store {
         if range.is_empty() {
             return Ok(());
         }
+        let presence = presence_rows(&self.connection, resolution, range.clone(), excluded)?;
+        let ids = presence
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        for name in presence_names(&self.connection, &ids)?.into_values() {
+            totals.entry(name).or_default();
+        }
         let excluded = serde_json::to_string(excluded)?;
-        let mut statement=self.connection.prepare_cached("SELECT n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM (SELECT name_id,SUM(cpu_seconds) AS cpu_seconds,SUM(gpu_seconds) AS gpu_seconds,MAX(peak_memory) AS peak_memory,MAX(peak_cpu) AS peak_cpu FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND minute NOT IN (SELECT value FROM json_each(?4)) GROUP BY name_id) p JOIN names n ON n.id=p.name_id")?;
+        let mut statement=self.connection.prepare_cached("SELECT n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM (SELECT name_id,TOTAL(cpu_seconds) AS cpu_seconds,TOTAL(gpu_seconds) AS gpu_seconds,MAX(peak_memory) AS peak_memory,MAX(peak_cpu) AS peak_cpu FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND minute NOT IN (SELECT value FROM json_each(?4)) GROUP BY name_id) p JOIN names n ON n.id=p.name_id")?;
         #[cfg(feature = "history-profile")]
         let profile_start = std::time::Instant::now();
         let mut rows = statement.query(params![
@@ -301,6 +368,178 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn decode_presence(bytes: &[u8]) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    let mut previous = 0u64;
+    let mut delta = 0u64;
+    let mut shift = 0;
+    for &byte in bytes {
+        if shift > 56 || (shift > 0 && byte == 0) {
+            return Err("Malformed history process presence".into());
+        }
+        delta |= u64::from(byte & 127) << shift;
+        if byte & 128 == 0 {
+            previous = previous
+                .checked_add(delta)
+                .filter(|id| delta > 0 && *id <= i64::MAX as u64)
+                .ok_or("Malformed history process presence")?;
+            ids.push(previous as i64);
+            delta = 0;
+            shift = 0;
+        } else {
+            shift += 7;
+        }
+    }
+    if shift != 0 || ids.is_empty() {
+        return Err("Malformed history process presence".into());
+    }
+    Ok(ids)
+}
+
+fn write_presence(
+    tx: &Transaction<'_>,
+    resolution: i64,
+    minute: u64,
+    ids: &BTreeSet<i64>,
+) -> Result<()> {
+    if ids.is_empty() {
+        tx.execute(
+            "DELETE FROM presence WHERE resolution=?1 AND minute=?2",
+            params![resolution, SqlU64(minute)],
+        )?;
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    let mut previous = 0;
+    for &id in ids {
+        let mut delta = u64::try_from(
+            id.checked_sub(previous)
+                .filter(|delta| *delta > 0)
+                .ok_or("Invalid history name ID")?,
+        )?;
+        while delta >= 128 {
+            bytes.push((delta as u8 & 127) | 128);
+            delta >>= 7;
+        }
+        bytes.push(delta as u8);
+        previous = id;
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO presence VALUES(?1,?2,?3)",
+        params![resolution, SqlU64(minute), bytes],
+    )?;
+    Ok(())
+}
+
+fn presence_rows(
+    connection: &Connection,
+    resolution: i64,
+    range: Range<u64>,
+    excluded: &[u64],
+) -> Result<Vec<(u64, Vec<i64>)>> {
+    let mut statement = connection.prepare_cached("SELECT minute,ids FROM presence WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND minute NOT IN (SELECT value FROM json_each(?4)) ORDER BY minute")?;
+    let mut rows = statement.query(params![
+        resolution,
+        SqlU64(range.start),
+        SqlU64(range.end),
+        serde_json::to_string(excluded)?
+    ])?;
+    let mut presence = Vec::new();
+    while let Some(row) = rows.next()? {
+        presence.push((
+            unsigned(row, 0)?,
+            decode_presence(&row.get::<_, Vec<u8>>(1)?)?,
+        ));
+    }
+    Ok(presence)
+}
+
+fn presence_names(connection: &Connection, ids: &BTreeSet<i64>) -> Result<BTreeMap<i64, String>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT id,name FROM names WHERE id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let names: BTreeMap<_, _> = statement
+        .query_map([serde_json::to_string(ids)?], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if names.len() != ids.len() {
+        return Err("History process presence refers to a missing name".into());
+    }
+    Ok(names)
+}
+
+fn pack_zero_rows(tx: &Transaction<'_>, resolution: i64, range: Range<u64>) -> Result<()> {
+    let mut statement = tx.prepare_cached("SELECT minute,name_id FROM process WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0 ORDER BY minute,name_id")?;
+    let mut rows = statement.query(params![resolution, SqlU64(range.start), SqlU64(range.end)])?;
+    let mut groups: BTreeMap<u64, BTreeSet<i64>> = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        groups
+            .entry(unsigned(row, 0)?)
+            .or_default()
+            .insert(row.get(1)?);
+    }
+    drop(rows);
+    for (minute, mut ids) in groups {
+        let existing: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT ids FROM presence WHERE resolution=?1 AND minute=?2",
+                params![resolution, SqlU64(minute)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            ids.extend(decode_presence(&existing)?);
+        }
+        write_presence(tx, resolution, minute, &ids)?;
+    }
+    tx.execute("DELETE FROM process WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0",params![resolution,SqlU64(range.start),SqlU64(range.end)])?;
+    Ok(())
+}
+
+fn rebuild_presence(
+    tx: &Transaction<'_>,
+    resolution: i64,
+    source: Range<u64>,
+    step: u64,
+) -> Result<()> {
+    let mut groups: BTreeMap<u64, BTreeSet<i64>> = BTreeMap::new();
+    for (minute, ids) in presence_rows(tx, 1, source.clone(), &[])? {
+        groups.entry(minute / step * step).or_default().extend(ids);
+    }
+    let start = source.start / step * step;
+    tx.execute(
+        "DELETE FROM presence WHERE resolution=?1 AND minute>=?2 AND minute<?3",
+        params![resolution, SqlU64(start), SqlU64(source.end)],
+    )?;
+    let mut statement = tx.prepare_cached(
+        "SELECT minute,name_id FROM process WHERE resolution=?1 AND minute>=?2 AND minute<?3",
+    )?;
+    let mut rows = statement.query(params![resolution, SqlU64(start), SqlU64(source.end)])?;
+    while let Some(row) = rows.next()? {
+        if let Some(ids) = groups.get_mut(&unsigned(row, 0)?) {
+            ids.remove(&row.get::<_, i64>(1)?);
+        }
+    }
+    for (minute, ids) in groups {
+        write_presence(tx, resolution, minute, &ids)?;
+    }
+    pack_zero_rows(tx, resolution, start..source.end)?;
+    Ok(())
+}
+
+fn collect_names(tx: &Transaction<'_>) -> Result<()> {
+    let mut statement = tx.prepare_cached("SELECT ids FROM presence")?;
+    let mut rows = statement.query([])?;
+    let mut ids = BTreeSet::new();
+    while let Some(row) = rows.next()? {
+        ids.extend(decode_presence(&row.get::<_, Vec<u8>>(0)?)?);
+    }
+    presence_names(tx, &ids)?;
+    tx.execute("DELETE FROM names WHERE id NOT IN (SELECT name_id FROM process UNION SELECT value FROM json_each(?1))",[serde_json::to_string(&ids)?])?;
+    Ok(())
 }
 
 fn system_bucket(row: &Row<'_>) -> rusqlite::Result<Bucket> {
@@ -337,6 +576,10 @@ fn process_total(row: &Row<'_>, offset: usize) -> rusqlite::Result<ProcessTotal>
 
 fn write_bucket(tx: &Transaction<'_>, b: &Bucket) -> Result<()> {
     tx.execute(
+        "DELETE FROM presence WHERE resolution=1 AND minute=?1",
+        [SqlU64(b.minute)],
+    )?;
+    tx.execute(
         "DELETE FROM process WHERE resolution=1 AND minute=?1",
         [SqlU64(b.minute)],
     )?;
@@ -361,8 +604,14 @@ fn write_bucket(tx: &Transaction<'_>, b: &Bucket) -> Result<()> {
     let mut insert = tx.prepare_cached(
         "INSERT INTO process SELECT 1,?1,id,?3,?4,?5,?6 FROM names WHERE name=?2",
     )?;
+    let mut zero_ids = BTreeSet::new();
+    let mut name_id = tx.prepare_cached("SELECT id FROM names WHERE name=?1")?;
     for (name, p) in &b.processes {
         intern.execute([name])?;
+        if p.cpu_seconds == 0. && p.gpu_seconds == 0. && p.peak_memory == 0 && p.peak_cpu == 0. {
+            zero_ids.insert(name_id.query_row([name], |r| r.get(0))?);
+            continue;
+        }
         insert.execute(params![
             SqlU64(b.minute),
             name,
@@ -372,6 +621,7 @@ fn write_bucket(tx: &Transaction<'_>, b: &Bucket) -> Result<()> {
             p.peak_cpu
         ])?;
     }
+    write_presence(tx, 1, b.minute, &zero_ids)?;
     Ok(())
 }
 
@@ -380,21 +630,23 @@ fn rebuild_hour(tx: &Transaction<'_>, hour: u64) -> Result<()> {
         "DELETE FROM process WHERE resolution=60 AND minute=?1",
         [SqlU64(hour)],
     )?;
-    tx.execute("INSERT INTO process SELECT 60,?1,name_id,SUM(cpu_seconds),SUM(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 AND minute>=?1 AND minute<?2 GROUP BY name_id",params![SqlU64(hour),SqlU64(hour+60)])?;
+    tx.execute("INSERT INTO process SELECT 60,?1,name_id,TOTAL(cpu_seconds),TOTAL(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 AND minute>=?1 AND minute<?2 GROUP BY name_id",params![SqlU64(hour),SqlU64(hour+60)])?;
+    rebuild_presence(tx, 60, hour..hour + 60, 60)?;
     Ok(())
 }
 
-fn compact(tx: &Transaction<'_>, now: u64) -> Result<()> {
+fn compact(tx: &Transaction<'_>, now: u64) -> Result<bool> {
     let cutoff = now.saturating_sub(7 * 1440) / 10 * 10;
     let expired = now.saturating_sub(30 * 1440) / 10 * 10;
     let watermark: u64 =
         tx.query_row("SELECT compacted_before FROM meta", [], |r| unsigned(r, 0))?;
     if cutoff <= watermark {
-        return Ok(());
+        return Ok(false);
     }
     tx.execute("INSERT OR REPLACE INTO system SELECT 10,minute/10*10,SUM(recorded),SUM(seconds),COALESCE(SUM(cpu*seconds)/NULLIF(SUM(seconds),0),MAX(cpu)),COALESCE(SUM(memory*seconds)/NULLIF(SUM(seconds),0),MAX(memory)),COALESCE(SUM(gpu*(CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END))/NULLIF(SUM((CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END)),0),MAX(gpu)),SUM((CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END)),COALESCE(SUM(temperature*(CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END))/NULLIF(SUM((CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END)),0),MAX(temperature)),SUM((CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END)),MAX(peak_cpu),MAX(peak_memory),MAX(peak_gpu),MAX(peak_temp) FROM system WHERE resolution=1 AND minute<?1 GROUP BY minute/10",[SqlU64(cutoff)])?;
-    tx.execute("INSERT OR REPLACE INTO process SELECT 10,minute/10*10,name_id,SUM(cpu_seconds),SUM(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process WHERE resolution=1 AND minute<?1 GROUP BY minute/10,name_id",[SqlU64(cutoff)])?;
-    for table in ["process", "system"] {
+    tx.execute("INSERT OR REPLACE INTO process SELECT 10,minute/10*10,name_id,TOTAL(cpu_seconds),TOTAL(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process WHERE resolution=1 AND minute<?1 GROUP BY minute/10,name_id",[SqlU64(cutoff)])?;
+    rebuild_presence(tx, 10, watermark..cutoff, 10)?;
+    for table in ["process", "system", "presence"] {
         tx.execute(&format!("DELETE FROM {table} WHERE (resolution=1 AND minute<?1) OR (resolution=10 AND minute<?2)"),params![SqlU64(cutoff),SqlU64(expired)])?;
     }
     let boundary_hour = cutoff / 60 * 60;
@@ -402,13 +654,14 @@ fn compact(tx: &Transaction<'_>, now: u64) -> Result<()> {
         "DELETE FROM process WHERE resolution=60 AND minute<?1",
         [SqlU64(boundary_hour)],
     )?;
-    rebuild_hour(tx, boundary_hour)?;
     tx.execute(
-        "DELETE FROM names WHERE NOT EXISTS(SELECT 1 FROM process WHERE process.name_id=names.id)",
-        [],
+        "DELETE FROM presence WHERE resolution=60 AND minute<?1",
+        [SqlU64(boundary_hour)],
     )?;
+    rebuild_hour(tx, boundary_hour)?;
+    collect_names(tx)?;
     tx.execute("UPDATE meta SET compacted_before=?1", [SqlU64(cutoff)])?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -541,7 +794,7 @@ mod tests {
             s.connection
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
     }
 
@@ -579,7 +832,7 @@ mod tests {
         let cpu: f64 = s
             .connection
             .query_row(
-                "SELECT SUM(cpu_seconds) FROM process WHERE resolution=60",
+                "SELECT TOTAL(cpu_seconds) FROM process WHERE resolution=60",
                 [],
                 |r| r.get(0),
             )
@@ -618,7 +871,7 @@ mod tests {
         let cpu: f64 = s
             .connection
             .query_row(
-                "SELECT SUM(cpu_seconds) FROM process WHERE resolution=10",
+                "SELECT TOTAL(cpu_seconds) FROM process WHERE resolution=10",
                 [],
                 |r| r.get(0),
             )
@@ -642,6 +895,351 @@ mod tests {
             assert_view_equal(
                 h.view(hours, 600180).unwrap(),
                 baseline.view(hours, 600180).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_migration_and_rollups_keep_large_integral_and_fractional_work() {
+        let f = Fixture::new();
+        let mut a = bucket(100, 60., 1.);
+        let mut b = bucket(101, 60., 1.);
+        for bucket in [&mut a, &mut b] {
+            bucket.processes.get_mut("worker").unwrap().cpu_seconds = 9e18;
+            bucket.processes.get_mut("worker").unwrap().gpu_seconds = 9e18;
+            bucket.processes.insert(
+                "fraction".into(),
+                ProcessTotal {
+                    cpu_seconds: 0.1,
+                    gpu_seconds: f64::from_bits(1),
+                    peak_cpu: 0.1f32,
+                    peak_memory: 123,
+                },
+            );
+        }
+        {
+            let mut s = f.open(101);
+            s.append([&a, &b], 101).unwrap();
+            s.connection.execute_batch("ALTER TABLE process RENAME TO v3_process; CREATE TABLE process(resolution INTEGER NOT NULL, minute INTEGER NOT NULL, name_id INTEGER NOT NULL,cpu_seconds REAL NOT NULL,gpu_seconds REAL NOT NULL,peak_memory INTEGER NOT NULL,peak_cpu REAL NOT NULL,PRIMARY KEY(resolution,minute,name_id)) WITHOUT ROWID; INSERT INTO process SELECT * FROM v3_process; DROP TABLE v3_process; CREATE INDEX process_name_minute ON process(name_id,resolution,minute); PRAGMA user_version=2;").unwrap();
+        }
+        let mut s = f.open(101);
+        let loaded = s.buckets(100..102, None).unwrap();
+        for b in loaded {
+            assert_eq!(
+                b.processes["worker"].cpu_seconds.to_bits(),
+                9e18f64.to_bits()
+            );
+            assert_eq!(
+                b.processes["fraction"].cpu_seconds.to_bits(),
+                0.1f64.to_bits()
+            );
+            assert_eq!(b.processes["fraction"].gpu_seconds.to_bits(), 1);
+            assert_eq!(b.processes["fraction"].peak_cpu.to_bits(), 0.1f32.to_bits());
+        }
+        assert_eq!(s.connection.query_row("SELECT typeof(cpu_seconds) FROM process WHERE resolution=1 AND name_id=(SELECT id FROM names WHERE name='worker') LIMIT 1", [], |r|r.get::<_,String>(0)).unwrap(),"integer");
+        for range in [100..102, 60..120] {
+            let totals = s.view_data(range, &VecDeque::new()).unwrap().1;
+            assert_eq!(totals["worker"].cpu_seconds, 1.8e19);
+            assert_eq!(totals["worker"].gpu_seconds, 1.8e19);
+        }
+        s.append(std::iter::empty(), 7 * 1440 + 110).unwrap();
+        let work: (f64,f64) = s.connection.query_row("SELECT cpu_seconds,gpu_seconds FROM process WHERE resolution=10 AND name_id=(SELECT id FROM names WHERE name='worker')",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(work, (1.8e19, 1.8e19));
+    }
+
+    #[test]
+    fn packed_presence_keeps_multibyte_names_through_import_rollup_and_expiry() {
+        let f = Fixture::new();
+        {
+            let c = Connection::open(f.0.join("history.sqlite")).unwrap();
+            c.execute_batch(include_str!("schema.sql")).unwrap();
+            c.execute("INSERT INTO names VALUES(16384,'unreferenced')", [])
+                .unwrap();
+        }
+        let mut legacy = History::default();
+        let mut b = bucket(100, 60., 1.);
+        b.processes = (0..300)
+            .map(|id| (format!("zero-{id:03}"), ProcessTotal::default()))
+            .collect();
+        legacy.buckets.push_back(b);
+        std::fs::write(
+            f.0.join("history.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let mut s = f.open(100);
+        assert_eq!(s.buckets(100..101, None).unwrap()[0].processes.len(), 300);
+        assert_eq!(
+            s.buckets(100..101, Some("zero-299")).unwrap()[0]
+                .processes
+                .len(),
+            1
+        );
+        assert_eq!(s.view_data(60..120, &VecDeque::new()).unwrap().1.len(), 300);
+        s.append(std::iter::empty(), 7 * 1440 + 110).unwrap();
+        assert_eq!(
+            s.connection
+                .query_row("SELECT COUNT(*) FROM names", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            300
+        );
+        let ids: Vec<u8> = s
+            .connection
+            .query_row("SELECT ids FROM presence WHERE resolution=10", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(decode_presence(&ids).unwrap().len(), 300);
+        s.append(std::iter::empty(), 30 * 1440 + 110).unwrap();
+        assert_eq!(
+            s.connection
+                .query_row("SELECT COUNT(*) FROM names", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_presence_migration_keeps_the_previous_schema_and_rows() {
+        let f = Fixture::new();
+        {
+            let s = f.open(100);
+            s.connection.execute_batch("INSERT INTO names VALUES(-1,'invalid-name-id'); INSERT INTO process VALUES(1,100,-1,0,0,0,0); CREATE INDEX process_name_minute ON process(name_id,resolution,minute); PRAGMA user_version=2;").unwrap();
+        }
+        assert!(Store::open(&f.0.join("history.sqlite"), &f.0.join("history.json"), 100).is_err());
+        let c = Connection::open(f.0.join("history.sqlite")).unwrap();
+        assert_eq!(
+            c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM process WHERE name_id=-1", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            1
+        );
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM pragma_index_list('process') WHERE name='process_name_minute'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn new_store_reclaims_expired_pages_incrementally() {
+        let f = Fixture::new();
+        let mut s = f.open(100);
+        assert_eq!(
+            s.connection
+                .query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let mut b = bucket(100, 60., 1.);
+        b.processes
+            .extend((0..1000).map(|id| (format!("name-{id}"), ProcessTotal::default())));
+        s.append([&b], 100).unwrap();
+        s.append(std::iter::empty(), 30 * 1440 + 110).unwrap();
+        assert_eq!(
+            s.connection
+                .query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            s.connection
+                .query_row("SELECT COUNT(*) FROM names", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn numeric_affinity_preserves_float_bits_and_stores_integers_compactly() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE probe(id INTEGER PRIMARY KEY, value NUMERIC NOT NULL) WITHOUT ROWID",
+        )
+        .unwrap();
+        let values = [
+            0.,
+            1.,
+            -1.,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            0.1,
+            f64::EPSILON,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            9007199254740992.,
+            9223372036854775808.,
+            f32::MAX as f64,
+            0.1f32 as f64,
+        ];
+        for (id, value) in values.into_iter().enumerate() {
+            c.execute("INSERT INTO probe VALUES(?1,?2)", params![id as i64, value])
+                .unwrap();
+            let (loaded, storage): (f64, String) = c
+                .query_row(
+                    "SELECT value,typeof(value) FROM probe WHERE id=?1",
+                    [id as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(loaded.to_bits(), value.to_bits());
+            assert_eq!(
+                storage,
+                if id < 3 || id == 10 {
+                    "integer"
+                } else {
+                    "real"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn zero_presence_migrates_every_resolution_and_keeps_named_history() {
+        let f = Fixture::new();
+        {
+            let mut s = f.open(101);
+            s.append([&bucket(100, 20., 30.)], 101).unwrap();
+            s.connection.execute_batch("INSERT INTO process SELECT 10,90,id,0,0,0,0 FROM names WHERE name='zero'; INSERT OR REPLACE INTO process SELECT 60,60,id,0,0,0,0 FROM names WHERE name='zero'; PRAGMA user_version=2;").unwrap();
+        }
+        let mut s = f.open(101);
+        let count: i64 = s.connection.query_row("SELECT COUNT(*) FROM process WHERE cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let count: i64 = s
+            .connection
+            .query_row("SELECT COUNT(*) FROM presence", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        let named = s.buckets(100..102, Some("zero")).unwrap();
+        assert_eq!(named[0].processes.len(), 1);
+        let analysis = crate::analysis::analyze("zero", "zero", 0., 101, &named)
+            .history
+            .unwrap();
+        assert_eq!(analysis.recorded_minutes, 1);
+        assert_eq!(analysis.core_minutes, 0.);
+        assert!(s
+            .view_data(60..120, &VecDeque::new())
+            .unwrap()
+            .1
+            .contains_key("zero"));
+        s.append(std::iter::empty(), 7 * 1440 + 110).unwrap();
+        let id: i64 = s
+            .connection
+            .query_row("SELECT id FROM names WHERE name='zero'", [], |r| r.get(0))
+            .unwrap();
+        let ids: Vec<u8> = s
+            .connection
+            .query_row(
+                "SELECT ids FROM presence WHERE resolution=10 AND minute=100",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ids.contains(&(id as u8)));
+        drop(s);
+        let mut s = f.open(7 * 1440 + 110);
+        assert_eq!(
+            s.connection
+                .query_row("SELECT COUNT(*) FROM names WHERE name='zero'", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        s.append(std::iter::empty(), 30 * 1440 + 120).unwrap();
+        assert_eq!(
+            s.connection
+                .query_row("SELECT COUNT(*) FROM presence", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            s.connection
+                .query_row("SELECT COUNT(*) FROM names", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn zero_presence_rollups_keep_names_and_replace_numeric_work() {
+        let f = Fixture::new();
+        let mut s = f.open(101);
+        let mut a = bucket(100, 20., 30.);
+        let mut b = bucket(101, 20., 40.);
+        a.processes
+            .insert("only-zero".into(), ProcessTotal::default());
+        b.processes
+            .insert("only-zero".into(), ProcessTotal::default());
+        b.processes.insert(
+            "zero".into(),
+            ProcessTotal {
+                cpu_seconds: 2.,
+                ..Default::default()
+            },
+        );
+        s.append([&a, &b], 101).unwrap();
+        let rows = s.view_data(60..120, &VecDeque::new()).unwrap().1;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows["zero"].cpu_seconds, 2.);
+        assert_eq!(rows["only-zero"].cpu_seconds, 0.);
+        b.processes.remove("zero");
+        s.append([&b], 101).unwrap();
+        assert_eq!(
+            s.view_data(60..120, &VecDeque::new()).unwrap().1["zero"].cpu_seconds,
+            0.
+        );
+        let named = s.buckets(100..102, Some("only-zero")).unwrap();
+        assert!(named.iter().all(|b| b.processes.len() == 1));
+        s.append(std::iter::empty(), 7 * 1440 + 110).unwrap();
+        let zero_rows: i64 = s.connection.query_row("SELECT COUNT(*) FROM process WHERE cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0", [], |r| r.get(0)).unwrap();
+        assert_eq!(zero_rows, 0);
+        assert_eq!(
+            s.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM presence WHERE resolution=10",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_presence_is_an_error_for_views_moments_and_named_reads() {
+        let f = Fixture::new();
+        let mut h = f.history(100);
+        h.buckets.push_back(bucket(100, 20., 30.));
+        h.dirty.insert(100);
+        h.persist(6000).unwrap();
+        h.buckets.clear();
+        for bytes in ["", "7f", "80", "00", "ffffffffffffffffff01", "01ff00"] {
+            h.store
+                .as_ref()
+                .unwrap()
+                .connection
+                .execute_batch(&format!("UPDATE presence SET ids=x'{bytes}'"))
+                .unwrap();
+            assert!(h.view(1, 6000).is_err(), "{bytes}");
+            assert!(
+                h.moment(super::super::MomentSelection {
+                    start_minute: 100,
+                    step: 1
+                })
+                .is_err(),
+                "{bytes}"
+            );
+            assert!(
+                h.analyze_process("zero", "zero", 0., 100).is_err(),
+                "{bytes}"
+            );
+            assert!(
+                h.analyze_process("absent", "absent", 0., 100).is_err(),
+                "{bytes}"
             );
         }
     }
@@ -1025,7 +1623,7 @@ mod tests {
     fn minute_reads_use_bounded_index_searches() {
         let f = Fixture::new();
         let s = f.open(100);
-        let sql="EXPLAIN QUERY PLAN SELECT name_id,SUM(cpu_seconds) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 AND minute>=50 AND minute<100 GROUP BY name_id";
+        let sql="EXPLAIN QUERY PLAN SELECT name_id,TOTAL(cpu_seconds) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 AND minute>=50 AND minute<100 GROUP BY name_id";
         let plans: Vec<String> = s
             .connection
             .prepare(sql)
@@ -1040,6 +1638,33 @@ mod tests {
             )),
             "{plans:?}"
         );
+        let named: Vec<String> = s
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {NAMED_BUCKETS_SQL}"))
+            .unwrap()
+            .query_map(params![50, 100, "zero"], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            named.iter().any(|p| p.contains("SEARCH s USING")
+                && p.contains("resolution=? AND minute>? AND minute<?")),
+            "{named:?}"
+        );
+        assert!(
+            named.iter().any(|p| p
+                .contains("SEARCH p USING PRIMARY KEY (resolution=? AND minute=? AND name_id=?)")),
+            "{named:?}"
+        );
+        let presence: Vec<String> = s.connection.prepare("EXPLAIN QUERY PLAN SELECT minute,ids FROM presence WHERE resolution=1 AND minute>=50 AND minute<100").unwrap().query_map([],|r|r.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(
+            presence.iter().any(|p| p.contains(
+                "SEARCH presence USING PRIMARY KEY (resolution=? AND minute>? AND minute<?)"
+            )),
+            "{presence:?}"
+        );
+        let gc: Vec<String> = s.connection.prepare("EXPLAIN QUERY PLAN DELETE FROM names WHERE id NOT IN (SELECT name_id FROM process UNION SELECT value FROM json_each('[]'))").unwrap().query_map([],|r|r.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(!gc.iter().any(|p| p.contains("CORRELATED")), "{gc:?}");
         let indexes: i64 = s
             .connection
             .query_row(
@@ -1048,7 +1673,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(indexes, 2);
+        assert_eq!(indexes, 1);
     }
     #[test]
     #[ignore]
