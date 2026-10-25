@@ -6,6 +6,7 @@ license = "MIT"
 
 [features]
 history-benchmark = []
+history-profile = []
 
 [dependencies]
 gtop-core = { path = "../gtop-core" }

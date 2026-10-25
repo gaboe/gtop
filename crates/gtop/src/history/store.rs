@@ -1,7 +1,7 @@
 use super::{Bucket, History, ProcessTotal};
 use rusqlite::{params, Connection, Row, Transaction, TransactionBehavior};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
     ops::Range,
     path::Path,
@@ -30,9 +30,16 @@ fn unsigned(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
 
 type Totals = BTreeMap<String, ProcessTotal>;
 
+struct WriterLock(File);
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 pub struct Store {
     connection: Connection,
-    _lock: File,
+    _lock: WriterLock,
 }
 
 impl Store {
@@ -124,9 +131,18 @@ impl Store {
             tx.execute("INSERT INTO migration VALUES(1,?1)", [buckets.len() as i64])?;
             tx.commit()?;
         }
+        let ready: bool =
+            connection.query_row("SELECT EXISTS(SELECT 1 FROM rollup_meta)", [], |r| r.get(0))?;
+        if !ready {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("DELETE FROM process WHERE resolution=60", [])?;
+            tx.execute("INSERT INTO process SELECT 60,minute/60*60,name_id,SUM(cpu_seconds),SUM(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 GROUP BY minute/60,name_id",[])?;
+            tx.execute("INSERT INTO rollup_meta VALUES(1)", [])?;
+            tx.commit()?;
+        }
         let mut store = Self {
             connection,
-            _lock: lock,
+            _lock: WriterLock(lock),
         };
         store.append(std::iter::empty(), minute)?;
         Ok(store)
@@ -142,11 +158,16 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let watermark: u64 =
             tx.query_row("SELECT compacted_before FROM meta", [], |r| unsigned(r, 0))?;
+        let mut hours = BTreeSet::new();
         for bucket in buckets {
             if bucket.minute < watermark {
                 return Err("History minute has already been compacted".into());
             }
             write_bucket(&tx, bucket)?;
+            hours.insert(bucket.minute / 60 * 60);
+        }
+        for hour in hours {
+            rebuild_hour(&tx, hour)?;
         }
         compact(&tx, minute)?;
         tx.commit()?;
@@ -174,7 +195,7 @@ impl Store {
         let sql = if name.is_some() {
             "SELECT p.minute,n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM names n JOIN process p INDEXED BY process_name_minute ON p.name_id=n.id WHERE n.name=?3 AND p.resolution=1 AND p.minute>=?1 AND p.minute<?2"
         } else {
-            "SELECT p.minute,n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM process p INDEXED BY process_minute JOIN names n ON n.id=p.name_id WHERE p.resolution=1 AND p.minute>=?1 AND p.minute<?2 AND ?3 IS NULL"
+            "SELECT p.minute,n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM process p INDEXED BY sqlite_autoindex_process_1 JOIN names n ON n.id=p.name_id WHERE p.resolution=1 AND p.minute>=?1 AND p.minute<?2 AND ?3 IS NULL"
         };
         let mut statement = self.connection.prepare_cached(sql)?;
         let mut rows = statement.query(params![SqlU64(range.start), SqlU64(range.end), name])?;
@@ -194,15 +215,65 @@ impl Store {
         range: Range<u64>,
         live: &VecDeque<Bucket>,
     ) -> Result<(VecDeque<Bucket>, Totals)> {
-        let excluded = serde_json::to_string(&live.iter().map(|b| b.minute).collect::<Vec<_>>())?;
-        let mut statement = self.connection.prepare_cached("SELECT n.name,SUM(p.cpu_seconds),SUM(p.gpu_seconds),MAX(p.peak_memory),MAX(p.peak_cpu) FROM process p INDEXED BY process_minute JOIN names n ON n.id=p.name_id WHERE p.resolution=1 AND p.minute>=?1 AND p.minute<?2 AND p.minute NOT IN (SELECT value FROM json_each(?3)) GROUP BY p.name_id")?;
-        let mut rows =
-            statement.query(params![SqlU64(range.start), SqlU64(range.end), excluded])?;
+        let live_minutes: Vec<_> = live
+            .iter()
+            .filter(|b| range.contains(&b.minute))
+            .map(|b| b.minute)
+            .collect();
+        let dirty_hours: BTreeSet<_> = live_minutes.iter().map(|m| m / 60 * 60).collect();
+        let full_start = range.start.div_ceil(60) * 60;
+        let full_end = range.end / 60 * 60;
         let mut totals = BTreeMap::new();
-        while let Some(row) = rows.next()? {
-            totals.insert(row.get(0)?, process_total(row, 1)?);
+        if full_start >= full_end {
+            self.aggregate(1, range.clone(), &live_minutes, &mut totals)?;
+        } else {
+            self.aggregate(
+                60,
+                full_start..full_end,
+                &dirty_hours.iter().copied().collect::<Vec<_>>(),
+                &mut totals,
+            )?;
+            self.aggregate(1, range.start..full_start, &live_minutes, &mut totals)?;
+            self.aggregate(1, full_end..range.end, &live_minutes, &mut totals)?;
+            for hour in dirty_hours.range(full_start..full_end) {
+                self.aggregate(1, *hour..*hour + 60, &live_minutes, &mut totals)?;
+            }
         }
         Ok((self.system(range)?, totals))
+    }
+
+    fn aggregate(
+        &self,
+        resolution: i64,
+        range: Range<u64>,
+        excluded: &[u64],
+        totals: &mut Totals,
+    ) -> Result<()> {
+        if range.is_empty() {
+            return Ok(());
+        }
+        let excluded = serde_json::to_string(excluded)?;
+        let mut statement=self.connection.prepare_cached("SELECT n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM (SELECT name_id,SUM(cpu_seconds) AS cpu_seconds,SUM(gpu_seconds) AS gpu_seconds,MAX(peak_memory) AS peak_memory,MAX(peak_cpu) AS peak_cpu FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND minute NOT IN (SELECT value FROM json_each(?4)) GROUP BY name_id) p JOIN names n ON n.id=p.name_id")?;
+        #[cfg(feature = "history-profile")]
+        let profile_start = std::time::Instant::now();
+        let mut rows = statement.query(params![
+            resolution,
+            SqlU64(range.start),
+            SqlU64(range.end),
+            excluded
+        ])?;
+        while let Some(row) = rows.next()? {
+            totals
+                .entry(row.get(0)?)
+                .or_default()
+                .merge(&process_total(row, 1)?);
+        }
+        #[cfg(feature = "history-profile")]
+        {
+            drop(rows);
+            eprintln!("aggregate resolution={} minutes={} elapsed_us={} vm_steps={} sorts={} fullscan_steps={}",resolution,range.end-range.start,profile_start.elapsed().as_micros(),statement.reset_status(rusqlite::StatementStatus::VmStep),statement.reset_status(rusqlite::StatementStatus::Sort),statement.reset_status(rusqlite::StatementStatus::FullscanStep));
+        }
+        Ok(())
     }
 }
 
@@ -273,6 +344,15 @@ fn write_bucket(tx: &Transaction<'_>, b: &Bucket) -> Result<()> {
     Ok(())
 }
 
+fn rebuild_hour(tx: &Transaction<'_>, hour: u64) -> Result<()> {
+    tx.execute(
+        "DELETE FROM process WHERE resolution=60 AND minute=?1",
+        [SqlU64(hour)],
+    )?;
+    tx.execute("INSERT INTO process SELECT 60,?1,name_id,SUM(cpu_seconds),SUM(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 AND minute>=?1 AND minute<?2 GROUP BY name_id",params![SqlU64(hour),SqlU64(hour+60)])?;
+    Ok(())
+}
+
 fn compact(tx: &Transaction<'_>, now: u64) -> Result<()> {
     let cutoff = now.saturating_sub(7 * 1440) / 10 * 10;
     let expired = now.saturating_sub(30 * 1440) / 10 * 10;
@@ -286,6 +366,12 @@ fn compact(tx: &Transaction<'_>, now: u64) -> Result<()> {
     for table in ["process", "system"] {
         tx.execute(&format!("DELETE FROM {table} WHERE (resolution=1 AND minute<?1) OR (resolution=10 AND minute<?2)"),params![SqlU64(cutoff),SqlU64(expired)])?;
     }
+    let boundary_hour = cutoff / 60 * 60;
+    tx.execute(
+        "DELETE FROM process WHERE resolution=60 AND minute<?1",
+        [SqlU64(boundary_hour)],
+    )?;
+    rebuild_hour(tx, boundary_hour)?;
     tx.execute(
         "DELETE FROM names WHERE NOT EXISTS(SELECT 1 FROM process WHERE process.name_id=names.id)",
         [],
@@ -625,11 +711,117 @@ mod tests {
         assert_eq!(std::fs::read(f.0.join("history.json")).unwrap(), b"broken");
     }
 
+    fn assert_view_equal(a: super::super::HistoryView, b: super::super::HistoryView) {
+        assert_eq!(a.start_minute, b.start_minute);
+        assert_eq!(a.covered, b.covered);
+        assert_eq!(a.total_cpu, b.total_cpu);
+        assert_eq!(
+            serde_json::to_value(a.rows).unwrap(),
+            serde_json::to_value(b.rows).unwrap()
+        );
+        assert_eq!(
+            a.columns
+                .iter()
+                .map(|c| c.as_ref().map(|c| (c.minute, c.seconds, c.cpu, c.memory)))
+                .collect::<Vec<_>>(),
+            b.columns
+                .iter()
+                .map(|c| c.as_ref().map(|c| (c.minute, c.seconds, c.cpu, c.memory)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hourly_views_keep_partial_edges_and_replace_dirty_minutes_exactly() {
+        let f = Fixture::new();
+        let mut baseline = History::default();
+        for minute in 240..724 {
+            let mut b = bucket(minute, 30., (minute % 5 + 1) as f64);
+            if [240, 360, 722].contains(&minute) {
+                b.processes.insert(
+                    "removed-peak".into(),
+                    ProcessTotal {
+                        cpu_seconds: 1000.,
+                        peak_memory: 9999,
+                        peak_cpu: 999.,
+                        ..Default::default()
+                    },
+                );
+            }
+            baseline.buckets.push_back(b);
+        }
+        {
+            let mut store = f.open(721);
+            store.append(&baseline.buckets, 721).unwrap();
+        }
+        let mut history = f.history(721);
+        for minute in [360, 375, 721] {
+            let mut replacement = bucket(minute, 10., 1.);
+            if minute == 375 {
+                replacement.processes.clear();
+            }
+            baseline.buckets.retain(|b| b.minute != minute);
+            baseline.buckets.push_back(replacement.clone());
+            history.buckets.retain(|b| b.minute != minute);
+            history.buckets.push_back(replacement);
+            history.dirty.insert(minute);
+        }
+        assert_view_equal(
+            history.view(8, 721 * 60).unwrap(),
+            baseline.view(8, 721 * 60).unwrap(),
+        );
+        assert!(!history
+            .view(8, 721 * 60)
+            .unwrap()
+            .rows
+            .iter()
+            .any(|r| r.0 == "removed-peak"));
+        history.persist(721 * 60).unwrap();
+        assert_view_equal(
+            history.view(8, 721 * 60).unwrap(),
+            baseline.view(8, 721 * 60).unwrap(),
+        );
+        assert_view_equal(
+            history.view(1, 721 * 60).unwrap(),
+            baseline.view(1, 721 * 60).unwrap(),
+        );
+    }
+
+    #[test]
+    fn compaction_expires_hourly_rows_and_rebuilds_the_partial_boundary_hour() {
+        let f = Fixture::new();
+        let mut store = f.open(170);
+        let buckets: Vec<_> = (100..180).map(|m| bucket(m, 30., 1.)).collect();
+        store.append(&buckets, 179).unwrap();
+        store.append(std::iter::empty(), 7 * 1440 + 130).unwrap();
+        let first: i64 = store
+            .connection
+            .query_row(
+                "SELECT MIN(minute) FROM process WHERE resolution=60",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(first, 120);
+        let cpu:f64=store.connection.query_row("SELECT cpu_seconds FROM process WHERE resolution=60 AND minute=120 AND name_id=(SELECT id FROM names WHERE name='worker')",[],|r|r.get(0)).unwrap();
+        assert_eq!(cpu, 50.);
+        store.append(std::iter::empty(), 30 * 1440 + 180).unwrap();
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM process WHERE resolution=60",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
     #[test]
     fn minute_reads_use_bounded_index_searches() {
         let f = Fixture::new();
         let s = f.open(100);
-        let sql="EXPLAIN QUERY PLAN SELECT name_id,SUM(cpu_seconds) FROM process INDEXED BY process_minute WHERE resolution=1 AND minute>=50 AND minute<100 GROUP BY name_id";
+        let sql="EXPLAIN QUERY PLAN SELECT name_id,SUM(cpu_seconds) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 AND minute>=50 AND minute<100 GROUP BY name_id";
         let plans: Vec<String> = s
             .connection
             .prepare(sql)
@@ -638,11 +830,16 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert!(plans.iter().any(|p|p.contains("SEARCH process USING INDEX process_minute (resolution=? AND minute>? AND minute<?)")),"{plans:?}");
+        assert!(
+            plans.iter().any(|p| p.contains(
+                "SEARCH process USING PRIMARY KEY (resolution=? AND minute>? AND minute<?)"
+            )),
+            "{plans:?}"
+        );
         let indexes: i64 = s
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND tbl_name='process'",
+                "SELECT COUNT(*) FROM pragma_index_list('process')",
                 [],
                 |r| r.get(0),
             )
