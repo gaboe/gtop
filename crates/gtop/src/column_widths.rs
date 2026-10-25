@@ -86,28 +86,20 @@ pub const HISTORY: [Column; 8] = [
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Widths {
     columns: BTreeMap<Column, f32>,
-    fill_name: bool,
 }
 impl Default for Widths {
     fn default() -> Self {
         Self {
             columns: BTreeMap::new(),
-            fill_name: true,
         }
     }
 }
 impl Widths {
     pub fn set(&mut self, column: Column, width: f32) {
         self.columns.insert(column, column.clamp_width(width));
-        if column == Column::Name {
-            self.fill_name = false;
-        }
     }
     pub fn reset(&mut self, column: Column) {
         self.columns.remove(&column);
-        if column == Column::Name {
-            self.fill_name = true;
-        }
     }
     pub fn compute(&self, columns: &[Column], viewport: f32) -> Vec<f32> {
         let mut widths: Vec<_> = columns
@@ -127,11 +119,18 @@ impl Widths {
         let total: f32 = widths.iter().sum();
         let spare = viewport - total;
         if spare >= 0. {
-            let fill = if !self.fill_name {
+            let fill = if self.columns.contains_key(&Column::Name) {
                 columns
                     .iter()
-                    .position(|c| matches!(c, Column::Command | Column::Share))
-                    .or_else(|| columns.iter().position(|c| *c == Column::Cpu))
+                    .position(|c| {
+                        matches!(c, Column::Command | Column::Share)
+                            && !self.columns.contains_key(c)
+                    })
+                    .or_else(|| {
+                        columns
+                            .iter()
+                            .position(|c| *c == Column::Cpu && !self.columns.contains_key(c))
+                    })
             } else {
                 columns.iter().position(|c| *c == Column::Name)
             };
@@ -318,10 +317,8 @@ mod tests {
 
     #[test]
     fn old_saved_name_width_ignores_stale_name_fill_flag() {
-        let mut widths: Widths = serde_json::from_str(
-            r#"{"columns":{"name":150.0},"fill_name":true}"#,
-        )
-        .unwrap();
+        let mut widths: Widths =
+            serde_json::from_str(r#"{"columns":{"name":150.0},"fill_name":true}"#).unwrap();
         let live = crate::model::ProcessColumn::ALL.map(Column::from);
         let name_index = live
             .iter()
