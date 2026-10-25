@@ -147,7 +147,16 @@ impl SystemMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use sysinfo::System;
+
+    struct ScratchFile(std::path::PathBuf);
+
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     /// Tests creation of system monitor
     #[test]
@@ -168,6 +177,53 @@ mod tests {
         monitor.disks_refreshed_at = initial - Duration::from_secs(60);
         monitor.refresh_disks(&mut disks);
         assert!(monitor.disks_refreshed_at >= initial);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn storage_refresh_reads_new_system_volume_capacity() {
+        let mut disks =
+            Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage());
+        let initial_available = disks
+            .iter()
+            .find(|disk| disk.mount_point() == Path::new("/"))
+            .unwrap()
+            .available_space();
+        let path = std::env::temp_dir().join(format!(
+            "gtop-capacity-refresh-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _scratch_file = ScratchFile(path.clone());
+        let mut file = std::fs::File::create(&path).unwrap();
+        let block = vec![0x6b; 1024 * 1024];
+        for _ in 0..512 {
+            file.write_all(&block).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut monitor = SystemMonitor::new(&Networks::new());
+        monitor.disks_refreshed_at = Instant::now() - Duration::from_secs(60);
+        monitor.refresh_disks(&mut disks);
+        let refreshed_available = disks
+            .iter()
+            .find(|disk| disk.mount_point() == Path::new("/"))
+            .unwrap()
+            .available_space();
+        let fresh_available = Disks::new_with_refreshed_list_specifics(
+            DiskRefreshKind::nothing().with_storage(),
+        )
+        .iter()
+        .find(|disk| disk.mount_point() == Path::new("/"))
+        .unwrap()
+        .available_space();
+
+        assert!(fresh_available < initial_available);
+        assert_eq!(refreshed_available, fresh_available);
     }
 
     /// Tests system statistics collection
