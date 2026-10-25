@@ -1,4 +1,5 @@
 use crate::{
+    column_widths::{self, Column, Drag, TableState, Widths},
     model::{process_order, ProcessColumn, ProcessKey, Search},
     palette::{presets, Base},
     rack,
@@ -24,6 +25,24 @@ fn row_tier(row: usize) -> RowTier {
 }
 
 pub struct SelectProcess(pub ProcessKey);
+pub struct WidthsChanged(pub Widths, pub bool);
+impl EventEmitter<WidthsChanged> for Processes {}
+
+impl From<ProcessColumn> for Column {
+    fn from(column: ProcessColumn) -> Self {
+        match column {
+            ProcessColumn::Lamp => Self::Lamp,
+            ProcessColumn::Name => Self::Name,
+            ProcessColumn::Pid => Self::Pid,
+            ProcessColumn::User => Self::User,
+            ProcessColumn::Cpu => Self::Cpu,
+            ProcessColumn::Memory => Self::Memory,
+            ProcessColumn::Gpu => Self::Gpu,
+            ProcessColumn::Ports => Self::Ports,
+            ProcessColumn::Command => Self::Command,
+        }
+    }
+}
 pub struct Processes {
     pub snapshot: Option<Rc<Snapshot>>,
     pub order: Vec<usize>,
@@ -35,6 +54,9 @@ pub struct Processes {
     pub compact: bool,
     pub root_focus: Option<FocusHandle>,
     scroll: UniformListScrollHandle,
+    pub widths: Widths,
+    sizing: TableState,
+    resolved: Vec<(ProcessColumn, f32)>,
 }
 impl EventEmitter<SelectProcess> for Processes {}
 impl Default for Processes {
@@ -50,6 +72,9 @@ impl Default for Processes {
             compact: false,
             root_focus: None,
             scroll: UniformListScrollHandle::new(),
+            widths: Widths::default(),
+            sizing: TableState::default(),
+            resolved: Vec::new(),
         }
     }
 }
@@ -86,24 +111,22 @@ impl Processes {
             .filter(|c| !self.compact || !matches!(c, ProcessColumn::User | ProcessColumn::Command))
             .collect()
     }
-    fn width(&self, c: ProcessColumn) -> f32 {
-        match c {
-            ProcessColumn::Lamp => 22.,
-            ProcessColumn::Name => {
-                if self.compact {
-                    150.
-                } else {
-                    200.
-                }
-            }
-            ProcessColumn::Pid => 70.,
-            ProcessColumn::User => 75.,
-            ProcessColumn::Cpu => 180.,
-            ProcessColumn::Memory => 90.,
-            ProcessColumn::Gpu => 65.,
-            ProcessColumn::Ports => 80.,
-            ProcessColumn::Command => 320.,
-        }
+    fn computed_widths(&self) -> Vec<f32> {
+        self.widths.compute(
+            &self
+                .columns()
+                .into_iter()
+                .map(Column::from)
+                .collect::<Vec<_>>(),
+            self.sizing.viewport,
+        )
+    }
+    fn width(&self, column: ProcessColumn) -> f32 {
+        self.resolved
+            .iter()
+            .find(|(kind, _)| *kind == column)
+            .unwrap()
+            .1
     }
     pub fn sort(&mut self, column: ProcessColumn, toggle: bool) {
         self.descending = if toggle && self.column == column {
@@ -151,7 +174,7 @@ impl Processes {
                     crate::palette::mix(t.base.ground, 0, 0.8)
                 }))
                 .cursor_pointer()
-                .children(self.columns().into_iter().map(|kind| {
+                .children(self.resolved.iter().copied().map(|(kind, width)| {
                     let color = if selected || (priority && culprit) {
                         t.base.led
                     } else if !priority {
@@ -164,11 +187,8 @@ impl Processes {
                         t.ink_row
                     };
                     let cell = div()
-                        .w(px(self.width(kind)))
+                        .w(px(width))
                         .flex_shrink_0()
-                        .when(kind == ProcessColumn::Command, |d| {
-                            d.flex_1().min_w_0().flex_shrink(1.)
-                        })
                         .px(px(10.))
                         .text_size(px(if priority { 14. } else { 12. }))
                         .when(priority && kind == ProcessColumn::Name, |d| {
@@ -225,6 +245,7 @@ impl Render for Processes {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.base.tokens();
         let columns = self.columns();
+        self.resolved = columns.into_iter().zip(self.computed_widths()).collect();
         let header = div()
             .flex()
             .h(px(29.))
@@ -232,17 +253,15 @@ impl Render for Processes {
             .bg(rgb(crate::palette::mix(t.base.plate, 0, 0.6)))
             .border_b_1()
             .border_color(rgb(t.rule_hi))
-            .children(columns.into_iter().map(|kind| {
+            .children(self.resolved.iter().copied().map(|(kind, width)| {
                 let selected = self.column == kind;
                 div()
                     .id(("header", kind as usize))
                     .role(Role::ColumnHeader)
-                    .w(px(self.width(kind)))
+                    .w(px(width))
                     .flex_shrink_0()
                     .whitespace_nowrap()
-                    .when(kind == ProcessColumn::Command, |d| {
-                        d.flex_1().min_w_0().flex_shrink(1.)
-                    })
+                    .relative()
                     .px(px(10.))
                     .py(px(7.))
                     .font_family("Archivo Labels")
@@ -250,7 +269,7 @@ impl Render for Processes {
                     .text_size(px(10.))
                     .text_color(rgb(if selected { t.base.led } else { t.silk_dim }))
                     .cursor_pointer()
-                    .child(crate::rack::tracked(format!(
+                    .child(div().overflow_hidden().child(crate::rack::tracked(format!(
                         "{}{}",
                         kind.label().to_uppercase(),
                         if selected {
@@ -262,7 +281,28 @@ impl Render for Processes {
                         } else {
                             ""
                         }
-                    )))
+                    ))))
+                    .when(kind != ProcessColumn::Lamp, |d| {
+                        d.child(column_widths::handle().on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                let column = Column::from(kind);
+                                if event.click_count == 2 {
+                                    this.sizing.drag = None;
+                                    this.widths.reset(column);
+                                    cx.emit(WidthsChanged(this.widths.clone(), true));
+                                } else {
+                                    this.sizing.drag = Some(Drag {
+                                        column,
+                                        start_x: event.position.x.into(),
+                                        start_width: this.width(kind),
+                                    });
+                                }
+                                cx.notify();
+                            }),
+                        ))
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(focus) = &this.root_focus {
                             window.focus(focus, cx);
@@ -290,30 +330,70 @@ impl Render for Processes {
         .track_scroll(&self.scroll)
         .flex_1()
         .min_h_0();
+        let total = self.resolved.iter().map(|(_, width)| width).sum::<f32>() + 2.;
+        let events = column_widths::events(
+            cx,
+            self.sizing.drag.is_some(),
+            |this, width, _, cx| {
+                let width = (*width - 2.).max(0.);
+                if (this.sizing.viewport - width).abs() > 0.5 {
+                    this.sizing.viewport = width;
+                    cx.notify();
+                }
+            },
+            |this, event, _, cx| {
+                if let Some(drag) = this.sizing.drag {
+                    this.widths.set(
+                        drag.column,
+                        drag.start_width + f32::from(event.position.x) - drag.start_x,
+                    );
+                    cx.emit(WidthsChanged(this.widths.clone(), false));
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            },
+            |this, _, _, cx| {
+                if this.sizing.drag.take().is_some() {
+                    cx.emit(WidthsChanged(this.widths.clone(), true));
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            },
+        );
         div()
-            .id("process-table")
-            .role(Role::Table)
-            .flex()
-            .flex_col()
+            .id("process-table-viewport")
+            .relative()
             .size_full()
-            .overflow_hidden()
-            .border_1()
-            .border_color(rgb(0))
-            .child(header)
-            .when(self.order.is_empty(), |d| {
-                d.child(div().p_4().child(if self.snapshot.is_none() {
-                    "Reading processes..."
-                } else {
-                    "No process matches. Esc clears the search."
-                }))
-            })
-            .when(!self.order.is_empty(), |d| {
-                d.child(top_rows)
-                    .when(has_remainder, |d| {
-                        d.child(div().h(px(1.)).w_full().bg(rgb(t.rule_hi)))
+            .min_w_0()
+            .overflow_x_scroll()
+            .child(events)
+            .child(
+                div()
+                    .id("process-table")
+                    .role(Role::Table)
+                    .flex()
+                    .flex_col()
+                    .w(px(total))
+                    .h_full()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(rgb(0))
+                    .child(header)
+                    .when(self.order.is_empty(), |d| {
+                        d.child(div().p_4().child(if self.snapshot.is_none() {
+                            "Reading processes..."
+                        } else {
+                            "No process matches. Esc clears the search."
+                        }))
                     })
-                    .child(remainder)
-            })
+                    .when(!self.order.is_empty(), |d| {
+                        d.child(top_rows)
+                            .when(has_remainder, |d| {
+                                d.child(div().h(px(1.)).w_full().bg(rgb(t.rule_hi)))
+                            })
+                            .child(remainder)
+                    }),
+            )
     }
 }
 fn now_blink() -> bool {
@@ -325,6 +405,211 @@ mod tests {
     use super::{row_tier, Processes, RowTier, SelectProcess, TOP_ROWS};
     use crate::model::{ProcessColumn, ProcessKey, Search};
     use std::rc::Rc;
+    #[gpui::test]
+    async fn name_handle_resizes_and_resets_without_sort_or_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{point, px, Modifiers, MouseButton, MouseDownEvent};
+        let (table, cx) = cx.add_window_view(|_, _| {
+            let mut table = Processes {
+                snapshot: Some(Rc::new(crate::test_data::snapshot())),
+                ..Default::default()
+            };
+            table.reorder();
+            table
+        });
+        cx.simulate_resize(gpui::size(px(1500.), px(600.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (start_width, sort, order) = cx.update(|_, cx| {
+            let table = table.read(cx);
+            (
+                table.width(ProcessColumn::Name),
+                table.column,
+                table.order.clone(),
+            )
+        });
+        let handle = point(px(22. + start_width - 2.), px(15.));
+        cx.simulate_mouse_down(handle, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let moved = point(handle.x - px(40.), px(100.));
+        cx.simulate_mouse_move(moved, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_mouse_up(moved, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            let table = table.read(cx);
+            assert_eq!(table.width(ProcessColumn::Name), start_width - 40.);
+            assert_eq!(table.column, sort);
+            assert_eq!(table.order, order);
+            assert!(table.selected.is_none());
+            assert!(table.sizing.drag.is_none());
+        });
+        let handle = point(handle.x - px(40.), px(15.));
+        cx.simulate_event(MouseDownEvent {
+            position: handle,
+            button: MouseButton::Left,
+            click_count: 2,
+            modifiers: Modifiers::default(),
+            first_mouse: false,
+        });
+        cx.simulate_mouse_up(handle, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            let table = table.read(cx);
+            assert_eq!(table.width(ProcessColumn::Name), start_width);
+            assert_eq!(table.column, sort);
+            assert!(table.selected.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn quick_handle_release_ends_drag_before_repaint(cx: &mut gpui::TestAppContext) {
+        use gpui::{
+            point, px, InputEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+            MouseUpEvent,
+        };
+        let (table, cx) = cx.add_window_view(|_, _| Processes::default());
+        cx.simulate_resize(gpui::size(px(1500.), px(600.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let x = cx.update(|_, cx| 22. + table.read(cx).width(ProcessColumn::Name) - 2.);
+        let position = point(px(x), px(15.));
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseUpEvent {
+                    position,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let before = cx.update(|_, cx| table.read(cx).width(ProcessColumn::Name));
+        cx.simulate_event(MouseMoveEvent {
+            position: point(position.x - px(40.), px(100.)),
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            let table = table.read(cx);
+            assert!(table.sizing.drag.is_none());
+            assert_eq!(table.width(ProcessColumn::Name), before);
+        });
+    }
+
+    #[gpui::test]
+    async fn quick_drag_before_repaint_resizes_and_ends_drag(cx: &mut gpui::TestAppContext) {
+        use gpui::{
+            point, px, InputEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+            MouseUpEvent,
+        };
+        let (table, cx) = cx.add_window_view(|_, _| Processes::default());
+        cx.simulate_resize(gpui::size(px(1500.), px(600.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (x, before) = cx.update(|_, cx| {
+            let table = table.read(cx);
+            (
+                22. + table.width(ProcessColumn::Name) - 2.,
+                table.width(ProcessColumn::Name),
+            )
+        });
+        let start = point(px(x), px(15.));
+        let end = point(px(x - 40.), px(100.));
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: start,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: end,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: end,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            let table = table.read(cx);
+            assert_eq!(table.width(ProcessColumn::Name), before - 40.);
+            assert!(table.sizing.drag.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn unpressed_mouse_move_does_not_resize_a_drag(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, px, Modifiers, MouseButton, MouseMoveEvent};
+        let (table, cx) = cx.add_window_view(|_, _| Processes::default());
+        cx.simulate_resize(gpui::size(px(1500.), px(600.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (x, before) = cx.update(|_, cx| {
+            let table = table.read(cx);
+            (
+                22. + table.width(ProcessColumn::Name) - 2.,
+                table.width(ProcessColumn::Name),
+            )
+        });
+        cx.simulate_mouse_down(
+            point(px(x), px(15.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_event(MouseMoveEvent {
+            position: point(px(x - 40.), px(100.)),
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            let table = table.read(cx);
+            assert!(table.sizing.drag.is_some());
+            assert_eq!(table.width(ProcessColumn::Name), before);
+        });
+        cx.simulate_mouse_up(
+            point(px(x - 40.), px(100.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+    }
+
     #[test]
     fn sort_has_two_states_and_keeps_identity() {
         let s = crate::test_data::snapshot();

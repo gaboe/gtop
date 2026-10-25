@@ -1,4 +1,5 @@
 mod analysis;
+mod column_widths;
 mod details;
 mod disk;
 mod disk_scan;
@@ -109,6 +110,7 @@ struct Monitor {
     view: Option<usize>,
     history_selected: Option<String>,
     history_scroll: UniformListScrollHandle,
+    history_columns: column_widths::TableState,
     metric: history::Metric,
     settings: palette::Settings,
     settings_writes: Option<mpsc::UnboundedSender<palette::Settings>>,
@@ -157,6 +159,7 @@ impl Monitor {
             let mut p = Processes::default();
             p.root_focus = Some(focus.clone());
             p.base = settings.base();
+            p.widths = settings.process_widths.clone();
             p
         });
         let stopping = Rc::new(std::cell::Cell::new(false));
@@ -178,7 +181,7 @@ impl Monitor {
                 }
                 if let Err(error) = result {
                     let _ = entity.update_in(cx, |this, _, cx| {
-                        this.status = format!("Palette could not be saved: {error}");
+                        this.status = format!("Settings could not be saved: {error}");
                         cx.notify();
                     });
                 }
@@ -217,6 +220,16 @@ impl Monitor {
                 this.settings_open = false;
                 this.select(*key, cx);
             }),
+            cx.subscribe_in(
+                &table,
+                window,
+                |this, _, event: &process_table::WidthsChanged, window, cx| {
+                    this.settings.process_widths = event.0.clone();
+                    if event.1 {
+                        this.persist_settings(window, cx);
+                    }
+                },
+            ),
             cx.observe_window_visibility(window, |this, visibility, _, _| {
                 if gtop_core::perf_enabled() {
                     eprintln!("perf visibility visible={}", visibility.is_visible());
@@ -589,6 +602,7 @@ impl Monitor {
             view: None,
             history_selected: None,
             history_scroll: UniformListScrollHandle::new(),
+            history_columns: column_widths::TableState::default(),
             metric: history::Metric::Cpu,
             settings,
             settings_writes: Some(settings_writes),
@@ -988,9 +1002,9 @@ mod wake_tests {
             super::HistoryRead::Moment,
             Some("database busy".into()),
         );
-        status = "Palette could not be saved: disk full".into();
+        status = "Settings could not be saved: disk full".into();
         errors.update(&mut status, super::HistoryRead::Moment, None);
-        assert_eq!(status, "Palette could not be saved: disk full");
+        assert_eq!(status, "Settings could not be saved: disk full");
     }
 
     #[test]

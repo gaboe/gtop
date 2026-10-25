@@ -136,15 +136,8 @@ fn history_row() -> Div {
     div().w_full().h(px(22.)).flex().items_center()
 }
 
-fn history_cell(weight: f32, right: bool) -> Div {
-    div()
-        .flex_grow(weight)
-        .flex_basis(px(0.))
-        .px(px(10.))
-        .when(right, |cell| {
-            cell.flex_shrink_0().whitespace_nowrap().text_right()
-        })
-        .when(!right, |cell| cell.min_w_0())
+fn history_cell(width: f32, right: bool) -> Div {
+    crate::column_widths::cell(width, right)
 }
 
 pub fn timestamp(seconds: u64, format: &str) -> String {
@@ -1445,28 +1438,89 @@ impl Monitor {
                     &t,
                 ))
                 .child(label(coverage, &t));
+            use crate::column_widths::{self, Column, Drag, HISTORY};
+            let widths = self
+                .settings
+                .history_widths
+                .compute(&HISTORY, self.history_columns.viewport);
+            let total = widths.iter().sum::<f32>() + 2.;
+            let events = column_widths::events(
+                cx,
+                self.history_columns.drag.is_some(),
+                |this, width, _, cx| {
+                    let width = (*width - 2.).max(0.);
+                    if (this.history_columns.viewport - width).abs() > 0.5 {
+                        this.history_columns.viewport = width;
+                        cx.notify();
+                    }
+                },
+                |this, event, _, cx| {
+                    if let Some(drag) = this.history_columns.drag {
+                        this.settings.history_widths.set(
+                            drag.column,
+                            drag.start_width + f32::from(event.position.x) - drag.start_x,
+                        );
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                },
+                |this, _, window, cx| {
+                    if this.history_columns.drag.take().is_some() {
+                        this.persist_settings(window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                },
+            );
             let headers = history_row()
                 .h(px(29.))
+                .flex_shrink_0()
                 .bg(rgb(t.base.plate))
                 .child(div().w(px(22.)).flex_shrink_0())
                 .children(
                     [
-                        ("PROCESS", 28., false),
-                        ("CORE TIME ▼", 12., true),
-                        ("SHARE", 20., false),
-                        ("OF ALL CPU", 10., true),
-                        ("GPU TIME", 9., true),
-                        ("PEAK MEMORY", 12., true),
-                        ("PEAK CPU %", 10., true),
+                        ("PROCESS", Column::Name, false),
+                        ("CORE TIME ▼", Column::CoreTime, true),
+                        ("SHARE", Column::Share, false),
+                        ("OF ALL CPU", Column::CpuShare, true),
+                        ("GPU TIME", Column::GpuTime, true),
+                        ("PEAK MEMORY", Column::PeakMemory, true),
+                        ("PEAK CPU %", Column::PeakCpu, true),
                     ]
-                    .map(|(name, weight, right)| {
-                        history_cell(weight, right).child(label(name, &t).text_color(rgb(
-                            if name.starts_with("CORE") {
-                                t.base.led
-                            } else {
-                                t.silk_dim
-                            },
-                        )))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (name, column, right))| {
+                        history_cell(widths[index + 1], right)
+                            .relative()
+                            .child(
+                                label(name, &t).text_color(rgb(if column == Column::CoreTime {
+                                    t.base.led
+                                } else {
+                                    t.silk_dim
+                                })),
+                            )
+                            .child(column_widths::handle().on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    if event.click_count == 2 {
+                                        this.history_columns.drag = None;
+                                        this.settings.history_widths.reset(column);
+                                        this.persist_settings(window, cx);
+                                    } else {
+                                        let widths = this
+                                            .settings
+                                            .history_widths
+                                            .compute(&HISTORY, this.history_columns.viewport);
+                                        this.history_columns.drag = Some(Drag {
+                                            column,
+                                            start_x: event.position.x.into(),
+                                            start_width: widths[index + 1],
+                                        });
+                                    }
+                                    cx.notify();
+                                }),
+                            ))
                     }),
                 );
             right = right
@@ -1478,8 +1532,16 @@ impl Monitor {
                 )
                 .child(
                     div()
+                        .id("history-table-viewport")
+                        .relative()
                         .flex_1()
                         .min_h_0()
+                        .min_w_0()
+                        .overflow_x_scroll()
+                        .child(events)
+                        .child(div()
+                        .w(px(total))
+                        .h_full()
                         .flex()
                         .flex_col()
                         .border_1()
@@ -1490,6 +1552,8 @@ impl Monitor {
                                 "history-rows",
                                 h.rows.len(),
                                 cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                                    let widths = this.settings.history_widths
+                                        .compute(&HISTORY, this.history_columns.viewport);
                                     let h = &this.history[index];
                                     let t = this.draft.unwrap_or(this.settings.base()).tokens();
                                     range
@@ -1540,17 +1604,17 @@ impl Monitor {
                                                             ),
                                                     )
                                                     .child(
-                                                        history_cell(28., false)
+                                                        history_cell(widths[1], false)
                                                             .truncate()
                                                             .child(row_text(name.clone())),
                                                     )
                                                     .child(
-                                                        history_cell(12., true).child(row_text(
+                                                        history_cell(widths[2], true).child(row_text(
                                                             core_time(p.cpu_seconds),
                                                         )),
                                                     )
                                                     .child(
-                                                        history_cell(20., false).child(
+                                                        history_cell(widths[3], false).child(
                                                             segments(
                                                                 (p.cpu_seconds
                                                                     / h.rows
@@ -1567,14 +1631,14 @@ impl Monitor {
                                                             .max_w(px(120.)),
                                                         ),
                                                     )
-                                                    .child(history_cell(10., true).child(row_text(
+                                                    .child(history_cell(widths[4], true).child(row_text(
                                                         format!(
                                                             "{:.1}%",
                                                             p.cpu_seconds / h.total_cpu.max(0.001)
                                                                 * 100.
                                                         ),
                                                     )))
-                                                    .child(history_cell(9., true).child(row_text(
+                                                    .child(history_cell(widths[5], true).child(row_text(
                                                         if p.gpu_seconds > 3. {
                                                             core_time(p.gpu_seconds)
                                                         } else {
@@ -1582,10 +1646,10 @@ impl Monitor {
                                                         },
                                                     )))
                                                     .child(
-                                                        history_cell(12., true)
+                                                        history_cell(widths[6], true)
                                                             .child(row_text(bytes(p.peak_memory))),
                                                     )
-                                                    .child(history_cell(10., true).child(
+                                                    .child(history_cell(widths[7], true).child(
                                                         row_text(format!("{:.1}", p.peak_cpu)),
                                                     )),
                                             )
@@ -1596,7 +1660,7 @@ impl Monitor {
                             .track_scroll(&self.history_scroll)
                             .flex_1()
                             .min_h_0(),
-                        ),
+                        )),
                 );
         } else {
             let h = &self.history[0];
@@ -1788,7 +1852,7 @@ impl Monitor {
         });
         cx.notify();
     }
-    fn persist_settings(&self, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub(crate) fn persist_settings(&self, _window: &mut Window, _cx: &mut Context<Self>) {
         if let Some(settings_writes) = self.settings_writes.as_ref() {
             let _ = settings_writes.unbounded_send(self.settings.clone());
         }
@@ -3230,12 +3294,14 @@ mod tests {
             history_row()
                 .child(div().w(px(22.)).flex_shrink_0())
                 .children(
-                    [28., 12., 20., 10., 9., 12., 10.]
+                    crate::column_widths::Widths::default()
+                        .compute(&crate::column_widths::HISTORY, 1000.)
                         .into_iter()
+                        .skip(1)
                         .enumerate()
-                        .map(|(column, weight)| {
+                        .map(|(column, width)| {
                             let widths = widths.clone();
-                            history_cell(weight, false).child(
+                            history_cell(width, !matches!(column, 0 | 2)).child(
                                 canvas(
                                     move |bounds, _, _| {
                                         widths.borrow_mut().push((
