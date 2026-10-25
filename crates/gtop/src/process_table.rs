@@ -93,15 +93,15 @@ impl Processes {
                 if self.compact {
                     150.
                 } else {
-                    225.
+                    200.
                 }
             }
             ProcessColumn::Pid => 70.,
-            ProcessColumn::User => 85.,
-            ProcessColumn::Cpu => 160.,
-            ProcessColumn::Memory => 100.,
+            ProcessColumn::User => 75.,
+            ProcessColumn::Cpu => 180.,
+            ProcessColumn::Memory => 90.,
             ProcessColumn::Gpu => 65.,
-            ProcessColumn::Ports => 90.,
+            ProcessColumn::Ports => 80.,
             ProcessColumn::Command => 320.,
         }
     }
@@ -175,6 +175,7 @@ impl Processes {
                             d.font_weight(FontWeight::SEMIBOLD)
                         })
                         .text_color(rgb(color))
+                        .whitespace_nowrap()
                         .truncate();
                     if kind == ProcessColumn::Lamp {
                         return cell.child(div().w(px(7.)).h(px(12.)).bg(rgb(
@@ -230,6 +231,7 @@ impl Render for Processes {
                     .role(Role::ColumnHeader)
                     .w(px(self.width(kind)))
                     .flex_shrink_0()
+                    .whitespace_nowrap()
                     .when(kind == ProcessColumn::Command, |d| {
                         d.flex_1().min_w_0().flex_shrink(1.)
                     })

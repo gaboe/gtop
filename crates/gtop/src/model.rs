@@ -152,7 +152,7 @@ impl ProcessColumn {
             Self::Name => "Process",
             Self::Pid => "PID",
             Self::User => "User",
-            Self::Cpu => "CPU % · bar = share of Mac",
+            Self::Cpu => "CPU % · bar = share",
             Self::Memory => "Memory",
             Self::Gpu => "GPU %",
             Self::Ports => "Ports",

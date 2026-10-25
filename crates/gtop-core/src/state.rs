@@ -104,11 +104,11 @@ impl AppState {
         sys.refresh_memory();
         #[cfg(not(target_os = "macos"))]
         ProcessMonitor::refresh(&mut sys, include_environ);
-        SystemMonitor::refresh_disks(&mut disks);
+        let mut system_monitor = self.system_monitor.lock().map_err(|e| e.to_string())?;
+        system_monitor.refresh_disks(&mut disks);
         networks.refresh(true);
         let refreshed = Instant::now();
         let mut process_monitor = self.process_monitor.lock().map_err(|e| e.to_string())?;
-        let mut system_monitor = self.system_monitor.lock().map_err(|e| e.to_string())?;
         let collected_ports;
         let ports_by_pid = if let Some(ports) = cached_ports {
             ports

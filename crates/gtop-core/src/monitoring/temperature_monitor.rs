@@ -30,6 +30,8 @@ pub struct TemperatureMonitor {
     groups: Vec<Option<usize>>,
     refreshed_at: Option<Instant>,
     readings: Vec<Temperature>,
+    #[cfg(target_os = "macos")]
+    gpu: Option<super::smc::GpuTemperature>,
 }
 
 impl Default for TemperatureMonitor {
@@ -51,6 +53,8 @@ impl TemperatureMonitor {
             groups,
             refreshed_at: None,
             readings: Vec::new(),
+            #[cfg(target_os = "macos")]
+            gpu: super::smc::GpuTemperature::new(),
         }
     }
 
@@ -70,6 +74,11 @@ impl TemperatureMonitor {
             if let Some(celsius) = component.temperature().filter(|c| c.is_finite()) {
                 hottest[group] = Some(hottest[group].map_or(celsius, |h| h.max(celsius)));
             }
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Some(celsius) = self.gpu.as_ref().and_then(|gpu| gpu.hottest()) {
+            hottest[1] = Some(hottest[1].map_or(celsius, |h| h.max(celsius)));
         }
 
         self.readings = GROUPS

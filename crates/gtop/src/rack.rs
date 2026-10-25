@@ -140,9 +140,11 @@ fn history_cell(weight: f32, right: bool) -> Div {
     div()
         .flex_grow(weight)
         .flex_basis(px(0.))
-        .min_w_0()
         .px(px(10.))
-        .when(right, |cell| cell.text_right())
+        .when(right, |cell| {
+            cell.flex_shrink_0().whitespace_nowrap().text_right()
+        })
+        .when(!right, |cell| cell.min_w_0())
 }
 
 pub fn timestamp(seconds: u64, format: &str) -> String {
@@ -1124,6 +1126,29 @@ impl Monitor {
                     t,
                 )),
         );
+        tower = tower.child(
+            win(t)
+                .child(label("SSD GB", t))
+                .child(lit(
+                    if stats.disk_total_bytes > 0 {
+                        format!(
+                            "{:.0} / {:.0}",
+                            stats.disk_used_bytes as f64 / 1e9,
+                            stats.disk_total_bytes as f64 / 1e9
+                        )
+                    } else {
+                        "N/A".into()
+                    },
+                    22.,
+                    stats.disk_used_bytes as f64 / stats.disk_total_bytes.max(1) as f64 > 0.92,
+                    t,
+                ))
+                .child(segments(
+                    stats.disk_used_bytes as f32 / stats.disk_total_bytes.max(1) as f32 * 100.,
+                    40,
+                    t,
+                )),
+        );
         let gpu = stats.gpus.first();
         let util = gpu.and_then(|g| g.utilization);
         tower = tower.child(
@@ -1217,15 +1242,18 @@ impl Monitor {
                     ),
             )
             .child(div().flex_1())
-            .child(label(
-                format!(
-                    "UP {} · NET ↓ {} ↑ {}/s",
-                    duration(stats.uptime),
-                    bytes(stats.network_rx_bytes),
-                    bytes(stats.network_tx_bytes)
-                ),
-                t,
-            ))
+            .child(label(format!("UP {}", duration(stats.uptime)), t).whitespace_nowrap())
+            .child(
+                label(
+                    format!(
+                        "NET ↓ {}/s ↑ {}/s",
+                        bytes(stats.network_rx_bytes),
+                        bytes(stats.network_tx_bytes)
+                    ),
+                    t,
+                )
+                .whitespace_nowrap(),
+            )
     }
     pub fn rack(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
         let t = self.draft.unwrap_or(self.settings.base()).tokens();

@@ -466,27 +466,36 @@ impl Monitor {
                                     )),
                             ),
                     )
-                    .child(detail_line(
-                        "Ports",
-                        if p.ports.is_empty() {
-                            "none".into()
-                        } else {
-                            p.ports
-                                .iter()
-                                .map(u16::to_string)
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        },
-                    ))
+                    .child(
+                        detail_line(
+                            "Ports",
+                            if p.ports.is_empty() {
+                                "none".into()
+                            } else {
+                                p.ports
+                                    .iter()
+                                    .map(u16::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            },
+                        )
+                        .mt(px(14.)),
+                    )
                     .child(detail_line(
                         "Started",
                         crate::rack::timestamp(p.start_time, "%x %X"),
                     ))
                     .child(detail_line("Running for", duration(p.run_time))),
             );
-            panel = panel
-                .child(detail_line("Executable", p.executable.clone()))
-                .child(detail_line("Arguments", p.argv.join(" ")));
+            panel = panel.child(
+                div()
+                    .px(px(18.))
+                    .py(px(12.))
+                    .border_b_1()
+                    .border_color(rgb(t.rule))
+                    .child(detail_line("Executable", p.executable.clone()))
+                    .child(detail_line("Arguments", p.argv.join(" "))),
+            );
             panel = panel.child(
                 div()
                     .p(px(18.))

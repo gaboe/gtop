@@ -700,7 +700,7 @@ mod tests {
             Command::new("/usr/bin/python3")
                 .args([
                     "-c",
-                    "import time; x=bytearray(16*1024*1024); time.sleep(30)",
+                    "import time; x=bytearray(16*1024*1024); x[:]=b'x'*len(x); time.sleep(30)",
                 ])
                 .env("GTOP_NATIVE_MARKER", "owned-child")
                 .spawn()
