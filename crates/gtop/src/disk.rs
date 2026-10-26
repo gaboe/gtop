@@ -388,18 +388,22 @@ fn publish_browse(
         );
         return tree.state == ScanState::Complete && !token.load(Ordering::Relaxed);
     }
+    let mut published_complete = false;
     let subtree = disk_scan::scan_beneath(&tree.root, path, home, token, |subtree| {
+        published_complete |= subtree.state == ScanState::Complete;
         let mut folder = subtree.folder(path, page, false);
         folder.root = tree.root.clone();
         let mut mailbox = output.lock().unwrap();
         mailbox.folder = Some((generation, navigation, folder));
         mailbox.notify();
     });
-    let mut folder = subtree.folder(path, page, false);
-    folder.root = tree.root.clone();
-    let mut mailbox = output.lock().unwrap();
-    mailbox.folder = Some((generation, navigation, folder));
-    mailbox.notify();
+    if !published_complete {
+        let mut folder = subtree.folder(path, page, false);
+        folder.root = tree.root.clone();
+        let mut mailbox = output.lock().unwrap();
+        mailbox.folder = Some((generation, navigation, folder));
+        mailbox.notify();
+    }
     subtree.state == ScanState::Complete && !token.load(Ordering::Relaxed)
 }
 fn prepare_cleanup(
@@ -1061,6 +1065,36 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    fn receive_cleanup_refresh(disk: &Disk) -> (String, Folder) {
+        let start = Instant::now();
+        loop {
+            let mut mailbox = disk.mailbox.lock().unwrap();
+            let status = mailbox.status.take();
+            let Some(status) = status else {
+                drop(mailbox);
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "cleanup timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            if status.contains("Rescanning") {
+                drop(mailbox);
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "cleanup timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            let folder = mailbox.folder.take();
+            drop(mailbox);
+            let (generation, navigation, folder) = folder.expect("cleanup refresh folder");
+            assert_eq!((generation, navigation), (disk.generation, disk.navigation));
+            return (status, folder);
+        }
+    }
     fn receive_proposal(disk: &Disk) -> (u64, u64, Result<Confirmation, String>) {
         let start = Instant::now();
         loop {
@@ -1434,8 +1468,8 @@ mod tests {
             disk.confirmation =
                 Some(Confirmation::new(&row.path, row.allocated, row.identity, &home).unwrap());
             disk.confirm(disk.proposal_id);
-            assert_eq!(disk.folder.as_ref().unwrap().state, ScanState::Complete);
-            let folder = receive(&mut disk, ScanState::Complete);
+            let (status, folder) = receive_cleanup_refresh(&disk);
+            assert!(!status.contains("Rescanning"), "{status}");
             assert_eq!(folder.path, home.join("child"));
             assert_eq!(
                 folder.rows[0].path.file_name().unwrap(),
@@ -1445,8 +1479,6 @@ mod tests {
                     "moved"
                 }
             );
-            let status = disk.mailbox.lock().unwrap().status.take().unwrap();
-            assert!(!status.contains("Rescanning"), "{status}");
             drop(disk);
             worker.join().unwrap();
             fs::remove_dir_all(home).unwrap();
