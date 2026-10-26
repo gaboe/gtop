@@ -42,8 +42,8 @@ pub fn apply(base: Base, cx: &mut App) {
         theme.button_foreground = rgb(t.silk_dim).into();
         theme.danger = rgb(base.hot).into();
         theme.danger_foreground = rgb(t.on_led).into();
-        theme.table = rgb(crate::palette::mix(base.ground, 0, 0.8)).into();
-        theme.table_head = rgb(crate::palette::mix(base.plate, 0, 0.6)).into();
+        theme.table = rgb(t.table).into();
+        theme.table_head = rgb(t.table_head).into();
         theme.table_head_foreground = rgb(t.silk_dim).into();
         theme.table_even = theme.table;
         theme.table_hover = rgb(t.plate2).into();

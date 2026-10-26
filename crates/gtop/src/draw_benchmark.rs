@@ -164,6 +164,13 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         );
         view
     });
+    let colors = palette::ColorField::ALL.map(|field| {
+        cx.new(|cx| InputState::new(window, cx).default_value(format!("#{:06x}", field.get(base))))
+    });
+    let color_pickers = palette::ColorField::ALL.map(|field| {
+        cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb(field.get(base))))
+    });
+    let subscriptions = Monitor::palette_subscriptions(&colors, &color_pickers, window, cx);
     Monitor {
         core: None,
         snapshot: Some(snapshot.clone()),
@@ -192,7 +199,9 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         last_snapshot: None,
         focus,
         draft: None,
-        colors: std::array::from_fn(|_| cx.new(|cx| InputState::new(window, cx))),
+        colors,
+        color_pickers,
+        picker_hex_synced: [false; 6],
         mix_name: cx.new(|cx| InputState::new(window, cx)),
         traces: [(
             ProcessKey::from(&snapshot.processes[0]),
@@ -205,7 +214,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         status: String::new(),
         pending_kill: None,
         wake: mpsc::channel(1).0,
-        _subscriptions: vec![],
+        _subscriptions: subscriptions,
         _refresh: Some(Task::ready(())),
         shutdown: None,
         _ports: Task::ready(()),
@@ -453,4 +462,474 @@ fn disk_keyboard_scroll_reveals_selected_row_after_summary() {
     assert!(selected.bottom() <= body.bottom());
     cx.update(|cx| m.update(cx, |m, _| m.disk.as_mut().unwrap().close()));
     std::fs::remove_dir_all(home).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "offscreen palette review; set GTOP_PALETTE_RENDER_DIR"]
+fn aluminium_offscreen_review() {
+    let directory = std::path::PathBuf::from(
+        std::env::var("GTOP_PALETTE_RENDER_DIR").expect("render directory"),
+    );
+    std::fs::create_dir_all(&directory).unwrap();
+    let disk_home = directory.join("disk-home");
+    std::fs::create_dir_all(&disk_home).unwrap();
+    for i in 0..160 {
+        std::fs::write(disk_home.join(format!("file-{i:03}")), [1u8; 4096]).unwrap();
+    }
+    FIXED_CLOCK.with(|v| v.set(true));
+    let mut cx = HeadlessAppContext::with_platform(
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+        Arc::new(gpui_kit_assets::Assets),
+        || {
+            Ok(Some(Box::new(
+                gpui_apple::metal_renderer::MetalHeadlessRenderer::new(),
+            )))
+        },
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    for bytes in [
+        include_bytes!("../assets/fonts/DotoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/JetBrainsMono.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoLabels.ttf").as_slice(),
+        include_bytes!("../assets/fonts/Silkscreen.ttf").as_slice(),
+    ] {
+        cx.text_system()
+            .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
+            .unwrap();
+    }
+
+    let mut monitor = None;
+    let handle = cx
+        .open_window(size(px(1480.), px(960.)), |window, cx| {
+            let entity = cx.new(|cx| fixture(window, cx));
+            entity.update(cx, |m, cx| {
+                m.settings.active = 4;
+                let base = m.settings.base();
+                m.table.update(cx, |table, cx| {
+                    table.base = base;
+                    cx.notify();
+                });
+                theme::apply(base, cx);
+                for field in palette::ColorField::ALL {
+                    m.color_pickers[field as usize].update(cx, |picker, cx| {
+                        picker.set_value(rgb(field.get(base)), window, cx)
+                    });
+                    m.colors[field as usize].update(cx, |input, cx| {
+                        input.set_value(format!("#{:06x}", field.get(base)), window, cx)
+                    });
+                }
+            });
+            monitor = Some(entity.clone());
+            cx.new(|cx| Root::new(entity, window, cx))
+        })
+        .unwrap();
+    let monitor = monitor.unwrap();
+    for (name, view, detail, kill) in [
+        ("live", None, false, false),
+        ("history", Some(2), false, false),
+        ("detail", None, true, false),
+        ("kill-confirmation", None, true, true),
+        ("disk", None, false, false),
+        ("palette", None, false, false),
+        ("picker", None, false, false),
+    ] {
+        cx.update(|cx| {
+            monitor.update(cx, |m, cx| {
+                m.view = view;
+                m.settings_open = matches!(name, "palette" | "picker");
+                if name == "picker" {
+                    m.color_pickers[palette::ColorField::Led as usize]
+                        .update(cx, |picker, cx| picker.set_open(true, cx));
+                }
+                m.details = None;
+                m.disk = None;
+                if name == "disk" {
+                    m.prepare_disk_scroll_test(disk_home.clone());
+                }
+                if detail {
+                    m.select(
+                        ProcessKey::from(&m.snapshot.as_ref().unwrap().processes[0]),
+                        cx,
+                    );
+                }
+                if kill {
+                    let key = ProcessKey::from(&m.snapshot.as_ref().unwrap().processes[0]);
+                    m.details.as_mut().unwrap().request_kill(key, true);
+                }
+                cx.notify();
+            })
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        cx.capture_screenshot(handle.into())
+            .unwrap()
+            .save(directory.join(format!("{name}.png")))
+            .unwrap();
+    }
+    FIXED_CLOCK.with(|v| v.set(false));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn picker_events_update_live_palette_and_coalesce_saved_settings() {
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("palette-events"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let (sender, mut receiver) = mpsc::unbounded();
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |m, _| {
+            m.settings_writes = Some(sender);
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+    let original = palette::presets()[0].base;
+    for field in palette::ColorField::ALL {
+        cx.update_window(handle.into(), |_, window, cx| {
+            let picker = monitor.read(cx).color_pickers[field as usize].clone();
+            picker.update(cx, |picker, cx| {
+                picker.update_color(gpui::rgba(0x12345680).into(), window, cx)
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let m = monitor.read(cx);
+            assert_eq!(field.get(m.settings.base()), 0x123456);
+            assert_eq!(m.table.read(cx).base, m.settings.base());
+            assert_eq!(m.settings.saved.len(), 1);
+            assert_eq!(
+                m.color_pickers[field as usize].read(cx).value(),
+                Some(rgb(0x123456).into())
+            );
+            assert_eq!(m.settings.active, palette::presets().len());
+            assert_eq!(
+                m.colors[field as usize].read(cx).value().as_str(),
+                "#123456"
+            );
+        });
+    }
+    cx.update_window(handle.into(), |_, window, cx| {
+        let input = monitor.read(cx).colors[palette::ColorField::Led as usize].clone();
+        window.focus(&input.read(cx).focus_handle(cx), cx);
+        input.update(cx, |input, cx| {
+            input.set_value("#654321", window, cx);
+            cx.emit(InputEvent::Change);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        let m = monitor.read(cx);
+        assert_eq!(m.settings.base().led, 0x654321);
+        assert!(m.colors[palette::ColorField::Led as usize]
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window));
+        assert_eq!(
+            m.color_pickers[palette::ColorField::Led as usize]
+                .read(cx)
+                .value(),
+            Some(rgb(0x654321).into())
+        );
+    })
+    .unwrap();
+    let latest = futures::executor::block_on(palette::next_settings(&mut receiver)).unwrap();
+    assert_eq!(latest.base().led, 0x654321);
+    assert_eq!(latest.saved.len(), 1);
+    assert_eq!(palette::presets()[0].base, original);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn random_draft_color_edits_stay_unsaved_until_save_or_discard() {
+    use gpui::{prelude::*, px, size, TestAppContext, TestDispatcher, VisualTestContext};
+    use gpui_component::Root;
+
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("random-draft-edit"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let (sender, mut receiver) = mpsc::unbounded();
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |m, _| {
+            m.settings.active = 5;
+            m.settings.saved.push(palette::Palette {
+                name: "Saved mix".into(),
+                base: palette::presets()[0].base,
+            });
+            m.settings_open = true;
+            m.draft = Some(palette::presets()[4].base);
+            m.settings_writes = Some(sender);
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        monitor.update(cx, |m, cx| {
+            let picker = m.color_pickers[palette::ColorField::Led as usize].clone();
+            picker.update(cx, |picker, cx| {
+                picker.update_color(rgb(0x654321).into(), window, cx)
+            });
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let m = monitor.read(cx);
+        assert_eq!(m.settings.active, 5);
+        assert_eq!(m.settings.saved.len(), 1);
+        assert_eq!(m.settings.saved[0].base, palette::presets()[0].base);
+        assert_eq!(m.draft.unwrap().led, 0x654321);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    let mut visual = VisualTestContext::from_window(handle.into(), &cx);
+    let discard = visual.debug_bounds("discard-palette").unwrap();
+    visual.simulate_click(discard.center(), Modifiers::default());
+    cx.update(|cx| {
+        let m = monitor.read(cx);
+        assert!(m.draft.is_none());
+        assert_eq!(m.settings.active, 5);
+        assert_eq!(m.settings.base(), palette::presets()[0].base);
+    });
+    let restored = futures::executor::block_on(palette::next_settings(&mut receiver)).unwrap();
+    assert_eq!(restored.base(), palette::presets()[0].base);
+    assert_eq!(restored.saved.len(), 1);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn saving_an_edited_random_draft_creates_one_saved_copy() {
+    use gpui::{prelude::*, px, size, TestAppContext, TestDispatcher, VisualTestContext};
+    use gpui_component::Root;
+
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("save-edited-random-draft"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let (sender, mut receiver) = mpsc::unbounded();
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |m, _| {
+            m.settings.active = 5;
+            m.settings.saved.push(palette::Palette {
+                name: "Saved mix".into(),
+                base: palette::presets()[0].base,
+            });
+            m.settings_open = true;
+            m.draft = Some(palette::presets()[4].base);
+            m.settings_writes = Some(sender);
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        monitor.update(cx, |m, cx| {
+            m.color_pickers[palette::ColorField::Led as usize].update(cx, |picker, cx| {
+                picker.update_color(rgb(0x654321).into(), window, cx)
+            });
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    let mut visual = VisualTestContext::from_window(handle.into(), &cx);
+    let save = visual.debug_bounds("save-palette").unwrap();
+    visual.simulate_click(save.center(), Modifiers::default());
+    cx.update(|cx| {
+        let m = monitor.read(cx);
+        assert!(m.draft.is_none());
+        assert_eq!(m.settings.active, 6);
+        assert_eq!(m.settings.saved.len(), 2);
+        assert_eq!(m.settings.base().led, 0x654321);
+        assert_eq!(m.settings.saved[0].base, palette::presets()[0].base);
+    });
+    let saved = futures::executor::block_on(palette::next_settings(&mut receiver)).unwrap();
+    assert_eq!(saved.active, 6);
+    assert_eq!(saved.saved.len(), 2);
+    assert_eq!(saved.base().led, 0x654321);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn entering_the_untouched_picker_hex_keeps_aluminium_rgb() {
+    use gpui::{prelude::*, px, size, TestAppContext, TestDispatcher};
+    use gpui_component::Root;
+
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("untouched-picker-hex"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let (sender, mut receiver) = mpsc::unbounded();
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |m, cx| {
+            m.settings.active = 4;
+            m.settings_open = true;
+            m.settings_writes = Some(sender);
+            let base = m.settings.base();
+            m.color_pickers[palette::ColorField::Led as usize].update(cx, |picker, cx| {
+                picker.set_value(rgb(base.led), window, cx);
+                picker.set_open(true, cx);
+            });
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+        let picker = monitor.read(cx).color_pickers[palette::ColorField::Led as usize].clone();
+        window.focus(&picker.read(cx).hex_input().read(cx).focus_handle(cx), cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(handle.into(), "enter");
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let m = monitor.read(cx);
+        assert_eq!(m.settings.base().led, 0x923d18);
+        assert!(m.settings.saved.is_empty());
+        assert_eq!(m.settings.active, 4);
+    });
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn deleting_a_saved_palette_while_amber_is_active_queues_settings() {
+    use gpui::{prelude::*, px, size, TestAppContext, TestDispatcher, VisualTestContext};
+    use gpui_component::Root;
+
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("delete-saved-palette"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let (sender, mut receiver) = mpsc::unbounded();
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |m, _| {
+            m.settings.saved.push(palette::Palette {
+                name: "Saved mix".into(),
+                base: palette::presets()[1].base,
+            });
+            m.settings.active = 0;
+            m.settings_open = true;
+            m.settings_writes = Some(sender);
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    let mut visual = VisualTestContext::from_window(handle.into(), &cx);
+    let delete = visual.debug_bounds("delete-palette-5").unwrap();
+    visual.simulate_click(delete.center(), Modifiers::default());
+    cx.update(|cx| {
+        let m = monitor.read(cx);
+        assert_eq!(m.settings.active, 0);
+        assert!(m.settings.saved.is_empty());
+    });
+    let queued = futures::executor::block_on(palette::next_settings(&mut receiver)).unwrap();
+    assert_eq!(queued.active, 0);
+    assert!(queued.saved.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn tower_title_stays_clear_of_the_upper_left_screw(cx: &mut TestAppContext) {
+    use gpui::{prelude::*, px, size, VisualTestContext};
+
+    struct TowerHeader(palette::Tokens);
+    impl Render for TowerHeader {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .w(px(300.))
+                .h(px(40.))
+                .child(rack::screws(&self.0, "tower"))
+                .child(rack::tower_title("SYSTEM MONITOR", &self.0))
+        }
+    }
+
+    for index in 0..palette::presets().len() {
+        let handle = cx.open_window(size(px(320.), px(80.)), |_, _| {
+            TowerHeader(palette::presets()[index].base.tokens())
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let mut visual = VisualTestContext::from_window(handle.into(), cx);
+        let title = visual.debug_bounds("tower-title").unwrap();
+        let screw = visual.debug_bounds("tower-screw-top-left").unwrap();
+        assert!(
+            title.origin.x >= screw.origin.x + screw.size.width,
+            "preset {index}: title {title:?} overlaps screw {screw:?}"
+        );
+    }
 }

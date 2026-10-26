@@ -287,9 +287,10 @@ impl Monitor {
                 .items_center()
                 .gap_3()
                 .p(px(8.))
-                .bg(rgb(theme::MANTLE))
+                .bg(rgb(t.confirmation_surface))
                 .border_1()
                 .border_color(rgb(theme::RED))
+                .text_color(rgb(t.base.silk))
                 .child(format!(
                     "Kill {} · PID {} · started {}?",
                     self.selected_process()
@@ -326,7 +327,7 @@ impl Monitor {
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
         let mut frame = div()
             .relative()
-            .child(crate::rack::screws(&t))
+            .child(crate::rack::screws(&t, "details"))
             .flex()
             .flex_col()
             .flex_shrink_0()

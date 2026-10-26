@@ -9,6 +9,103 @@ pub struct Base {
     pub hot: u32,
     pub ok: u32,
 }
+
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub enum ColorField {
+    Ground,
+    Plate,
+    Silk,
+    Led,
+    Hot,
+    Ok,
+}
+impl ColorField {
+    pub const ALL: [Self; 6] = [
+        Self::Ground,
+        Self::Plate,
+        Self::Silk,
+        Self::Led,
+        Self::Hot,
+        Self::Ok,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ground => "Ground",
+            Self::Plate => "Panel",
+            Self::Silk => "Labels",
+            Self::Led => "Accent",
+            Self::Hot => "Hot",
+            Self::Ok => "OK and ports",
+        }
+    }
+    pub fn get(self, base: Base) -> u32 {
+        match self {
+            Self::Ground => base.ground,
+            Self::Plate => base.plate,
+            Self::Silk => base.silk,
+            Self::Led => base.led,
+            Self::Hot => base.hot,
+            Self::Ok => base.ok,
+        }
+    }
+    pub fn set(self, base: &mut Base, value: u32) {
+        match self {
+            Self::Ground => base.ground = value,
+            Self::Plate => base.plate = value,
+            Self::Silk => base.silk = value,
+            Self::Led => base.led = value,
+            Self::Hot => base.hot = value,
+            Self::Ok => base.ok = value,
+        }
+    }
+}
+
+pub fn contrast(a: u32, b: u32) -> f64 {
+    fn luminance(color: u32) -> f64 {
+        0.2126 * linear((color >> 16) as f64 / 255.)
+            + 0.7152 * linear(((color >> 8) & 255) as f64 / 255.)
+            + 0.0722 * linear((color & 255) as f64 / 255.)
+    }
+    let a = luminance(a);
+    let b = luminance(b);
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+impl Base {
+    pub fn text_contrast(self, field: ColorField) -> f64 {
+        let t = self.tokens();
+        let colors = [
+            self.silk, t.silk_dim, t.ink_row, t.cmd, self.led, self.hot, self.ok,
+        ];
+        let selected = field.get(self);
+        let foregrounds: &[u32] = match field {
+            ColorField::Led | ColorField::Hot | ColorField::Ok => std::slice::from_ref(&selected),
+            _ => &colors,
+        };
+        let mut minimum = f64::INFINITY;
+        for &foreground in foregrounds {
+            for background in [
+                self.ground,
+                self.plate,
+                t.confirmation_surface,
+                t.plate2,
+                t.well,
+                t.table,
+                t.table_head,
+                t.selection,
+                t.readout,
+            ] {
+                minimum = minimum.min(contrast(foreground, background));
+            }
+        }
+        if matches!(field, ColorField::Led | ColorField::Hot) {
+            minimum = minimum.min(contrast(t.on_led, field.get(self)));
+        }
+        minimum
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Palette {
     pub name: String,
@@ -63,12 +160,12 @@ pub fn presets() -> Vec<Palette> {
         Palette {
             name: "Aluminium".into(),
             base: Base {
-                ground: 0x9fa3a8,
-                plate: 0xc8cbcf,
-                silk: 0x121315,
-                led: 0xff5a00,
-                hot: 0xc40000,
-                ok: 0x00874a,
+                ground: 0xe8e9e5,
+                plate: 0xf5f5f0,
+                silk: 0x252a2b,
+                led: 0x923d18,
+                hot: 0xac292a,
+                ok: 0x236344,
             },
         },
     ]
@@ -89,6 +186,12 @@ pub struct Tokens {
     pub cmd: u32,
     pub on_led: u32,
     pub light: bool,
+    pub table: u32,
+    pub table_head: u32,
+    pub selection: u32,
+    pub readout: u32,
+    pub well_rule: u32,
+    pub confirmation_surface: u32,
 }
 fn linear(v: f64) -> f64 {
     if v <= 0.04045 {
@@ -146,12 +249,12 @@ impl Base {
         Tokens {
             base: b,
             light,
-            plate2: mix(b.plate, b.silk, if light { 0.88 } else { 0.93 }),
-            rule: mix(b.plate, b.silk, if light { 0.78 } else { 0.86 }),
-            rule_hi: mix(b.plate, b.silk, if light { 0.62 } else { 0.74 }),
-            silk_dim: mix(b.silk, b.plate, 0.58),
+            plate2: mix(b.plate, b.silk, if light { 0.94 } else { 0.93 }),
+            rule: mix(b.plate, b.silk, if light { 0.82 } else { 0.86 }),
+            rule_hi: mix(b.plate, b.silk, if light { 0.46 } else { 0.74 }),
+            silk_dim: mix(b.silk, b.plate, if light { 0.76 } else { 0.58 }),
             ink_row: mix(b.silk, b.plate, 0.78),
-            seg_off: mix(b.plate, b.silk, if light { 0.82 } else { 0.9 }),
+            seg_off: mix(b.plate, b.silk, if light { 0.91 } else { 0.9 }),
             hot_off: mix(b.hot, b.plate, 0.2),
             led_off: mix(b.led, b.plate, 0.16),
             well: mix(
@@ -160,8 +263,30 @@ impl Base {
                 if light { 0.8 } else { 0.6 },
             ),
             row_rule: mix(b.ground, b.silk, if light { 0.88 } else { 0.94 }),
-            cmd: mix(b.silk, b.ground, if light { 0.6 } else { 0.48 }),
+            cmd: mix(b.silk, b.ground, if light { 0.76 } else { 0.48 }),
             on_led: if light { 0xffffff } else { 0 },
+            table: if light {
+                mix(b.ground, 0xffffff, 0.35)
+            } else {
+                mix(b.ground, 0, 0.8)
+            },
+            table_head: if light {
+                b.ground
+            } else {
+                mix(b.plate, 0, 0.6)
+            },
+            selection: if light {
+                mix(b.plate, b.led, 0.92)
+            } else {
+                mix(mix(b.plate, b.silk, 0.93), b.led, 0.7)
+            },
+            readout: if light {
+                mix(b.ground, 0xffffff, 0.35)
+            } else {
+                mix(b.ground, 0, 0.8)
+            },
+            well_rule: if light { mix(b.plate, b.silk, 0.82) } else { 0 },
+            confirmation_surface: if light { b.plate } else { crate::theme::MANTLE },
         }
     }
 }
@@ -232,6 +357,27 @@ pub async fn finish_writer<W>(
 }
 
 impl Settings {
+    pub fn edit_base(&mut self, base: Base) -> bool {
+        if self.base() == base {
+            return false;
+        }
+        let presets = presets();
+        if let Some(saved) = self
+            .active
+            .checked_sub(presets.len())
+            .and_then(|i| self.saved.get_mut(i))
+        {
+            saved.base = base;
+        } else {
+            let original = presets.get(self.active).unwrap_or(&presets[0]);
+            self.saved.push(Palette {
+                name: format!("{} custom", original.name),
+                base,
+            });
+            self.active = presets.len() + self.saved.len() - 1;
+        }
+        true
+    }
     pub fn load() -> Self {
         std::fs::read(super::history::support_path("palette.json"))
             .ok()
@@ -276,6 +422,134 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aluminium_contrast_covers_text_controls_and_meters() {
+        let t = presets()[4].base.tokens();
+        let backgrounds = [
+            ("ground", t.base.ground),
+            ("plate", t.base.plate),
+            ("kill confirmation", t.confirmation_surface),
+            ("secondary", t.plate2),
+            ("well", t.well),
+            ("table", t.table),
+            ("header", t.table_head),
+            ("selection", t.selection),
+            ("readout", t.readout),
+        ];
+        for (name, color) in [
+            ("silk", t.base.silk),
+            ("dim", t.silk_dim),
+            ("row", t.ink_row),
+            ("command", t.cmd),
+            ("accent", t.base.led),
+            ("critical", t.base.hot),
+            ("positive", t.base.ok),
+        ] {
+            for (surface, background) in backgrounds {
+                let ratio = contrast(color, background);
+                println!("text {name}/{surface}: {ratio:.2}:1");
+                assert!(ratio >= 4.5, "{name}/{surface}: {ratio:.2}:1 < 4.5");
+            }
+        }
+        for (name, foreground, background) in [
+            ("primary button", t.on_led, t.base.led),
+            ("danger button", t.on_led, t.base.hot),
+        ] {
+            println!("button {name}: {:.2}:1", contrast(foreground, background));
+            assert!(contrast(foreground, background) >= 4.5, "{name}");
+        }
+        for (name, surface) in backgrounds {
+            println!("control {name}: {:.2}:1", contrast(t.rule_hi, surface));
+            assert!(
+                contrast(t.rule_hi, surface) >= 3.,
+                "control outline/{name}: {}",
+                contrast(t.rule_hi, surface)
+            );
+        }
+        for ink in [t.base.led, t.base.hot, t.base.ok] {
+            for background in [
+                t.readout,
+                t.seg_off,
+                mix(t.base.led, t.base.ground, 0.12),
+                t.hot_off,
+            ] {
+                println!(
+                    "meter {ink:06x}/{background:06x}: {:.2}:1",
+                    contrast(ink, background)
+                );
+                assert!(
+                    contrast(ink, background) >= 3.,
+                    "meter {ink:06x}/{background:06x}: {}",
+                    contrast(ink, background)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn editing_a_preset_creates_one_saved_copy_and_round_trips() {
+        for field in ColorField::ALL {
+            let mut settings = Settings {
+                active: 4,
+                ..Default::default()
+            };
+            let original = settings.base();
+            let mut edited = original;
+            field.set(&mut edited, 0x123456);
+            assert!(settings.edit_base(edited));
+            assert_eq!(settings.saved.len(), 1);
+            assert_eq!(settings.active, presets().len());
+            assert_eq!(settings.base(), edited);
+            assert_eq!(presets()[4].base, original);
+            assert!(!settings.edit_base(edited));
+            field.set(&mut edited, 0x345678);
+            assert!(settings.edit_base(edited));
+            assert_eq!(settings.saved.len(), 1);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("palette.json");
+            settings.save_to(&path).unwrap();
+            let stored: Settings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(stored.active, settings.active);
+            assert_eq!(stored.base(), edited);
+            assert_eq!(stored.saved[0].name, "Aluminium custom");
+        }
+    }
+
+    #[test]
+    fn custom_palette_contrast_reports_readable_and_unreadable_text() {
+        let mut base = presets()[4].base;
+        for field in ColorField::ALL {
+            assert!(base.text_contrast(field) >= 4.5);
+        }
+        base.led = base.plate;
+        assert_eq!(base.text_contrast(ColorField::Led), 1.);
+        base.silk = base.ground;
+        assert!(base.text_contrast(ColorField::Silk) < 4.5);
+    }
+
+    #[test]
+    fn kill_confirmation_text_contrasts_with_its_surface_in_every_preset() {
+        for preset in presets() {
+            let tokens = preset.base.tokens();
+            assert!(
+                contrast(preset.base.silk, tokens.confirmation_surface) >= 4.5,
+                "{} kill confirmation: {:.2}:1",
+                preset.name,
+                contrast(preset.base.silk, tokens.confirmation_surface)
+            );
+        }
+        for preset in presets()
+            .into_iter()
+            .filter(|preset| preset.name != "Aluminium")
+        {
+            assert_eq!(
+                preset.base.tokens().confirmation_surface,
+                crate::theme::MANTLE
+            );
+        }
+    }
+
     #[test]
     fn invalid_width_data_keeps_palette_selection() {
         let settings: Settings = serde_json::from_str(r#"{"active":3,"saved":[],"process_widths":{"columns":{"name":"bad"},"fill_name":true},"history_widths":null}"#).unwrap();

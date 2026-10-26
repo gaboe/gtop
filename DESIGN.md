@@ -66,13 +66,34 @@ The other shipped palettes use the same roles, in this order:
 | Ice | #07090c | #0f141a | #dfe8f0 | #43d6ff | #ff3b6b | #b4ff39 |
 | Phosphor | #050805 | #0c120d | #d6f5d9 | #39ff6a | #ff4a2e | #d8ff5a |
 | Neon | #0a0710 | #130e1c | #f1e6ff | #ff2bd6 | #ffe600 | #00f0ff |
-| Aluminium | #9fa3a8 | #c8cbcf | #121315 | #ff5a00 | #c40000 | #00874a |
+| Aluminium | #e8e9e5 | #f5f5f0 | #252a2b | #923d18 | #ac292a | #236344 |
 
 `Base::tokens` derives secondary colors in OKLab. `mix(a, b, p)` gives `a` weight `p`.
-`silk_dim` mixes silk and plate at 0.58. `ink_row` uses 0.78.
+In dark palettes, `silk_dim` mixes silk and plate at 0.58. `ink_row` uses 0.78.
 `rule`, `rule_hi`, `plate2`, `well`, and `row_rule` adapt to the base ground's brightness.
-Inactive segments mix led and ground at 0.12. Ghost digits use 0.18.
+Dark inactive segments mix led and ground at 0.12. Ghost digits use 0.18.
 Use these derived roles when a palette changes. Fixed gray replacements lose the palette relationship.
+
+### Aluminium light mode
+
+Aluminium uses a warm silver ground and pale enamel plates. Charcoal labels and
+burnt-orange readings keep the rack legible in daylight. Red marks high load;
+forest green marks positive status. Values and labels retain the same geometry.
+
+Light readout and table wells use `well`; table headings use `table_head`.
+`selection` is a quiet orange wash. `plate2` marks secondary and hover surfaces.
+`silk_dim` and `cmd` retain text contrast on every light surface.
+`rule_hi` supplies control outlines and the scrollbar. Quiet row rules separate
+rows without competing with data. Disk selection uses `selection`, not an outline
+color. Active meter ink contrasts with both the well and inactive segments.
+Ghost digits remain faint guides. They do not carry values.
+
+Light mode disables glyph, lamp, unit, and segment glow. Dark palettes retain
+all existing colors and mixes. The contrast test in `palette.rs` checks text,
+control outlines, status, selections, and meter ink against their real surfaces.
+The ignored `aluminium_offscreen_review` test renders live, history, detail, and
+disk fixtures through GPUI's headless Metal renderer. It never opens a native window.
+Set `GTOP_PALETTE_RENDER_DIR` to the output directory before running that test.
 
 ## Typography
 
@@ -143,10 +164,10 @@ bar full and add up to four bright overflow ticks, so multi-core use remains vis
 Live process CPU bars use the same percentage shown in the CPU column. History CPU
 bars use each process's peak CPU percentage. The live column heading is `CPU %`.
 A CPU bar ignores negative and non-finite values.
-The table virtualizes rows. A selected process row uses `mix(plate2, led, 0.7)`.
+The table virtualizes rows. A selected process row uses `selection`, which retains `mix(plate2, led, 0.7)` in dark palettes.
 Selected history rows use `plate2`. Neither table adds a hover fill or a silk selection border.
 Row separators use `row_rule`.
-The table well and header use distinct dark mixes of ground and plate.
+The table well and header use `table` and `table_head`. Dark palettes retain their distinct mixes of ground and plate.
 
 ### Buttons and inputs
 
@@ -159,7 +180,15 @@ Dangerous actions use `hot`. Secondary controls use `plate` and `plate2`.
 
 Live and history controls sit above the main area. Keyboard hints use bordered keycaps.
 The tower stays visible beside process details, history moments, disk information, and the palette editor.
-The palette editor exposes the six base roles and saved mixes.
+The palette editor exposes the six base roles and saved mixes. Each role has a
+native ColorPicker and a six-digit hex input. Picker and hex edits apply live.
+The first edit to a preset creates a saved custom copy. Later edits update that
+copy through the coalesced settings writer. Random mixes remain drafts until saved.
+Each row shows its minimum text contrast across the derived panel, readout, table,
+and selected-row backgrounds. Accent and Hot also check the button foreground.
+The row says `Below AA` below 4.5:1. This warning uses black or white ink so it
+remains readable when the custom palette has poor text contrast.
+The palette panel scrolls when saved copies exceed the available height.
 
 ## Do's and Don'ts
 
