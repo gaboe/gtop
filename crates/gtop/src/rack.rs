@@ -677,10 +677,10 @@ pub fn hatch(color: u32) -> Div {
 }
 
 pub fn segments(value: f32, n: usize, t: &Tokens) -> Div {
-    let active = (value.clamp(0., 100.) / 100. * n as f32).round() as usize;
+    let active = segment_fill(value, n);
     div()
         .flex()
-        .gap(px(2.))
+        .gap(px(CPU_SEGMENT_GAP))
         .h(px(8.))
         .w_full()
         .children((0..n).map(|i| {
@@ -701,6 +701,85 @@ pub fn segments(value: f32, n: usize, t: &Tokens) -> Div {
                     bar.shadow(vec![crate::glow::shadow(t.base.led, 4., 153)])
                 })
         }))
+}
+
+fn segment_fill(value: f32, n: usize) -> usize {
+    if !value.is_finite() || n == 0 {
+        return 0;
+    }
+    (value.clamp(0., 100.) / 100. * n as f32).round() as usize
+}
+
+const CPU_SEGMENT_GAP: f32 = 2.;
+const CPU_OVERFLOW_WIDTH: f32 = 11.;
+const CPU_OVERFLOW_GAP: f32 = 2.;
+const CPU_MIN_SEGMENT_WIDTH: f32 = 1.;
+
+fn cpu_segment_count(n: usize, width: f32, overflow: bool) -> usize {
+    let reserved = if overflow {
+        CPU_OVERFLOW_WIDTH + CPU_OVERFLOW_GAP
+    } else {
+        0.
+    };
+    let available = (width - reserved).max(0.);
+    let fit = ((available + CPU_SEGMENT_GAP) / (CPU_MIN_SEGMENT_WIDTH + CPU_SEGMENT_GAP)).floor()
+        as usize;
+    n.min(fit)
+}
+
+pub fn cpu_segments(value: f32, n: usize, width: f32, height: f32, t: &Tokens) -> Div {
+    let overflow = if value.is_finite() && value > 100. {
+        ((value / 100.).ceil() as usize).saturating_sub(1).min(4)
+    } else {
+        0
+    };
+    let segment_count = cpu_segment_count(n, width, overflow > 0);
+    div()
+        .flex()
+        .items_center()
+        .gap(px(CPU_OVERFLOW_GAP))
+        .w(px(width))
+        .h(px(height))
+        .child(
+            segments(value, segment_count, t)
+                .flex_1()
+                .min_w_0()
+                .h(px(height)),
+        )
+        .when(overflow > 0, |bar| {
+            bar.child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .gap(px(1.))
+                    .children((0..4).map(|index| {
+                        let active = index < overflow;
+                        div()
+                            .w(px(2.))
+                            .h(px(height))
+                            .bg(rgb(if active { t.base.hot } else { t.seg_off }))
+                            .when(active && !t.light, |tick| {
+                                tick.shadow(vec![crate::glow::shadow(t.base.hot, 4., 153)])
+                            })
+                    })),
+            )
+        })
+}
+
+#[cfg(test)]
+mod cpu_segment_tests {
+    use super::segment_fill;
+
+    #[test]
+    fn cpu_bar_fill_uses_one_core_as_full_scale() {
+        assert_eq!(segment_fill(0., 18), 0);
+        assert_eq!(segment_fill(54., 18), 10);
+        assert_eq!(segment_fill(100., 18), 18);
+        assert_eq!(segment_fill(104., 18), 18);
+        assert_eq!(segment_fill(400., 18), 18);
+        assert_eq!(segment_fill(f32::NAN, 18), 0);
+        assert_eq!(segment_fill(-4., 18), 0);
+    }
 }
 
 fn core_label(prefix: &str, number: usize) -> String {
@@ -1542,7 +1621,7 @@ impl Monitor {
                     [
                         ("PROCESS", Column::Name, false),
                         ("CORE TIME ▼", Column::CoreTime, true),
-                        ("SHARE", Column::Share, false),
+                        ("PEAK CPU %", Column::Share, false),
                         ("OF ALL CPU", Column::CpuShare, true),
                         ("GPU TIME", Column::GpuTime, true),
                         ("PEAK MEMORY", Column::PeakMemory, true),
@@ -1600,128 +1679,158 @@ impl Monitor {
                         .min_w_0()
                         .overflow_x_scroll()
                         .child(events)
-                        .child(div()
-                        .w(px(total))
-                        .h_full()
-                        .flex()
-                        .flex_col()
-                        .border_1()
-                        .border_color(rgb(t.rule))
-                        .child(headers)
                         .child(
-                            uniform_list(
-                                "history-rows",
-                                h.rows.len(),
-                                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                                    let widths = this.settings.history_widths
-                                        .compute(&HISTORY, this.history_columns.viewport);
-                                    let h = &this.history[index];
-                                    let t = this.draft.unwrap_or(this.settings.base()).tokens();
-                                    range
-                                        .filter_map(|row| {
-                                            let (name, p) = h.rows.get(row)?;
-                                            let selected = this
-                                                .history_selected
-                                                .as_ref()
-                                                .map(|n| n == name)
-                                                .unwrap_or(row == 0);
-                                            let key = name.clone();
-                                            let row_text = |text: String| {
-                                                if selected || row < 3 {
-                                                    crate::glow::text(text, false, &t)
-                                                        .into_any_element()
-                                                } else {
-                                                    text.into_any_element()
-                                                }
-                                            };
-                                            Some(
-                                                history_row()
-                                                    .id(("history-row", row))
-                                                    .bg(rgb(if selected {
-                                                        t.plate2
-                                                    } else {
-                                                        t.base.ground
-                                                    }))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.history_selected = Some(key.clone());
-                                                        cx.notify();
-                                                    }))
-                                                    .border_b_1()
-                                                    .border_color(rgb(t.row_rule))
-                                                    .text_color(rgb(if selected || row < 3 {
-                                                        t.base.led
-                                                    } else {
-                                                        t.ink_row
-                                                    }))
-                                                    .child(
-                                                        div()
-                                                            .w(px(22.))
-                                                            .flex_shrink_0()
-                                                            .px(px(10.))
-                                                            .child(
-                                                                lamp(t.base.led, row < 3, &t)
-                                                                    .w(px(7.))
-                                                                    .h(px(12.)),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        history_cell(widths[1], false)
-                                                            .truncate()
-                                                            .child(row_text(name.clone())),
-                                                    )
-                                                    .child(
-                                                        history_cell(widths[2], true).child(row_text(
-                                                            core_time(p.cpu_seconds),
-                                                        )),
-                                                    )
-                                                    .child(
-                                                        history_cell(widths[3], false).child(
-                                                            segments(
-                                                                (p.cpu_seconds
-                                                                    / h.rows
-                                                                        .first()
-                                                                        .map(|r| r.1.cpu_seconds)
-                                                                        .unwrap_or(1.)
-                                                                        .max(0.001)
-                                                                    * 100.)
-                                                                    as f32,
-                                                                30,
-                                                                &t,
-                                                            )
-                                                            .w_full()
-                                                            .max_w(px(120.)),
-                                                        ),
-                                                    )
-                                                    .child(history_cell(widths[4], true).child(row_text(
-                                                        format!(
-                                                            "{:.1}%",
-                                                            p.cpu_seconds / h.total_cpu.max(0.001)
-                                                                * 100.
-                                                        ),
-                                                    )))
-                                                    .child(history_cell(widths[5], true).child(row_text(
-                                                        if p.gpu_seconds > 3. {
-                                                            core_time(p.gpu_seconds)
-                                                        } else {
-                                                            "·".into()
-                                                        },
-                                                    )))
-                                                    .child(
-                                                        history_cell(widths[6], true)
-                                                            .child(row_text(bytes(p.peak_memory))),
-                                                    )
-                                                    .child(history_cell(widths[7], true).child(
-                                                        row_text(format!("{:.1}", p.peak_cpu)),
-                                                    )),
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                }),
-                            )
-                            .track_scroll(&self.history_scroll)
-                            .flex_1()
-                            .min_h_0(),
-                        )),
+                            div()
+                                .w(px(total))
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .border_1()
+                                .border_color(rgb(t.rule))
+                                .child(headers)
+                                .child(
+                                    uniform_list(
+                                        "history-rows",
+                                        h.rows.len(),
+                                        cx.processor(
+                                            move |this, range: std::ops::Range<usize>, _, cx| {
+                                                let widths = this.settings.history_widths.compute(
+                                                    &HISTORY,
+                                                    this.history_columns.viewport,
+                                                );
+                                                let h = &this.history[index];
+                                                let t = this
+                                                    .draft
+                                                    .unwrap_or(this.settings.base())
+                                                    .tokens();
+                                                range
+                                                    .filter_map(|row| {
+                                                        let (name, p) = h.rows.get(row)?;
+                                                        let selected = this
+                                                            .history_selected
+                                                            .as_ref()
+                                                            .map(|n| n == name)
+                                                            .unwrap_or(row == 0);
+                                                        let key = name.clone();
+                                                        let row_text = |text: String| {
+                                                            if selected || row < 3 {
+                                                                crate::glow::text(text, false, &t)
+                                                                    .into_any_element()
+                                                            } else {
+                                                                text.into_any_element()
+                                                            }
+                                                        };
+                                                        Some(
+                                                            history_row()
+                                                                .id(("history-row", row))
+                                                                .bg(rgb(if selected {
+                                                                    t.plate2
+                                                                } else {
+                                                                    t.base.ground
+                                                                }))
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.history_selected =
+                                                                            Some(key.clone());
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .border_b_1()
+                                                                .border_color(rgb(t.row_rule))
+                                                                .text_color(rgb(
+                                                                    if selected || row < 3 {
+                                                                        t.base.led
+                                                                    } else {
+                                                                        t.ink_row
+                                                                    },
+                                                                ))
+                                                                .child(
+                                                                    div()
+                                                                        .w(px(22.))
+                                                                        .flex_shrink_0()
+                                                                        .px(px(10.))
+                                                                        .child(
+                                                                            lamp(
+                                                                                t.base.led,
+                                                                                row < 3,
+                                                                                &t,
+                                                                            )
+                                                                            .w(px(7.))
+                                                                            .h(px(12.)),
+                                                                        ),
+                                                                )
+                                                                .child(
+                                                                    history_cell(widths[1], false)
+                                                                        .truncate()
+                                                                        .child(row_text(
+                                                                            name.clone(),
+                                                                        )),
+                                                                )
+                                                                .child(
+                                                                    history_cell(widths[2], true)
+                                                                        .child(row_text(
+                                                                            core_time(
+                                                                                p.cpu_seconds,
+                                                                            ),
+                                                                        )),
+                                                                )
+                                                                .child(
+                                                                    history_cell(widths[3], false)
+                                                                        .child(cpu_segments(
+                                                                            p.peak_cpu,
+                                                                            30,
+                                                                            (widths[3] - 20.)
+                                                                                .min(120.),
+                                                                            8.,
+                                                                            &t,
+                                                                        )),
+                                                                )
+                                                                .child(
+                                                                    history_cell(widths[4], true)
+                                                                        .child(row_text(format!(
+                                                                            "{:.1}%",
+                                                                            p.cpu_seconds
+                                                                                / h.total_cpu
+                                                                                    .max(0.001)
+                                                                                * 100.
+                                                                        ))),
+                                                                )
+                                                                .child(
+                                                                    history_cell(widths[5], true)
+                                                                        .child(row_text(
+                                                                            if p.gpu_seconds > 3. {
+                                                                                core_time(
+                                                                                    p.gpu_seconds,
+                                                                                )
+                                                                            } else {
+                                                                                "·".into()
+                                                                            },
+                                                                        )),
+                                                                )
+                                                                .child(
+                                                                    history_cell(widths[6], true)
+                                                                        .child(row_text(bytes(
+                                                                            p.peak_memory,
+                                                                        ))),
+                                                                )
+                                                                .child(
+                                                                    history_cell(widths[7], true)
+                                                                        .child(row_text(format!(
+                                                                            "{:.1}",
+                                                                            p.peak_cpu
+                                                                        ))),
+                                                                ),
+                                                        )
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            },
+                                        ),
+                                    )
+                                    .track_scroll(&self.history_scroll)
+                                    .flex_1()
+                                    .min_h_0(),
+                                ),
+                        ),
                 );
         } else {
             let h = &self.history[0];
@@ -2444,11 +2553,12 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::{
-        div, draw_readout_text, lit_unit, vfd_digit_width, Bounds, DrawMetrics, Path, Pixels,
-        Tokens, UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES,
-        WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
+        cpu_segments, div, draw_readout_text, history_cell, lit_unit, vfd_digit_width, Bounds,
+        DrawMetrics, Path, Pixels, Tokens, UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS,
+        WIN_DOT_CACHE_MAX_BYTES, WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES,
+        WIN_DOT_CACHE_SLOTS,
     };
-    use gpui::{prelude::*, TestAppContext, Window};
+    use gpui::{prelude::*, px, TestAppContext, Window};
 
     struct UnitLayoutTestView {
         tokens: Tokens,
@@ -2461,6 +2571,25 @@ mod tests {
                     .into_iter()
                     .map(|(size, unit)| lit_unit("99".into(), unit, size, false, &self.tokens)),
             )
+        }
+    }
+
+    struct CpuMeterLayoutTestView {
+        tokens: Tokens,
+    }
+
+    impl Render for CpuMeterLayoutTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(20.))
+                .child(cpu_segments(54., 18, 78., 12., &self.tokens))
+                .child(
+                    history_cell(75., true)
+                        .overflow_hidden()
+                        .child(cpu_segments(104., 30, 55., 8., &self.tokens)),
+                )
         }
     }
 
@@ -3440,6 +3569,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[gpui::test]
+    async fn priority_cpu_meter_uses_the_requested_height(cx: &mut TestAppContext) {
+        let tokens = crate::palette::presets()[0].base.tokens();
+        let window = cx.add_window(|_, _| CpuMeterLayoutTestView { tokens });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let quads = cx
+            .update_window(window.into(), |_, window, _| window.painted_quads())
+            .unwrap();
+        let scale = cx
+            .update_window(window.into(), |_, window, _| window.scale_factor())
+            .unwrap();
+        let priority: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.bounds.origin.y.as_f32() / scale < 20.)
+            .collect();
+        assert_eq!(priority.len(), 18);
+        assert!(priority
+            .iter()
+            .all(|quad| quad.bounds.size.height.as_f32() / scale == 12.));
+    }
+
+    #[gpui::test]
+    async fn narrow_history_cpu_meter_keeps_main_segments_visible(cx: &mut TestAppContext) {
+        let tokens = crate::palette::presets()[0].base.tokens();
+        let window = cx.add_window(|_, _| CpuMeterLayoutTestView { tokens });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let quads = cx
+            .update_window(window.into(), |_, window, _| window.painted_quads())
+            .unwrap();
+        let scale = cx
+            .update_window(window.into(), |_, window, _| window.scale_factor())
+            .unwrap();
+        let narrow_history: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.bounds.origin.y.as_f32() / scale >= 20.)
+            .collect();
+        assert!(narrow_history.len() > 4, "the full bar must remain visible");
+        assert!(narrow_history
+            .iter()
+            .all(|quad| quad.bounds.size.width.as_f32() / scale > 0.));
+        assert!(narrow_history
+            .iter()
+            .all(|quad| quad.bounds.size.height.as_f32() / scale == 8.));
     }
 
     #[test]

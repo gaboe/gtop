@@ -149,7 +149,6 @@ impl Processes {
         let priority = row_tier(row) == RowTier::Priority;
         let culprit = p.cpu_usage > 100. && row < 4;
         let selected = self.selected == Some(key);
-        let cores = self.snapshot.as_ref()?.stats.cpu_usage.len().max(1);
         let height = if priority { 30. } else { 22. };
         Some(
             div()
@@ -213,15 +212,17 @@ impl Processes {
                         )));
                     }
                     cell.when(kind == ProcessColumn::Cpu, |d| {
-                        d.flex().items_center().justify_end().gap_2().child(
-                            rack::segments(
-                                p.cpu_usage / cores as f32,
+                        d.flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(rack::cpu_segments(
+                                p.cpu_usage,
                                 if priority { 18 } else { 14 },
+                                if priority { 78. } else { 69. },
+                                if priority { 12. } else { 8. },
                                 t,
-                            )
-                            .w(px(if priority { 78. } else { 69. }))
-                            .h(px(if priority { 12. } else { 8. })),
-                        )
+                            ))
                     })
                     .child(
                         if (selected || priority && culprit)
