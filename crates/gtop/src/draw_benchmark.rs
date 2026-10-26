@@ -210,6 +210,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         shutdown: None,
         _ports: Task::ready(()),
         _frames: Task::ready(()),
+        _perf_writer: Task::ready(()),
     }
 }
 

@@ -22,6 +22,7 @@ use gpui_component::{
     input::{InputEvent, InputState},
     Root,
 };
+use gtop::perf;
 use gtop_core::{AppState, Snapshot};
 use model::{ProcessKey, Search};
 use process_table::Processes;
@@ -133,6 +134,7 @@ struct Monitor {
     _refresh: Option<Task<()>>,
     shutdown: Option<ShutdownDrains>,
     _ports: Task<()>,
+    _perf_writer: Task<()>,
     _frames: Task<()>,
 }
 
@@ -270,6 +272,8 @@ impl Monitor {
             u32,
             Vec<u16>,
         >::new()));
+        let perf = Arc::new(perf::PerfCounters::default());
+        let history_perf = perf.clone();
         let port_cache = cached_ports.clone();
         let ports_task = cx.spawn_in(window, async move |entity, cx| loop {
             let Ok(running) =
@@ -331,6 +335,7 @@ impl Monitor {
                     });
                     (!this.paused, window.is_visible() && this.table.read(cx).search.needs_ports(), this.interval, this.moment, this.metric, selected_detail)
                 }) else { break; };
+                history_perf.set_refresh_interval(seconds);
                 if moment.is_none() {
                     cached_moment = None;
                     cached_metric = None;
@@ -426,6 +431,7 @@ impl Monitor {
                 let previous_moment = cached_moment;
                 let previous_metric = cached_metric;
                 let previous_analysis_key = cached_analysis_key;
+                let sample_perf = history_perf.clone();
                 let result = cx.background_executor().spawn(async move {
                     let start = std::time::Instant::now();
                     let snapshot = if !ports {
@@ -436,7 +442,9 @@ impl Monitor {
                     } else {
                         state.snapshot(false, true)
                     };
-                    let tick_ms = start.elapsed().as_secs_f64() * 1000.;
+                    let sample_duration = start.elapsed();
+                    sample_perf.add_sampler(sample_duration);
+                    let tick_ms = sample_duration.as_secs_f64() * 1000.;
                     let mut views = None;
                     let mut moment_detail = None;
                     let mut process_analysis = None;
@@ -445,7 +453,10 @@ impl Monitor {
                         let now = rack::now();
 
                         let update = (|| -> history::Result<()> {
-                        history.record(snapshot, now, seconds as f64)?;
+                        let history_record_started = std::time::Instant::now();
+                        let recorded = history.record(snapshot, now, seconds as f64);
+                        sample_perf.add_history_write(history_record_started.elapsed());
+                        recorded?;
                         let minute = now as u64 / 60;
                         let minute_changed = cached_minute != Some(minute);
                         if let Some((key, name, command, _fallback_cpu, needs_analysis)) = selected_detail.as_ref() {
@@ -466,7 +477,10 @@ impl Monitor {
                         }
                         if minute_changed {
                             views = Some([history.view(1,now as u64)?, history.view(8,now as u64)?, history.view(24,now as u64)?]);
-                            history.persist(now as u64)?;
+                            let write_started = std::time::Instant::now();
+                            let persisted = history.persist(now as u64);
+                            sample_perf.add_history_write(write_started.elapsed());
+                            persisted?;
                             cached_minute = Some(minute);
                             history_save=Some(Ok(()));
                         }
@@ -545,14 +559,29 @@ impl Monitor {
             }).await;
         }.boxed_local().shared();
         let refresh = cx.foreground_executor().spawn(history_drain.clone());
+        let frame_perf = perf.clone();
         let frames = cx.spawn_in(window, async move |entity, cx| {
             let mut previous = None;
             let mut sampled_at = std::time::Instant::now();
+            let mut cpu_baseline = None;
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let now = std::time::Instant::now();
                 let elapsed = now.duration_since(sampled_at).as_secs_f64();
                 sampled_at = now;
+                let state = perf::window_state();
+                frame_perf.add_window_time(state, Duration::from_secs_f64(elapsed));
+                let process_cpu = perf::process_cpu_seconds();
+                if let Some(previous_cpu) = cpu_baseline.replace(process_cpu) {
+                    if let (Some(previous_cpu), Some(process_cpu)) = (previous_cpu, process_cpu) {
+                        if process_cpu >= previous_cpu {
+                            frame_perf.add_process_cpu(
+                                state,
+                                Duration::from_secs_f64(process_cpu - previous_cpu),
+                            );
+                        }
+                    }
+                }
                 if entity
                     .update_in(cx, |this, window, _| {
                         let snapshot = window.frame_duration_snapshot();
@@ -564,6 +593,12 @@ impl Monitor {
                             }
                         }
                         let draw_ms = (!draws.is_empty()).then(|| draws.mean() / 1_000_000.);
+                        frame_perf.add_draws(
+                            draws.len(),
+                            Duration::from_secs_f64(
+                                draw_ms.unwrap_or_default() * draws.len() as f64 / 1000.,
+                            ),
+                        );
                         this.draw_metrics.record(draws.len(), elapsed, draw_ms);
                         if gtop_core::perf_enabled() {
                             eprintln!(
@@ -583,6 +618,28 @@ impl Monitor {
                     .is_err()
                 {
                     break;
+                }
+            }
+        });
+        let writer_perf = perf.clone();
+        let writer_executor = cx.background_executor().clone();
+        let timer_executor = writer_executor.clone();
+        let perf_writer = writer_executor.spawn(async move {
+            let started = std::time::Instant::now();
+            let mut recorder = match perf::PerfRecorder::open(
+                &history::support_path("perf.sqlite"),
+                writer_perf,
+            ) {
+                Ok(recorder) => recorder,
+                Err(error) => {
+                    eprintln!("Performance telemetry could not open: {error}");
+                    return;
+                }
+            };
+            loop {
+                timer_executor.timer(Duration::from_secs(60)).await;
+                if let Err(error) = recorder.record_if_due(started.elapsed(), rack::now() as u64) {
+                    eprintln!("Performance telemetry could not be saved: {error}");
                 }
             }
         });
@@ -630,6 +687,7 @@ impl Monitor {
             }),
             _frames: frames,
             _ports: ports_task,
+            _perf_writer: perf_writer,
         }
     }
 

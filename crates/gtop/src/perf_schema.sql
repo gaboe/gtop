@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS perf_minute (
+    wall_seconds INTEGER PRIMARY KEY,
+    process_cpu_seconds REAL NOT NULL,
+    visible_seconds REAL NOT NULL,
+    occluded_seconds REAL NOT NULL,
+    hidden_seconds REAL NOT NULL,
+    minimized_seconds REAL NOT NULL,
+    unknown_seconds REAL NOT NULL,
+    cpu_visible_seconds REAL NOT NULL,
+    cpu_occluded_seconds REAL NOT NULL,
+    cpu_hidden_seconds REAL NOT NULL,
+    cpu_minimized_seconds REAL NOT NULL,
+    cpu_unknown_seconds REAL NOT NULL,
+    draw_count INTEGER NOT NULL,
+    draw_total_ms REAL NOT NULL,
+    sampler_runs INTEGER NOT NULL,
+    sampler_total_ms REAL NOT NULL,
+    history_write_ms REAL NOT NULL,
+    refresh_interval_seconds INTEGER NOT NULL,
+    app_version TEXT NOT NULL,
+    app_commit TEXT NOT NULL
+);
