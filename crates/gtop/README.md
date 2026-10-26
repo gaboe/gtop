@@ -6,7 +6,7 @@ From the repository root, run:
 cargo run --release -p gtop
 ```
 
-The native app uses the same monitoring crate as Tauri. It does not start a webview. The Tauri app still builds from the shared workspace.
+The app uses `gtop-core` for system monitoring. It does not start a webview.
 
 To create an ad hoc signed macOS bundle, run:
 
@@ -14,7 +14,7 @@ To create an ad hoc signed macOS bundle, run:
 sh crates/gtop/package-macos.sh
 ```
 
-The bundle is `target/release/bundle/macos/gtop.app`. Packaging does not install it in `/Applications`.
+The bundle is `target/gtop-native/gtop.app`. Packaging does not install it in `/Applications`.
 
 Click a table header to sort. Click it again to reverse the order. Search accepts names, commands, PID substrings, and comma-separated alternatives. Use `:3000` or `port:3000` to find a local bound port. Port collection runs only while the search contains a valid port term.
 
@@ -37,9 +37,7 @@ On macOS, `font-kit` enables native text. The app compiles Metal shaders at star
 Run the focused checks from the repository root:
 
 ```sh
-cargo test -p gtop-core
-cargo test --release -p gtop
-cargo fmt --all --check
-cargo clippy -p gtop-core -p gtop
-npx tauri build --bundles app
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
 ```
