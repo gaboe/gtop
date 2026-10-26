@@ -123,6 +123,10 @@ static UNIT_PATHS: OnceLock<Mutex<HashMap<UnitCacheKey, UnitPaths>>> = OnceLock:
 
 #[cfg(test)]
 static UNIT_GLYPH_TEST_BOUNDS: Mutex<Vec<Bounds<Pixels>>> = Mutex::new(Vec::new());
+#[cfg(test)]
+pub(crate) static UNIT_GLYPH_TEST_GHOST_PATHS: Mutex<Vec<(char, bool)>> = Mutex::new(Vec::new());
+#[cfg(test)]
+pub(crate) static DIGIT_GHOST_TEST_TEXTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn core_time(seconds: f64) -> String {
     let minutes = seconds / 60.;
@@ -199,6 +203,10 @@ pub fn lit(text: String, size: f32, hot: bool, t: &Tokens) -> Div {
             .chars()
             .map(|c| if c.is_ascii_digit() { '8' } else { c })
             .collect::<String>();
+        #[cfg(test)]
+        if !crate::draw_benchmark::fixed_clock() {
+            DIGIT_GHOST_TEST_TEXTS.lock().unwrap().push(ghost.clone());
+        }
         readout = readout.child(
             div()
                 .absolute()
@@ -285,6 +293,13 @@ fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
                     UNIT_GLYPH_TEST_BOUNDS.lock().unwrap().push(bounds);
                 }
                 let (lit, ghost_path) = unit_paths(bounds, unit, ghost.is_some());
+                #[cfg(test)]
+                if !crate::draw_benchmark::fixed_clock() {
+                    UNIT_GLYPH_TEST_GHOST_PATHS
+                        .lock()
+                        .unwrap()
+                        .push((unit, ghost_path.is_some()));
+                }
                 if let (Some(ghost_path), Some(ghost)) = (ghost_path, ghost) {
                     window.paint_path(ghost_path, rgb(ghost));
                 }
@@ -325,6 +340,11 @@ fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
     )
 }
 
+#[cfg(test)]
+pub(crate) fn unit_glyph_for_test(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
+    unit_glyph(unit, size, hot, t)
+}
+
 pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
     let width_chars = value.chars().count().max(3);
     let value = format!("{value:>width_chars$}");
@@ -351,6 +371,10 @@ pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> 
                 }
             })
             .collect::<String>();
+        #[cfg(test)]
+        if !crate::draw_benchmark::fixed_clock() {
+            DIGIT_GHOST_TEST_TEXTS.lock().unwrap().push(ghost.clone());
+        }
         digits = digits.child(
             div()
                 .absolute()

@@ -467,17 +467,26 @@ fn disk_keyboard_scroll_reveals_selected_row_after_summary() {
 #[cfg(target_os = "macos")]
 struct GhostLayerReview {
     tokens: palette::Tokens,
+    content: GhostLayerContent,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum GhostLayerContent {
+    Full,
+    Unit(char),
 }
 
 #[cfg(target_os = "macos")]
 impl Render for GhostLayerReview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let content = div()
             .flex()
             .items_start()
             .gap(px(24.))
-            .bg(rgb(self.tokens.base.ground))
-            .child(
+            .bg(rgb(self.tokens.base.ground));
+        match self.content {
+            GhostLayerContent::Full => content.child(
                 crate::rack::win(&self.tokens)
                     .child(crate::rack::lit("48".into(), 42., false, &self.tokens))
                     .child(crate::rack::lit_unit(
@@ -487,7 +496,14 @@ impl Render for GhostLayerReview {
                         false,
                         &self.tokens,
                     )),
-            )
+            ),
+            GhostLayerContent::Unit(unit) => content.child(crate::rack::unit_glyph_for_test(
+                unit,
+                42.,
+                false,
+                &self.tokens,
+            )),
+        }
     }
 }
 
@@ -526,56 +542,84 @@ fn headless_ghost_layers_match_palette_mode() {
         .open_window(size(px(600.), px(100.)), |_, cx| {
             let entity = cx.new(|_| GhostLayerReview {
                 tokens: palette::presets()[0].base.tokens(),
+                content: GhostLayerContent::Full,
             });
             view = Some(entity.clone());
             entity
         })
         .unwrap();
     let view = view.unwrap();
-    let mut counts = Vec::new();
     for (name, base, expect_ghost) in [
         ("aluminium", palette::presets()[4].base, false),
         ("amber", palette::presets()[0].base, true),
     ] {
-        let tokens = base.tokens();
-        cx.update(|cx| view.update(cx, |view, _| view.tokens = tokens));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.refresh();
-            window.draw(cx).clear(cx);
-        })
-        .unwrap();
-        let image = cx.capture_screenshot(handle.into()).unwrap();
-        image.save(directory.join(format!("{name}.png"))).unwrap();
-        let tokens = base.tokens();
-        let colors = [
-            palette::mix(base.led, base.ground, 0.18),
-            palette::mix(base.led, tokens.readout, 0.07),
-        ];
-        let painted = colors.map(|color| {
-            let rgba = [
-                ((color >> 16) & 0xff) as u8,
-                ((color >> 8) & 0xff) as u8,
-                (color & 0xff) as u8,
-                0xff,
-            ];
-            image.pixels().filter(|pixel| pixel.0 == rgba).count()
-        });
-        counts.push((name, expect_ghost, painted));
-    }
+        for (layer, content) in [
+            ("full", GhostLayerContent::Full),
+            ("percent", GhostLayerContent::Unit('%')),
+            ("degree", GhostLayerContent::Unit('°')),
+        ] {
+            let tokens = base.tokens();
+            cx.update(|cx| {
+                view.update(cx, |view, _| {
+                    view.tokens = tokens;
+                    view.content = content;
+                })
+            });
+            if matches!(content, GhostLayerContent::Unit(_)) {
+                crate::rack::UNIT_GLYPH_TEST_GHOST_PATHS
+                    .lock()
+                    .unwrap()
+                    .clear();
+            }
+            if matches!(content, GhostLayerContent::Full) {
+                crate::rack::DIGIT_GHOST_TEST_TEXTS.lock().unwrap().clear();
+            }
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            let image = cx.capture_screenshot(handle.into()).unwrap();
+            image
+                .save(directory.join(format!("{name}-{layer}.png")))
+                .unwrap();
+            if let GhostLayerContent::Unit(unit) = content {
+                let rendered_paths =
+                    std::mem::take(&mut *crate::rack::UNIT_GLYPH_TEST_GHOST_PATHS.lock().unwrap());
+                assert!(
+                    rendered_paths.contains(&(unit, expect_ghost)),
+                    "{name} {layer} ghost path states were {rendered_paths:?}"
+                );
+            }
 
-    for (name, expect_ghost, painted) in counts {
-        assert_eq!(
-            painted[0] > 0,
-            expect_ghost,
-            "{name} ghost glyph pixel count was {}",
-            painted[0]
-        );
-        assert_eq!(
-            painted[1] > 0,
-            expect_ghost,
-            "{name} readout dot pixel count was {}",
-            painted[1]
-        );
+            if matches!(content, GhostLayerContent::Full) {
+                let rendered_ghosts =
+                    std::mem::take(&mut *crate::rack::DIGIT_GHOST_TEST_TEXTS.lock().unwrap());
+                assert_eq!(
+                    rendered_ghosts.contains(&"88".into()),
+                    expect_ghost,
+                    "{name} lit digit ghost layers were {rendered_ghosts:?}"
+                );
+                assert_eq!(
+                    rendered_ghosts.contains(&"888".into()),
+                    expect_ghost,
+                    "{name} lit_unit digit ghost layers were {rendered_ghosts:?}"
+                );
+                let dots = palette::mix(base.led, tokens.readout, 0.07);
+                let dots_rgba = [
+                    ((dots >> 16) & 0xff) as u8,
+                    ((dots >> 8) & 0xff) as u8,
+                    (dots & 0xff) as u8,
+                    0xff,
+                ];
+                let dot_pixels = image.pixels().filter(|pixel| pixel.0 == dots_rgba).count();
+                assert_eq!(
+                    dot_pixels > 0,
+                    expect_ghost,
+                    "{name} readout dot pixel count was {dot_pixels}"
+                );
+            }
+        }
     }
 }
 
