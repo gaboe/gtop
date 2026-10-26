@@ -603,55 +603,28 @@ impl Monitor {
                     ),
             );
         }
-        let environment = match &details.environment {
-            Environment::Unrequested => div(),
-            Environment::Loading => div().child("Reading environment..."),
-            Environment::Failed(e) => div().text_color(rgb(t.base.hot)).child(e.clone()),
-            Environment::Loaded(values) if details.environment_open => {
-                if values.is_empty() {
-                    div().child("This process exposes no environment variables.")
-                } else {
-                    div().child(selectable_content(
-                        window,
-                        "environment-text",
-                        &values.join("\n"),
-                    ))
-                }
-            }
-            Environment::Loaded(_) => div().child("Environment hidden"),
-        };
-        panel = panel.child(
+        let environment =
+            environment_content(window, &details.environment, details.environment_open, &t);
+        panel = panel.child(environment_section(
             div()
-                .id("environment-scroll")
-                .max_h(px(240.))
-                .flex_shrink_0()
-                .overflow_y_scroll()
-                .overflow_x_scroll()
-                .px(px(12.))
-                .py(px(10.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(crate::rack::label("ENVIRONMENT", &t))
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(crate::rack::label("ENVIRONMENT", &t))
-                        .child(
-                            Button::new("toggle-environment")
-                                .label(if details.environment_open {
-                                    "HIDE · E"
-                                } else {
-                                    "LOAD · E"
-                                })
-                                .rack(&t)
-                                .small()
-                                .disabled(!self.environment_enabled())
-                                .on_click(
-                                    cx.listener(|this, _, w, cx| this.fetch_environment(w, cx)),
-                                ),
-                        ),
-                )
-                .child(environment),
-        );
+                    Button::new("toggle-environment")
+                        .label(if details.environment_open {
+                            "HIDE · E"
+                        } else {
+                            "LOAD · E"
+                        })
+                        .rack(&t)
+                        .small()
+                        .disabled(!self.environment_enabled())
+                        .on_click(cx.listener(|this, _, w, cx| this.fetch_environment(w, cx))),
+                ),
+            environment,
+        ));
         let mut frame = frame.child(detail_body(panel, &details.body_scroll)).child(
             div()
                 .flex()
@@ -699,6 +672,44 @@ fn detail_body(content: Div, scroll: &ScrollHandle) -> Stateful<Div> {
         .min_h_0()
         .overflow_y_scroll()
         .track_scroll(scroll)
+        .child(content)
+}
+
+fn environment_content(
+    window: &Window,
+    environment: &Environment,
+    open: bool,
+    tokens: &crate::palette::Tokens,
+) -> Div {
+    match environment {
+        Environment::Unrequested => div(),
+        Environment::Loading => div().child("Reading environment..."),
+        Environment::Failed(error) => div().text_color(rgb(tokens.base.hot)).child(error.clone()),
+        Environment::Loaded(values) if open => {
+            if values.is_empty() {
+                div().child("This process exposes no environment variables.")
+            } else {
+                div().child(selectable_content(
+                    window,
+                    "environment-text",
+                    &values.join("\n"),
+                ))
+            }
+        }
+        Environment::Loaded(_) => div().child("Environment hidden"),
+    }
+}
+
+fn environment_section(header: Div, content: Div) -> Stateful<Div> {
+    div()
+        .id("environment-scroll")
+        .max_h(px(240.))
+        .flex_shrink_0()
+        .overflow_y_scroll()
+        .overflow_x_scroll()
+        .px(px(12.))
+        .py(px(10.))
+        .child(header)
         .child(content)
 }
 
@@ -1035,9 +1046,13 @@ fn detail_line(label: &str, value: String) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{kill_completed, Details, Environment, KillState};
+    use super::{
+        environment_content, environment_section, kill_completed, Details, Environment, KillState,
+    };
     use crate::model::ProcessKey;
+    use crate::rack::RackButton;
     use gpui::{prelude::*, *};
+    use gpui_component::Sizable;
     use std::prelude::v1::test;
 
     fn selected(key: ProcessKey) -> Details {
@@ -1066,6 +1081,11 @@ mod tests {
     impl Render for SelectableLayoutTest {
         fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let token = format!("{} END_OF_COMMAND", "some_long_project_name_".repeat(60));
+            let tokens = crate::palette::presets()[1].base.tokens();
+            let environment = Environment::Loaded(vec![
+                format!("KEY={token}"),
+                format!("NEXT={token} END_OF_ENVIRONMENT"),
+            ]);
             div()
                 .w(px(220.))
                 .flex()
@@ -1083,18 +1103,23 @@ mod tests {
                         .child(super::selectable_content(window, "command-text", &token)),
                 )
                 .child(
-                    div()
-                        .id("environment-scroll")
-                        .debug_selector(|| "environment-scroll".into())
-                        .w_full()
-                        .max_h(px(52.))
-                        .overflow_x_scroll()
-                        .track_scroll(&self.environment_scroll)
-                        .child(super::selectable_content(
-                            window,
-                            "environment-value",
-                            &format!("KEY={token}\nNEXT={token} END_OF_ENVIRONMENT"),
-                        )),
+                    environment_section(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(crate::rack::label("ENVIRONMENT", &tokens))
+                            .child(
+                                gpui_component::button::Button::new("toggle-environment")
+                                    .label("HIDE · E")
+                                    .rack(&tokens)
+                                    .small(),
+                            ),
+                        environment_content(window, &environment, true, &tokens),
+                    )
+                    .debug_selector(|| "environment-scroll".into())
+                    .w_full()
+                    .track_scroll(&self.environment_scroll),
                 )
         }
     }
@@ -1117,7 +1142,7 @@ mod tests {
             "command bounds: {command:?}"
         );
         assert!(
-            environment.size.height <= px(52.),
+            environment.size.height <= px(240.),
             "environment bounds: {environment:?}"
         );
         assert!(
