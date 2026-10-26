@@ -86,6 +86,27 @@ class PerfReportTests(unittest.TestCase):
             self.assertEqual((groups[1].draws_per_min, groups[1].mean_draw_ms, groups[1].sampler_runs_per_min, groups[1].mean_sampler_ms), (30., 5., 30., 3.))
             self.assertEqual((groups[0].mean_system_cpu_busy_pct, groups[1].mean_system_cpu_busy_pct), (60., 70.))
 
+    def test_whole_interval_work_is_reported_once_without_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "perf.sqlite"
+            with sqlite3.connect(source) as db:
+                schema = Path(__file__).parents[1] / "src" / "perf_schema.sql"
+                db.executescript(schema.read_text())
+                insert_minutes(db, [
+                    ((3660, 1, 30, 0, 30, 0, 0, .6, 0, .4, 0, 0, 120, 600,
+                      20, 400, 0, 3, "1.0", "a", 3600), 10., 50.),
+                ])
+            output = StringIO()
+            with patch.object(sys, "argv", ["perf-report.py", str(source)]), redirect_stdout(output):
+                self.assertEqual(report.main(), 0)
+            lines = output.getvalue().splitlines()
+            self.assertEqual(lines[1:3], [
+                "1\t1.0\tvisible\t8-20\t1\t2.000\t2.000\t2.000",
+                "1\t1.0\thidden\t8-20\t1\t1.333\t1.333\t1.333",
+            ])
+            self.assertEqual(lines[4], "hour_utc\tversion\tload_bucket\tintervals\tdraws_per_min\tmean_draw_ms\tsampler_runs_per_min\tmean_sampler_ms\tmean_system_cpu_busy_pct")
+            self.assertEqual(lines[5], "1\t1.0\t8-20\t1\t120.000\t5.000\t20.000\t20.000\t50.000")
+
     def test_load_bucket_edges(self):
         self.assertEqual([report.load_bucket(value) for value in (None, 7.9, 8., 20., 40.)], [
             "unknown", "<8", "8-20", "20-40", ">40"
