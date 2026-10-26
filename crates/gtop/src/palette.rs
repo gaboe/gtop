@@ -88,6 +88,7 @@ impl Base {
             for background in [
                 self.ground,
                 self.plate,
+                t.confirmation_surface,
                 t.plate2,
                 t.well,
                 t.table,
@@ -190,6 +191,7 @@ pub struct Tokens {
     pub selection: u32,
     pub readout: u32,
     pub well_rule: u32,
+    pub confirmation_surface: u32,
 }
 fn linear(v: f64) -> f64 {
     if v <= 0.04045 {
@@ -284,6 +286,7 @@ impl Base {
                 mix(b.ground, 0, 0.8)
             },
             well_rule: if light { mix(b.plate, b.silk, 0.82) } else { 0 },
+            confirmation_surface: if light { b.plate } else { crate::theme::MANTLE },
         }
     }
 }
@@ -426,6 +429,7 @@ mod tests {
         let backgrounds = [
             ("ground", t.base.ground),
             ("plate", t.base.plate),
+            ("kill confirmation", t.confirmation_surface),
             ("secondary", t.plate2),
             ("well", t.well),
             ("table", t.table),
@@ -522,6 +526,28 @@ mod tests {
         assert_eq!(base.text_contrast(ColorField::Led), 1.);
         base.silk = base.ground;
         assert!(base.text_contrast(ColorField::Silk) < 4.5);
+    }
+
+    #[test]
+    fn kill_confirmation_text_contrasts_with_its_surface_in_every_preset() {
+        for preset in presets() {
+            let tokens = preset.base.tokens();
+            assert!(
+                contrast(preset.base.silk, tokens.confirmation_surface) >= 4.5,
+                "{} kill confirmation: {:.2}:1",
+                preset.name,
+                contrast(preset.base.silk, tokens.confirmation_surface)
+            );
+        }
+        for preset in presets()
+            .into_iter()
+            .filter(|preset| preset.name != "Aluminium")
+        {
+            assert_eq!(
+                preset.base.tokens().confirmation_surface,
+                crate::theme::MANTLE
+            );
+        }
     }
 
     #[test]

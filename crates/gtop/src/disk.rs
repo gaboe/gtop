@@ -864,7 +864,7 @@ impl Monitor {
         );
         let mut panel = div()
             .relative()
-            .child(crate::rack::screws(&t))
+            .child(crate::rack::screws(&t, "disk"))
             .flex()
             .flex_col()
             .w(px(380.))

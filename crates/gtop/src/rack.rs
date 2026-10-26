@@ -392,11 +392,18 @@ fn unit_with_peak(
                 ),
         )
 }
-pub fn screws(t: &Tokens) -> Div {
+pub fn screws(t: &Tokens, section: &str) -> Div {
     let mut d = div().absolute().size_full();
     for (right, bottom) in [(false, false), (true, false), (false, true), (true, true)] {
         d = d.child(
             div()
+                .debug_selector(|| {
+                    format!(
+                        "{section}-screw-{}-{}",
+                        if bottom { "bottom" } else { "top" },
+                        if right { "right" } else { "left" }
+                    )
+                })
                 .absolute()
                 .w(px(7.))
                 .h(px(7.))
@@ -427,6 +434,14 @@ pub fn screws(t: &Tokens) -> Div {
         );
     }
     d
+}
+
+pub(super) fn tower_title(title: impl Into<SharedString>, t: &Tokens) -> Stateful<Div> {
+    div().id("tower-title").pl(px(20.)).pb(px(2.)).child(
+        label(title, t)
+            .debug_selector(|| "tower-title".into())
+            .text_color(rgb(t.silk_dim)),
+    )
 }
 
 const WIN_DOT_CACHE_SLOTS: usize = 32;
@@ -1254,7 +1269,7 @@ impl Monitor {
         let mut tower = div()
             .relative()
             .id("tower")
-            .child(screws(t))
+            .child(screws(t, "tower"))
             .w(px(300.))
             .flex_shrink_0()
             .h_full()
@@ -1268,19 +1283,14 @@ impl Monitor {
             .bg(rgb(t.base.plate))
             .border_1()
             .border_color(rgb(t.rule))
-            .child(
-                div().px(px(4.)).pb(px(2.)).child(
-                    label(
-                        self.snapshot
-                            .as_ref()
-                            .and_then(|s| s.stats.gpus.first())
-                            .map(|g| g.name.to_uppercase())
-                            .unwrap_or_else(|| "SYSTEM MONITOR".into()),
-                        t,
-                    )
-                    .text_color(rgb(t.silk_dim)),
-                ),
-            );
+            .child(tower_title(
+                self.snapshot
+                    .as_ref()
+                    .and_then(|s| s.stats.gpus.first())
+                    .map(|g| g.name.to_uppercase())
+                    .unwrap_or_else(|| "SYSTEM MONITOR".into()),
+                t,
+            ));
         let Some(s) = self.snapshot.as_ref() else {
             return tower.child("Reading system information");
         };
@@ -1456,7 +1466,7 @@ impl Monitor {
                 .whitespace_nowrap(),
             )
     }
-    pub fn rack(&self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+    pub fn rack(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
         let compact = self.settings_open || self.details.is_some() || self.moment.is_some();
         if self.table.read(cx).compact != compact {
@@ -2004,7 +2014,7 @@ impl Monitor {
             .child(self.tower(&t, cx))
             .child(right);
         if self.settings_open {
-            root = root.child(self.palette_panel(&t, cx));
+            root = root.child(self.palette_panel(&t, window, cx));
         } else if self.moment.is_some() {
             root = root.child(self.moment_panel(&t, cx));
         } else if let Some(disk) = self.disk_panel(cx) {
@@ -2070,15 +2080,21 @@ impl Monitor {
             return;
         }
         field.set(&mut base, value);
-        self.settings.edit_base(base);
-        self.draft = None;
+        let is_draft = self.draft.is_some();
+        if is_draft {
+            self.draft = Some(base);
+        } else {
+            self.settings.edit_base(base);
+        }
         self.colors[field as usize].update(cx, |input, cx| {
             input.set_value(format!("#{value:06x}"), window, cx)
         });
         self.color_pickers[field as usize]
             .update(cx, |picker, cx| picker.set_value(rgb(value), window, cx));
         self.apply_palette(cx);
-        self.persist_settings(window, cx);
+        if !is_draft {
+            self.persist_settings(window, cx);
+        }
     }
     pub fn apply_palette(&mut self, cx: &mut Context<Self>) {
         let base = self.draft.unwrap_or(self.settings.base());
@@ -2441,7 +2457,12 @@ impl Monitor {
         cx.stop_propagation();
         cx.notify();
     }
-    fn palette_panel(&self, t: &Tokens, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn palette_panel(
+        &mut self,
+        t: &Tokens,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let mut list = div().flex().flex_col().gap(px(4.));
         for (i, p) in self.settings.palettes().into_iter().enumerate() {
             list = list.child(
@@ -2488,9 +2509,11 @@ impl Monitor {
                             Button::new(("delete-palette", i))
                                 .label("Del")
                                 .rack(t)
+                                .debug_selector(|| format!("delete-palette-{i}"))
                                 .on_click(cx.listener(move |this, _, w, cx| {
                                     this.settings.saved.remove(i - 5);
                                     this.use_palette(0, w, cx);
+                                    this.persist_settings(w, cx);
                                 })),
                         )
                     }),
@@ -2535,6 +2558,17 @@ impl Monitor {
             )
             .children(palette::ColorField::ALL.into_iter().map(|field| {
                 let i = field as usize;
+                if self.color_pickers[i].read(cx).is_open() && !self.picker_hex_synced[i] {
+                    let value = field.get(self.draft.unwrap_or(self.settings.base()));
+                    self.color_pickers[i].update(cx, |picker, cx| {
+                        picker.hex_input().update(cx, |input, cx| {
+                            input.set_value(format!("#{value:06x}"), window, cx)
+                        });
+                    });
+                    self.picker_hex_synced[i] = true;
+                } else if !self.color_pickers[i].read(cx).is_open() {
+                    self.picker_hex_synced[i] = false;
+                }
                 let ratio = t.base.text_contrast(field);
                 let status = if ratio >= 4.5 { "AA" } else { "Below AA" };
                 div()
@@ -2585,6 +2619,7 @@ impl Monitor {
                             } else {
                                 "Rename"
                             })
+                            .debug_selector(|| "save-palette".into())
                             .disabled(
                                 self.draft.is_none()
                                     && self.settings.active < palette::presets().len(),
@@ -2621,6 +2656,7 @@ impl Monitor {
                     .child(
                         Button::new("discard-palette")
                             .label("Discard")
+                            .debug_selector(|| "discard-palette".into())
                             .disabled(self.draft.is_none())
                             .rack(t)
                             .on_click(cx.listener(|this, _, w, cx| {
@@ -3772,6 +3808,7 @@ mod tests {
 
     #[gpui::test]
     async fn vfd_unit_glyph_matches_digit_ink_span_at_supported_sizes(cx: &mut TestAppContext) {
+        UNIT_GLYPH_TEST_BOUNDS.lock().unwrap().clear();
         let tokens = crate::palette::presets()[0].base.tokens();
         let window = cx.add_window(|_, _| UnitLayoutTestView { tokens });
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
