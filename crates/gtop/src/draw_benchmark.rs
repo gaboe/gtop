@@ -565,12 +565,6 @@ fn headless_ghost_layers_match_palette_mode() {
                     view.content = content;
                 })
             });
-            if matches!(content, GhostLayerContent::Unit(_)) {
-                crate::rack::UNIT_GLYPH_TEST_GHOST_PATHS
-                    .lock()
-                    .unwrap()
-                    .clear();
-            }
             if matches!(content, GhostLayerContent::Full) {
                 crate::rack::DIGIT_GHOST_TEST_TEXTS.lock().unwrap().clear();
             }
@@ -583,12 +577,27 @@ fn headless_ghost_layers_match_palette_mode() {
             image
                 .save(directory.join(format!("{name}-{layer}.png")))
                 .unwrap();
-            if let GhostLayerContent::Unit(unit) = content {
-                let rendered_paths =
-                    std::mem::take(&mut *crate::rack::UNIT_GLYPH_TEST_GHOST_PATHS.lock().unwrap());
+            if let GhostLayerContent::Unit(_) = content {
+                let ghost = palette::mix(base.led, base.ground, 0.18);
+                let ghost_rgba = [
+                    ((ghost >> 16) & 0xff) as u8,
+                    ((ghost >> 8) & 0xff) as u8,
+                    (ghost & 0xff) as u8,
+                    0xff,
+                ];
+                let ghost_pixels = image
+                    .pixels()
+                    .filter(|pixel| {
+                        pixel
+                            .0
+                            .iter()
+                            .zip(ghost_rgba)
+                            .all(|(actual, expected)| actual.abs_diff(expected) <= 12)
+                    })
+                    .count();
                 assert!(
-                    rendered_paths.contains(&(unit, expect_ghost)),
-                    "{name} {layer} ghost path states were {rendered_paths:?}"
+                    (ghost_pixels > 0) == expect_ghost,
+                    "{name} {layer} ghost pixel count near {ghost_rgba:?} was {ghost_pixels}"
                 );
             }
 

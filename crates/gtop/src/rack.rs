@@ -124,8 +124,6 @@ static UNIT_PATHS: OnceLock<Mutex<HashMap<UnitCacheKey, UnitPaths>>> = OnceLock:
 #[cfg(test)]
 static UNIT_GLYPH_TEST_BOUNDS: Mutex<Vec<Bounds<Pixels>>> = Mutex::new(Vec::new());
 #[cfg(test)]
-pub(crate) static UNIT_GLYPH_TEST_GHOST_PATHS: Mutex<Vec<(char, bool)>> = Mutex::new(Vec::new());
-#[cfg(test)]
 pub(crate) static DIGIT_GHOST_TEST_TEXTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn core_time(seconds: f64) -> String {
@@ -279,11 +277,10 @@ fn unit_paths(bounds: Bounds<Pixels>, unit: char, with_ghost: bool) -> UnitPaths
     paths
 }
 
-fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
+fn unit_glyph(unit: char, size: f32, hot: bool, glow: bool, t: &Tokens) -> Div {
     let led = if hot { t.base.hot } else { t.base.led };
     let ghost = (!t.light).then(|| palette::mix(t.base.led, t.base.ground, 0.18));
     let bounds = unit_glyph_bounds(size);
-    let glow = !t.light;
     div().ml(px(size * 0.12)).flex_shrink_0().child(
         canvas(
             |_, _, _| {},
@@ -293,13 +290,6 @@ fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
                     UNIT_GLYPH_TEST_BOUNDS.lock().unwrap().push(bounds);
                 }
                 let (lit, ghost_path) = unit_paths(bounds, unit, ghost.is_some());
-                #[cfg(test)]
-                if !crate::draw_benchmark::fixed_clock() {
-                    UNIT_GLYPH_TEST_GHOST_PATHS
-                        .lock()
-                        .unwrap()
-                        .push((unit, ghost_path.is_some()));
-                }
                 if let (Some(ghost_path), Some(ghost)) = (ghost_path, ghost) {
                     window.paint_path(ghost_path, rgb(ghost));
                 }
@@ -342,7 +332,7 @@ fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
 
 #[cfg(test)]
 pub(crate) fn unit_glyph_for_test(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
-    unit_glyph(unit, size, hot, t)
+    unit_glyph(unit, size, hot, false, t)
 }
 
 pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
@@ -390,7 +380,7 @@ pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> 
         .items_start()
         .flex_shrink_0()
         .child(digits.child(crate::glow::text(value, hot, t).whitespace_nowrap()))
-        .child(unit_glyph(unit, size, hot, t))
+        .child(unit_glyph(unit, size, hot, !t.light, t))
 }
 
 fn vfd_digit_width(size: f32, characters: usize) -> f32 {
