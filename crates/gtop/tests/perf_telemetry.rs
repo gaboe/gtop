@@ -13,11 +13,19 @@ fn recorder_writes_after_one_minute_of_injected_time_in_scratch_home() {
         WindowState::Hidden,
         Duration::from_secs(59),
         Duration::from_millis(250),
+        Some(10.),
+        Some(70.),
     );
     assert!(!recorder
         .record_if_due(Duration::from_secs(59), 2_000_000_000)
         .unwrap());
-    counters.add_window_sample(WindowState::Hidden, Duration::from_secs(1), Duration::ZERO);
+    counters.add_window_sample(
+        WindowState::Hidden,
+        Duration::from_secs(1),
+        Duration::ZERO,
+        Some(14.),
+        Some(50.),
+    );
     assert!(recorder
         .record_if_due(Duration::from_secs(60), 2_000_000_060)
         .unwrap());
@@ -27,15 +35,18 @@ fn recorder_writes_after_one_minute_of_injected_time_in_scratch_home() {
         .query_row("SELECT COUNT(*) FROM perf_minute", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 1);
-    let (hidden_seconds, hidden_cpu): (f64, f64) = connection
+    let (hidden_seconds, hidden_cpu, mean_load, mean_system_cpu_busy):
+        (f64, f64, Option<f64>, Option<f64>) = connection
         .query_row(
-            "SELECT hidden_seconds, cpu_hidden_seconds FROM perf_minute",
+            "SELECT hidden_seconds, cpu_hidden_seconds, mean_load_1m, mean_system_cpu_busy_percent FROM perf_minute",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
     assert_eq!(hidden_seconds, 60.);
     assert_eq!(hidden_cpu, 0.25);
+    assert_eq!(mean_load, Some(12.));
+    assert_eq!(mean_system_cpu_busy, Some(60.));
     drop(connection);
     let _ = std::fs::remove_dir_all(home);
 }

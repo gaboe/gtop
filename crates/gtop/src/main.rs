@@ -564,6 +564,7 @@ impl Monitor {
             let mut previous = None;
             let mut sampled_at = std::time::Instant::now();
             let mut cpu_baseline = perf::CpuBaseline::new(perf::process_cpu_seconds());
+            let mut system_cpu_baseline = perf::SystemCpuBaseline::new(perf::system_cpu_ticks());
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let now = std::time::Instant::now();
@@ -571,7 +572,14 @@ impl Monitor {
                 sampled_at = now;
                 let state = perf::window_state();
                 let cpu = cpu_baseline.sample(perf::process_cpu_seconds());
-                frame_perf.add_window_sample(state, Duration::from_secs_f64(elapsed), cpu);
+                let system_cpu_busy = system_cpu_baseline.sample(perf::system_cpu_ticks());
+                frame_perf.add_window_sample(
+                    state,
+                    Duration::from_secs_f64(elapsed),
+                    cpu,
+                    perf::load_average_1m(),
+                    system_cpu_busy,
+                );
                 if entity
                     .update_in(cx, |this, window, _| {
                         let snapshot = window.frame_duration_snapshot();

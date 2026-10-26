@@ -1,6 +1,9 @@
 import importlib.util
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -10,6 +13,20 @@ report = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(report)
 
 
+def insert_minutes(db, entries):
+    sql = """INSERT INTO perf_minute (
+        wall_seconds, process_cpu_seconds, visible_seconds, occluded_seconds,
+        hidden_seconds, minimized_seconds, unknown_seconds, cpu_visible_seconds,
+        cpu_occluded_seconds, cpu_hidden_seconds, cpu_minimized_seconds,
+        cpu_unknown_seconds, draw_count, draw_total_ms, sampler_runs,
+        sampler_total_ms, history_write_ms, refresh_interval_seconds,
+        app_version, app_commit, mean_load_1m, mean_system_cpu_busy_percent,
+        interval_start_seconds
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+    for values, load, busy in entries:
+        db.execute(sql, (*values[:20], load, busy, values[20]))
+
+
 class PerfReportTests(unittest.TestCase):
     def test_report_splits_state_and_version_by_utc_hour(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -17,24 +34,25 @@ class PerfReportTests(unittest.TestCase):
             with sqlite3.connect(source) as db:
                 schema = Path(__file__).parents[1] / "src" / "perf_schema.sql"
                 db.executescript(schema.read_text())
-                db.executemany(
-                    "INSERT INTO perf_minute VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)",
-                    [
-                        (3660, 0.8, 30, 0, 30, 0, 0, 0.6, 0, 0.2, 0, 0, 2, 1, 1, 2, 0.1, 3, "1.0", "a", 3600),
-                        (3720, 1.6, 30, 0, 30, 0, 0, 1.2, 0, 0.4, 0, 0, 2, 1, 1, 2, 0.1, 3, "1.0", "a", 3600),
-                        (7260, 0.5, 60, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 2, 1, 1, 2, 0.1, 3, "2.0", "b", 7200),
-                    ],
-                )
+                insert_minutes(db, [
+                    ((3660, 0.8, 30, 0, 30, 0, 0, 0.6, 0, 0.2, 0, 0, 2, 1, 1, 2, 0.1, 3, "1.0", "a", 3600), 10., 30.),
+                    ((3720, 1.6, 30, 0, 30, 0, 0, 1.2, 0, 0.4, 0, 0, 2, 1, 1, 2, 0.1, 3, "1.0", "a", 3600), 10., 50.),
+                    ((7260, 0.5, 60, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 2, 1, 1, 2, 0.1, 3, "2.0", "b", 7200), 4., 20.),
+                ])
             with tempfile.TemporaryDirectory() as scratch:
                 copied = Path(scratch) / "copy.sqlite"
                 report.copy_database(source, copied)
                 summaries = report.summarize(copied)
-            self.assertEqual(summaries[0], ("1", "1.0", "hidden", 2, 1.0, 1.3333333333333333, 1.3333333333333333))
-            visible = [row for row in summaries if row[1:] and row[1] == "1.0" and row[2] == "visible"]
-            self.assertEqual(visible[0][4], 3.0)
-            self.assertEqual(visible[0][5], 4.0)
-            self.assertEqual(visible[0][6], 4.0)
-            self.assertEqual(len([row for row in summaries if row[0] == "2"]), 1)
+            hidden = summaries[0]
+            self.assertEqual((hidden.hour, hidden.version, hidden.state, hidden.load_bucket), ("1", "1.0", "hidden", "8-20"))
+            self.assertEqual((hidden.minutes, hidden.median_core_pct, hidden.p90_core_pct, hidden.p95_core_pct), (2, 1.0, 1.3333333333333333, 1.3333333333333333))
+            self.assertEqual((hidden.draws_per_min, hidden.mean_draw_ms, hidden.sampler_runs_per_min, hidden.mean_sampler_ms), (2., .5, 1., 2.))
+            self.assertEqual(hidden.mean_system_cpu_busy_pct, 40.)
+            visible = [row for row in summaries if row.version == "1.0" and row.state == "visible"]
+            self.assertEqual(visible[0].median_core_pct, 3.0)
+            self.assertEqual(visible[0].p90_core_pct, 4.0)
+            self.assertEqual(visible[0].p95_core_pct, 4.0)
+            self.assertEqual(len([row for row in summaries if row.hour == "2"]), 1)
 
     def test_boundary_ending_and_crossing_minutes_use_start_hour(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -42,12 +60,53 @@ class PerfReportTests(unittest.TestCase):
             with sqlite3.connect(source) as db:
                 schema = Path(__file__).parents[1] / "src" / "perf_schema.sql"
                 db.executescript(schema.read_text())
-                for end, start in [(3600, 3540), (3630, 3570)]:
-                    db.execute(
-                        "INSERT INTO perf_minute VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)",
-                        (end, 6, 60, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, "1", "a", start),
-                    )
-            self.assertEqual(report.summarize(source), [("0", "1", "visible", 2, 10., 10., 10.)])
+                insert_minutes(db, [
+                    ((end, 6, 60, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, "1", "a", start), None, None)
+                    for end, start in [(3600, 3540), (3630, 3570)]
+                ])
+            summary = report.summarize(source)[0]
+            self.assertEqual((summary.hour, summary.version, summary.state, summary.load_bucket), ("0", "1", "visible", "unknown"))
+            self.assertEqual((summary.minutes, summary.median_core_pct, summary.p90_core_pct, summary.p95_core_pct), (2, 10., 10., 10.))
+            self.assertEqual((summary.draws_per_min, summary.mean_draw_ms, summary.sampler_runs_per_min, summary.mean_sampler_ms), (0., None, 0., None))
+            self.assertIsNone(summary.mean_system_cpu_busy_pct)
+
+    def test_report_splits_load_buckets_and_aggregates_draw_and_sampler_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "perf.sqlite"
+            with sqlite3.connect(source) as db:
+                schema = Path(__file__).parents[1] / "src" / "perf_schema.sql"
+                db.executescript(schema.read_text())
+                insert_minutes(db, [
+                    ((3660, 1, 60, 0, 0, 0, 0, .6, 0, 0, 0, 0, 30, 90, 60, 120, 0, 3, "1", "a", 3600), 25., 60.),
+                    ((3720, 1, 60, 0, 0, 0, 0, .3, 0, 0, 0, 0, 30, 150, 30, 90, 0, 3, "1", "a", 3660), 45., 70.),
+                ])
+            groups = report.summarize(source)
+            self.assertEqual([row.load_bucket for row in groups], ["20-40", ">40"])
+            self.assertEqual((groups[0].draws_per_min, groups[0].mean_draw_ms, groups[0].sampler_runs_per_min, groups[0].mean_sampler_ms), (30., 3., 60., 2.))
+            self.assertEqual((groups[1].draws_per_min, groups[1].mean_draw_ms, groups[1].sampler_runs_per_min, groups[1].mean_sampler_ms), (30., 5., 30., 3.))
+            self.assertEqual((groups[0].mean_system_cpu_busy_pct, groups[1].mean_system_cpu_busy_pct), (60., 70.))
+
+    def test_load_bucket_edges(self):
+        self.assertEqual([report.load_bucket(value) for value in (None, 7.9, 8., 20., 40.)], [
+            "unknown", "<8", "8-20", "20-40", ">40"
+        ])
+
+    def test_main_prints_load_and_performance_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "perf.sqlite"
+            with sqlite3.connect(source) as db:
+                schema = Path(__file__).parents[1] / "src" / "perf_schema.sql"
+                db.executescript(schema.read_text())
+                insert_minutes(db, [
+                    ((3660, 1, 60, 0, 0, 0, 0, .6, 0, 0, 0, 0, 30, 90, 60, 120, 0, 3, "1", "a", 3600), 25., 60.),
+                ])
+            output = StringIO()
+            with patch.object(sys, "argv", ["perf-report.py", str(source)]), redirect_stdout(output):
+                self.assertEqual(report.main(), 0)
+            self.assertEqual(output.getvalue().splitlines(), [
+                "hour_utc\tversion\tstate\tload_bucket\tminutes\tmedian_core_pct\tp90_core_pct\tp95_core_pct\tdraws_per_min\tmean_draw_ms\tsampler_runs_per_min\tmean_sampler_ms\tmean_system_cpu_busy_pct",
+                "1\t1\tvisible\t20-40\t1\t1.000\t1.000\t1.000\t30.000\t3.000\t60.000\t2.000\t60.000",
+            ])
 
     def test_copy_uses_read_only_source_connection(self):
         with tempfile.TemporaryDirectory() as directory:
