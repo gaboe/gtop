@@ -563,25 +563,15 @@ impl Monitor {
         let frames = cx.spawn_in(window, async move |entity, cx| {
             let mut previous = None;
             let mut sampled_at = std::time::Instant::now();
-            let mut cpu_baseline = None;
+            let mut cpu_baseline = perf::CpuBaseline::new(perf::process_cpu_seconds());
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let now = std::time::Instant::now();
                 let elapsed = now.duration_since(sampled_at).as_secs_f64();
                 sampled_at = now;
                 let state = perf::window_state();
-                frame_perf.add_window_time(state, Duration::from_secs_f64(elapsed));
-                let process_cpu = perf::process_cpu_seconds();
-                if let Some(previous_cpu) = cpu_baseline.replace(process_cpu) {
-                    if let (Some(previous_cpu), Some(process_cpu)) = (previous_cpu, process_cpu) {
-                        if process_cpu >= previous_cpu {
-                            frame_perf.add_process_cpu(
-                                state,
-                                Duration::from_secs_f64(process_cpu - previous_cpu),
-                            );
-                        }
-                    }
-                }
+                let cpu = cpu_baseline.sample(perf::process_cpu_seconds());
+                frame_perf.add_window_sample(state, Duration::from_secs_f64(elapsed), cpu);
                 if entity
                     .update_in(cx, |this, window, _| {
                         let snapshot = window.frame_duration_snapshot();

@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS perf_minute (
-    wall_seconds INTEGER PRIMARY KEY,
+    wall_seconds INTEGER NOT NULL,
     process_cpu_seconds REAL NOT NULL,
     visible_seconds REAL NOT NULL,
     occluded_seconds REAL NOT NULL,
@@ -18,5 +18,7 @@ CREATE TABLE IF NOT EXISTS perf_minute (
     history_write_ms REAL NOT NULL,
     refresh_interval_seconds INTEGER NOT NULL,
     app_version TEXT NOT NULL,
-    app_commit TEXT NOT NULL
+    app_commit TEXT NOT NULL,
+    sample_id INTEGER PRIMARY KEY,
+    interval_start_seconds REAL NOT NULL
 );

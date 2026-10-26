@@ -40,7 +40,10 @@ def summarize(path: Path) -> list[tuple[str, str, str, int, float, float, float]
     with sqlite3.connect(path) as db:
         db.row_factory = sqlite3.Row
         for row in db.execute("SELECT * FROM perf_minute ORDER BY wall_seconds"):
-            hour = int(row["wall_seconds"]) // 3600
+            # Assign the whole minute to its start hour, including boundary-ending minutes.
+            start = (row["interval_start_seconds"] if "interval_start_seconds" in row.keys()
+                     else row["wall_seconds"] - sum(float(row[column]) for _, column, _ in STATES))
+            hour = math.floor(start / 3600)
             version = row["app_version"]
             for state, seconds_column, cpu_column in STATES:
                 seconds = float(row[seconds_column])

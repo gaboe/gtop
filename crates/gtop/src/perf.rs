@@ -1,9 +1,10 @@
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::{
+    collections::VecDeque,
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -36,6 +37,7 @@ pub enum WindowState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MinuteSample {
     pub wall_seconds: u64,
+    pub interval_start_seconds: f64,
     pub process_cpu_seconds: f64,
     pub state_seconds: [f64; WINDOW_STATE_COUNT],
     pub state_cpu_seconds: [f64; WINDOW_STATE_COUNT],
@@ -50,8 +52,7 @@ pub struct MinuteSample {
 }
 
 pub struct PerfCounters {
-    state_ns: [AtomicU64; WINDOW_STATE_COUNT],
-    state_cpu_ns: [AtomicU64; WINDOW_STATE_COUNT],
+    window: Mutex<WindowTotals>,
     draw_count: AtomicU64,
     draw_total_ns: AtomicU64,
     sampler_runs: AtomicU64,
@@ -60,11 +61,34 @@ pub struct PerfCounters {
     refresh_interval_seconds: AtomicU64,
 }
 
+#[derive(Default)]
+struct WindowTotals {
+    seconds: [f64; WINDOW_STATE_COUNT],
+    cpu_seconds: [f64; WINDOW_STATE_COUNT],
+}
+
+pub struct CpuBaseline(Option<f64>);
+
+impl CpuBaseline {
+    pub fn new(cpu: Option<f64>) -> Self {
+        Self(cpu)
+    }
+
+    pub fn sample(&mut self, cpu: Option<f64>) -> Duration {
+        let previous = std::mem::replace(&mut self.0, cpu);
+        match (previous, cpu) {
+            (Some(previous), Some(current)) if current >= previous => {
+                Duration::from_secs_f64(current - previous)
+            }
+            _ => Duration::ZERO,
+        }
+    }
+}
+
 impl Default for PerfCounters {
     fn default() -> Self {
         Self {
-            state_ns: std::array::from_fn(|_| AtomicU64::new(0)),
-            state_cpu_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            window: Mutex::default(),
             draw_count: AtomicU64::new(0),
             draw_total_ns: AtomicU64::new(0),
             sampler_runs: AtomicU64::new(0),
@@ -76,18 +100,10 @@ impl Default for PerfCounters {
 }
 
 impl PerfCounters {
-    pub fn add_window_time(&self, state: WindowState, elapsed: Duration) {
-        self.state_ns[state as usize].fetch_add(
-            elapsed.as_nanos().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
-    }
-
-    pub fn add_process_cpu(&self, state: WindowState, elapsed: Duration) {
-        self.state_cpu_ns[state as usize].fetch_add(
-            elapsed.as_nanos().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
+    pub fn add_window_sample(&self, state: WindowState, elapsed: Duration, cpu: Duration) {
+        let mut window = self.window.lock().unwrap();
+        window.seconds[state as usize] += elapsed.as_secs_f64();
+        window.cpu_seconds[state as usize] += cpu.as_secs_f64();
     }
 
     pub fn add_draws(&self, count: u64, total: Duration) {
@@ -119,15 +135,13 @@ impl PerfCounters {
     }
 
     pub fn take(&self, wall_seconds: u64) -> MinuteSample {
-        let state_seconds = std::array::from_fn(|index| {
-            self.state_ns[index].swap(0, Ordering::Relaxed) as f64 / 1_000_000_000.
-        });
-        let state_cpu_seconds = std::array::from_fn(|index| {
-            self.state_cpu_ns[index].swap(0, Ordering::Relaxed) as f64 / 1_000_000_000.
-        });
+        let window = std::mem::take(&mut *self.window.lock().unwrap());
+        let state_seconds = window.seconds;
+        let state_cpu_seconds = window.cpu_seconds;
         let process_cpu_seconds = state_cpu_seconds.iter().sum();
         MinuteSample {
             wall_seconds,
+            interval_start_seconds: wall_seconds as f64 - state_seconds.iter().sum::<f64>(),
             process_cpu_seconds,
             state_seconds,
             state_cpu_seconds,
@@ -141,35 +155,6 @@ impl PerfCounters {
             app_commit: option_env!("GTOP_GIT_COMMIT").unwrap_or("unknown"),
         }
     }
-
-    fn restore(&self, sample: &MinuteSample) {
-        for index in 0..WINDOW_STATE_COUNT {
-            self.state_ns[index].fetch_add(
-                (sample.state_seconds[index] * 1_000_000_000.) as u64,
-                Ordering::Relaxed,
-            );
-            self.state_cpu_ns[index].fetch_add(
-                (sample.state_cpu_seconds[index] * 1_000_000_000.) as u64,
-                Ordering::Relaxed,
-            );
-        }
-        self.draw_count
-            .fetch_add(sample.draw_count, Ordering::Relaxed);
-        self.draw_total_ns.fetch_add(
-            (sample.draw_total_ms * 1_000_000.) as u64,
-            Ordering::Relaxed,
-        );
-        self.sampler_runs
-            .fetch_add(sample.sampler_runs, Ordering::Relaxed);
-        self.sampler_total_ns.fetch_add(
-            (sample.sampler_total_ms * 1_000_000.) as u64,
-            Ordering::Relaxed,
-        );
-        self.history_write_ns.fetch_add(
-            (sample.history_write_ms * 1_000_000.) as u64,
-            Ordering::Relaxed,
-        );
-    }
 }
 
 pub struct PerfStore {
@@ -180,6 +165,7 @@ pub struct PerfRecorder {
     counters: Arc<PerfCounters>,
     store: PerfStore,
     last_write: Duration,
+    pending: VecDeque<MinuteSample>,
 }
 
 impl PerfRecorder {
@@ -188,6 +174,7 @@ impl PerfRecorder {
             counters,
             store: PerfStore::open(path)?,
             last_write: Duration::ZERO,
+            pending: VecDeque::new(),
         })
     }
 
@@ -196,16 +183,19 @@ impl PerfRecorder {
         elapsed: Duration,
         wall_seconds: u64,
     ) -> rusqlite::Result<bool> {
-        if elapsed.saturating_sub(self.last_write) < Duration::from_secs(60) {
-            return Ok(false);
+        let due = elapsed.saturating_sub(self.last_write) >= Duration::from_secs(60);
+        if due {
+            let mut sample = self.counters.take(wall_seconds);
+            sample.interval_start_seconds =
+                wall_seconds as f64 - elapsed.saturating_sub(self.last_write).as_secs_f64();
+            self.pending.push_back(sample);
+            self.last_write = elapsed;
         }
-        let sample = self.counters.take(wall_seconds);
-        if let Err(error) = self.store.record(&sample) {
-            self.counters.restore(&sample);
-            return Err(error);
+        while let Some(sample) = self.pending.front() {
+            self.store.record(sample)?;
+            self.pending.pop_front();
         }
-        self.last_write = elapsed;
-        Ok(true)
+        Ok(due)
     }
 }
 
@@ -215,13 +205,37 @@ impl PerfStore {
             std::fs::create_dir_all(parent)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         }
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;",
         )?;
-        connection.execute_batch(include_str!("perf_schema.sql"))?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let legacy = tx
+            .prepare("PRAGMA table_info(perf_minute)")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|(name, pk)| name == "wall_seconds" && *pk != 0);
+        if legacy {
+            tx.execute_batch("ALTER TABLE perf_minute RENAME TO perf_minute_legacy;")?;
+            tx.execute_batch(include_str!("perf_schema.sql"))?;
+            tx.execute_batch(
+                "INSERT INTO perf_minute SELECT *, NULL,
+                wall_seconds - visible_seconds - occluded_seconds - hidden_seconds
+                - minimized_seconds - unknown_seconds FROM perf_minute_legacy;
+                DROP TABLE perf_minute_legacy;",
+            )?;
+        } else {
+            tx.execute_batch(include_str!("perf_schema.sql"))?;
+        }
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS perf_minute_wall_seconds ON perf_minute(wall_seconds);",
+        )?;
+        tx.commit()?;
         Ok(Self { connection })
     }
 
@@ -230,8 +244,8 @@ impl PerfStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT OR REPLACE INTO perf_minute VALUES (
-                ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20
+            "INSERT INTO perf_minute VALUES (
+                ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,NULL,?21
             )",
             params![
                 sample.wall_seconds as i64,
@@ -254,6 +268,7 @@ impl PerfStore {
                 sample.refresh_interval_seconds as i64,
                 sample.app_version,
                 sample.app_commit,
+                sample.interval_start_seconds,
             ],
         )?;
         tx.execute(
@@ -334,10 +349,149 @@ mod tests {
     use super::*;
 
     #[test]
+    fn concurrent_samples_never_separate_cpu_from_duration() {
+        let counters = Arc::new(PerfCounters::default());
+        let producer = counters.clone();
+        let thread = std::thread::spawn(move || {
+            for _ in 0..10000 {
+                producer.add_window_sample(
+                    WindowState::Visible,
+                    Duration::from_secs(1),
+                    Duration::from_millis(100),
+                );
+            }
+        });
+        let mut total = 0.;
+        while !thread.is_finished() {
+            let sample = counters.take(10000);
+            assert!((sample.state_cpu_seconds[0] - sample.state_seconds[0] / 10.).abs() < 1e-8);
+            total += sample.state_seconds[0];
+        }
+        thread.join().unwrap();
+        let sample = counters.take(10000);
+        assert!((sample.state_cpu_seconds[0] - sample.state_seconds[0] / 10.).abs() < 1e-8);
+        assert_eq!(total + sample.state_seconds[0], 10000.);
+    }
+
+    #[test]
+    fn first_cpu_interval_uses_initial_baseline() {
+        let mut baseline = CpuBaseline::new(Some(3.));
+        assert_eq!(baseline.sample(Some(3.25)), Duration::from_millis(250));
+        assert_eq!(baseline.sample(None), Duration::ZERO);
+        assert_eq!(baseline.sample(Some(4.)), Duration::ZERO);
+        assert_eq!(baseline.sample(Some(3.)), Duration::ZERO);
+    }
+
+    #[test]
+    fn collisions_and_clock_rollback_keep_all_samples() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("perf.sqlite");
+        let mut first = PerfStore::open(&path).unwrap();
+        let mut second = PerfStore::open(&path).unwrap();
+        for (index, wall, cpu) in [(0, 10000, 1.), (1, 10000, 9.), (0, 9940, 2.)] {
+            let store = if index == 0 { &mut first } else { &mut second };
+            let mut sample = PerfCounters::default().take(wall);
+            sample.process_cpu_seconds = cpu;
+            store.record(&sample).unwrap();
+        }
+        let result: (i64, f64) = first
+            .connection
+            .query_row(
+                "SELECT count(*), sum(process_cpu_seconds) FROM perf_minute",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(result, (3, 12.));
+    }
+
+    #[test]
+    fn locked_write_keeps_original_minutes_and_timestamps() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("perf.sqlite");
+        let counters = Arc::new(PerfCounters::default());
+        let mut recorder = PerfRecorder::open(&path, counters.clone()).unwrap();
+        recorder
+            .store
+            .connection
+            .busy_timeout(Duration::ZERO)
+            .unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        counters.add_window_sample(
+            WindowState::Visible,
+            Duration::from_secs(60),
+            Duration::from_secs(6),
+        );
+        assert!(recorder
+            .record_if_due(Duration::from_secs(60), 3599)
+            .is_err());
+        blocker.execute_batch("ROLLBACK").unwrap();
+        counters.add_window_sample(
+            WindowState::Visible,
+            Duration::from_secs(60),
+            Duration::from_millis(600),
+        );
+        assert!(recorder
+            .record_if_due(Duration::from_secs(120), 3659)
+            .unwrap());
+        let samples = recorder.store.connection.prepare(
+            "SELECT wall_seconds, interval_start_seconds, visible_seconds, cpu_visible_seconds FROM perf_minute ORDER BY sample_id").unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?, row.get::<_, f64>(3)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(
+            samples,
+            vec![(3599, 3539., 60., 6.), (3659, 3599., 60., 0.6)]
+        );
+    }
+
+    #[test]
+    fn legacy_database_migration_preserves_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("perf.sqlite");
+        let legacy = include_str!("perf_schema.sql")
+            .replace(
+                "wall_seconds INTEGER NOT NULL",
+                "wall_seconds INTEGER PRIMARY KEY",
+            )
+            .replace(
+                ",\n    sample_id INTEGER PRIMARY KEY,\n    interval_start_seconds REAL NOT NULL",
+                "",
+            );
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(&legacy).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO perf_minute VALUES (3600,6,60,0,0,0,0,6,0,0,0,0,0,0,0,0,0,3,'1','a')",
+            )
+            .unwrap();
+        drop(connection);
+        let mut store = PerfStore::open(&path).unwrap();
+        store.record(&PerfCounters::default().take(3600)).unwrap();
+        let count: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM perf_minute", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let start: f64 = store
+            .connection
+            .query_row(
+                "SELECT interval_start_seconds FROM perf_minute WHERE sample_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(start, 3540.);
+    }
+
+    #[test]
     fn counters_return_interval_totals_and_reset_after_take() {
         let counters = PerfCounters::default();
-        counters.add_window_time(WindowState::Visible, Duration::from_secs(42));
-        counters.add_process_cpu(WindowState::Visible, Duration::from_millis(800));
+        counters.add_window_sample(
+            WindowState::Visible,
+            Duration::from_secs(42),
+            Duration::from_millis(800),
+        );
         counters.add_draws(12, Duration::from_millis(30));
         counters.add_sampler(Duration::from_millis(25));
         counters.add_sampler(Duration::from_millis(35));

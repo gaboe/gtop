@@ -9,12 +9,15 @@ fn recorder_writes_after_one_minute_of_injected_time_in_scratch_home() {
     let path = home.join("Library/Application Support/gtop/perf.sqlite");
     let counters = Arc::new(PerfCounters::default());
     let mut recorder = PerfRecorder::open(&path, counters.clone()).unwrap();
-    counters.add_window_time(WindowState::Hidden, Duration::from_secs(59));
-    counters.add_process_cpu(WindowState::Hidden, Duration::from_millis(250));
+    counters.add_window_sample(
+        WindowState::Hidden,
+        Duration::from_secs(59),
+        Duration::from_millis(250),
+    );
     assert!(!recorder
         .record_if_due(Duration::from_secs(59), 2_000_000_000)
         .unwrap());
-    counters.add_window_time(WindowState::Hidden, Duration::from_secs(1));
+    counters.add_window_sample(WindowState::Hidden, Duration::from_secs(1), Duration::ZERO);
     assert!(recorder
         .record_if_due(Duration::from_secs(60), 2_000_000_060)
         .unwrap());

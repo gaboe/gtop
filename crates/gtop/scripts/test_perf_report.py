@@ -18,11 +18,11 @@ class PerfReportTests(unittest.TestCase):
                 schema = Path(__file__).parents[1] / "src" / "perf_schema.sql"
                 db.executescript(schema.read_text())
                 db.executemany(
-                    "INSERT INTO perf_minute VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO perf_minute VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)",
                     [
-                        (3600, 0.8, 30, 0, 30, 0, 0, 0.6, 0, 0.2, 0, 0, 2, 1, 1, 2, 0.1, 3, "1.0", "a"),
-                        (3660, 1.6, 30, 0, 30, 0, 0, 1.2, 0, 0.4, 0, 0, 2, 1, 1, 2, 0.1, 3, "1.0", "a"),
-                        (7200, 0.5, 60, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 2, 1, 1, 2, 0.1, 3, "2.0", "b"),
+                        (3660, 0.8, 30, 0, 30, 0, 0, 0.6, 0, 0.2, 0, 0, 2, 1, 1, 2, 0.1, 3, "1.0", "a", 3600),
+                        (3720, 1.6, 30, 0, 30, 0, 0, 1.2, 0, 0.4, 0, 0, 2, 1, 1, 2, 0.1, 3, "1.0", "a", 3600),
+                        (7260, 0.5, 60, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 2, 1, 1, 2, 0.1, 3, "2.0", "b", 7200),
                     ],
                 )
             with tempfile.TemporaryDirectory() as scratch:
@@ -35,6 +35,19 @@ class PerfReportTests(unittest.TestCase):
             self.assertEqual(visible[0][5], 4.0)
             self.assertEqual(visible[0][6], 4.0)
             self.assertEqual(len([row for row in summaries if row[0] == "2"]), 1)
+
+    def test_boundary_ending_and_crossing_minutes_use_start_hour(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "perf.sqlite"
+            with sqlite3.connect(source) as db:
+                schema = Path(__file__).parents[1] / "src" / "perf_schema.sql"
+                db.executescript(schema.read_text())
+                for end, start in [(3600, 3540), (3630, 3570)]:
+                    db.execute(
+                        "INSERT INTO perf_minute VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)",
+                        (end, 6, 60, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, "1", "a", start),
+                    )
+            self.assertEqual(report.summarize(source), [("0", "1", "visible", 2, 10., 10., 10.)])
 
     def test_copy_uses_read_only_source_connection(self):
         with tempfile.TemporaryDirectory() as directory:
