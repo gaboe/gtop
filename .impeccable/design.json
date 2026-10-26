@@ -24,7 +24,7 @@
       "refersTo": "rack-button",
       "description": "Square outlined control with printed lettering. Native GPUI remains the source.",
       "html": "<button class=\"ds-rack\">PAUSE</button>",
-      "css": ".ds-rack{background:color-mix(in oklab,#020303 70%,transparent);color:#e8e6df;border:1px solid #434545;border-radius:0;font:700 10px \"Archivo Labels\",sans-serif;padding:4px 8px}.ds-rack:hover{background:color-mix(in oklab,#020303 50%,transparent)}.ds-rack:active{background:color-mix(in oklab,#020303 30%,transparent)}.ds-rack:focus-visible{outline:2px solid #ffb000;outline-offset:2px}"
+      "css": ".ds-rack{background:color-mix(in oklab,#020303 30%,transparent);color:#e8e6df;border:1px solid #434545;border-radius:0;font:700 10px \"Archivo Labels\",sans-serif;padding:4px 8px}.ds-rack:hover{background:color-mix(in oklab,#020303 50%,transparent)}.ds-rack:active{background:color-mix(in oklab,#020303 70%,transparent)}.ds-rack:focus-visible{outline:2px solid #ffb000;outline-offset:2px}"
     },
     {
       "name": "Find control",
