@@ -2,6 +2,18 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=GTOP_GIT_COMMIT");
+    // The nearest `.git` entry selects which metadata the paths below resolve
+    // to. Watching every candidate up to it reruns this script when that entry
+    // is relinked, removed or added; a missing path makes Cargo always rerun.
+    let manifest =
+        std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+    for dir in manifest.ancestors() {
+        let entry = dir.join(".git");
+        println!("cargo:rerun-if-changed={}", entry.display());
+        if entry.exists() {
+            break;
+        }
+    }
     for input in ["HEAD", "packed-refs"] {
         watch_git_path(input);
     }

@@ -38,6 +38,17 @@ class BuildMetadataTests(unittest.TestCase):
             self.assertEqual(run("cargo", "run", "--offline", "--quiet"), run("git", "rev-parse", "--short", "HEAD"))
             run("git", "checkout", "--quiet", "--detach", "HEAD~1")
             self.assertEqual(run("cargo", "run", "--offline", "--quiet"), run("git", "rev-parse", "--short", "HEAD"))
+            other = scratch / "other-git"
+            run("git", "init", "--quiet", "--bare", str(other))
+            tree = subprocess.check_output(["git", "--git-dir", str(other), "mktree"], input="", env=env, text=True).strip()
+            commit = subprocess.check_output(["git", "--git-dir", str(other), "commit-tree", tree, "-m", "other"], env=env, text=True).strip()
+            subprocess.check_call(["git", "--git-dir", str(other), "update-ref", "refs/heads/main", commit], env=env)
+            subprocess.check_call(["git", "--git-dir", str(other), "symbolic-ref", "HEAD", "refs/heads/main"], env=env)
+            (repo / ".git").write_text(f"gitdir: {other}\n")
+            self.assertEqual(run("cargo", "run", "--offline", "--quiet"), commit[:len(run("git", "rev-parse", "--short", "HEAD"))])
+            (repo / ".git").unlink()
+            self.assertEqual(run("cargo", "run", "--offline", "--quiet"), "unknown")
+            (repo / ".git").write_text(f"gitdir: {scratch / 'git'}\n")
             env["GTOP_GIT_COMMIT"] = "explicit-reproducible"
             self.assertEqual(run("cargo", "run", "--offline", "--quiet"), "explicit-reproducible")
             env.pop("GTOP_GIT_COMMIT")
