@@ -1,8 +1,7 @@
 use serde::Serialize;
 use std::fmt::Debug;
 
-/// Process information exposed to the frontend via Tauri
-/// Contains formatted and filtered process data for UI consumption
+/// Formatted process data for the monitor UI.
 #[derive(Serialize, Debug, Clone)]
 pub struct ProcessInfo {
     /// Process ID

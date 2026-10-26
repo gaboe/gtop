@@ -177,23 +177,6 @@ section {
   object-fit: contain;
 }
 
-.hero-background img[src*="screenshot.png"] {
-  display: none;
-}
-
-.hero-background img[src*="screenshot-light.png"] {
-  display: block;
-}
-
-/* Dark mode */
-[data-theme="dark"] .hero-background img[src*="screenshot.png"] {
-  display: block;
-}
-
-[data-theme="dark"] .hero-background img[src*="screenshot-light.png"] {
-  display: none;
-}
-
 .gradient-text {
   font-size: 3rem;
   font-weight: 800;
