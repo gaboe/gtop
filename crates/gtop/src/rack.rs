@@ -703,24 +703,30 @@ pub fn segments(value: f32, n: usize, t: &Tokens) -> Div {
         }))
 }
 
-fn core_bank(name: &str, values: &[(usize, f32)], t: &Tokens) -> Div {
+fn core_label(prefix: &str, number: usize) -> String {
+    format!("{prefix}{}", number + 1)
+}
+
+fn core_bank(name: &str, prefix: &str, values: &[(usize, f32)], t: &Tokens) -> Div {
     let average = values.iter().map(|(_, value)| value).sum::<f32>() / values.len().max(1) as f32;
     div()
         .flex_1()
-        .min_w_0()
+        .flex_basis(px(40.))
+        .flex_grow(values.len() as f32)
+        .min_w(px(96.))
         .child(
             div()
                 .flex()
                 .justify_between()
                 .child(label(name, t))
-                .child(label(format!("{average:.0} %"), t)),
+                .child(label(format!("{average:.0}%"), t)),
         )
         .child(
             div()
                 .flex()
                 .items_end()
                 .gap(px(2.))
-                .children(values.iter().map(|(index, value)| {
+                .children(values.iter().enumerate().map(|(number, (_, value))| {
                     let active = (value.clamp(0., 100.) / 100. * 12.).round() as usize;
                     div()
                         .flex_1()
@@ -750,8 +756,9 @@ fn core_bank(name: &str, values: &[(usize, f32)], t: &Tokens) -> Div {
                                 .text_center()
                                 .font_family("JetBrains Mono")
                                 .text_size(px(8.))
+                                .whitespace_nowrap()
                                 .text_color(rgb(t.silk_dim))
-                                .child((index + 1).to_string()),
+                                .child(core_label(prefix, number)),
                         )
                 })),
         )
@@ -765,12 +772,13 @@ fn core_banks(usage: &[f32], topology: &CpuTopology, t: &Tokens) -> Div {
             efficiency,
         } => {
             banks = banks
-                .child(core_bank("P CORES", &performance, t))
-                .child(core_bank("E CORES", &efficiency, t));
+                .child(core_bank("P CORES", "P", &performance, t))
+                .child(core_bank("E CORES", "E", &efficiency, t));
         }
         CpuBanks::Cores(cores) => {
             banks = banks.child(core_bank(
                 "CORES",
+                "",
                 &cores.iter().copied().enumerate().collect::<Vec<_>>(),
                 t,
             ))
@@ -2401,6 +2409,15 @@ mod tests {
                     .map(|(size, unit)| lit_unit("99".into(), unit, size, false, &self.tokens)),
             )
         }
+    }
+
+    #[test]
+    fn core_labels_number_each_bank_from_one() {
+        assert_eq!(super::core_label("P", 0), "P1");
+        assert_eq!(super::core_label("P", 9), "P10");
+        assert_eq!(super::core_label("E", 0), "E1");
+        assert_eq!(super::core_label("E", 3), "E4");
+        assert_eq!(super::core_label("", 0), "1");
     }
 
     fn doto_nine_ink_span(size: f32) -> (f32, f32) {
