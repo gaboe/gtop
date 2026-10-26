@@ -680,7 +680,7 @@ pub fn segments(value: f32, n: usize, t: &Tokens) -> Div {
     let active = segment_fill(value, n);
     div()
         .flex()
-        .gap(px(2.))
+        .gap(px(CPU_SEGMENT_GAP))
         .h(px(8.))
         .w_full()
         .children((0..n).map(|i| {
@@ -710,28 +710,59 @@ fn segment_fill(value: f32, n: usize) -> usize {
     (value.clamp(0., 100.) / 100. * n as f32).round() as usize
 }
 
-pub fn cpu_segments(value: f32, n: usize, t: &Tokens) -> Div {
+const CPU_SEGMENT_GAP: f32 = 2.;
+const CPU_OVERFLOW_WIDTH: f32 = 11.;
+const CPU_OVERFLOW_GAP: f32 = 2.;
+const CPU_MIN_SEGMENT_WIDTH: f32 = 1.;
+
+fn cpu_segment_count(n: usize, width: f32, overflow: bool) -> usize {
+    let reserved = if overflow {
+        CPU_OVERFLOW_WIDTH + CPU_OVERFLOW_GAP
+    } else {
+        0.
+    };
+    let available = (width - reserved).max(0.);
+    let fit = ((available + CPU_SEGMENT_GAP) / (CPU_MIN_SEGMENT_WIDTH + CPU_SEGMENT_GAP)).floor()
+        as usize;
+    n.min(fit)
+}
+
+pub fn cpu_segments(value: f32, n: usize, width: f32, height: f32, t: &Tokens) -> Div {
     let overflow = if value.is_finite() && value > 100. {
         ((value / 100.).ceil() as usize).saturating_sub(1).min(4)
     } else {
         0
     };
+    let segment_count = cpu_segment_count(n, width, overflow > 0);
     div()
         .flex()
         .items_center()
-        .gap(px(2.))
-        .child(segments(value, n, t))
+        .gap(px(CPU_OVERFLOW_GAP))
+        .w(px(width))
+        .h(px(height))
+        .child(
+            segments(value, segment_count, t)
+                .flex_1()
+                .min_w_0()
+                .h(px(height)),
+        )
         .when(overflow > 0, |bar| {
-            bar.child(div().flex().gap(px(1.)).children((0..4).map(|index| {
-                let active = index < overflow;
+            bar.child(
                 div()
-                    .w(px(2.))
-                    .h(px(8.))
-                    .bg(rgb(if active { t.base.hot } else { t.seg_off }))
-                    .when(active && !t.light, |tick| {
-                        tick.shadow(vec![crate::glow::shadow(t.base.hot, 4., 153)])
-                    })
-            })))
+                    .flex()
+                    .flex_shrink_0()
+                    .gap(px(1.))
+                    .children((0..4).map(|index| {
+                        let active = index < overflow;
+                        div()
+                            .w(px(2.))
+                            .h(px(height))
+                            .bg(rgb(if active { t.base.hot } else { t.seg_off }))
+                            .when(active && !t.light, |tick| {
+                                tick.shadow(vec![crate::glow::shadow(t.base.hot, 4., 153)])
+                            })
+                    })),
+            )
         })
 }
 
@@ -1745,13 +1776,14 @@ impl Monitor {
                                                                 )
                                                                 .child(
                                                                     history_cell(widths[3], false)
-                                                                        .child(
-                                                                            cpu_segments(
-                                                                                p.peak_cpu, 30, &t,
-                                                                            )
-                                                                            .w_full()
-                                                                            .max_w(px(120.)),
-                                                                        ),
+                                                                        .child(cpu_segments(
+                                                                            p.peak_cpu,
+                                                                            30,
+                                                                            (widths[3] - 20.)
+                                                                                .min(120.),
+                                                                            8.,
+                                                                            &t,
+                                                                        )),
                                                                 )
                                                                 .child(
                                                                     history_cell(widths[4], true)
@@ -2552,13 +2584,11 @@ mod tests {
                 .flex()
                 .flex_col()
                 .gap(px(20.))
-                .child(cpu_segments(54., 18, &self.tokens).w(px(78.)).h(px(12.)))
+                .child(cpu_segments(54., 18, 78., 12., &self.tokens))
                 .child(
-                    history_cell(90., true).overflow_hidden().child(
-                        cpu_segments(104., 30, &self.tokens)
-                            .w_full()
-                            .max_w(px(120.)),
-                    ),
+                    history_cell(75., true)
+                        .overflow_hidden()
+                        .child(cpu_segments(104., 30, 55., 8., &self.tokens)),
                 )
         }
     }
