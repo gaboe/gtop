@@ -164,6 +164,13 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         );
         view
     });
+    let colors = palette::ColorField::ALL.map(|field| {
+        cx.new(|cx| InputState::new(window, cx).default_value(format!("#{:06x}", field.get(base))))
+    });
+    let color_pickers = palette::ColorField::ALL.map(|field| {
+        cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb(field.get(base))))
+    });
+    let subscriptions = Monitor::palette_subscriptions(&colors, &color_pickers, window, cx);
     Monitor {
         core: None,
         snapshot: Some(snapshot.clone()),
@@ -192,7 +199,8 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         last_snapshot: None,
         focus,
         draft: None,
-        colors: std::array::from_fn(|_| cx.new(|cx| InputState::new(window, cx))),
+        colors,
+        color_pickers,
         mix_name: cx.new(|cx| InputState::new(window, cx)),
         traces: [(
             ProcessKey::from(&snapshot.processes[0]),
@@ -205,7 +213,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         status: String::new(),
         pending_kill: None,
         wake: mpsc::channel(1).0,
-        _subscriptions: vec![],
+        _subscriptions: subscriptions,
         _refresh: Some(Task::ready(())),
         shutdown: None,
         _ports: Task::ready(()),
@@ -501,6 +509,14 @@ fn aluminium_offscreen_review() {
                     cx.notify();
                 });
                 theme::apply(base, cx);
+                for field in palette::ColorField::ALL {
+                    m.color_pickers[field as usize].update(cx, |picker, cx| {
+                        picker.set_value(rgb(field.get(base)), window, cx)
+                    });
+                    m.colors[field as usize].update(cx, |input, cx| {
+                        input.set_value(format!("#{:06x}", field.get(base)), window, cx)
+                    });
+                }
             });
             monitor = Some(entity.clone());
             cx.new(|cx| Root::new(entity, window, cx))
@@ -512,10 +528,17 @@ fn aluminium_offscreen_review() {
         ("history", Some(2), false),
         ("detail", None, true),
         ("disk", None, false),
+        ("palette", None, false),
+        ("picker", None, false),
     ] {
         cx.update(|cx| {
             monitor.update(cx, |m, cx| {
                 m.view = view;
+                m.settings_open = matches!(name, "palette" | "picker");
+                if name == "picker" {
+                    m.color_pickers[palette::ColorField::Led as usize]
+                        .update(cx, |picker, cx| picker.set_open(true, cx));
+                }
                 m.details = None;
                 m.disk = None;
                 if name == "disk" {
@@ -541,4 +564,84 @@ fn aluminium_offscreen_review() {
             .unwrap();
     }
     FIXED_CLOCK.with(|v| v.set(false));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn picker_events_update_live_palette_and_coalesce_saved_settings() {
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("palette-events"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let (sender, mut receiver) = mpsc::unbounded();
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |m, _| {
+            m.settings_writes = Some(sender);
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+    let original = palette::presets()[0].base;
+    for field in palette::ColorField::ALL {
+        cx.update_window(handle.into(), |_, window, cx| {
+            let picker = monitor.read(cx).color_pickers[field as usize].clone();
+            picker.update(cx, |picker, cx| {
+                picker.update_color(gpui::rgba(0x12345680).into(), window, cx)
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let m = monitor.read(cx);
+            assert_eq!(field.get(m.settings.base()), 0x123456);
+            assert_eq!(m.table.read(cx).base, m.settings.base());
+            assert_eq!(m.settings.saved.len(), 1);
+            assert_eq!(
+                m.color_pickers[field as usize].read(cx).value(),
+                Some(rgb(0x123456).into())
+            );
+            assert_eq!(m.settings.active, palette::presets().len());
+            assert_eq!(
+                m.colors[field as usize].read(cx).value().as_str(),
+                "#123456"
+            );
+        });
+    }
+    cx.update_window(handle.into(), |_, window, cx| {
+        let input = monitor.read(cx).colors[palette::ColorField::Led as usize].clone();
+        window.focus(&input.read(cx).focus_handle(cx), cx);
+        input.update(cx, |input, cx| {
+            input.set_value("#654321", window, cx);
+            cx.emit(InputEvent::Change);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        let m = monitor.read(cx);
+        assert_eq!(m.settings.base().led, 0x654321);
+        assert!(m.colors[palette::ColorField::Led as usize]
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window));
+        assert_eq!(
+            m.color_pickers[palette::ColorField::Led as usize]
+                .read(cx)
+                .value(),
+            Some(rgb(0x654321).into())
+        );
+    })
+    .unwrap();
+    let latest = futures::executor::block_on(palette::next_settings(&mut receiver)).unwrap();
+    assert_eq!(latest.base().led, 0x654321);
+    assert_eq!(latest.saved.len(), 1);
+    assert_eq!(palette::presets()[0].base, original);
 }

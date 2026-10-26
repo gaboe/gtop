@@ -180,7 +180,15 @@ Dangerous actions use `hot`. Secondary controls use `plate` and `plate2`.
 
 Live and history controls sit above the main area. Keyboard hints use bordered keycaps.
 The tower stays visible beside process details, history moments, disk information, and the palette editor.
-The palette editor exposes the six base roles and saved mixes.
+The palette editor exposes the six base roles and saved mixes. Each role has a
+native ColorPicker and a six-digit hex input. Picker and hex edits apply live.
+The first edit to a preset creates a saved custom copy. Later edits update that
+copy through the coalesced settings writer. Random mixes remain drafts until saved.
+Each row shows its minimum text contrast across the derived panel, readout, table,
+and selected-row backgrounds. Accent and Hot also check the button foreground.
+The row says `Below AA` below 4.5:1. This warning uses black or white ink so it
+remains readable when the custom palette has poor text contrast.
+The palette panel scrolls when saved copies exceed the available height.
 
 ## Do's and Don'ts
 

@@ -64,6 +64,11 @@
       "description": "Rectangular active segments with the shipped two-pixel gap.",
       "html": "<div class=\"ds-meter\" role=\"img\" aria-label=\"Three active segments\"><i></i><i></i><i></i></div>",
       "css": ".ds-meter{display:flex;gap:2px;height:8px}.ds-meter i{flex:1;background:#ffb000;box-shadow:0 0 4px #ffb00099}"
+    },
+    {
+      "name": "Palette color editor",
+      "kind": "custom",
+      "description": "Native gpui-component ColorPicker plus hex input for each of six base roles. Shows the lowest text contrast ratio and Below AA warning. First preset edit creates a persisted custom copy; subsequent edits update that copy live."
     }
   ],
   "narrative": {

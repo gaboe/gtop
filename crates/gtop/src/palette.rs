@@ -9,6 +9,102 @@ pub struct Base {
     pub hot: u32,
     pub ok: u32,
 }
+
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub enum ColorField {
+    Ground,
+    Plate,
+    Silk,
+    Led,
+    Hot,
+    Ok,
+}
+impl ColorField {
+    pub const ALL: [Self; 6] = [
+        Self::Ground,
+        Self::Plate,
+        Self::Silk,
+        Self::Led,
+        Self::Hot,
+        Self::Ok,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ground => "Ground",
+            Self::Plate => "Panel",
+            Self::Silk => "Labels",
+            Self::Led => "Accent",
+            Self::Hot => "Hot",
+            Self::Ok => "OK and ports",
+        }
+    }
+    pub fn get(self, base: Base) -> u32 {
+        match self {
+            Self::Ground => base.ground,
+            Self::Plate => base.plate,
+            Self::Silk => base.silk,
+            Self::Led => base.led,
+            Self::Hot => base.hot,
+            Self::Ok => base.ok,
+        }
+    }
+    pub fn set(self, base: &mut Base, value: u32) {
+        match self {
+            Self::Ground => base.ground = value,
+            Self::Plate => base.plate = value,
+            Self::Silk => base.silk = value,
+            Self::Led => base.led = value,
+            Self::Hot => base.hot = value,
+            Self::Ok => base.ok = value,
+        }
+    }
+}
+
+pub fn contrast(a: u32, b: u32) -> f64 {
+    fn luminance(color: u32) -> f64 {
+        0.2126 * linear((color >> 16) as f64 / 255.)
+            + 0.7152 * linear(((color >> 8) & 255) as f64 / 255.)
+            + 0.0722 * linear((color & 255) as f64 / 255.)
+    }
+    let a = luminance(a);
+    let b = luminance(b);
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+impl Base {
+    pub fn text_contrast(self, field: ColorField) -> f64 {
+        let t = self.tokens();
+        let colors = [
+            self.silk, t.silk_dim, t.ink_row, t.cmd, self.led, self.hot, self.ok,
+        ];
+        let selected = field.get(self);
+        let foregrounds: &[u32] = match field {
+            ColorField::Led | ColorField::Hot | ColorField::Ok => std::slice::from_ref(&selected),
+            _ => &colors,
+        };
+        let mut minimum = f64::INFINITY;
+        for &foreground in foregrounds {
+            for background in [
+                self.ground,
+                self.plate,
+                t.plate2,
+                t.well,
+                t.table,
+                t.table_head,
+                t.selection,
+                t.readout,
+            ] {
+                minimum = minimum.min(contrast(foreground, background));
+            }
+        }
+        if matches!(field, ColorField::Led | ColorField::Hot) {
+            minimum = minimum.min(contrast(t.on_led, field.get(self)));
+        }
+        minimum
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Palette {
     pub name: String,
@@ -258,6 +354,27 @@ pub async fn finish_writer<W>(
 }
 
 impl Settings {
+    pub fn edit_base(&mut self, base: Base) -> bool {
+        if self.base() == base {
+            return false;
+        }
+        let presets = presets();
+        if let Some(saved) = self
+            .active
+            .checked_sub(presets.len())
+            .and_then(|i| self.saved.get_mut(i))
+        {
+            saved.base = base;
+        } else {
+            let original = presets.get(self.active).unwrap_or(&presets[0]);
+            self.saved.push(Palette {
+                name: format!("{} custom", original.name),
+                base,
+            });
+            self.active = presets.len() + self.saved.len() - 1;
+        }
+        true
+    }
     pub fn load() -> Self {
         std::fs::read(super::history::support_path("palette.json"))
             .ok()
@@ -303,18 +420,6 @@ impl Settings {
 mod tests {
     use super::*;
 
-    fn luminance(color: u32) -> f64 {
-        0.2126 * linear((color >> 16) as f64 / 255.)
-            + 0.7152 * linear(((color >> 8) & 255) as f64 / 255.)
-            + 0.0722 * linear((color & 255) as f64 / 255.)
-    }
-
-    fn contrast(a: u32, b: u32) -> f64 {
-        let a = luminance(a);
-        let b = luminance(b);
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
-    }
-
     #[test]
     fn aluminium_contrast_covers_text_controls_and_meters() {
         let t = presets()[4].base.tokens();
@@ -347,9 +452,11 @@ mod tests {
             ("primary button", t.on_led, t.base.led),
             ("danger button", t.on_led, t.base.hot),
         ] {
+            println!("button {name}: {:.2}:1", contrast(foreground, background));
             assert!(contrast(foreground, background) >= 4.5, "{name}");
         }
         for (name, surface) in backgrounds {
+            println!("control {name}: {:.2}:1", contrast(t.rule_hi, surface));
             assert!(
                 contrast(t.rule_hi, surface) >= 3.,
                 "control outline/{name}: {}",
@@ -363,6 +470,10 @@ mod tests {
                 mix(t.base.led, t.base.ground, 0.12),
                 t.hot_off,
             ] {
+                println!(
+                    "meter {ink:06x}/{background:06x}: {:.2}:1",
+                    contrast(ink, background)
+                );
                 assert!(
                     contrast(ink, background) >= 3.,
                     "meter {ink:06x}/{background:06x}: {}",
@@ -370,6 +481,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn editing_a_preset_creates_one_saved_copy_and_round_trips() {
+        for field in ColorField::ALL {
+            let mut settings = Settings {
+                active: 4,
+                ..Default::default()
+            };
+            let original = settings.base();
+            let mut edited = original;
+            field.set(&mut edited, 0x123456);
+            assert!(settings.edit_base(edited));
+            assert_eq!(settings.saved.len(), 1);
+            assert_eq!(settings.active, presets().len());
+            assert_eq!(settings.base(), edited);
+            assert_eq!(presets()[4].base, original);
+            assert!(!settings.edit_base(edited));
+            field.set(&mut edited, 0x345678);
+            assert!(settings.edit_base(edited));
+            assert_eq!(settings.saved.len(), 1);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("palette.json");
+            settings.save_to(&path).unwrap();
+            let stored: Settings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(stored.active, settings.active);
+            assert_eq!(stored.base(), edited);
+            assert_eq!(stored.saved[0].name, "Aluminium custom");
+        }
+    }
+
+    #[test]
+    fn custom_palette_contrast_reports_readable_and_unreadable_text() {
+        let mut base = presets()[4].base;
+        for field in ColorField::ALL {
+            assert!(base.text_contrast(field) >= 4.5);
+        }
+        base.led = base.plate;
+        assert_eq!(base.text_contrast(ColorField::Led), 1.);
+        base.silk = base.ground;
+        assert!(base.text_contrast(ColorField::Silk) < 4.5);
     }
 
     #[test]
