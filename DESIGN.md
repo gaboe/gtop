@@ -76,15 +76,18 @@ Use these derived roles when a palette changes. Fixed gray replacements lose the
 
 ## Typography
 
-All four faces are bundled assets. Doto Display carries illuminated numbers at weight 900, with a line height equal to its size.
+All five faces are bundled assets. Doto Display carries illuminated numbers at weight 900, with a line height equal to its size.
 Readouts use sizes such as 22 px and 42 px. JetBrains Mono carries exact data, commands, and process rows.
-Archivo Labels carries compact uppercase printed labels and outlined controls.
-Silkscreen carries keyboard hints and compact navigation lettering.
+Archivo Labels carries compact uppercase labels, navigation, and outlined controls.
+Archivo Display carries the selected-process heading at weight 800 and 30 px.
+Silkscreen carries keyboard hints and the tower's self-monitor values.
 Core labels use JetBrains Mono at 8 px. Table rows use 12 px data text, with larger text in priority rows.
 
-The percent and degree signs are authored 5 by 7 glyphs. They are canvas paths, not font substitutes.
-Their ink height is 0.69 of the readout size, with a top offset of 0.155 and a width-to-height ratio of 10:14.
-This aligns them with Doto's digit ink. `UNIT_GLYPHS`, `unit_glyph_bounds`, and `unit_paths` own this geometry.
+The percent and degree signs use authored 5 by 7 canvas paths, not font glyphs.
+The canvas box uses a top offset of 0.155, a height of 0.69 times the readout size, and a width-to-height ratio of 10:14.
+These values describe the canvas box, not the ink bounds of both signs.
+The percent ink spans 13.64 canvas units. The degree sign lights dots only in its first four rows.
+`UNIT_GLYPHS`, `unit_glyph_bounds`, and `unit_paths` own this geometry.
 Other characters remain real font text.
 
 ## Layout
@@ -94,8 +97,9 @@ The root has 10 px padding and an 8 px gap. The system tower stays 300 px wide a
 The process or history area fills the remaining width. A selected detail panel or the palette editor takes 380 px beside it.
 There is no mobile breakpoint or stacked mobile layout.
 
-Tower panels have 12 px horizontal padding, 14 px top padding, 12 px bottom padding, and 8 px gaps.
-Recessed readouts have 12 px horizontal padding, 10 px vertical padding, and 6 px internal gaps.
+The tower has 12 px horizontal padding, 14 px top padding, 12 px bottom padding, and 8 px gaps.
+Recessed panels use 12 px horizontal padding and 10 px vertical padding.
+Their default gap is 6 px. The CPU panel uses a 2 px gap.
 Process rows are normally 22 px high. Priority rows are 30 px high.
 History rows are 22 px high, beneath a 29 px header. Columns can resize and scroll horizontally.
 
@@ -124,7 +128,8 @@ The percent and degree glyphs keep their authored dot geometry at each readout s
 
 `lit` layers a dim ghost value behind sharp Doto text and cached glow.
 `lit_unit` adds the authored unit glyph on the same baseline.
-Horizontal meters have 2 px gaps and an 8 px height. The final 15 percent of their segments use hot color.
+Horizontal meters have 2 px gaps and an 8 px height. Priority process rows use 12 px meter height.
+The final 15 percent of each meter uses hot color.
 Core meters use twelve vertical segments in a 36 px column, with 1 px vertical gaps.
 Performance and efficiency banks have separate averages and P1 or E1 numbering.
 Each bank has a 40 px flex basis, a 96 px minimum, and grows in proportion to its core count. Core labels stay on one line.
@@ -133,15 +138,17 @@ When topology cannot be verified, one generic bank shows numeric labels.
 ### Process and history tables
 
 Rows use the shared column-width model. Exact values align within their columns.
-The table virtualizes rows. Active and hovered rows use `plate2`.
-The active row has a silk-colored border. Row separators use `row_rule`.
+The table virtualizes rows. A selected process row uses `mix(plate2, led, 0.7)`.
+Selected history rows use `plate2`. Neither table adds a hover fill or a silk selection border.
+Row separators use `row_rule`.
 The table well and header use distinct dark mixes of ground and plate.
 
 ### Buttons and inputs
 
 Rack buttons are outlined, square, and use bold printed labels.
 Input wells, focus rings, primary actions, and dangerous actions receive their colors through `theme::apply`.
-The accent uses led. Dangerous actions use hot. Secondary controls use plate and plate2.
+The theme accent uses `plate2`. Primary actions and the focus ring use `led`.
+Dangerous actions use `hot`. Secondary controls use `plate` and `plate2`.
 
 ### Navigation and side panels
 

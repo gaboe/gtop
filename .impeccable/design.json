@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-26T04:20:24.757254+00:00",
+  "generatedAt": "2026-10-26T04:58:32Z",
   "title": "Design system: gtop Rack",
   "extensions": {
     "shadows": [
@@ -24,14 +24,14 @@
       "refersTo": "rack-button",
       "description": "Square outlined control with printed lettering. Native GPUI remains the source.",
       "html": "<button class=\"ds-rack\">PAUSE</button>",
-      "css": ".ds-rack{background:#141618;color:#e8e6df;border:1px solid #434545;border-radius:0;font:700 10px \"Archivo Labels\",sans-serif;padding:4px 8px}.ds-rack:hover,.ds-rack:active{background:#202223}.ds-rack:focus-visible{outline:2px solid #ffb000;outline-offset:2px}"
+      "css": ".ds-rack{background:color-mix(in oklab,#020303 70%,transparent);color:#e8e6df;border:1px solid #434545;border-radius:0;font:700 10px \"Archivo Labels\",sans-serif;padding:4px 8px}.ds-rack:hover{background:color-mix(in oklab,#020303 50%,transparent)}.ds-rack:active{background:color-mix(in oklab,#020303 30%,transparent)}.ds-rack:focus-visible{outline:2px solid #ffb000;outline-offset:2px}"
     },
     {
-      "name": "Search field",
+      "name": "Find control",
       "kind": "input",
-      "description": "Recessed field with accent focus. HTML is a visual reference for the native input.",
-      "html": "<input class=\"ds-search\" aria-label=\"Search\" placeholder=\"name, pid, command or port\">",
-      "css": ".ds-search{background:#020303;color:#e8e6df;border:1px solid #2c2e2f;border-radius:0;font:12px \"JetBrains Mono\",monospace;padding:6px 8px}.ds-search:focus-visible{outline:2px solid #ffb000}"
+      "description": "The persistent FIND wrapper contains the unadorned search input.",
+      "html": "<div class=\"ds-find\"><span>FIND</span><input aria-label=\"Search\" placeholder=\"name, pid, command or port\"></div>",
+      "css": ".ds-find{display:flex;align-items:center;gap:10px;padding:0 12px;background:#020303;border:1px solid #2c2e2f;color:color-mix(in oklab,#e8e6df 58%,#141618);font:700 10px \"Archivo Labels\",sans-serif}.ds-find input{flex:1;min-width:0;background:transparent;border:0;outline:0;color:#e8e6df;font:12px \"JetBrains Mono\",monospace}.ds-find input:focus-visible{outline:0}"
     },
     {
       "name": "VFD well",

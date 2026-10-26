@@ -707,13 +707,57 @@ fn core_label(prefix: &str, number: usize) -> String {
     format!("{prefix}{}", number + 1)
 }
 
-fn core_bank(name: &str, prefix: &str, values: &[(usize, f32)], t: &Tokens) -> Div {
+const CORE_BANK_ROW_WIDTH: f32 = 248.;
+const CORE_BANK_MIN_WIDTH: f32 = 96.;
+const CORE_BANK_FLEX_BASIS: f32 = 40.;
+const CORE_BANK_GAP: f32 = 8.;
+const CORE_CELL_GAP: f32 = 2.;
+const CORE_LABEL_GLYPH_WIDTH: f32 = 4.8;
+
+fn core_label_stride(prefix: &str, count: usize, bank_width: f32) -> usize {
+    if count == 0 {
+        return 1;
+    }
+
+    let label_width = core_label(prefix, count - 1).len() as f32 * CORE_LABEL_GLYPH_WIDTH;
+    let cell_width = (bank_width - CORE_CELL_GAP * (count - 1) as f32) / count as f32;
+    let label_center_spacing = cell_width + CORE_CELL_GAP;
+    (label_width / label_center_spacing).ceil().max(1.) as usize
+}
+
+fn hybrid_bank_widths(performance_count: usize, efficiency_count: usize) -> (f32, f32) {
+    let total_count = (performance_count + efficiency_count).max(1) as f32;
+    let available_width = CORE_BANK_ROW_WIDTH - CORE_BANK_GAP;
+    let free_space = available_width - 2. * CORE_BANK_FLEX_BASIS;
+    let mut performance_width =
+        CORE_BANK_FLEX_BASIS + free_space * performance_count as f32 / total_count;
+    let mut efficiency_width = available_width - performance_width;
+
+    if performance_width < CORE_BANK_MIN_WIDTH {
+        performance_width = CORE_BANK_MIN_WIDTH;
+        efficiency_width = available_width - performance_width;
+    } else if efficiency_width < CORE_BANK_MIN_WIDTH {
+        efficiency_width = CORE_BANK_MIN_WIDTH;
+        performance_width = available_width - efficiency_width;
+    }
+
+    (performance_width, efficiency_width)
+}
+
+fn core_bank(
+    name: &str,
+    prefix: &str,
+    values: &[(usize, f32)],
+    bank_width: f32,
+    t: &Tokens,
+) -> Div {
     let average = values.iter().map(|(_, value)| value).sum::<f32>() / values.len().max(1) as f32;
+    let label_stride = core_label_stride(prefix, values.len(), bank_width);
     div()
         .flex_1()
-        .flex_basis(px(40.))
+        .flex_basis(px(CORE_BANK_FLEX_BASIS))
         .flex_grow(values.len() as f32)
-        .min_w(px(96.))
+        .min_w(px(CORE_BANK_MIN_WIDTH))
         .child(
             div()
                 .flex()
@@ -721,65 +765,74 @@ fn core_bank(name: &str, prefix: &str, values: &[(usize, f32)], t: &Tokens) -> D
                 .child(label(name, t))
                 .child(label(format!("{average:.0}%"), t)),
         )
-        .child(
-            div()
-                .flex()
-                .items_end()
-                .gap(px(2.))
-                .children(values.iter().enumerate().map(|(number, (_, value))| {
-                    let active = (value.clamp(0., 100.) / 100. * 12.).round() as usize;
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(div().flex().flex_col().gap(px(1.)).h(px(36.)).children(
-                            (0..12).rev().map(|segment| {
-                                div()
-                                    .flex_1()
-                                    .bg(rgb(if *value > 90. && segment >= 9 {
-                                        t.base.hot
-                                    } else if segment < active {
-                                        t.base.led
-                                    } else {
-                                        palette::mix(t.base.led, t.base.ground, 0.12)
-                                    }))
-                                    .when(segment < active && !t.light, |bar| {
-                                        bar.shadow(vec![if *value > 90. && segment >= 9 {
-                                            crate::glow::shadow(t.base.hot, 4., 153)
-                                        } else {
-                                            crate::glow::shadow(t.base.led, 4., 140)
-                                        }])
-                                    })
-                            }),
-                        ))
-                        .child(
+        .child(div().flex().items_end().gap(px(CORE_CELL_GAP)).children(
+            values.iter().enumerate().map(|(number, (_, value))| {
+                let active = (value.clamp(0., 100.) / 100. * 12.).round() as usize;
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().flex().flex_col().gap(px(1.)).h(px(36.)).children(
+                        (0..12).rev().map(|segment| {
                             div()
-                                .text_center()
-                                .font_family("JetBrains Mono")
-                                .text_size(px(8.))
-                                .whitespace_nowrap()
-                                .text_color(rgb(t.silk_dim))
-                                .child(core_label(prefix, number)),
-                        )
-                })),
-        )
+                                .flex_1()
+                                .bg(rgb(if *value > 90. && segment >= 9 {
+                                    t.base.hot
+                                } else if segment < active {
+                                    t.base.led
+                                } else {
+                                    palette::mix(t.base.led, t.base.ground, 0.12)
+                                }))
+                                .when(segment < active && !t.light, |bar| {
+                                    bar.shadow(vec![if *value > 90. && segment >= 9 {
+                                        crate::glow::shadow(t.base.hot, 4., 153)
+                                    } else {
+                                        crate::glow::shadow(t.base.led, 4., 140)
+                                    }])
+                                })
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .text_center()
+                            .font_family("JetBrains Mono")
+                            .text_size(px(8.))
+                            .whitespace_nowrap()
+                            .text_color(rgb(t.silk_dim))
+                            .child(if number % label_stride == 0 {
+                                core_label(prefix, number)
+                            } else {
+                                String::new()
+                            }),
+                    )
+            }),
+        ))
 }
 
 fn core_banks(usage: &[f32], topology: &CpuTopology, t: &Tokens) -> Div {
-    let mut banks = div().flex().gap(px(8.));
+    let mut banks = div().flex().gap(px(CORE_BANK_GAP));
     match topology.banks(usage) {
         CpuBanks::Hybrid {
             performance,
             efficiency,
         } => {
+            let (performance_width, efficiency_width) =
+                hybrid_bank_widths(performance.len(), efficiency.len());
             banks = banks
-                .child(core_bank("P CORES", "P", &performance, t))
-                .child(core_bank("E CORES", "E", &efficiency, t));
+                .child(core_bank(
+                    "P CORES",
+                    "P",
+                    &performance,
+                    performance_width,
+                    t,
+                ))
+                .child(core_bank("E CORES", "E", &efficiency, efficiency_width, t));
         }
         CpuBanks::Cores(cores) => {
             banks = banks.child(core_bank(
                 "CORES",
                 "",
                 &cores.iter().copied().enumerate().collect::<Vec<_>>(),
+                CORE_BANK_ROW_WIDTH,
                 t,
             ))
         }
@@ -2418,6 +2471,14 @@ mod tests {
         assert_eq!(super::core_label("E", 0), "E1");
         assert_eq!(super::core_label("E", 3), "E4");
         assert_eq!(super::core_label("", 0), "1");
+    }
+
+    #[test]
+    fn core_label_stride_keeps_labels_inside_their_cells() {
+        assert_eq!(super::core_label_stride("P", 12, 144.), 2);
+        assert_eq!(super::core_label_stride("P", 24, 144.), 3);
+        assert_eq!(super::core_label_stride("E", 4, 96.), 1);
+        assert_eq!(super::core_label_stride("", 0, 248.), 1);
     }
 
     fn doto_nine_ink_span(size: f32) -> (f32, f32) {
