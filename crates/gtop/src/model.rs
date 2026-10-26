@@ -333,7 +333,7 @@ mod tests {
         );
     }
     #[test]
-    fn ports_follow_svelte_parse_rules() {
+    fn port_terms_follow_parse_rules() {
         for term in [":1", ":65535", "port:443", " PORT:03000 "] {
             assert!(parse_port(term).is_some(), "{term}");
         }
