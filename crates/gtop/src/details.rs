@@ -689,11 +689,7 @@ fn environment_content(
             if values.is_empty() {
                 div().child("This process exposes no environment variables.")
             } else {
-                div().child(selectable_content(
-                    window,
-                    "environment-text",
-                    &values.join("\n"),
-                ))
+                selectable_content(window, "environment-text", &values.join("\n"))
             }
         }
         Environment::Loaded(_) => div().child("Environment hidden"),
