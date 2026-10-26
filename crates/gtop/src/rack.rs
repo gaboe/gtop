@@ -117,12 +117,14 @@ const UNIT_GLYPHS: [(char, [&str; 7]); 2] = [
     ),
 ];
 
-type UnitPaths = (Path<Pixels>, Path<Pixels>);
-type UnitCacheKey = (char, u32, u32, u32);
+type UnitPaths = (Path<Pixels>, Option<Path<Pixels>>);
+type UnitCacheKey = (char, u32, u32, u32, bool);
 static UNIT_PATHS: OnceLock<Mutex<HashMap<UnitCacheKey, UnitPaths>>> = OnceLock::new();
 
 #[cfg(test)]
 static UNIT_GLYPH_TEST_BOUNDS: Mutex<Vec<Bounds<Pixels>>> = Mutex::new(Vec::new());
+#[cfg(test)]
+pub(crate) static DIGIT_GHOST_TEST_TEXTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn core_time(seconds: f64) -> String {
     let minutes = seconds / 60.;
@@ -187,34 +189,41 @@ fn draw_readout_text(metrics: DrawMetrics) -> String {
     )
 }
 pub fn lit(text: String, size: f32, hot: bool, t: &Tokens) -> Div {
-    let ghost: String = text
-        .chars()
-        .map(|c| if c.is_ascii_digit() { '8' } else { c })
-        .collect();
-    div()
+    let mut readout = div()
         .relative()
         .font_family("Doto Display")
         .font_weight(FontWeight::BLACK)
         .text_size(px(size))
         .line_height(px(size))
-        .text_color(rgb(if hot { t.base.hot } else { t.base.led }))
-        .child(
+        .text_color(rgb(if hot { t.base.hot } else { t.base.led }));
+    if !t.light {
+        let ghost = text
+            .chars()
+            .map(|c| if c.is_ascii_digit() { '8' } else { c })
+            .collect::<String>();
+        #[cfg(test)]
+        if !crate::draw_benchmark::fixed_clock() {
+            DIGIT_GHOST_TEST_TEXTS.lock().unwrap().push(ghost.clone());
+        }
+        readout = readout.child(
             div()
                 .absolute()
                 .top_0()
                 .left_0()
                 .text_color(rgb(palette::mix(t.base.led, t.base.ground, 0.18)))
                 .child(ghost),
-        )
-        .child(crate::glow::text(text, hot, t))
+        );
+    }
+    readout.child(crate::glow::text(text, hot, t))
 }
 
-fn unit_paths(bounds: Bounds<Pixels>, unit: char) -> UnitPaths {
+fn unit_paths(bounds: Bounds<Pixels>, unit: char, with_ghost: bool) -> UnitPaths {
     let key = (
         unit,
         f32::from(bounds.origin.x).to_bits(),
         f32::from(bounds.origin.y).to_bits(),
         f32::from(bounds.size.height).to_bits(),
+        with_ghost,
     );
     let cache = UNIT_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(cache) = cache.lock() {
@@ -230,12 +239,18 @@ fn unit_paths(bounds: Bounds<Pixels>, unit: char) -> UnitPaths {
     let origin_x = f32::from(bounds.origin.x);
     let origin_y = f32::from(bounds.origin.y);
     let mut lit = PathBuilder::fill();
-    let mut ghost = PathBuilder::fill();
+    let mut ghost = with_ghost.then(PathBuilder::fill);
     for (y, row) in rows.iter().enumerate() {
         for (x, bit) in row.bytes().enumerate() {
             let center_x = origin_x + (x as f32 * 2. + 1.) * scale;
             let center_y = origin_y + (y as f32 * 2. + 1.) * scale;
-            let path = if bit == b'1' { &mut lit } else { &mut ghost };
+            let path = if bit == b'1' {
+                &mut lit
+            } else if let Some(ghost) = ghost.as_mut() {
+                ghost
+            } else {
+                continue;
+            };
             let radius = scale * 0.82;
             let points = (0..12)
                 .map(|i| {
@@ -251,7 +266,7 @@ fn unit_paths(bounds: Bounds<Pixels>, unit: char) -> UnitPaths {
     }
     let paths = (
         lit.build().expect("lit unit geometry"),
-        ghost.build().expect("ghost unit geometry"),
+        ghost.map(|ghost| ghost.build().expect("ghost unit geometry")),
     );
     if let Ok(mut cache) = cache.lock() {
         if cache.len() >= 32 {
@@ -262,11 +277,10 @@ fn unit_paths(bounds: Bounds<Pixels>, unit: char) -> UnitPaths {
     paths
 }
 
-fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
+fn unit_glyph(unit: char, size: f32, hot: bool, glow: bool, t: &Tokens) -> Div {
     let led = if hot { t.base.hot } else { t.base.led };
-    let ghost = palette::mix(t.base.led, t.base.ground, 0.18);
+    let ghost = (!t.light).then(|| palette::mix(t.base.led, t.base.ground, 0.18));
     let bounds = unit_glyph_bounds(size);
-    let glow = !t.light;
     div().ml(px(size * 0.12)).flex_shrink_0().child(
         canvas(
             |_, _, _| {},
@@ -275,8 +289,10 @@ fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
                 if !crate::draw_benchmark::fixed_clock() {
                     UNIT_GLYPH_TEST_BOUNDS.lock().unwrap().push(bounds);
                 }
-                let (lit, ghost_path) = unit_paths(bounds, unit);
-                window.paint_path(ghost_path, rgb(ghost));
+                let (lit, ghost_path) = unit_paths(bounds, unit, ghost.is_some());
+                if let (Some(ghost_path), Some(ghost)) = (ghost_path, ghost) {
+                    window.paint_path(ghost_path, rgb(ghost));
+                }
                 if glow {
                     let scale = f32::from(bounds.size.height) / 14.;
                     let rows = UNIT_GLYPHS
@@ -314,48 +330,57 @@ fn unit_glyph(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
     )
 }
 
+#[cfg(test)]
+pub(crate) fn unit_glyph_for_test(unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
+    unit_glyph(unit, size, hot, false, t)
+}
+
 pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> Div {
     let width_chars = value.chars().count().max(3);
     let value = format!("{value:>width_chars$}");
-    let ghost: String = value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_digit() || c.is_whitespace() {
-                '8'
-            } else {
-                c
-            }
-        })
-        .collect();
     let width = px(vfd_digit_width(size, width_chars));
+    let mut digits = div()
+        .relative()
+        .w(width)
+        .h(px(size))
+        .flex_shrink_0()
+        .whitespace_nowrap()
+        .font_family("Doto Display")
+        .font_weight(FontWeight::BLACK)
+        .text_size(px(size))
+        .line_height(px(size))
+        .text_color(rgb(if hot { t.base.hot } else { t.base.led }));
+    if !t.light {
+        let ghost = value
+            .chars()
+            .map(|c| {
+                if c.is_ascii_digit() || c.is_whitespace() {
+                    '8'
+                } else {
+                    c
+                }
+            })
+            .collect::<String>();
+        #[cfg(test)]
+        if !crate::draw_benchmark::fixed_clock() {
+            DIGIT_GHOST_TEST_TEXTS.lock().unwrap().push(ghost.clone());
+        }
+        digits = digits.child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .text_color(rgb(palette::mix(t.base.led, t.base.ground, 0.18)))
+                .whitespace_nowrap()
+                .child(ghost),
+        );
+    }
     div()
         .flex()
         .items_start()
         .flex_shrink_0()
-        .child(
-            div()
-                .relative()
-                .w(width)
-                .h(px(size))
-                .flex_shrink_0()
-                .whitespace_nowrap()
-                .font_family("Doto Display")
-                .font_weight(FontWeight::BLACK)
-                .text_size(px(size))
-                .line_height(px(size))
-                .text_color(rgb(if hot { t.base.hot } else { t.base.led }))
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .text_color(rgb(palette::mix(t.base.led, t.base.ground, 0.18)))
-                        .whitespace_nowrap()
-                        .child(ghost),
-                )
-                .child(crate::glow::text(value, hot, t).whitespace_nowrap()),
-        )
-        .child(unit_glyph(unit, size, hot, t))
+        .child(digits.child(crate::glow::text(value, hot, t).whitespace_nowrap()))
+        .child(unit_glyph(unit, size, hot, !t.light, t))
 }
 
 fn vfd_digit_width(size: f32, characters: usize) -> f32 {
@@ -641,7 +666,7 @@ fn cached_win_dots(cache: &RefCell<WinDotCache>, bounds: Bounds<Pixels>) -> Opti
 }
 
 pub fn win(t: &Tokens) -> Div {
-    let dots = palette::mix(t.base.led, t.readout, 0.07);
+    let dots = (!t.light).then(|| palette::mix(t.base.led, t.readout, 0.07));
     div()
         .relative()
         .overflow_hidden()
@@ -658,9 +683,11 @@ pub fn win(t: &Tokens) -> Div {
             canvas(
                 |_, _, _| {},
                 move |bounds, _, window, _| {
-                    let path = WIN_DOT_CACHE.with(|cache| cached_win_dots(cache, bounds));
-                    if let Some(path) = path {
-                        window.paint_path(path, rgb(dots));
+                    if let Some(dots) = dots {
+                        let path = WIN_DOT_CACHE.with(|cache| cached_win_dots(cache, bounds));
+                        if let Some(path) = path {
+                            window.paint_path(path, rgb(dots));
+                        }
                     }
                 },
             )
@@ -3784,6 +3811,7 @@ mod tests {
                     gpui::size(gpui::px(10.), gpui::px(14.)),
                 ),
                 '%',
+                true,
             );
         }
         assert!(super::UNIT_PATHS.get().unwrap().lock().unwrap().len() <= 32);
