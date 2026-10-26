@@ -421,7 +421,12 @@ impl Monitor {
                 ),
         )
     }
-    pub(super) fn details(&self, panel_width: DetailWidth, cx: &mut Context<Self>) -> Option<Div> {
+    pub(super) fn details(
+        &self,
+        window: &Window,
+        panel_width: DetailWidth,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
         let details = self.details.as_ref()?;
         let key = details.key;
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
@@ -594,7 +599,7 @@ impl Monitor {
                             .overflow_x_scroll()
                             .p_2()
                             .bg(rgb(t.well))
-                            .child(selectable("command-text", &p.command)),
+                            .child(selectable_content(window, "command-text", &p.command)),
                     ),
             );
         }
@@ -606,7 +611,11 @@ impl Monitor {
                 if values.is_empty() {
                     div().child("This process exposes no environment variables.")
                 } else {
-                    div().child(selectable("environment-text", &values.join("\n")))
+                    div().child(selectable_content(
+                        window,
+                        "environment-text",
+                        &values.join("\n"),
+                    ))
                 }
             }
             Environment::Loaded(_) => div().child("Environment hidden"),
@@ -942,6 +951,28 @@ fn selectable(id: &'static str, text: &str) -> gpui_component::text::TextView {
         .scrollable(false)
         .whitespace_nowrap()
 }
+
+fn selectable_content(window: &Window, id: &'static str, text: &str) -> Div {
+    let font = font("JetBrains Mono");
+    let font_size = px(12.);
+    let width = text
+        .lines()
+        .map(|line| {
+            let run = TextRun {
+                len: line.len(),
+                font: font.clone(),
+                color: window.text_style().color,
+                ..Default::default()
+            };
+            window
+                .text_system()
+                .layout_line(line, font_size, &[run], None)
+                .width
+        })
+        .fold(px(0.), Pixels::max)
+        + px(1.);
+    div().w(width).child(selectable(id, text))
+}
 fn detail_readout(name: &'static str, value: String, t: &crate::palette::Tokens) -> Stateful<Div> {
     div()
         .id(name)
@@ -1027,42 +1058,60 @@ mod tests {
         }
     }
 
-    struct SelectableLayoutTest;
+    struct SelectableLayoutTest {
+        command_scroll: ScrollHandle,
+        environment_scroll: ScrollHandle,
+    }
 
     impl Render for SelectableLayoutTest {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let token = "some_long_project_name_".repeat(6);
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let token = format!("{} END_OF_COMMAND", "some_long_project_name_".repeat(60));
             div()
                 .w(px(220.))
                 .flex()
                 .flex_col()
+                .font_family("JetBrains Mono")
+                .text_size(px(12.))
                 .child(
                     div()
-                        .id("command-text")
-                        .debug_selector(|| "command-text".into())
+                        .id("command-scroll")
+                        .debug_selector(|| "command-scroll".into())
                         .w_full()
-                        .child(super::selectable("command-value", &token)),
+                        .max_h(px(30.))
+                        .overflow_x_scroll()
+                        .track_scroll(&self.command_scroll)
+                        .child(super::selectable_content(window, "command-text", &token)),
                 )
                 .child(
                     div()
-                        .id("environment-text")
-                        .debug_selector(|| "environment-text".into())
+                        .id("environment-scroll")
+                        .debug_selector(|| "environment-scroll".into())
                         .w_full()
-                        .child(super::selectable(
+                        .max_h(px(52.))
+                        .overflow_x_scroll()
+                        .track_scroll(&self.environment_scroll)
+                        .child(super::selectable_content(
+                            window,
                             "environment-value",
-                            &format!("KEY={token}\nNEXT={token}"),
+                            &format!("KEY={token}\nNEXT={token} END_OF_ENVIRONMENT"),
                         )),
                 )
         }
     }
 
     #[gpui::test]
-    async fn selectable_values_do_not_wrap_inside_long_tokens(cx: &mut gpui::TestAppContext) {
+    async fn selectable_values_do_not_wrap_and_scroll_to_line_ends(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let (_, visual) = cx.add_window_view(|_, _| SelectableLayoutTest);
+        let command_scroll = ScrollHandle::new();
+        let environment_scroll = ScrollHandle::new();
+        let (_, visual) = cx.add_window_view(|_, _| SelectableLayoutTest {
+            command_scroll: command_scroll.clone(),
+            environment_scroll: environment_scroll.clone(),
+        });
+        visual.run_until_parked();
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        let command = visual.debug_bounds("command-text").unwrap();
-        let environment = visual.debug_bounds("environment-text").unwrap();
+        let command = visual.debug_bounds("command-scroll").unwrap();
+        let environment = visual.debug_bounds("environment-scroll").unwrap();
         assert!(
             command.size.height <= px(30.),
             "command bounds: {command:?}"
@@ -1071,6 +1120,49 @@ mod tests {
             environment.size.height <= px(52.),
             "environment bounds: {environment:?}"
         );
+        assert!(
+            command_scroll.max_offset().x > px(100.),
+            "command line end is not reachable: {:?}",
+            command_scroll.max_offset()
+        );
+        assert!(
+            environment_scroll.max_offset().x > px(100.),
+            "environment line end is not reachable: {:?}",
+            environment_scroll.max_offset()
+        );
+
+        for (position, scroll) in [
+            (command.center(), &command_scroll),
+            (environment.center(), &environment_scroll),
+        ] {
+            visual.update(|window, cx| {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position,
+                        pressed_button: None,
+                        modifiers: Modifiers::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(-20_000.), px(0.))),
+                        modifiers: Modifiers::default(),
+                        touch_phase: TouchPhase::Moved,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(
+                scroll.offset().x,
+                -scroll.max_offset().x,
+                "scroll input did not reach the end of {position:?}"
+            );
+        }
     }
 
     #[test]

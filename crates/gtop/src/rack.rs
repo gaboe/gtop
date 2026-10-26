@@ -2024,7 +2024,7 @@ impl Monitor {
             root = root.child(self.moment_panel(&t, cx));
         } else if let Some(disk) = self.disk_panel(panel_width, cx) {
             root = root.child(disk.h_full());
-        } else if let Some(details) = self.details(panel_width, cx) {
+        } else if let Some(details) = self.details(window, panel_width, cx) {
             root = root.child(details.h_full());
         }
         root
