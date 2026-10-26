@@ -9,7 +9,7 @@ rtk proxy python3 crates/gtop/scripts/perf-report.py "$HOME/Library/Application 
 rtk proxy python3 -m unittest discover -s crates/gtop/scripts -p 'test_perf_report.py' -v
 ```
 
-The report opens the source database read-only, copies it to a temporary SQLite file, and reads the copy. It prints median, p90, and p95 CPU use of one core for each UTC hour, app version, and window state.
+The report opens the source database read-only, copies it to a temporary SQLite file, and reads the copy. It prints median, p90, and p95 CPU use of one core for each UTC hour, app version, window state, and mean-load bucket. It also prints draws per minute, mean draw time, sampler runs per minute, mean sampler time, and mean whole-machine CPU busy percent. Rows without load data use the `unknown` bucket.
 
 ## Full Monitor draw benchmark
 

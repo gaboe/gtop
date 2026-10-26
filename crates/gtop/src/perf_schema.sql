@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS perf_minute (
     refresh_interval_seconds INTEGER NOT NULL,
     app_version TEXT NOT NULL,
     app_commit TEXT NOT NULL,
+    mean_load_1m REAL,
+    mean_system_cpu_busy_percent REAL,
     sample_id INTEGER PRIMARY KEY,
     interval_start_seconds REAL NOT NULL
 );
