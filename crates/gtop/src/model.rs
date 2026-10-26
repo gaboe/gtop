@@ -453,4 +453,38 @@ mod tests {
             vec![0, 2, 1]
         );
     }
+
+    #[test]
+    fn unknown_age_is_unavailable() {
+        let mut unknown = process(20, "unknown", 0., vec![]);
+        unknown.start_time = 0;
+        unknown.run_time = 0;
+
+        assert_eq!(ProcessColumn::Age.text(&unknown), "·");
+    }
+
+    #[test]
+    fn unknown_age_sorts_after_known_processes_in_both_directions() {
+        let mut old = process(30, "old", 0., vec![]);
+        old.start_time = 5;
+        old.run_time = 999_999;
+        let mut unknown_later_pid = process(40, "unknown-later", 0., vec![]);
+        unknown_later_pid.start_time = 0;
+        unknown_later_pid.run_time = 0;
+        let mut recent = process(10, "recent", 0., vec![]);
+        recent.start_time = 100;
+        let mut unknown_earlier_pid = process(20, "unknown-earlier", 0., vec![]);
+        unknown_earlier_pid.start_time = 0;
+        unknown_earlier_pid.run_time = 0;
+        let processes = vec![unknown_later_pid, recent, unknown_earlier_pid, old];
+
+        assert_eq!(
+            process_order(&processes, &Search::default(), ProcessColumn::Age, true),
+            vec![3, 1, 2, 0]
+        );
+        assert_eq!(
+            process_order(&processes, &Search::default(), ProcessColumn::Age, false),
+            vec![1, 3, 2, 0]
+        );
+    }
 }

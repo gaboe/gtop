@@ -245,6 +245,26 @@ pub fn events<T: 'static>(
 #[cfg(test)]
 mod tests {
     use super::{Column, Widths, HISTORY};
+
+    #[test]
+    fn age_minimum_fits_999_day_label_in_priority_rows() {
+        let font = ttf_parser::Face::parse(include_bytes!("../assets/fonts/JetBrainsMono.ttf"), 0)
+            .expect("bundled JetBrains Mono font");
+        let label = "999d 00h";
+        let units_per_em = f32::from(font.units_per_em());
+        let text_width = label
+            .chars()
+            .map(|character| {
+                let glyph = font.glyph_index(character).expect("duration glyph");
+                f32::from(font.glyph_hor_advance(glyph).expect("glyph advance"))
+                    / units_per_em
+                    * 14.
+            })
+            .sum::<f32>();
+
+        assert!(Column::Age.minimum() >= text_width + 20.);
+    }
+
     #[test]
     fn hidden_preferences_survive_narrow_and_wide_layouts() {
         let mut widths = Widths::default();
