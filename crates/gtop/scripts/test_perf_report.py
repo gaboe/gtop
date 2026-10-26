@@ -42,17 +42,18 @@ class PerfReportTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as scratch:
                 copied = Path(scratch) / "copy.sqlite"
                 report.copy_database(source, copied)
-                summaries = report.summarize(copied)
+                summaries, work = report.summarize(copied)
             hidden = summaries[0]
             self.assertEqual((hidden.hour, hidden.version, hidden.state, hidden.load_bucket), ("1", "1.0", "hidden", "8-20"))
             self.assertEqual((hidden.minutes, hidden.median_core_pct, hidden.p90_core_pct, hidden.p95_core_pct), (2, 1.0, 1.3333333333333333, 1.3333333333333333))
-            self.assertEqual((hidden.draws_per_min, hidden.mean_draw_ms, hidden.sampler_runs_per_min, hidden.mean_sampler_ms), (2., .5, 1., 2.))
-            self.assertEqual(hidden.mean_system_cpu_busy_pct, 40.)
+            self.assertEqual((work[0].draws_per_min, work[0].mean_draw_ms, work[0].sampler_runs_per_min, work[0].mean_sampler_ms), (4 / 3, .5, 2 / 3, 2.))
+            self.assertEqual(work[0].mean_system_cpu_busy_pct, 40.)
             visible = [row for row in summaries if row.version == "1.0" and row.state == "visible"]
             self.assertEqual(visible[0].median_core_pct, 3.0)
             self.assertEqual(visible[0].p90_core_pct, 4.0)
             self.assertEqual(visible[0].p95_core_pct, 4.0)
             self.assertEqual(len([row for row in summaries if row.hour == "2"]), 1)
+            self.assertEqual(len([row for row in work if row.hour == "2"]), 1)
 
     def test_boundary_ending_and_crossing_minutes_use_start_hour(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -64,11 +65,11 @@ class PerfReportTests(unittest.TestCase):
                     ((end, 6, 60, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, "1", "a", start), None, None)
                     for end, start in [(3600, 3540), (3630, 3570)]
                 ])
-            summary = report.summarize(source)[0]
-            self.assertEqual((summary.hour, summary.version, summary.state, summary.load_bucket), ("0", "1", "visible", "unknown"))
-            self.assertEqual((summary.minutes, summary.median_core_pct, summary.p90_core_pct, summary.p95_core_pct), (2, 10., 10., 10.))
-            self.assertEqual((summary.draws_per_min, summary.mean_draw_ms, summary.sampler_runs_per_min, summary.mean_sampler_ms), (0., None, 0., None))
-            self.assertIsNone(summary.mean_system_cpu_busy_pct)
+            summary, work = report.summarize(source)
+            self.assertEqual((summary[0].hour, summary[0].version, summary[0].state, summary[0].load_bucket), ("0", "1", "visible", "unknown"))
+            self.assertEqual((summary[0].minutes, summary[0].median_core_pct, summary[0].p90_core_pct, summary[0].p95_core_pct), (2, 10., 10., 10.))
+            self.assertEqual((work[0].draws_per_min, work[0].mean_draw_ms, work[0].sampler_runs_per_min, work[0].mean_sampler_ms), (0., None, 0., None))
+            self.assertIsNone(work[0].mean_system_cpu_busy_pct)
 
     def test_report_splits_load_buckets_and_aggregates_draw_and_sampler_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -80,11 +81,28 @@ class PerfReportTests(unittest.TestCase):
                     ((3660, 1, 60, 0, 0, 0, 0, .6, 0, 0, 0, 0, 30, 90, 60, 120, 0, 3, "1", "a", 3600), 25., 60.),
                     ((3720, 1, 60, 0, 0, 0, 0, .3, 0, 0, 0, 0, 30, 150, 30, 90, 0, 3, "1", "a", 3660), 45., 70.),
                 ])
-            groups = report.summarize(source)
+            states, groups = report.summarize(source)
             self.assertEqual([row.load_bucket for row in groups], ["20-40", ">40"])
             self.assertEqual((groups[0].draws_per_min, groups[0].mean_draw_ms, groups[0].sampler_runs_per_min, groups[0].mean_sampler_ms), (30., 3., 60., 2.))
             self.assertEqual((groups[1].draws_per_min, groups[1].mean_draw_ms, groups[1].sampler_runs_per_min, groups[1].mean_sampler_ms), (30., 5., 30., 3.))
             self.assertEqual((groups[0].mean_system_cpu_busy_pct, groups[1].mean_system_cpu_busy_pct), (60., 70.))
+
+    def test_rates_use_summed_interval_seconds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "perf.sqlite"
+            with sqlite3.connect(source) as db:
+                schema = Path(__file__).parents[1] / "src" / "perf_schema.sql"
+                db.executescript(schema.read_text())
+                insert_minutes(db, [
+                    ((3660, 1, 60, 0, 0, 0, 0, .6, 0, 0, 0, 0, 120, 600,
+                      20, 400, 0, 3, "1.0", "a", 3600), 10., 50.),
+                    ((3780, 1, 120, 0, 0, 0, 0, .6, 0, 0, 0, 0, 120, 600,
+                      40, 800, 0, 3, "1.0", "a", 3660), 10., 50.),
+                ])
+            _, work = report.summarize(source)
+            self.assertEqual(work[0].intervals, 2)
+            self.assertEqual(work[0].draws_per_min, 80.)
+            self.assertEqual(work[0].sampler_runs_per_min, 20.)
 
     def test_whole_interval_work_is_reported_once_without_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -101,8 +119,8 @@ class PerfReportTests(unittest.TestCase):
                 self.assertEqual(report.main(), 0)
             lines = output.getvalue().splitlines()
             self.assertEqual(lines[1:3], [
-                "1\t1.0\tvisible\t8-20\t1\t2.000\t2.000\t2.000",
                 "1\t1.0\thidden\t8-20\t1\t1.333\t1.333\t1.333",
+                "1\t1.0\tvisible\t8-20\t1\t2.000\t2.000\t2.000",
             ])
             self.assertEqual(lines[4], "hour_utc\tversion\tload_bucket\tintervals\tdraws_per_min\tmean_draw_ms\tsampler_runs_per_min\tmean_sampler_ms\tmean_system_cpu_busy_pct")
             self.assertEqual(lines[5], "1\t1.0\t8-20\t1\t120.000\t5.000\t20.000\t20.000\t50.000")
@@ -125,8 +143,11 @@ class PerfReportTests(unittest.TestCase):
             with patch.object(sys, "argv", ["perf-report.py", str(source)]), redirect_stdout(output):
                 self.assertEqual(report.main(), 0)
             self.assertEqual(output.getvalue().splitlines(), [
-                "hour_utc\tversion\tstate\tload_bucket\tminutes\tmedian_core_pct\tp90_core_pct\tp95_core_pct\tdraws_per_min\tmean_draw_ms\tsampler_runs_per_min\tmean_sampler_ms\tmean_system_cpu_busy_pct",
-                "1\t1\tvisible\t20-40\t1\t1.000\t1.000\t1.000\t30.000\t3.000\t60.000\t2.000\t60.000",
+                "hour_utc\tversion\tstate\tload_bucket\tminutes\tmedian_core_pct\tp90_core_pct\tp95_core_pct",
+                "1\t1\tvisible\t20-40\t1\t1.000\t1.000\t1.000",
+                "",
+                "hour_utc\tversion\tload_bucket\tintervals\tdraws_per_min\tmean_draw_ms\tsampler_runs_per_min\tmean_sampler_ms\tmean_system_cpu_busy_pct",
+                "1\t1\t20-40\t1\t30.000\t3.000\t60.000\t2.000\t60.000",
             ])
 
     def test_copy_uses_read_only_source_connection(self):
