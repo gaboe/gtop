@@ -168,11 +168,7 @@ impl Processes {
                 .items_center()
                 .border_b_1()
                 .border_color(rgb(t.row_rule))
-                .bg(rgb(if selected {
-                    crate::palette::mix(t.plate2, t.base.led, 0.7)
-                } else {
-                    crate::palette::mix(t.base.ground, 0, 0.8)
-                }))
+                .bg(rgb(if selected { t.selection } else { t.table }))
                 .cursor_pointer()
                 .children(self.resolved.iter().copied().map(|(kind, width)| {
                     let color = if selected || (priority && culprit) {
@@ -253,7 +249,7 @@ impl Render for Processes {
             .flex()
             .h(px(29.))
             .flex_shrink_0()
-            .bg(rgb(crate::palette::mix(t.base.plate, 0, 0.6)))
+            .bg(rgb(t.table_head))
             .border_b_1()
             .border_color(rgb(t.rule_hi))
             .children(self.resolved.iter().copied().map(|(kind, width)| {
@@ -380,7 +376,7 @@ impl Render for Processes {
                     .h_full()
                     .overflow_hidden()
                     .border_1()
-                    .border_color(rgb(0))
+                    .border_color(rgb(t.well_rule))
                     .child(header)
                     .when(self.order.is_empty(), |d| {
                         d.child(div().p_4().child(if self.snapshot.is_none() {

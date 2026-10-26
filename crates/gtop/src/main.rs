@@ -19,6 +19,7 @@ use details::Details;
 use futures::{channel::mpsc, FutureExt, StreamExt};
 use gpui::{prelude::*, *};
 use gpui_component::{
+    color_picker::ColorPickerState,
     input::{InputEvent, InputState},
     Root,
 };
@@ -125,6 +126,8 @@ struct Monitor {
     focus: FocusHandle,
     draft: Option<palette::Base>,
     colors: [Entity<InputState>; 6],
+    color_pickers: [Entity<ColorPickerState>; 6],
+    picker_hex_synced: [bool; 6],
     mix_name: Entity<InputState>,
     traces: std::collections::HashMap<ProcessKey, std::collections::VecDeque<(f64, f32)>>,
     interval: u64,
@@ -153,6 +156,9 @@ impl Monitor {
             base.ok,
         ]
         .map(|v| cx.new(|cx| InputState::new(window, cx).default_value(format!("#{v:06x}"))));
+        let color_pickers = palette::ColorField::ALL.map(|field| {
+            cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb(field.get(base))))
+        });
         let mix_name = cx.new(|cx| InputState::new(window, cx).placeholder("Name this mix"));
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -240,35 +246,12 @@ impl Monitor {
                 this.wake();
             }),
         ];
-        for (index, input) in colors.iter().enumerate() {
-            subscriptions.push(
-                cx.subscribe_in(input, window, move |this, input, event, _, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        let text = input.read(cx).value();
-                        if let Some(v) = text
-                            .strip_prefix('#')
-                            .filter(|s| s.len() == 6)
-                            .and_then(|s| u32::from_str_radix(s, 16).ok())
-                        {
-                            let mut b = this.draft.unwrap_or(this.settings.base());
-                            if [b.ground, b.plate, b.silk, b.led, b.hot, b.ok][index] == v {
-                                return;
-                            }
-                            match index {
-                                0 => b.ground = v,
-                                1 => b.plate = v,
-                                2 => b.silk = v,
-                                3 => b.led = v,
-                                4 => b.hot = v,
-                                _ => b.ok = v,
-                            };
-                            this.draft = Some(b);
-                            this.apply_palette(cx);
-                        }
-                    }
-                }),
-            );
-        }
+        subscriptions.extend(Self::palette_subscriptions(
+            &colors,
+            &color_pickers,
+            window,
+            cx,
+        ));
         let cached_ports = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
             u32,
             Vec<u16>,
@@ -672,6 +655,8 @@ impl Monitor {
             focus,
             draft: None,
             colors,
+            color_pickers,
+            picker_hex_synced: [false; 6],
             mix_name,
             traces: std::collections::HashMap::new(),
             interval: 3,

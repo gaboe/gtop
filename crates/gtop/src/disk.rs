@@ -748,7 +748,9 @@ impl Monitor {
                         .p(px(6.))
                         .border_b_1()
                         .border_color(rgb(t.rule))
-                        .when(index == disk.selected, |d| d.bg(rgb(t.rule_hi)))
+                        .when(index == disk.selected, |d| {
+                            d.bg(rgb(if t.light { t.selection } else { t.rule_hi }))
+                        })
                         .child(
                             div()
                                 .flex()
@@ -866,7 +868,7 @@ impl Monitor {
         );
         let mut panel = div()
             .relative()
-            .child(crate::rack::screws(&t))
+            .child(crate::rack::screws(&t, "disk"))
             .flex()
             .flex_col()
             .w(px(self.settings.detail_width.pixels()))
