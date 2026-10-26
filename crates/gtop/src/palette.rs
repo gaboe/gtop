@@ -296,10 +296,34 @@ mod tests {
     #[test]
     fn column_settings_load_old_files_and_round_trip() {
         use crate::column_widths::Column;
-        let mut settings: Settings = serde_json::from_str(r#"{"active":0,"saved":[]}"#).unwrap();
-        assert_eq!(settings.process_widths, Default::default());
+        let old_settings =
+            r#"{"active":0,"saved":[],"process_widths":{"columns":{"name":333.0,"memory":104.0}}}"#;
+        let mut settings: Settings = serde_json::from_str(old_settings).unwrap();
         assert_eq!(settings.history_widths, Default::default());
-        settings.process_widths.set(Column::Name, 333.);
+        let live = crate::model::ProcessColumn::ALL.map(Column::from);
+        let widths = settings.process_widths.compute(&live, 1400.);
+        assert_eq!(
+            widths[live
+                .iter()
+                .position(|column| *column == Column::Age)
+                .unwrap()],
+            Column::Age.default_width()
+        );
+        assert_eq!(
+            widths[live
+                .iter()
+                .position(|column| *column == Column::Memory)
+                .unwrap()],
+            104.
+        );
+        assert_eq!(
+            widths[live
+                .iter()
+                .position(|column| *column == Column::Name)
+                .unwrap()],
+            333.
+        );
+        settings.process_widths.set(Column::Age, 125.);
         settings.history_widths.set(Column::CoreTime, 177.);
         settings.detail_width = crate::details::DetailWidth::new(455.);
         let directory =
@@ -308,6 +332,13 @@ mod tests {
         settings.save_to(&path).unwrap();
         let stored: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(stored.process_widths, settings.process_widths);
+        assert_eq!(
+            stored.process_widths.compute(&live, 1400.)[live
+                .iter()
+                .position(|column| *column == Column::Age)
+                .unwrap()],
+            125.
+        );
         assert_eq!(stored.history_widths, settings.history_widths);
         assert_eq!(stored.detail_width, settings.detail_width);
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);

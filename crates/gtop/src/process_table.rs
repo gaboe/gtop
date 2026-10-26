@@ -37,6 +37,7 @@ impl From<ProcessColumn> for Column {
             ProcessColumn::User => Self::User,
             ProcessColumn::Cpu => Self::Cpu,
             ProcessColumn::Memory => Self::Memory,
+            ProcessColumn::Age => Self::Age,
             ProcessColumn::Gpu => Self::Gpu,
             ProcessColumn::Ports => Self::Ports,
             ProcessColumn::Command => Self::Command,
@@ -195,7 +196,8 @@ impl Processes {
                         })
                         .text_color(rgb(color))
                         .whitespace_nowrap()
-                        .truncate();
+                        .truncate()
+                        .when(kind == ProcessColumn::Age, |d| d.text_right());
                     if kind == ProcessColumn::Lamp {
                         return cell.child(div().w(px(7.)).h(px(12.)).bg(rgb(
                             if p.cpu_usage > 400. {
@@ -637,6 +639,46 @@ mod tests {
             .iter()
             .all(|i| ProcessKey::from(&p.snapshot.as_ref().unwrap().processes[*i]) != key));
     }
+
+    #[test]
+    fn age_sort_starts_with_oldest_process_and_toggles_to_newest() {
+        let mut snapshot = crate::test_data::snapshot();
+        let processes = std::sync::Arc::make_mut(&mut snapshot.processes);
+        for process in processes.iter_mut() {
+            process.start_time = 1000;
+        }
+        processes[0].start_time = 50;
+        processes[1].start_time = 10;
+        processes[2].start_time = 30;
+        let mut table = Processes {
+            snapshot: Some(Rc::new(snapshot)),
+            ..Default::default()
+        };
+
+        table.sort(ProcessColumn::Age, true);
+        assert!(table.descending);
+        assert_eq!(table.process(0).unwrap().start_time, 10);
+
+        table.sort(ProcessColumn::Age, true);
+        assert!(!table.descending);
+        assert_eq!(table.process(0).unwrap().start_time, 1000);
+    }
+
+    #[test]
+    fn age_stays_visible_in_full_and_compact_layouts() {
+        let full = Processes::default();
+        assert!(full.columns().contains(&ProcessColumn::Age));
+
+        let compact = Processes {
+            compact: true,
+            ..Default::default()
+        }
+        .columns();
+        assert!(compact.contains(&ProcessColumn::Age));
+        assert!(!compact.contains(&ProcessColumn::User));
+        assert!(!compact.contains(&ProcessColumn::Command));
+    }
+
     #[test]
     fn rendered_identity_stays_bound_after_reorder() {
         let s = crate::test_data::snapshot();
