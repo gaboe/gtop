@@ -73,7 +73,7 @@ The other shipped palettes use the same roles, in this order:
 `Base::tokens` derives secondary colors in OKLab. `mix(a, b, p)` gives `a` weight `p`.
 In dark palettes, `silk_dim` mixes silk and plate at 0.58. `ink_row` uses 0.78.
 `rule`, `rule_hi`, `plate2`, `well`, and `row_rule` adapt to the base ground's brightness.
-Dark inactive segments mix led and ground at 0.12. Ghost digits use 0.18.
+Dark inactive segments mix led and ground at 0.12. Dark ghost digits use 0.18.
 Use these derived roles when a palette changes. Fixed gray replacements lose the palette relationship.
 
 ### Aluminium light mode
@@ -88,7 +88,8 @@ Light readout and table wells use `well`; table headings use `table_head`.
 `rule_hi` supplies control outlines and the scrollbar. Quiet row rules separate
 rows without competing with data. Disk selection uses `selection`, not an outline
 color. Active meter ink contrasts with both the well and inactive segments.
-Ghost digits remain faint guides. They do not carry values.
+Dark palettes keep faint ghost digits as guides. Light palettes omit ghost digits
+and readout dot grids because their unlit pixels reduce text contrast.
 
 Light mode disables glyph, lamp, unit, and segment glow. Dark palettes retain
 all existing colors and mixes. The contrast test in `palette.rs` checks text,
@@ -130,7 +131,7 @@ History rows are 22 px high, beneath a 29 px header. Columns can resize and scro
 
 Depth comes from dark readout wells, thin borders, small screw details, and lit foreground marks.
 Readout wells mix ground with black at 0.8 and have a black 1 px border.
-A faint dot grid sits on a 3 px pitch behind the readings.
+A faint dot grid sits on a 3 px pitch behind dark palette readings.
 
 Glow is part of the VFD world. It has zero offset and does not imply a floating card.
 `glow.rs` rasterizes font outlines into cached blurred glyph images.
@@ -149,7 +150,8 @@ The percent and degree glyphs keep their authored dot geometry at each readout s
 
 ### Readouts and meters
 
-`lit` layers a dim ghost value behind sharp Doto text and cached glow.
+`lit` layers a dim ghost value behind sharp Doto text and cached glow in dark
+palettes. Light palettes omit the ghost value and retain the same text width.
 `lit_unit` adds the authored unit glyph on the same baseline.
 Horizontal meters have 2 px gaps and an 8 px height. Priority process rows use 12 px meter height.
 The final 15 percent of each meter uses hot color.
