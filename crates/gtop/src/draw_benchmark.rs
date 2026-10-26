@@ -465,6 +465,121 @@ fn disk_keyboard_scroll_reveals_selected_row_after_summary() {
 }
 
 #[cfg(target_os = "macos")]
+struct GhostLayerReview {
+    tokens: palette::Tokens,
+}
+
+#[cfg(target_os = "macos")]
+impl Render for GhostLayerReview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_start()
+            .gap(px(24.))
+            .bg(rgb(self.tokens.base.ground))
+            .child(
+                crate::rack::win(&self.tokens)
+                    .child(crate::rack::lit("48".into(), 42., false, &self.tokens))
+                    .child(crate::rack::lit_unit(
+                        "48".into(),
+                        '%',
+                        42.,
+                        false,
+                        &self.tokens,
+                    )),
+            )
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a Metal device; set GTOP_GHOST_RENDER_DIR"]
+fn headless_ghost_layers_match_palette_mode() {
+    let directory = std::path::PathBuf::from(
+        std::env::var("GTOP_GHOST_RENDER_DIR").expect("ghost render directory"),
+    );
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut cx = HeadlessAppContext::with_platform(
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+        Arc::new(gpui_kit_assets::Assets),
+        || {
+            Ok(Some(Box::new(
+                gpui_apple::metal_renderer::MetalHeadlessRenderer::new(),
+            )))
+        },
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    for bytes in [
+        include_bytes!("../assets/fonts/DotoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/JetBrainsMono.ttf").as_slice(),
+    ] {
+        cx.text_system()
+            .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
+            .unwrap();
+    }
+
+    let mut view = None;
+    let handle = cx
+        .open_window(size(px(600.), px(100.)), |_, cx| {
+            let entity = cx.new(|_| GhostLayerReview {
+                tokens: palette::presets()[0].base.tokens(),
+            });
+            view = Some(entity.clone());
+            entity
+        })
+        .unwrap();
+    let view = view.unwrap();
+    let mut counts = Vec::new();
+    for (name, base, expect_ghost) in [
+        ("aluminium", palette::presets()[4].base, false),
+        ("amber", palette::presets()[0].base, true),
+    ] {
+        let tokens = base.tokens();
+        cx.update(|cx| view.update(cx, |view, _| view.tokens = tokens));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let image = cx.capture_screenshot(handle.into()).unwrap();
+        image.save(directory.join(format!("{name}.png"))).unwrap();
+        let tokens = base.tokens();
+        let colors = [
+            palette::mix(base.led, base.ground, 0.18),
+            palette::mix(base.led, tokens.readout, 0.07),
+        ];
+        let painted = colors.map(|color| {
+            let rgba = [
+                ((color >> 16) & 0xff) as u8,
+                ((color >> 8) & 0xff) as u8,
+                (color & 0xff) as u8,
+                0xff,
+            ];
+            image.pixels().filter(|pixel| pixel.0 == rgba).count()
+        });
+        counts.push((name, expect_ghost, painted));
+    }
+
+    for (name, expect_ghost, painted) in counts {
+        assert_eq!(
+            painted[0] > 0,
+            expect_ghost,
+            "{name} ghost glyph pixel count was {}",
+            painted[0]
+        );
+        assert_eq!(
+            painted[1] > 0,
+            expect_ghost,
+            "{name} readout dot pixel count was {}",
+            painted[1]
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 #[ignore = "offscreen palette review; set GTOP_PALETTE_RENDER_DIR"]
 fn aluminium_offscreen_review() {
