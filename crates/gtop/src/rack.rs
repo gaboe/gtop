@@ -2521,11 +2521,12 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::{
-        div, draw_readout_text, lit_unit, vfd_digit_width, Bounds, DrawMetrics, Path, Pixels,
-        Tokens, UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES,
-        WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
+        cpu_segments, div, draw_readout_text, history_cell, lit_unit, vfd_digit_width, Bounds,
+        DrawMetrics, Path, Pixels, Tokens, UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS,
+        WIN_DOT_CACHE_MAX_BYTES, WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES,
+        WIN_DOT_CACHE_SLOTS,
     };
-    use gpui::{prelude::*, TestAppContext, Window};
+    use gpui::{prelude::*, px, TestAppContext, Window};
 
     struct UnitLayoutTestView {
         tokens: Tokens,
@@ -2538,6 +2539,27 @@ mod tests {
                     .into_iter()
                     .map(|(size, unit)| lit_unit("99".into(), unit, size, false, &self.tokens)),
             )
+        }
+    }
+
+    struct CpuMeterLayoutTestView {
+        tokens: Tokens,
+    }
+
+    impl Render for CpuMeterLayoutTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(20.))
+                .child(cpu_segments(54., 18, &self.tokens).w(px(78.)).h(px(12.)))
+                .child(
+                    history_cell(90., true).overflow_hidden().child(
+                        cpu_segments(104., 30, &self.tokens)
+                            .w_full()
+                            .max_w(px(120.)),
+                    ),
+                )
         }
     }
 
@@ -3517,6 +3539,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[gpui::test]
+    async fn priority_cpu_meter_uses_the_requested_height(cx: &mut TestAppContext) {
+        let tokens = crate::palette::presets()[0].base.tokens();
+        let window = cx.add_window(|_, _| CpuMeterLayoutTestView { tokens });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let quads = cx
+            .update_window(window.into(), |_, window, _| window.painted_quads())
+            .unwrap();
+        let scale = cx
+            .update_window(window.into(), |_, window, _| window.scale_factor())
+            .unwrap();
+        let priority: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.bounds.origin.y.as_f32() / scale < 20.)
+            .collect();
+        assert_eq!(priority.len(), 18);
+        assert!(priority
+            .iter()
+            .all(|quad| quad.bounds.size.height.as_f32() / scale == 12.));
+    }
+
+    #[gpui::test]
+    async fn narrow_history_cpu_meter_keeps_main_segments_visible(cx: &mut TestAppContext) {
+        let tokens = crate::palette::presets()[0].base.tokens();
+        let window = cx.add_window(|_, _| CpuMeterLayoutTestView { tokens });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let quads = cx
+            .update_window(window.into(), |_, window, _| window.painted_quads())
+            .unwrap();
+        let scale = cx
+            .update_window(window.into(), |_, window, _| window.scale_factor())
+            .unwrap();
+        let narrow_history: Vec<_> = quads
+            .iter()
+            .filter(|quad| quad.bounds.origin.y.as_f32() / scale >= 20.)
+            .collect();
+        assert!(narrow_history.len() > 4, "the full bar must remain visible");
+        assert!(narrow_history
+            .iter()
+            .all(|quad| quad.bounds.size.width.as_f32() / scale > 0.));
+        assert!(narrow_history
+            .iter()
+            .all(|quad| quad.bounds.size.height.as_f32() / scale == 8.));
     }
 
     #[test]
