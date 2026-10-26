@@ -63,12 +63,12 @@ pub fn presets() -> Vec<Palette> {
         Palette {
             name: "Aluminium".into(),
             base: Base {
-                ground: 0x9fa3a8,
-                plate: 0xc8cbcf,
-                silk: 0x121315,
-                led: 0xff5a00,
-                hot: 0xc40000,
-                ok: 0x00874a,
+                ground: 0xe8e9e5,
+                plate: 0xf5f5f0,
+                silk: 0x252a2b,
+                led: 0x923d18,
+                hot: 0xac292a,
+                ok: 0x236344,
             },
         },
     ]
@@ -89,6 +89,11 @@ pub struct Tokens {
     pub cmd: u32,
     pub on_led: u32,
     pub light: bool,
+    pub table: u32,
+    pub table_head: u32,
+    pub selection: u32,
+    pub readout: u32,
+    pub well_rule: u32,
 }
 fn linear(v: f64) -> f64 {
     if v <= 0.04045 {
@@ -146,12 +151,12 @@ impl Base {
         Tokens {
             base: b,
             light,
-            plate2: mix(b.plate, b.silk, if light { 0.88 } else { 0.93 }),
-            rule: mix(b.plate, b.silk, if light { 0.78 } else { 0.86 }),
-            rule_hi: mix(b.plate, b.silk, if light { 0.62 } else { 0.74 }),
-            silk_dim: mix(b.silk, b.plate, 0.58),
+            plate2: mix(b.plate, b.silk, if light { 0.94 } else { 0.93 }),
+            rule: mix(b.plate, b.silk, if light { 0.82 } else { 0.86 }),
+            rule_hi: mix(b.plate, b.silk, if light { 0.46 } else { 0.74 }),
+            silk_dim: mix(b.silk, b.plate, if light { 0.76 } else { 0.58 }),
             ink_row: mix(b.silk, b.plate, 0.78),
-            seg_off: mix(b.plate, b.silk, if light { 0.82 } else { 0.9 }),
+            seg_off: mix(b.plate, b.silk, if light { 0.91 } else { 0.9 }),
             hot_off: mix(b.hot, b.plate, 0.2),
             led_off: mix(b.led, b.plate, 0.16),
             well: mix(
@@ -160,8 +165,29 @@ impl Base {
                 if light { 0.8 } else { 0.6 },
             ),
             row_rule: mix(b.ground, b.silk, if light { 0.88 } else { 0.94 }),
-            cmd: mix(b.silk, b.ground, if light { 0.6 } else { 0.48 }),
+            cmd: mix(b.silk, b.ground, if light { 0.76 } else { 0.48 }),
             on_led: if light { 0xffffff } else { 0 },
+            table: if light {
+                mix(b.ground, 0xffffff, 0.35)
+            } else {
+                mix(b.ground, 0, 0.8)
+            },
+            table_head: if light {
+                b.ground
+            } else {
+                mix(b.plate, 0, 0.6)
+            },
+            selection: if light {
+                mix(b.plate, b.led, 0.92)
+            } else {
+                mix(mix(b.plate, b.silk, 0.93), b.led, 0.7)
+            },
+            readout: if light {
+                mix(b.ground, 0xffffff, 0.35)
+            } else {
+                mix(b.ground, 0, 0.8)
+            },
+            well_rule: if light { mix(b.plate, b.silk, 0.82) } else { 0 },
         }
     }
 }
@@ -276,6 +302,76 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn luminance(color: u32) -> f64 {
+        0.2126 * linear((color >> 16) as f64 / 255.)
+            + 0.7152 * linear(((color >> 8) & 255) as f64 / 255.)
+            + 0.0722 * linear((color & 255) as f64 / 255.)
+    }
+
+    fn contrast(a: u32, b: u32) -> f64 {
+        let a = luminance(a);
+        let b = luminance(b);
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn aluminium_contrast_covers_text_controls_and_meters() {
+        let t = presets()[4].base.tokens();
+        let backgrounds = [
+            ("ground", t.base.ground),
+            ("plate", t.base.plate),
+            ("secondary", t.plate2),
+            ("well", t.well),
+            ("table", t.table),
+            ("header", t.table_head),
+            ("selection", t.selection),
+            ("readout", t.readout),
+        ];
+        for (name, color) in [
+            ("silk", t.base.silk),
+            ("dim", t.silk_dim),
+            ("row", t.ink_row),
+            ("command", t.cmd),
+            ("accent", t.base.led),
+            ("critical", t.base.hot),
+            ("positive", t.base.ok),
+        ] {
+            for (surface, background) in backgrounds {
+                let ratio = contrast(color, background);
+                println!("text {name}/{surface}: {ratio:.2}:1");
+                assert!(ratio >= 4.5, "{name}/{surface}: {ratio:.2}:1 < 4.5");
+            }
+        }
+        for (name, foreground, background) in [
+            ("primary button", t.on_led, t.base.led),
+            ("danger button", t.on_led, t.base.hot),
+        ] {
+            assert!(contrast(foreground, background) >= 4.5, "{name}");
+        }
+        for (name, surface) in backgrounds {
+            assert!(
+                contrast(t.rule_hi, surface) >= 3.,
+                "control outline/{name}: {}",
+                contrast(t.rule_hi, surface)
+            );
+        }
+        for ink in [t.base.led, t.base.hot, t.base.ok] {
+            for background in [
+                t.readout,
+                t.seg_off,
+                mix(t.base.led, t.base.ground, 0.12),
+                t.hot_off,
+            ] {
+                assert!(
+                    contrast(ink, background) >= 3.,
+                    "meter {ink:06x}/{background:06x}: {}",
+                    contrast(ink, background)
+                );
+            }
+        }
+    }
+
     #[test]
     fn invalid_width_data_keeps_palette_selection() {
         let settings: Settings = serde_json::from_str(r#"{"active":3,"saved":[],"process_widths":{"columns":{"name":"bad"},"fill_name":true},"history_widths":null}"#).unwrap();

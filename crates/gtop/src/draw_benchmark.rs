@@ -454,3 +454,91 @@ fn disk_keyboard_scroll_reveals_selected_row_after_summary() {
     cx.update(|cx| m.update(cx, |m, _| m.disk.as_mut().unwrap().close()));
     std::fs::remove_dir_all(home).unwrap();
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "offscreen palette review; set GTOP_PALETTE_RENDER_DIR"]
+fn aluminium_offscreen_review() {
+    let directory = std::path::PathBuf::from(
+        std::env::var("GTOP_PALETTE_RENDER_DIR").expect("render directory"),
+    );
+    std::fs::create_dir_all(&directory).unwrap();
+    FIXED_CLOCK.with(|v| v.set(true));
+    let mut cx = HeadlessAppContext::with_platform(
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+        Arc::new(gpui_kit_assets::Assets),
+        || {
+            Ok(Some(Box::new(
+                gpui_apple::metal_renderer::MetalHeadlessRenderer::new(),
+            )))
+        },
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    for bytes in [
+        include_bytes!("../assets/fonts/DotoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/JetBrainsMono.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoLabels.ttf").as_slice(),
+        include_bytes!("../assets/fonts/Silkscreen.ttf").as_slice(),
+    ] {
+        cx.text_system()
+            .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
+            .unwrap();
+    }
+
+    let mut monitor = None;
+    let handle = cx
+        .open_window(size(px(1480.), px(960.)), |window, cx| {
+            let entity = cx.new(|cx| fixture(window, cx));
+            entity.update(cx, |m, cx| {
+                m.settings.active = 4;
+                let base = m.settings.base();
+                m.table.update(cx, |table, cx| {
+                    table.base = base;
+                    cx.notify();
+                });
+                theme::apply(base, cx);
+            });
+            monitor = Some(entity.clone());
+            cx.new(|cx| Root::new(entity, window, cx))
+        })
+        .unwrap();
+    let monitor = monitor.unwrap();
+    for (name, view, detail) in [
+        ("live", None, false),
+        ("history", Some(2), false),
+        ("detail", None, true),
+        ("disk", None, false),
+    ] {
+        cx.update(|cx| {
+            monitor.update(cx, |m, cx| {
+                m.view = view;
+                m.details = None;
+                m.disk = None;
+                if name == "disk" {
+                    m.prepare_disk_draw_benchmark();
+                }
+                if detail {
+                    m.select(
+                        ProcessKey::from(&m.snapshot.as_ref().unwrap().processes[0]),
+                        cx,
+                    );
+                }
+                cx.notify();
+            })
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        cx.capture_screenshot(handle.into())
+            .unwrap()
+            .save(directory.join(format!("{name}.png")))
+            .unwrap();
+    }
+    FIXED_CLOCK.with(|v| v.set(false));
+}

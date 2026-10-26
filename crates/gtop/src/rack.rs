@@ -625,7 +625,7 @@ fn cached_win_dots(cache: &RefCell<WinDotCache>, bounds: Bounds<Pixels>) -> Opti
 }
 
 pub fn win(t: &Tokens) -> Div {
-    let dots = palette::mix(t.base.led, palette::mix(t.base.ground, 0, 0.8), 0.07);
+    let dots = palette::mix(t.base.led, t.readout, 0.07);
     div()
         .relative()
         .overflow_hidden()
@@ -635,9 +635,9 @@ pub fn win(t: &Tokens) -> Div {
         .gap(px(6.))
         .px(px(12.))
         .py(px(10.))
-        .bg(rgb(palette::mix(t.base.ground, 0, 0.8)))
+        .bg(rgb(t.readout))
         .border_1()
-        .border_color(rgb(0))
+        .border_color(rgb(t.well_rule))
         .child(
             canvas(
                 |_, _, _| {},
