@@ -138,6 +138,11 @@ When topology cannot be verified, one generic bank shows numeric labels.
 ### Process and history tables
 
 Rows use the shared column-width model. Exact values align within their columns.
+CPU bars use one core as full scale: 100% fills the bar. Values above 100% keep the
+bar full and add up to four bright overflow ticks, so multi-core use remains visible.
+Live process CPU bars use the same percentage shown in the CPU column. History CPU
+bars use each process's peak CPU percentage. The live column heading is `CPU %`.
+A CPU bar ignores negative and non-finite values.
 The table virtualizes rows. A selected process row uses `mix(plate2, led, 0.7)`.
 Selected history rows use `plate2`. Neither table adds a hover fill or a silk selection border.
 Row separators use `row_rule`.
