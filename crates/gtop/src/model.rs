@@ -130,18 +130,20 @@ pub enum ProcessColumn {
     User,
     Cpu,
     Memory,
+    Age,
     Gpu,
     Ports,
     Command,
 }
 impl ProcessColumn {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Lamp,
         Self::Name,
         Self::Pid,
         Self::User,
         Self::Cpu,
         Self::Memory,
+        Self::Age,
         Self::Gpu,
         Self::Ports,
         Self::Command,
@@ -154,6 +156,7 @@ impl ProcessColumn {
             Self::User => "User",
             Self::Cpu => "CPU %",
             Self::Memory => "Memory",
+            Self::Age => "Age",
             Self::Gpu => "GPU %",
             Self::Ports => "Ports",
             Self::Command => "Command",
@@ -166,6 +169,7 @@ impl ProcessColumn {
             Self::User => a.user.cmp(&b.user),
             Self::Cpu | Self::Lamp => a.cpu_usage.total_cmp(&b.cpu_usage),
             Self::Memory => a.memory_usage.cmp(&b.memory_usage),
+            Self::Age => b.start_time.cmp(&a.start_time),
             Self::Gpu => a
                 .gpu_usage
                 .partial_cmp(&b.gpu_usage)
@@ -182,6 +186,7 @@ impl ProcessColumn {
             Self::User => p.user.clone(),
             Self::Cpu => format!("{:.1}", p.cpu_usage),
             Self::Memory => bytes(p.memory_usage),
+            Self::Age => compact_duration(p.run_time),
             Self::Gpu => p
                 .gpu_usage
                 .filter(|v| *v >= 0.05)
@@ -271,6 +276,18 @@ pub fn duration(seconds: u64) -> String {
     }
 }
 
+fn compact_duration(seconds: u64) -> String {
+    if seconds >= 86400 {
+        format!("{}d {:02}h", seconds / 86400, seconds / 3600 % 24)
+    } else if seconds >= 3600 {
+        format!("{}h {:02}m", seconds / 3600, seconds / 60 % 60)
+    } else if seconds >= 60 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +324,27 @@ mod tests {
         assert_eq!(bytes(1_000_000), "1.0 MB");
         assert_eq!(bytes(1_000_000_000), "1.0 GB");
         assert_eq!(bytes(16_000_000_000), "16.0 GB");
+    }
+
+    #[test]
+    fn age_labels_use_compact_duration_units() {
+        for (seconds, expected) in [
+            (0, "0s"),
+            (45, "45s"),
+            (59, "59s"),
+            (60, "1m"),
+            (720, "12m"),
+            (3599, "59m"),
+            (3600, "1h 00m"),
+            (11040, "3h 04m"),
+            (86399, "23h 59m"),
+            (86400, "1d 00h"),
+            (439200, "5d 02h"),
+        ] {
+            let mut process = process(1, "age", 0., vec![]);
+            process.run_time = seconds;
+            assert_eq!(ProcessColumn::Age.text(&process), expected);
+        }
     }
 
     #[test]
@@ -390,6 +428,29 @@ mod tests {
         assert_eq!(
             process_order(&processes, &Search::new("c"), ProcessColumn::Cpu, true),
             vec![2]
+        );
+    }
+
+    #[test]
+    fn age_sort_uses_start_time_and_keeps_pid_ties_in_both_directions() {
+        let mut old = process(30, "old", 0., vec![]);
+        old.start_time = 5;
+        old.run_time = 1;
+        let mut same_age = process(20, "same-age", 0., vec![]);
+        same_age.start_time = 5;
+        same_age.run_time = 10_000;
+        let mut recent = process(10, "recent", 0., vec![]);
+        recent.start_time = 100;
+        recent.run_time = 1_000_000;
+        let processes = vec![recent, old, same_age];
+
+        assert_eq!(
+            process_order(&processes, &Search::default(), ProcessColumn::Age, true),
+            vec![2, 1, 0]
+        );
+        assert_eq!(
+            process_order(&processes, &Search::default(), ProcessColumn::Age, false),
+            vec![0, 2, 1]
         );
     }
 }

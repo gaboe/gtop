@@ -11,6 +11,7 @@ pub enum Column {
     User,
     Cpu,
     Memory,
+    Age,
     Gpu,
     Ports,
     Command,
@@ -30,6 +31,7 @@ impl Column {
             Self::User => 75.,
             Self::Cpu => 180.,
             Self::Memory => 90.,
+            Self::Age => 100.,
             Self::Gpu => 65.,
             Self::Ports => 80.,
             Self::Command => 320.,
@@ -49,6 +51,7 @@ impl Column {
             Self::User => 60.,
             Self::Cpu => 145.,
             Self::Memory => 80.,
+            Self::Age => 85.,
             Self::Gpu => 60.,
             Self::Ports => 65.,
             Self::Command => 100.,
@@ -292,6 +295,13 @@ mod tests {
     }
 
     #[test]
+    fn age_is_a_live_column_and_stays_out_of_history() {
+        let live = crate::model::ProcessColumn::ALL.map(Column::from);
+        assert!(live.contains(&Column::Age));
+        assert!(!HISTORY.contains(&Column::Age));
+    }
+
+    #[test]
     fn explicit_fill_columns_preserve_full_width_in_live_and_history_tables() {
         let live = crate::model::ProcessColumn::ALL.map(Column::from);
         for (columns, fill) in [
@@ -324,7 +334,11 @@ mod tests {
         widths.reset(Column::Command);
         let reset = widths.compute(&live, 1400.);
         assert_eq!(reset[1], 150.);
-        assert_eq!(reset[8], Column::Command.default_width());
+        let command = live
+            .iter()
+            .position(|column| *column == Column::Command)
+            .unwrap();
+        assert_eq!(reset[command], Column::Command.default_width());
         assert_eq!(reset.iter().sum::<f32>(), 1400.);
         widths.reset(Column::Name);
         assert!(widths.compute(&live, 1400.)[1] > Column::Name.default_width());
