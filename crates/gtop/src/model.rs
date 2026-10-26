@@ -170,10 +170,14 @@ impl ProcessColumn {
             Self::Cpu | Self::Lamp => a.cpu_usage.total_cmp(&b.cpu_usage),
             Self::Memory => a.memory_usage.cmp(&b.memory_usage),
             Self::Age => b.start_time.cmp(&a.start_time),
-            Self::Gpu => a
-                .gpu_usage
-                .partial_cmp(&b.gpu_usage)
-                .unwrap_or(Ordering::Equal),
+            Self::Gpu => match (a.gpu_usage, b.gpu_usage) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (Some(a), Some(b)) if a.is_nan() && !b.is_nan() => Ordering::Less,
+                (Some(a), Some(b)) if !a.is_nan() && b.is_nan() => Ordering::Greater,
+                (Some(a), Some(b)) => a.total_cmp(&b),
+            },
             Self::Ports => a.ports.cmp(&b.ports),
             Self::Command => a.command.cmp(&b.command),
         }
@@ -359,6 +363,38 @@ mod tests {
             process.run_time = seconds;
             assert_eq!(ProcessColumn::Age.text(&process), expected);
         }
+    }
+
+    #[test]
+    fn gpu_sort_orders_nan_zero_and_positive_values_in_both_directions() {
+        let mut processes = vec![
+            process(4, "nan-later", 0., vec![]),
+            process(3, "positive", 0., vec![]),
+            process(2, "zero", 0., vec![]),
+            process(1, "nan-earlier", 0., vec![]),
+        ];
+        processes[0].gpu_usage = Some(f32::NAN);
+        processes[1].gpu_usage = Some(12.5);
+        processes[2].gpu_usage = Some(0.);
+        processes[3].gpu_usage = Some(f32::NAN);
+
+        let ascending = process_order(&processes, &Search::default(), ProcessColumn::Gpu, false);
+        assert_eq!(
+            ascending
+                .iter()
+                .map(|&index| processes[index].pid)
+                .collect::<Vec<_>>(),
+            [1, 4, 2, 3]
+        );
+
+        let descending = process_order(&processes, &Search::default(), ProcessColumn::Gpu, true);
+        assert_eq!(
+            descending
+                .iter()
+                .map(|&index| processes[index].pid)
+                .collect::<Vec<_>>(),
+            [3, 2, 1, 4]
+        );
     }
 
     #[test]
