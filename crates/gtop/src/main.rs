@@ -102,6 +102,7 @@ struct Monitor {
     table: Entity<Processes>,
     search: Entity<InputState>,
     details: Option<Details>,
+    panel_resize: details::PanelResize,
     disk: Option<disk::Disk>,
     paused: bool,
     history: [history::HistoryView; 3],
@@ -630,6 +631,7 @@ impl Monitor {
             table,
             search,
             details: None,
+            panel_resize: details::PanelResize::default(),
             disk: None,
             paused: false,
             history: std::array::from_fn(|_| history::HistoryView::default()),
@@ -685,6 +687,7 @@ impl Monitor {
             if let Some(disk) = &mut self.disk {
                 disk.close();
             }
+            self.panel_resize.finish();
             self.moment = Some(selection);
             self.moment_selected = 0;
             if self

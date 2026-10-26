@@ -6,9 +6,108 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     button::{Button, ButtonVariants},
+    tooltip::Tooltip,
     Disableable, Sizable,
 };
 use gtop_core::ProcessInfo;
+use serde::{Deserialize, Deserializer, Serialize};
+
+pub(super) const DETAIL_WIDTH_MIN: f32 = 280.;
+pub(super) const DETAIL_WIDTH_MAX: f32 = 560.;
+pub(super) const DETAIL_WIDTH_DEFAULT: f32 = 380.;
+const DETAIL_WINDOW_RESERVED_WIDTH: f32 = 820.;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(super) struct DetailWidth(f32);
+
+impl DetailWidth {
+    pub(super) fn new(width: f32) -> Self {
+        Self(if width.is_finite() {
+            width.clamp(DETAIL_WIDTH_MIN, DETAIL_WIDTH_MAX)
+        } else {
+            DETAIL_WIDTH_DEFAULT
+        })
+    }
+
+    pub(super) fn pixels(self) -> f32 {
+        self.0
+    }
+
+    pub(super) fn for_window(self, window_width: f32) -> Self {
+        let maximum =
+            (window_width - DETAIL_WINDOW_RESERVED_WIDTH).clamp(DETAIL_WIDTH_MIN, DETAIL_WIDTH_MAX);
+        Self(self.0.min(maximum))
+    }
+}
+
+impl Default for DetailWidth {
+    fn default() -> Self {
+        Self(DETAIL_WIDTH_DEFAULT)
+    }
+}
+
+impl<'de> Deserialize<'de> for DetailWidth {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        f32::deserialize(deserializer).map(Self::new)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DetailResize {
+    start_x: f32,
+    start_width: DetailWidth,
+}
+
+impl DetailResize {
+    pub(super) fn new(start_x: f32, start_width: DetailWidth) -> Self {
+        Self {
+            start_x,
+            start_width,
+        }
+    }
+
+    pub(super) fn width_at(self, x: f32) -> DetailWidth {
+        DetailWidth::new(self.start_width.pixels() + self.start_x - x)
+    }
+}
+
+#[derive(Default)]
+pub(super) struct PanelResize {
+    drag: Option<DetailResize>,
+}
+
+impl PanelResize {
+    pub(super) fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    pub(super) fn begin(
+        &mut self,
+        reset: bool,
+        start_x: f32,
+        width: DetailWidth,
+    ) -> Option<DetailWidth> {
+        if reset {
+            self.drag = None;
+            Some(DetailWidth::default())
+        } else {
+            self.drag = Some(DetailResize::new(start_x, width));
+            None
+        }
+    }
+
+    pub(super) fn width_at(&self, x: f32) -> Option<DetailWidth> {
+        self.drag.map(|drag| drag.width_at(x))
+    }
+
+    pub(super) fn finish(&mut self) -> bool {
+        self.drag.take().is_some()
+    }
+}
 
 enum Environment {
     Unrequested,
@@ -128,6 +227,7 @@ impl Details {
 impl Monitor {
     pub(super) fn select(&mut self, key: ProcessKey, cx: &mut Context<Self>) {
         self.moment = None;
+        self.panel_resize.finish();
         if let Some(disk) = &mut self.disk {
             disk.close();
         }
@@ -321,7 +421,12 @@ impl Monitor {
                 ),
         )
     }
-    pub(super) fn details(&self, cx: &mut Context<Self>) -> Option<Div> {
+    pub(super) fn details(
+        &self,
+        window: &Window,
+        panel_width: DetailWidth,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
         let details = self.details.as_ref()?;
         let key = details.key;
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
@@ -331,7 +436,7 @@ impl Monitor {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .w(px(380.))
+            .w(px(panel_width.pixels()))
             .h_full()
             .min_h_0()
             .overflow_hidden()
@@ -340,27 +445,14 @@ impl Monitor {
             .border_color(rgb(t.rule_hi));
         let mut panel = div().flex().flex_col().flex_shrink_0();
         if let Some(p) = self.selected_process() {
-            if self.process_exited() {
-                frame = frame.child(crate::rack::label(details.exit_marker(), &t));
-            }
-            frame = frame.child(
-                div()
-                    .flex_shrink_0()
-                    .p(px(18.))
-                    .border_b_1()
-                    .border_color(rgb(t.rule))
-                    .child(crate::rack::label(
-                        format!("PID {} · {} · CLICK ANOTHER ROW TO SWITCH", p.pid, p.user),
-                        &t,
-                    ))
-                    .child(
-                        div()
-                            .font_family("Archivo Display")
-                            .font_weight(FontWeight::EXTRA_BOLD)
-                            .text_size(px(30.))
-                            .child(p.name.to_uppercase()),
-                    ),
-            );
+            let exit_marker = self.process_exited().then(|| details.exit_marker());
+            frame = frame.child(detail_header(
+                p.pid,
+                &p.user,
+                &p.name,
+                exit_marker.as_deref(),
+                &t,
+            ));
             let trace = self.traces.get(&key);
             let top = self.snapshot.as_ref().unwrap().stats.cpu_usage.len() as f32 * 50.;
             let trace_now = if self.process_exited() {
@@ -397,7 +489,7 @@ impl Monitor {
                         })
                 }));
             panel = panel.child(
-                div().p(px(18.)).child(
+                div().px(px(12.)).py(px(10.)).child(
                     crate::rack::win(&t)
                         .child(
                             div()
@@ -427,7 +519,8 @@ impl Monitor {
             ));
             panel = panel.child(
                 div()
-                    .p(px(18.))
+                    .px(px(12.))
+                    .py(px(10.))
                     .border_b_1()
                     .border_color(rgb(t.rule))
                     .child(
@@ -445,33 +538,21 @@ impl Monitor {
                                         &t,
                                     )),
                             )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(10.))
-                                    .child(detail_readout(
-                                        "DISK READ",
-                                        format!(
-                                            "{:.1} MB/s",
-                                            p.disk_usage.0 as f64
-                                                / p.disk_sample_seconds
-                                                    .unwrap_or(self.sample_seconds)
-                                                / 1e6
-                                        ),
-                                        &t,
-                                    ))
-                                    .child(detail_readout(
-                                        "DISK WRITE",
-                                        format!(
-                                            "{:.1} MB/s",
-                                            p.disk_usage.1 as f64
-                                                / p.disk_sample_seconds
-                                                    .unwrap_or(self.sample_seconds)
-                                                / 1e6
-                                        ),
-                                        &t,
-                                    )),
-                            ),
+                            .child(disk_rate_readouts(
+                                format!(
+                                    "{:.1} MB/s",
+                                    p.disk_usage.0 as f64
+                                        / p.disk_sample_seconds.unwrap_or(self.sample_seconds)
+                                        / 1e6
+                                ),
+                                format!(
+                                    "{:.1} MB/s",
+                                    p.disk_usage.1 as f64
+                                        / p.disk_sample_seconds.unwrap_or(self.sample_seconds)
+                                        / 1e6
+                                ),
+                                &t,
+                            )),
                     )
                     .child(
                         detail_line(
@@ -496,8 +577,8 @@ impl Monitor {
             );
             panel = panel.child(
                 div()
-                    .px(px(18.))
-                    .py(px(12.))
+                    .px(px(12.))
+                    .py(px(10.))
                     .border_b_1()
                     .border_color(rgb(t.rule))
                     .child(detail_line("Executable", p.executable.clone()))
@@ -505,7 +586,8 @@ impl Monitor {
             );
             panel = panel.child(
                 div()
-                    .p(px(18.))
+                    .px(px(12.))
+                    .py(px(10.))
                     .border_b_1()
                     .border_color(rgb(t.rule))
                     .child(crate::rack::label("COMMAND", &t))
@@ -514,89 +596,72 @@ impl Monitor {
                             .id("command-value")
                             .max_h(px(64.))
                             .overflow_y_scroll()
+                            .overflow_x_scroll()
                             .p_2()
                             .bg(rgb(t.well))
-                            .child(selectable("command-text", &p.command)),
+                            .child(selectable_content(window, "command-text", &p.command)),
                     ),
             );
         }
-        let environment = match &details.environment {
-            Environment::Unrequested => div(),
-            Environment::Loading => div().child("Reading environment..."),
-            Environment::Failed(e) => div().text_color(rgb(t.base.hot)).child(e.clone()),
-            Environment::Loaded(values) if details.environment_open => {
-                if values.is_empty() {
-                    div().child("This process exposes no environment variables.")
-                } else {
-                    div().child(selectable("environment-text", &values.join("\n")))
-                }
-            }
-            Environment::Loaded(_) => div().child("Environment hidden"),
-        };
-        panel = panel.child(
+        let environment =
+            environment_content(window, &details.environment, details.environment_open, &t);
+        panel = panel.child(environment_section(
             div()
-                .id("environment-scroll")
-                .max_h(px(240.))
-                .flex_shrink_0()
-                .overflow_y_scroll()
-                .p(px(18.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(crate::rack::label("ENVIRONMENT", &t))
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(crate::rack::label("ENVIRONMENT", &t))
-                        .child(
-                            Button::new("toggle-environment")
-                                .label(if details.environment_open {
-                                    "HIDE · E"
-                                } else {
-                                    "LOAD · E"
-                                })
-                                .rack(&t)
-                                .small()
-                                .disabled(!self.environment_enabled())
-                                .on_click(
-                                    cx.listener(|this, _, w, cx| this.fetch_environment(w, cx)),
-                                ),
-                        ),
+                    Button::new("toggle-environment")
+                        .label(if details.environment_open {
+                            "HIDE · E"
+                        } else {
+                            "LOAD · E"
+                        })
+                        .rack(&t)
+                        .small()
+                        .disabled(!self.environment_enabled())
+                        .on_click(cx.listener(|this, _, w, cx| this.fetch_environment(w, cx))),
+                ),
+            environment,
+        ));
+        let mut frame = frame.child(detail_body(panel, &details.body_scroll)).child(
+            div()
+                .flex()
+                .gap_2()
+                .flex_shrink_0()
+                .px(px(12.))
+                .py(px(10.))
+                .child(
+                    Button::new("close-details")
+                        .flex_1()
+                        .label("Close · Esc")
+                        .rack(&t)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.panel_resize.finish();
+                            close_details(&mut this.details);
+                            cx.notify();
+                        })),
                 )
-                .child(environment),
+                .child(
+                    Button::new("kill")
+                        .flex_1()
+                        .label("Kill · X")
+                        .rack(&t)
+                        .danger()
+                        .disabled(self.process_exited())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let alive = !this.process_exited();
+                            if let Some(d) = this.details.as_mut() {
+                                d.request_kill(key, alive);
+                            }
+                            cx.notify();
+                        })),
+                ),
         );
-        Some(
-            frame.child(detail_body(panel, &details.body_scroll)).child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .flex_shrink_0()
-                    .p(px(18.))
-                    .child(
-                        Button::new("close-details")
-                            .flex_1()
-                            .label("Close · Esc")
-                            .rack(&t)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                close_details(&mut this.details);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("kill")
-                            .flex_1()
-                            .label("Kill · X")
-                            .rack(&t)
-                            .danger()
-                            .disabled(self.process_exited())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let alive = !this.process_exited();
-                                if let Some(d) = this.details.as_mut() {
-                                    d.request_kill(key, alive);
-                                }
-                                cx.notify();
-                            })),
-                    ),
-            ),
-        )
+        frame = frame.child(self.panel_resize_handle(cx));
+        frame = frame.child(self.panel_resize_events(cx));
+        Some(frame)
     }
 }
 
@@ -607,6 +672,40 @@ fn detail_body(content: Div, scroll: &ScrollHandle) -> Stateful<Div> {
         .min_h_0()
         .overflow_y_scroll()
         .track_scroll(scroll)
+        .child(content)
+}
+
+fn environment_content(
+    window: &Window,
+    environment: &Environment,
+    open: bool,
+    tokens: &crate::palette::Tokens,
+) -> Div {
+    match environment {
+        Environment::Unrequested => div(),
+        Environment::Loading => div().child("Reading environment..."),
+        Environment::Failed(error) => div().text_color(rgb(tokens.base.hot)).child(error.clone()),
+        Environment::Loaded(values) if open => {
+            if values.is_empty() {
+                div().child("This process exposes no environment variables.")
+            } else {
+                selectable_content(window, "environment-text", &values.join("\n"))
+            }
+        }
+        Environment::Loaded(_) => div().child("Environment hidden"),
+    }
+}
+
+fn environment_section(header: Div, content: Div) -> Stateful<Div> {
+    div()
+        .id("environment-scroll")
+        .max_h(px(240.))
+        .flex_shrink_0()
+        .overflow_y_scroll()
+        .overflow_x_scroll()
+        .px(px(12.))
+        .py(px(10.))
+        .child(header)
         .child(content)
 }
 
@@ -623,6 +722,85 @@ fn analysis_sample(
     }
 }
 
+fn detail_header(
+    pid: u32,
+    user: &str,
+    title: &str,
+    exit_marker: Option<&str>,
+    t: &crate::palette::Tokens,
+) -> Stateful<Div> {
+    let mut header = div()
+        .id("detail-header")
+        .debug_selector(|| "detail-panel-header".into())
+        .flex()
+        .flex_col()
+        .flex_shrink_0();
+    if let Some(exit_marker) = exit_marker {
+        header = header.child(
+            div()
+                .id("detail-exit-marker")
+                .px(px(12.))
+                .py(px(10.))
+                .border_b_1()
+                .border_color(rgb(t.rule))
+                .child(
+                    crate::rack::label(exit_marker.to_string(), t)
+                        .debug_selector(|| "detail-exit-marker".into()),
+                ),
+        );
+    }
+    let full_title = title.to_string();
+    header.child(
+        div()
+            .flex_shrink_0()
+            .px(px(12.))
+            .py(px(10.))
+            .border_b_1()
+            .border_color(rgb(t.rule))
+            .child(
+                div()
+                    .id("detail-identity")
+                    .debug_selector(|| "detail-identity".into())
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .truncate()
+                    .child(
+                        crate::rack::label(format!("PID {pid} · {user}"), t)
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .truncate(),
+                    ),
+            )
+            .child(
+                div()
+                    .id("detail-switch-hint")
+                    .debug_selector(|| "detail-switch-hint".into())
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .truncate()
+                    .child(
+                        crate::rack::label("CLICK ANOTHER ROW TO SWITCH", t)
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .truncate(),
+                    ),
+            )
+            .child(
+                div()
+                    .id("detail-process-title")
+                    .debug_selector(|| "detail-process-title".into())
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .truncate()
+                    .font_family("Archivo Display")
+                    .font_weight(FontWeight::EXTRA_BOLD)
+                    .text_size(px(30.))
+                    .child(full_title.to_uppercase())
+                    .tooltip(move |window, cx| Tooltip::new(full_title.clone()).build(window, cx)),
+            ),
+    )
+}
+
 fn analysis_panel(
     analysis: Option<&crate::analysis::ProcessAnalysis>,
     name: &str,
@@ -630,7 +808,11 @@ fn analysis_panel(
     cores: usize,
     t: &crate::palette::Tokens,
 ) -> Div {
-    let mut panel = div().p(px(18.)).border_b_1().border_color(rgb(t.rule));
+    let mut panel = div()
+        .px(px(12.))
+        .py(px(10.))
+        .border_b_1()
+        .border_color(rgb(t.rule));
     let Some(analysis) = analysis else {
         return panel.child(crate::rack::win(t).child("Reading process analysis…"));
     };
@@ -639,23 +821,38 @@ fn analysis_panel(
             .child(
                 div()
                     .flex()
+                    .min_w_0()
                     .justify_between()
-                    .child(crate::rack::label("WHAT IT IS", t))
-                    .child(crate::rack::label(analysis.identity.source, t)),
+                    .gap(px(8.))
+                    .child(crate::rack::label("WHAT IT IS", t).whitespace_nowrap())
+                    .child(
+                        crate::rack::label(analysis.identity.source, t)
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .truncate(),
+                    ),
             )
             .child(
                 div()
                     .flex()
+                    .min_w_0()
                     .items_center()
                     .justify_between()
                     .child(
                         div()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_size(px(14.))
                             .text_color(rgb(t.base.silk))
                             .child(analysis.identity.what.clone()),
                     )
-                    .child(crate::rack::label(analysis.identity.kind.to_uppercase(), t)),
+                    .child(
+                        crate::rack::label(analysis.identity.kind.to_uppercase(), t)
+                            .flex_shrink_0()
+                            .whitespace_nowrap(),
+                    ),
             )
             .child(
                 div()
@@ -667,10 +864,17 @@ fn analysis_panel(
     let mut history_panel = crate::rack::win(t).child(
         div()
             .flex()
+            .min_w_0()
+            .gap(px(8.))
             .justify_between()
-            .child(crate::rack::label("HISTORY · 24 H", t))
+            .child(crate::rack::label("HISTORY · 24 H", t).whitespace_nowrap())
             .when(analysis.history.is_some(), |d| {
-                d.child(crate::rack::label(format!("ALL {name} PROCESSES"), t))
+                d.child(
+                    crate::rack::label(format!("ALL {name} PROCESSES"), t)
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .truncate(),
+                )
             }),
     );
     if let Some(history) = &analysis.history {
@@ -752,40 +956,100 @@ fn selectable(id: &'static str, text: &str) -> gpui_component::text::TextView {
     gpui_component::text::TextView::html(id, format!("<pre>{escaped}</pre>"))
         .selectable(true)
         .scrollable(false)
+        .whitespace_nowrap()
 }
-fn detail_readout(name: &str, value: String, t: &crate::palette::Tokens) -> Div {
+
+fn selectable_content(window: &Window, id: &'static str, text: &str) -> Div {
+    let font = font("JetBrains Mono");
+    let font_size = px(12.);
+    let width = text
+        .lines()
+        .map(|line| {
+            let run = TextRun {
+                len: line.len(),
+                font: font.clone(),
+                color: window.text_style().color,
+                ..Default::default()
+            };
+            window
+                .text_system()
+                .layout_line(line, font_size, &[run], None)
+                .width
+        })
+        .fold(px(0.), Pixels::max)
+        + px(1.);
+    div().w(width).child(selectable(id, text))
+}
+fn detail_readout(name: &'static str, value: String, t: &crate::palette::Tokens) -> Stateful<Div> {
     div()
+        .id(name)
+        .debug_selector(move || format!("detail-readout-{name}"))
         .flex_1()
         .min_w_0()
-        .child(crate::rack::label(name.to_string(), t))
-        .child(if let Some(number) = value.strip_suffix('%') {
-            crate::rack::lit_unit(number.to_string(), '%', 22., false, t)
-        } else {
-            crate::rack::lit(value, 22., false, t)
-        })
+        .child(
+            crate::rack::label(name.to_string(), t)
+                .min_w_0()
+                .whitespace_nowrap()
+                .truncate(),
+        )
+        .child(
+            div()
+                .whitespace_nowrap()
+                .child(if let Some(number) = value.strip_suffix('%') {
+                    crate::rack::lit_unit(number.to_string(), '%', 22., false, t)
+                } else {
+                    crate::rack::lit(value, 22., false, t)
+                }),
+        )
+}
+
+fn disk_rate_readouts(read: String, write: String, t: &crate::palette::Tokens) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(detail_readout("DISK READ", read, t))
+        .child(detail_readout("DISK WRITE", write, t))
 }
 
 fn detail_line(label: &str, value: String) -> Div {
     div()
         .flex()
+        .items_baseline()
         .flex_shrink_0()
-        .gap_2()
-        .py(px(3.))
+        .gap(px(8.))
+        .py(px(4.))
         .child(
             div()
                 .w(px(96.))
+                .flex_shrink_0()
+                .min_w_0()
+                .whitespace_nowrap()
+                .truncate()
                 .font_family("Archivo Labels")
                 .text_size(px(10.))
                 .child(label.to_uppercase()),
         )
-        .child(div().flex_1().min_w_0().child(value))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_nowrap()
+                .truncate()
+                .child(value),
+        )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{kill_completed, Details, Environment, KillState};
+    use super::{
+        environment_content, environment_section, kill_completed, Details, Environment, KillState,
+    };
     use crate::model::ProcessKey;
-    use gpui::ScrollHandle;
+    use crate::rack::RackButton;
+    use gpui::{prelude::*, *};
+    use gpui_component::Sizable;
+    use std::prelude::v1::test;
 
     fn selected(key: ProcessKey) -> Details {
         let process = crate::test_data::process(key.pid, "builder", 42.);
@@ -802,6 +1066,123 @@ mod tests {
             environment_open: false,
             body_scroll: ScrollHandle::new(),
             kill: KillState::Ready,
+        }
+    }
+
+    struct SelectableLayoutTest {
+        command_scroll: ScrollHandle,
+        environment_scroll: ScrollHandle,
+    }
+
+    impl Render for SelectableLayoutTest {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let token = format!("{} END_OF_COMMAND", "some_long_project_name_".repeat(60));
+            let tokens = crate::palette::presets()[1].base.tokens();
+            let environment = Environment::Loaded(vec![
+                format!("KEY={token}"),
+                format!("NEXT={token} END_OF_ENVIRONMENT"),
+            ]);
+            div()
+                .w(px(220.))
+                .flex()
+                .flex_col()
+                .font_family("JetBrains Mono")
+                .text_size(px(12.))
+                .child(
+                    div()
+                        .id("command-scroll")
+                        .debug_selector(|| "command-scroll".into())
+                        .w_full()
+                        .max_h(px(30.))
+                        .overflow_x_scroll()
+                        .track_scroll(&self.command_scroll)
+                        .child(super::selectable_content(window, "command-text", &token)),
+                )
+                .child(
+                    environment_section(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(crate::rack::label("ENVIRONMENT", &tokens))
+                            .child(
+                                gpui_component::button::Button::new("toggle-environment")
+                                    .label("HIDE · E")
+                                    .rack(&tokens)
+                                    .small(),
+                            ),
+                        environment_content(window, &environment, true, &tokens),
+                    )
+                    .debug_selector(|| "environment-scroll".into())
+                    .w_full()
+                    .track_scroll(&self.environment_scroll),
+                )
+        }
+    }
+
+    #[gpui::test]
+    async fn selectable_values_do_not_wrap_and_scroll_to_line_ends(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let command_scroll = ScrollHandle::new();
+        let environment_scroll = ScrollHandle::new();
+        let (_, visual) = cx.add_window_view(|_, _| SelectableLayoutTest {
+            command_scroll: command_scroll.clone(),
+            environment_scroll: environment_scroll.clone(),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let command = visual.debug_bounds("command-scroll").unwrap();
+        let environment = visual.debug_bounds("environment-scroll").unwrap();
+        assert!(
+            command.size.height <= px(30.),
+            "command bounds: {command:?}"
+        );
+        assert!(
+            environment.size.height <= px(240.),
+            "environment bounds: {environment:?}"
+        );
+        assert!(
+            command_scroll.max_offset().x > px(100.),
+            "command line end is not reachable: {:?}",
+            command_scroll.max_offset()
+        );
+        assert!(
+            environment_scroll.max_offset().x > px(100.),
+            "environment line end is not reachable: {:?}",
+            environment_scroll.max_offset()
+        );
+
+        for (position, scroll) in [
+            (command.center(), &command_scroll),
+            (environment.center(), &environment_scroll),
+        ] {
+            visual.update(|window, cx| {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position,
+                        pressed_button: None,
+                        modifiers: Modifiers::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(-20_000.), px(0.))),
+                        modifiers: Modifiers::default(),
+                        touch_phase: TouchPhase::Moved,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(
+                scroll.offset().x,
+                -scroll.max_offset().x,
+                "scroll input did not reach the end of {position:?}"
+            );
         }
     }
 
@@ -890,6 +1271,351 @@ mod tests {
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         assert_eq!(scroll.offset().y, px(-740.));
+        detail_panel_layout::assert_minimum_width(cx);
+        detail_panel_layout::assert_disk_rates_do_not_wrap(cx);
+        detail_panel_layout::assert_window_resize_only_clamps_rendered_width(cx);
+        detail_panel_layout::resize_state_clamps_resets_and_persists();
+        detail_panel_layout::resize_interaction(cx);
+    }
+
+    mod detail_panel_layout {
+        use super::super::{
+            detail_header, disk_rate_readouts, DetailWidth, PanelResize, DETAIL_WIDTH_DEFAULT,
+            DETAIL_WIDTH_MAX, DETAIL_WIDTH_MIN,
+        };
+        use gpui::{prelude::*, *};
+
+        struct HeaderLayoutTest(crate::palette::Tokens);
+
+        impl Render for HeaderLayoutTest {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .relative()
+                    .w(px(280.))
+                    .h(px(180.))
+                    .child(crate::rack::screws(&self.0, "details"))
+                    .child(detail_header(
+                        74412,
+                        "gabrielecegi",
+                        "Rust test or build binary of mini_speed_is_a_long_process_name",
+                        Some("EXITED · last seen 12:34:56"),
+                        &self.0,
+                    ))
+            }
+        }
+
+        struct DiskReadoutLayoutTest(crate::palette::Tokens);
+
+        impl Render for DiskReadoutLayoutTest {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(256.)).child(disk_rate_readouts(
+                    "1500.0 MB/s".into(),
+                    "3000.0 MB/s".into(),
+                    &self.0,
+                ))
+            }
+        }
+
+        struct ResizeLayoutTest {
+            width: DetailWidth,
+            resize: PanelResize,
+            persisted: Option<DetailWidth>,
+        }
+
+        struct WindowClampLayoutTest {
+            saved: DetailWidth,
+        }
+
+        impl Render for WindowClampLayoutTest {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let visible = self.saved.for_window(f32::from(window.bounds().size.width));
+                div()
+                    .id("responsive-detail-panel")
+                    .debug_selector(|| "responsive-detail-panel".into())
+                    .w(px(visible.pixels()))
+                    .h(px(100.))
+            }
+        }
+
+        impl Render for ResizeLayoutTest {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let handle = crate::column_widths::handle_left().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        if let Some(width) = this.resize.begin(
+                            event.click_count == 2,
+                            event.position.x.into(),
+                            this.width,
+                        ) {
+                            this.width = width;
+                            this.persisted = Some(width);
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                );
+                let events = crate::column_widths::events(
+                    cx,
+                    self.resize.is_dragging(),
+                    |_, _, _, _| {},
+                    |this, event, _, cx| {
+                        if let Some(width) = this.resize.width_at(event.position.x.into()) {
+                            this.width = width;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    },
+                    |this, _, _, cx| {
+                        if this.resize.finish() {
+                            let stored: crate::palette::Settings = serde_json::from_value(
+                                serde_json::to_value(crate::palette::Settings {
+                                    detail_width: this.width,
+                                    ..Default::default()
+                                })
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            this.persisted = Some(stored.detail_width);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    },
+                );
+                div()
+                    .id("resize-test-panel")
+                    .relative()
+                    .w(px(self.width.pixels()))
+                    .h(px(120.))
+                    .child(handle)
+                    .child(events)
+            }
+        }
+
+        pub(super) fn assert_minimum_width(cx: &mut TestAppContext) {
+            let tokens = crate::palette::presets()[0].base.tokens();
+            let (_, visual) = cx.add_window_view(|_, _| HeaderLayoutTest(tokens));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+
+            let panel = visual.debug_bounds("detail-panel-header").unwrap();
+            let exit = visual.debug_bounds("detail-exit-marker").unwrap();
+            let screw = visual.debug_bounds("details-screw-top-left").unwrap();
+            let identity = visual.debug_bounds("detail-identity").unwrap();
+            let hint = visual.debug_bounds("detail-switch-hint").unwrap();
+            let title = visual.debug_bounds("detail-process-title").unwrap();
+            for line in [exit, identity, hint, title] {
+                assert!(line.origin.x >= panel.origin.x + px(12.));
+                assert!(
+                    line.origin.x + line.size.width <= panel.origin.x + panel.size.width - px(12.)
+                );
+            }
+            assert!(identity.size.height <= px(16.));
+            assert!(hint.size.height <= px(16.));
+            assert!(title.size.height <= px(50.));
+            assert!(exit.origin.x >= screw.origin.x + screw.size.width + px(2.));
+        }
+
+        pub(super) fn assert_disk_rates_do_not_wrap(cx: &mut TestAppContext) {
+            let tokens = crate::palette::presets()[0].base.tokens();
+            let (_, visual) = cx.add_window_view(|_, _| DiskReadoutLayoutTest(tokens));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            for readout in ["DISK READ", "DISK WRITE"] {
+                let selector = match readout {
+                    "DISK READ" => "detail-readout-DISK READ",
+                    _ => "detail-readout-DISK WRITE",
+                };
+                let bounds = visual.debug_bounds(selector).unwrap();
+                assert!(
+                    bounds.size.width >= px(250.),
+                    "{readout} bounds: {bounds:?}"
+                );
+            }
+        }
+
+        pub(super) fn assert_window_resize_only_clamps_rendered_width(cx: &mut TestAppContext) {
+            let (panel, visual) = cx.add_window_view(|_, _| WindowClampLayoutTest {
+                saved: DetailWidth::new(560.),
+            });
+            for (window_width, panel_width) in [(1480., 560.), (1200., 380.), (1480., 560.)] {
+                visual.simulate_resize(size(px(window_width), px(400.)));
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+                let bounds = visual.debug_bounds("responsive-detail-panel").unwrap();
+                assert_eq!(bounds.size.width, px(panel_width));
+                assert_eq!(
+                    panel.read_with(visual, |panel, _| panel.saved.pixels()),
+                    560.
+                );
+            }
+        }
+
+        pub(super) fn resize_state_clamps_resets_and_persists() {
+            let mut resize = PanelResize::default();
+            let initial = DetailWidth::default();
+            assert!(resize.begin(false, 100., initial).is_none());
+            assert!(resize.is_dragging());
+            assert_eq!(resize.width_at(1000.).unwrap().pixels(), DETAIL_WIDTH_MIN);
+            assert_eq!(resize.width_at(-1000.).unwrap().pixels(), DETAIL_WIDTH_MAX);
+            assert!(resize.finish());
+            assert!(!resize.is_dragging());
+
+            assert_eq!(
+                resize.begin(true, 100., DetailWidth::new(500.)).unwrap(),
+                initial
+            );
+            assert!(!resize.is_dragging());
+            assert!(!resize.finish());
+
+            let stored: crate::palette::Settings = serde_json::from_value(
+                serde_json::to_value(crate::palette::Settings {
+                    detail_width: DetailWidth::new(455.),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(stored.detail_width.pixels(), 455.);
+            assert_eq!(initial.pixels(), DETAIL_WIDTH_DEFAULT);
+
+            let saved = DetailWidth::new(560.);
+            assert_eq!(saved.for_window(1200.).pixels(), 380.);
+            assert_eq!(saved.for_window(1480.).pixels(), 560.);
+            assert_eq!(saved.pixels(), 560.);
+        }
+
+        pub(super) fn resize_interaction(cx: &mut TestAppContext) {
+            let (panel, visual) = cx.add_window_view(|_, _| ResizeLayoutTest {
+                width: DetailWidth::default(),
+                resize: PanelResize::default(),
+                persisted: None,
+            });
+            visual.simulate_resize(size(px(800.), px(400.)));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+
+            for end_x in [1000., -1000.] {
+                dispatch_drag(visual, end_x);
+            }
+            let (width, persisted, _) = panel_state(&panel, visual);
+            assert_eq!(width.pixels(), DETAIL_WIDTH_MAX);
+            assert_eq!(persisted.unwrap().pixels(), DETAIL_WIDTH_MAX);
+
+            dispatch_click(visual, 2);
+            let (width, persisted, _) = panel_state(&panel, visual);
+            assert_eq!(width.pixels(), DETAIL_WIDTH_DEFAULT);
+            assert_eq!(persisted.unwrap().pixels(), DETAIL_WIDTH_DEFAULT);
+
+            dispatch_click(visual, 1);
+            let (_, _, is_dragging) = panel_state(&panel, visual);
+            assert!(!is_dragging);
+
+            dispatch_right_release_after_left_down(visual);
+            let (width, _, is_dragging) = panel_state(&panel, visual);
+            assert_eq!(width.pixels(), DETAIL_WIDTH_DEFAULT);
+            assert!(!is_dragging);
+        }
+
+        fn panel_state(
+            panel: &Entity<ResizeLayoutTest>,
+            cx: &mut VisualTestContext,
+        ) -> (DetailWidth, Option<DetailWidth>, bool) {
+            cx.update(|_, cx| {
+                let panel = panel.read(cx);
+                (panel.width, panel.persisted, panel.resize.is_dragging())
+            })
+        }
+
+        fn dispatch_drag(cx: &mut VisualTestContext, end_x: f32) {
+            let start = point(px(3.), px(20.));
+            let end = point(px(end_x), px(20.));
+            cx.update(|window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: start,
+                        button: MouseButton::Left,
+                        click_count: 1,
+                        modifiers: Modifiers::default(),
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: end,
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Modifiers::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position: end,
+                        button: MouseButton::Left,
+                        click_count: 1,
+                        modifiers: Modifiers::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+
+        fn dispatch_click(cx: &mut VisualTestContext, click_count: usize) {
+            let position = point(px(3.), px(20.));
+            cx.update(|window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        click_count,
+                        modifiers: Modifiers::default(),
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position,
+                        button: MouseButton::Left,
+                        click_count,
+                        modifiers: Modifiers::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+
+        fn dispatch_right_release_after_left_down(cx: &mut VisualTestContext) {
+            let position = point(px(3.), px(20.));
+            cx.update(|window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        click_count: 1,
+                        modifiers: Modifiers::default(),
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position,
+                        button: MouseButton::Right,
+                        click_count: 1,
+                        modifiers: Modifiers::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
     }
 
     #[test]

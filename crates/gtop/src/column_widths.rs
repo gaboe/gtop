@@ -188,10 +188,19 @@ pub fn cell(width: f32, right: bool) -> Div {
 }
 
 pub fn handle() -> Stateful<Div> {
+    resize_handle("column-resize", false)
+}
+
+pub fn handle_left() -> Stateful<Div> {
+    resize_handle("detail-resize", true)
+}
+
+fn resize_handle(id: &'static str, left: bool) -> Stateful<Div> {
     div()
-        .id("column-resize")
+        .id(id)
         .absolute()
-        .right_0()
+        .when(left, |handle| handle.left_0())
+        .when(!left, |handle| handle.right_0())
         .top_0()
         .h_full()
         .w(px(7.))
@@ -199,7 +208,8 @@ pub fn handle() -> Stateful<Div> {
         .child(
             div()
                 .absolute()
-                .right_0()
+                .when(left, |line| line.left_0())
+                .when(!left, |line| line.right_0())
                 .top(px(5.))
                 .bottom(px(5.))
                 .w(px(1.))
@@ -232,7 +242,7 @@ pub fn events<T: 'static>(
             });
             let finish = std::rc::Rc::new(finish);
             window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-                if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                if phase == DispatchPhase::Capture {
                     finish(event, window, cx);
                 }
             });

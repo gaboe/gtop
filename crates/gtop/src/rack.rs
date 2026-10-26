@@ -436,7 +436,7 @@ pub fn screws(t: &Tokens, section: &str) -> Div {
                 .border_1()
                 .border_color(rgb(t.rule_hi))
                 .when(right, |d| d.right(px(5.)))
-                .when(!right, |d| d.left(px(5.)))
+                .when(!right, |d| d.left(px(2.)))
                 .when(bottom, |d| d.bottom(px(5.)))
                 .when(!bottom, |d| d.top(px(5.)))
                 .child(
@@ -1495,6 +1495,10 @@ impl Monitor {
     }
     pub fn rack(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
+        let panel_width = self
+            .settings
+            .detail_width
+            .for_window(f32::from(window.bounds().size.width));
         let compact = self.settings_open || self.details.is_some() || self.moment.is_some();
         if self.table.read(cx).compact != compact {
             self.table.update(cx, |p, cx| {
@@ -1999,6 +2003,7 @@ impl Monitor {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings_open = !this.settings_open;
                                 if this.settings_open {
+                                    this.panel_resize.finish();
                                     if let Some(disk) = &mut this.disk {
                                         disk.close();
                                     }
@@ -2044,13 +2049,63 @@ impl Monitor {
             root = root.child(self.palette_panel(&t, window, cx));
         } else if self.moment.is_some() {
             root = root.child(self.moment_panel(&t, cx));
-        } else if let Some(disk) = self.disk_panel(cx) {
-            root = root.child(disk);
-        } else if let Some(details) = self.details(cx) {
-            root = root.child(details.w(px(380.)).h_full());
+        } else if let Some(disk) = self.disk_panel(panel_width, cx) {
+            root = root.child(disk.h_full());
+        } else if let Some(details) = self.details(window, panel_width, cx) {
+            root = root.child(details.h_full());
         }
         root
     }
+    pub(super) fn panel_resize_handle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        crate::column_widths::handle_left().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                let width = this
+                    .settings
+                    .detail_width
+                    .for_window(f32::from(window.bounds().size.width));
+                if event.click_count == 2 {
+                    this.settings.detail_width = this
+                        .panel_resize
+                        .begin(true, event.position.x.into(), width)
+                        .unwrap();
+                    this.persist_settings(window, cx);
+                } else {
+                    this.panel_resize
+                        .begin(false, event.position.x.into(), width);
+                }
+                cx.notify();
+            }),
+        )
+    }
+
+    pub(super) fn panel_resize_events(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::column_widths::events(
+            cx,
+            self.panel_resize.is_dragging(),
+            |_, _, _, _| {},
+            |this, event, window, cx| {
+                if let Some(width) = this
+                    .panel_resize
+                    .width_at(event.position.x.into())
+                    .map(|width| width.for_window(f32::from(window.bounds().size.width)))
+                {
+                    this.settings.detail_width = width;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            },
+            |this, _, window, cx| {
+                if this.panel_resize.finish() {
+                    this.persist_settings(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            },
+        )
+    }
+
     pub(super) fn palette_subscriptions(
         inputs: &[Entity<gpui_component::input::InputState>; 6],
         pickers: &[Entity<ColorPickerState>; 6],
@@ -2386,6 +2441,7 @@ impl Monitor {
             "s" => {
                 self.settings_open = !self.settings_open;
                 if self.settings_open {
+                    self.panel_resize.finish();
                     if let Some(disk) = &mut self.disk {
                         disk.close();
                     }
@@ -2402,6 +2458,7 @@ impl Monitor {
                 if self.settings_open {
                     self.settings_open = false;
                 } else {
+                    self.panel_resize.finish();
                     crate::details::close_details(&mut self.details);
                 }
             }
