@@ -572,6 +572,7 @@ fn worker_with_trash(
 impl Monitor {
     pub(super) fn open_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.details = None;
+        self.panel_resize.finish();
         self.moment = None;
         self.settings_open = false;
         if let Some(disk) = &mut self.disk {
@@ -629,7 +630,7 @@ impl Monitor {
     pub(super) fn disk_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
         let disk = self.disk.as_ref().filter(|d| d.open)?;
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
-        let mut body = div().flex().flex_col().gap(px(6.)).p(px(14.));
+        let mut body = div().flex().flex_col().gap(px(6.)).px(px(12.)).py(px(10.));
         if let Some(folder) = &disk.folder {
             let state = match &folder.state {
                 ScanState::Scanning => "Scanning · partial sizes".into(),
@@ -658,6 +659,9 @@ impl Monitor {
                     .into_any_element(),
                 div()
                     .text_size(px(10.))
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .truncate()
                     .child(folder.path.display().to_string())
                     .into_any_element(),
             ];
@@ -865,7 +869,7 @@ impl Monitor {
             .child(crate::rack::screws(&t))
             .flex()
             .flex_col()
-            .w(px(380.))
+            .w(px(self.settings.detail_width.pixels()))
             .flex_shrink_0()
             .h_full()
             .min_h_0()
@@ -874,7 +878,8 @@ impl Monitor {
             .border_color(rgb(t.rule_hi))
             .child(
                 div()
-                    .p(px(18.))
+                    .px(px(12.))
+                    .py(px(10.))
                     .border_b_1()
                     .border_color(rgb(t.rule))
                     .child(crate::rack::label("DISK SPACE", &t))
@@ -957,7 +962,8 @@ impl Monitor {
                 div()
                     .id("disk-status")
                     .role(Role::Status)
-                    .p(px(10.))
+                    .px(px(12.))
+                    .py(px(10.))
                     .text_size(px(10.))
                     .child(disk.status.clone()),
             )
@@ -968,9 +974,12 @@ impl Monitor {
                     .small()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.disk.as_mut().unwrap().close();
+                        this.panel_resize.finish();
                         cx.notify();
                     })),
-            );
+            )
+            .child(self.panel_resize_handle(cx))
+            .child(self.panel_resize_events(cx));
         Some(panel)
     }
 }

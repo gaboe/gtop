@@ -6,9 +6,101 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     button::{Button, ButtonVariants},
+    tooltip::Tooltip,
     Disableable, Sizable,
 };
 use gtop_core::ProcessInfo;
+use serde::{Deserialize, Deserializer, Serialize};
+
+pub(super) const DETAIL_WIDTH_MIN: f32 = 280.;
+pub(super) const DETAIL_WIDTH_MAX: f32 = 560.;
+pub(super) const DETAIL_WIDTH_DEFAULT: f32 = 380.;
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(super) struct DetailWidth(f32);
+
+impl DetailWidth {
+    pub(super) fn new(width: f32) -> Self {
+        Self(if width.is_finite() {
+            width.clamp(DETAIL_WIDTH_MIN, DETAIL_WIDTH_MAX)
+        } else {
+            DETAIL_WIDTH_DEFAULT
+        })
+    }
+
+    pub(super) fn pixels(self) -> f32 {
+        self.0
+    }
+}
+
+impl Default for DetailWidth {
+    fn default() -> Self {
+        Self(DETAIL_WIDTH_DEFAULT)
+    }
+}
+
+impl<'de> Deserialize<'de> for DetailWidth {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        f32::deserialize(deserializer).map(Self::new)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DetailResize {
+    start_x: f32,
+    start_width: DetailWidth,
+}
+
+impl DetailResize {
+    pub(super) fn new(start_x: f32, start_width: DetailWidth) -> Self {
+        Self {
+            start_x,
+            start_width,
+        }
+    }
+
+    pub(super) fn width_at(self, x: f32) -> DetailWidth {
+        DetailWidth::new(self.start_width.pixels() + self.start_x - x)
+    }
+}
+
+#[derive(Default)]
+pub(super) struct PanelResize {
+    drag: Option<DetailResize>,
+}
+
+impl PanelResize {
+    pub(super) fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    pub(super) fn begin(
+        &mut self,
+        reset: bool,
+        start_x: f32,
+        width: DetailWidth,
+    ) -> Option<DetailWidth> {
+        if reset {
+            self.drag = None;
+            Some(DetailWidth::default())
+        } else {
+            self.drag = Some(DetailResize::new(start_x, width));
+            None
+        }
+    }
+
+    pub(super) fn width_at(&self, x: f32) -> Option<DetailWidth> {
+        self.drag.map(|drag| drag.width_at(x))
+    }
+
+    pub(super) fn finish(&mut self) -> bool {
+        self.drag.take().is_some()
+    }
+}
 
 enum Environment {
     Unrequested,
@@ -128,6 +220,7 @@ impl Details {
 impl Monitor {
     pub(super) fn select(&mut self, key: ProcessKey, cx: &mut Context<Self>) {
         self.moment = None;
+        self.panel_resize.finish();
         if let Some(disk) = &mut self.disk {
             disk.close();
         }
@@ -330,7 +423,7 @@ impl Monitor {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .w(px(380.))
+            .w(px(self.settings.detail_width.pixels()))
             .h_full()
             .min_h_0()
             .overflow_hidden()
@@ -339,27 +432,14 @@ impl Monitor {
             .border_color(rgb(t.rule_hi));
         let mut panel = div().flex().flex_col().flex_shrink_0();
         if let Some(p) = self.selected_process() {
-            if self.process_exited() {
-                frame = frame.child(crate::rack::label(details.exit_marker(), &t));
-            }
-            frame = frame.child(
-                div()
-                    .flex_shrink_0()
-                    .p(px(18.))
-                    .border_b_1()
-                    .border_color(rgb(t.rule))
-                    .child(crate::rack::label(
-                        format!("PID {} · {} · CLICK ANOTHER ROW TO SWITCH", p.pid, p.user),
-                        &t,
-                    ))
-                    .child(
-                        div()
-                            .font_family("Archivo Display")
-                            .font_weight(FontWeight::EXTRA_BOLD)
-                            .text_size(px(30.))
-                            .child(p.name.to_uppercase()),
-                    ),
-            );
+            let exit_marker = self.process_exited().then(|| details.exit_marker());
+            frame = frame.child(detail_header(
+                p.pid,
+                &p.user,
+                &p.name,
+                exit_marker.as_deref(),
+                &t,
+            ));
             let trace = self.traces.get(&key);
             let top = self.snapshot.as_ref().unwrap().stats.cpu_usage.len() as f32 * 50.;
             let trace_now = if self.process_exited() {
@@ -396,7 +476,7 @@ impl Monitor {
                         })
                 }));
             panel = panel.child(
-                div().p(px(18.)).child(
+                div().px(px(12.)).py(px(10.)).child(
                     crate::rack::win(&t)
                         .child(
                             div()
@@ -426,7 +506,8 @@ impl Monitor {
             ));
             panel = panel.child(
                 div()
-                    .p(px(18.))
+                    .px(px(12.))
+                    .py(px(10.))
                     .border_b_1()
                     .border_color(rgb(t.rule))
                     .child(
@@ -495,8 +576,8 @@ impl Monitor {
             );
             panel = panel.child(
                 div()
-                    .px(px(18.))
-                    .py(px(12.))
+                    .px(px(12.))
+                    .py(px(10.))
                     .border_b_1()
                     .border_color(rgb(t.rule))
                     .child(detail_line("Executable", p.executable.clone()))
@@ -504,7 +585,8 @@ impl Monitor {
             );
             panel = panel.child(
                 div()
-                    .p(px(18.))
+                    .px(px(12.))
+                    .py(px(10.))
                     .border_b_1()
                     .border_color(rgb(t.rule))
                     .child(crate::rack::label("COMMAND", &t))
@@ -513,6 +595,7 @@ impl Monitor {
                             .id("command-value")
                             .max_h(px(64.))
                             .overflow_y_scroll()
+                            .overflow_x_scroll()
                             .p_2()
                             .bg(rgb(t.well))
                             .child(selectable("command-text", &p.command)),
@@ -538,7 +621,8 @@ impl Monitor {
                 .max_h(px(240.))
                 .flex_shrink_0()
                 .overflow_y_scroll()
-                .p(px(18.))
+                .px(px(12.))
+                .py(px(10.))
                 .child(
                     div()
                         .flex()
@@ -562,40 +646,43 @@ impl Monitor {
                 )
                 .child(environment),
         );
-        Some(
-            frame.child(detail_body(panel, &details.body_scroll)).child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .flex_shrink_0()
-                    .p(px(18.))
-                    .child(
-                        Button::new("close-details")
-                            .flex_1()
-                            .label("Close · Esc")
-                            .rack(&t)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                close_details(&mut this.details);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("kill")
-                            .flex_1()
-                            .label("Kill · X")
-                            .rack(&t)
-                            .danger()
-                            .disabled(self.process_exited())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let alive = !this.process_exited();
-                                if let Some(d) = this.details.as_mut() {
-                                    d.request_kill(key, alive);
-                                }
-                                cx.notify();
-                            })),
-                    ),
-            ),
-        )
+        let mut frame = frame.child(detail_body(panel, &details.body_scroll)).child(
+            div()
+                .flex()
+                .gap_2()
+                .flex_shrink_0()
+                .px(px(12.))
+                .py(px(10.))
+                .child(
+                    Button::new("close-details")
+                        .flex_1()
+                        .label("Close · Esc")
+                        .rack(&t)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.panel_resize.finish();
+                            close_details(&mut this.details);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("kill")
+                        .flex_1()
+                        .label("Kill · X")
+                        .rack(&t)
+                        .danger()
+                        .disabled(self.process_exited())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let alive = !this.process_exited();
+                            if let Some(d) = this.details.as_mut() {
+                                d.request_kill(key, alive);
+                            }
+                            cx.notify();
+                        })),
+                ),
+        );
+        frame = frame.child(self.panel_resize_handle(cx));
+        frame = frame.child(self.panel_resize_events(cx));
+        Some(frame)
     }
 }
 
@@ -622,6 +709,85 @@ fn analysis_sample(
     }
 }
 
+fn detail_header(
+    pid: u32,
+    user: &str,
+    title: &str,
+    exit_marker: Option<&str>,
+    t: &crate::palette::Tokens,
+) -> Stateful<Div> {
+    let mut header = div()
+        .id("detail-header")
+        .debug_selector(|| "detail-panel-header".into())
+        .flex()
+        .flex_col()
+        .flex_shrink_0();
+    if let Some(exit_marker) = exit_marker {
+        header = header.child(
+            div()
+                .id("detail-exit-marker")
+                .px(px(12.))
+                .py(px(10.))
+                .border_b_1()
+                .border_color(rgb(t.rule))
+                .child(
+                    crate::rack::label(exit_marker.to_string(), t)
+                        .debug_selector(|| "detail-exit-marker".into()),
+                ),
+        );
+    }
+    let full_title = title.to_string();
+    header.child(
+        div()
+            .flex_shrink_0()
+            .px(px(12.))
+            .py(px(10.))
+            .border_b_1()
+            .border_color(rgb(t.rule))
+            .child(
+                div()
+                    .id("detail-identity")
+                    .debug_selector(|| "detail-identity".into())
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .truncate()
+                    .child(
+                        crate::rack::label(format!("PID {pid} · {user}"), t)
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .truncate(),
+                    ),
+            )
+            .child(
+                div()
+                    .id("detail-switch-hint")
+                    .debug_selector(|| "detail-switch-hint".into())
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .truncate()
+                    .child(
+                        crate::rack::label("CLICK ANOTHER ROW TO SWITCH", t)
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .truncate(),
+                    ),
+            )
+            .child(
+                div()
+                    .id("detail-process-title")
+                    .debug_selector(|| "detail-process-title".into())
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .truncate()
+                    .font_family("Archivo Display")
+                    .font_weight(FontWeight::EXTRA_BOLD)
+                    .text_size(px(30.))
+                    .child(full_title.to_uppercase())
+                    .tooltip(move |window, cx| Tooltip::new(full_title.clone()).build(window, cx)),
+            ),
+    )
+}
+
 fn analysis_panel(
     analysis: Option<&crate::analysis::ProcessAnalysis>,
     name: &str,
@@ -629,7 +795,11 @@ fn analysis_panel(
     cores: usize,
     t: &crate::palette::Tokens,
 ) -> Div {
-    let mut panel = div().p(px(18.)).border_b_1().border_color(rgb(t.rule));
+    let mut panel = div()
+        .px(px(12.))
+        .py(px(10.))
+        .border_b_1()
+        .border_color(rgb(t.rule));
     let Some(analysis) = analysis else {
         return panel.child(crate::rack::win(t).child("Reading process analysis…"));
     };
@@ -638,23 +808,38 @@ fn analysis_panel(
             .child(
                 div()
                     .flex()
+                    .min_w_0()
                     .justify_between()
-                    .child(crate::rack::label("WHAT IT IS", t))
-                    .child(crate::rack::label(analysis.identity.source, t)),
+                    .gap(px(8.))
+                    .child(crate::rack::label("WHAT IT IS", t).whitespace_nowrap())
+                    .child(
+                        crate::rack::label(analysis.identity.source, t)
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .truncate(),
+                    ),
             )
             .child(
                 div()
                     .flex()
+                    .min_w_0()
                     .items_center()
                     .justify_between()
                     .child(
                         div()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_size(px(14.))
                             .text_color(rgb(t.base.silk))
                             .child(analysis.identity.what.clone()),
                     )
-                    .child(crate::rack::label(analysis.identity.kind.to_uppercase(), t)),
+                    .child(
+                        crate::rack::label(analysis.identity.kind.to_uppercase(), t)
+                            .flex_shrink_0()
+                            .whitespace_nowrap(),
+                    ),
             )
             .child(
                 div()
@@ -666,10 +851,17 @@ fn analysis_panel(
     let mut history_panel = crate::rack::win(t).child(
         div()
             .flex()
+            .min_w_0()
+            .gap(px(8.))
             .justify_between()
-            .child(crate::rack::label("HISTORY · 24 H", t))
+            .child(crate::rack::label("HISTORY · 24 H", t).whitespace_nowrap())
             .when(analysis.history.is_some(), |d| {
-                d.child(crate::rack::label(format!("ALL {name} PROCESSES"), t))
+                d.child(
+                    crate::rack::label(format!("ALL {name} PROCESSES"), t)
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .truncate(),
+                )
             }),
     );
     if let Some(history) = &analysis.history {
@@ -756,7 +948,12 @@ fn detail_readout(name: &str, value: String, t: &crate::palette::Tokens) -> Div 
     div()
         .flex_1()
         .min_w_0()
-        .child(crate::rack::label(name.to_string(), t))
+        .child(
+            crate::rack::label(name.to_string(), t)
+                .min_w_0()
+                .whitespace_nowrap()
+                .truncate(),
+        )
         .child(if let Some(number) = value.strip_suffix('%') {
             crate::rack::lit_unit(number.to_string(), '%', 22., false, t)
         } else {
@@ -767,17 +964,29 @@ fn detail_readout(name: &str, value: String, t: &crate::palette::Tokens) -> Div 
 fn detail_line(label: &str, value: String) -> Div {
     div()
         .flex()
+        .items_baseline()
         .flex_shrink_0()
-        .gap_2()
-        .py(px(3.))
+        .gap(px(8.))
+        .py(px(4.))
         .child(
             div()
                 .w(px(96.))
+                .flex_shrink_0()
+                .min_w_0()
+                .whitespace_nowrap()
+                .truncate()
                 .font_family("Archivo Labels")
                 .text_size(px(10.))
                 .child(label.to_uppercase()),
         )
-        .child(div().flex_1().min_w_0().child(value))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_nowrap()
+                .truncate()
+                .child(value),
+        )
 }
 
 #[cfg(test)]
@@ -889,6 +1098,244 @@ mod tests {
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         assert_eq!(scroll.offset().y, px(-740.));
+        detail_panel_layout::assert_minimum_width(cx);
+        detail_panel_layout::resize_state_clamps_resets_and_persists();
+        detail_panel_layout::resize_interaction(cx);
+    }
+
+    mod detail_panel_layout {
+        use super::super::{
+            detail_header, DetailWidth, PanelResize, DETAIL_WIDTH_DEFAULT, DETAIL_WIDTH_MAX,
+            DETAIL_WIDTH_MIN,
+        };
+        use gpui::{prelude::*, *};
+
+        struct HeaderLayoutTest(crate::palette::Tokens);
+
+        impl Render for HeaderLayoutTest {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(280.)).h(px(180.)).child(detail_header(
+                    74412,
+                    "gabrielecegi",
+                    "Rust test or build binary of mini_speed_is_a_long_process_name",
+                    Some("EXITED · last seen 12:34:56"),
+                    &self.0,
+                ))
+            }
+        }
+
+        struct ResizeLayoutTest {
+            width: DetailWidth,
+            resize: PanelResize,
+            persisted: Option<DetailWidth>,
+        }
+
+        impl Render for ResizeLayoutTest {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let handle = crate::column_widths::handle_left().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        if let Some(width) = this.resize.begin(
+                            event.click_count == 2,
+                            event.position.x.into(),
+                            this.width,
+                        ) {
+                            this.width = width;
+                            this.persisted = Some(width);
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                );
+                let events = crate::column_widths::events(
+                    cx,
+                    self.resize.is_dragging(),
+                    |_, _, _, _| {},
+                    |this, event, _, cx| {
+                        if let Some(width) = this.resize.width_at(event.position.x.into()) {
+                            this.width = width;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    },
+                    |this, _, _, cx| {
+                        if this.resize.finish() {
+                            let stored: crate::palette::Settings = serde_json::from_value(
+                                serde_json::to_value(crate::palette::Settings {
+                                    detail_width: this.width,
+                                    ..Default::default()
+                                })
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            this.persisted = Some(stored.detail_width);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    },
+                );
+                div()
+                    .id("resize-test-panel")
+                    .relative()
+                    .w(px(self.width.pixels()))
+                    .h(px(120.))
+                    .child(handle)
+                    .child(events)
+            }
+        }
+
+        pub(super) fn assert_minimum_width(cx: &mut TestAppContext) {
+            let tokens = crate::palette::presets()[0].base.tokens();
+            let (_, visual) = cx.add_window_view(|_, _| HeaderLayoutTest(tokens));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+
+            let panel = visual.debug_bounds("detail-panel-header").unwrap();
+            let exit = visual.debug_bounds("detail-exit-marker").unwrap();
+            let identity = visual.debug_bounds("detail-identity").unwrap();
+            let hint = visual.debug_bounds("detail-switch-hint").unwrap();
+            let title = visual.debug_bounds("detail-process-title").unwrap();
+            for line in [exit, identity, hint, title] {
+                assert!(line.origin.x >= panel.origin.x + px(12.));
+                assert!(
+                    line.origin.x + line.size.width <= panel.origin.x + panel.size.width - px(12.)
+                );
+            }
+            assert!(identity.size.height <= px(16.));
+            assert!(hint.size.height <= px(16.));
+            assert!(title.size.height <= px(50.));
+        }
+
+        pub(super) fn resize_state_clamps_resets_and_persists() {
+            let mut resize = PanelResize::default();
+            let initial = DetailWidth::default();
+            assert!(resize.begin(false, 100., initial).is_none());
+            assert!(resize.is_dragging());
+            assert_eq!(resize.width_at(1000.).unwrap().pixels(), DETAIL_WIDTH_MIN);
+            assert_eq!(resize.width_at(-1000.).unwrap().pixels(), DETAIL_WIDTH_MAX);
+            assert!(resize.finish());
+            assert!(!resize.is_dragging());
+
+            assert_eq!(
+                resize.begin(true, 100., DetailWidth::new(500.)).unwrap(),
+                initial
+            );
+            assert!(!resize.is_dragging());
+            assert!(!resize.finish());
+
+            let stored: crate::palette::Settings = serde_json::from_value(
+                serde_json::to_value(crate::palette::Settings {
+                    detail_width: DetailWidth::new(455.),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(stored.detail_width.pixels(), 455.);
+            assert_eq!(initial.pixels(), DETAIL_WIDTH_DEFAULT);
+        }
+
+        pub(super) fn resize_interaction(cx: &mut TestAppContext) {
+            let (panel, visual) = cx.add_window_view(|_, _| ResizeLayoutTest {
+                width: DetailWidth::default(),
+                resize: PanelResize::default(),
+                persisted: None,
+            });
+            visual.simulate_resize(size(px(800.), px(400.)));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+
+            for end_x in [1000., -1000.] {
+                dispatch_drag(visual, end_x);
+            }
+            let (width, persisted, _) = panel_state(&panel, visual);
+            assert_eq!(width.pixels(), DETAIL_WIDTH_MAX);
+            assert_eq!(persisted.unwrap().pixels(), DETAIL_WIDTH_MAX);
+
+            dispatch_click(visual, 2);
+            let (width, persisted, _) = panel_state(&panel, visual);
+            assert_eq!(width.pixels(), DETAIL_WIDTH_DEFAULT);
+            assert_eq!(persisted.unwrap().pixels(), DETAIL_WIDTH_DEFAULT);
+
+            dispatch_click(visual, 1);
+            let (_, _, is_dragging) = panel_state(&panel, visual);
+            assert!(!is_dragging);
+        }
+
+        fn panel_state(
+            panel: &Entity<ResizeLayoutTest>,
+            cx: &mut VisualTestContext,
+        ) -> (DetailWidth, Option<DetailWidth>, bool) {
+            cx.update(|_, cx| {
+                let panel = panel.read(cx);
+                (panel.width, panel.persisted, panel.resize.is_dragging())
+            })
+        }
+
+        fn dispatch_drag(cx: &mut VisualTestContext, end_x: f32) {
+            let start = point(px(3.), px(20.));
+            let end = point(px(end_x), px(20.));
+            cx.update(|window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: start,
+                        button: MouseButton::Left,
+                        click_count: 1,
+                        modifiers: Modifiers::default(),
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: end,
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Modifiers::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position: end,
+                        button: MouseButton::Left,
+                        click_count: 1,
+                        modifiers: Modifiers::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+
+        fn dispatch_click(cx: &mut VisualTestContext, click_count: usize) {
+            let position = point(px(3.), px(20.));
+            cx.update(|window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        click_count,
+                        modifiers: Modifiers::default(),
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position,
+                        button: MouseButton::Left,
+                        click_count,
+                        modifiers: Modifiers::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
     }
 
     #[test]

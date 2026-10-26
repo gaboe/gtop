@@ -196,11 +196,20 @@ pub fn random_base(r: [f64; 5]) -> Base {
 pub struct Settings {
     pub active: usize,
     pub saved: Vec<Palette>,
+    #[serde(default, deserialize_with = "read_detail_width")]
+    pub detail_width: crate::details::DetailWidth,
     #[serde(default, deserialize_with = "read_widths")]
     pub process_widths: crate::column_widths::Widths,
     #[serde(default, deserialize_with = "read_widths")]
     pub history_widths: crate::column_widths::Widths,
 }
+fn read_detail_width<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<crate::details::DetailWidth, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 fn read_widths<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<crate::column_widths::Widths, D::Error> {
@@ -292,6 +301,7 @@ mod tests {
         assert_eq!(settings.history_widths, Default::default());
         settings.process_widths.set(Column::Name, 333.);
         settings.history_widths.set(Column::CoreTime, 177.);
+        settings.detail_width = crate::details::DetailWidth::new(455.);
         let directory =
             std::env::temp_dir().join(format!("gtop-column-settings-{}", std::process::id()));
         let path = directory.join("palette.json");
@@ -299,8 +309,30 @@ mod tests {
         let stored: Settings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(stored.process_widths, settings.process_widths);
         assert_eq!(stored.history_widths, settings.history_widths);
+        assert_eq!(stored.detail_width, settings.detail_width);
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn detail_width_defaults_clamps_and_survives_invalid_settings() {
+        use crate::details::{
+            DetailWidth, DETAIL_WIDTH_DEFAULT, DETAIL_WIDTH_MAX, DETAIL_WIDTH_MIN,
+        };
+
+        let old: Settings = serde_json::from_str(r#"{"active":0,"saved":[]}"#).unwrap();
+        assert_eq!(old.detail_width, DetailWidth::default());
+        assert_eq!(old.detail_width.pixels(), DETAIL_WIDTH_DEFAULT);
+
+        let narrow: Settings =
+            serde_json::from_str(r#"{"active":0,"saved":[],"detail_width":10}"#).unwrap();
+        let wide: Settings =
+            serde_json::from_str(r#"{"active":0,"saved":[],"detail_width":900}"#).unwrap();
+        let invalid: Settings =
+            serde_json::from_str(r#"{"active":0,"saved":[],"detail_width":"bad"}"#).unwrap();
+        assert_eq!(narrow.detail_width.pixels(), DETAIL_WIDTH_MIN);
+        assert_eq!(wide.detail_width.pixels(), DETAIL_WIDTH_MAX);
+        assert_eq!(invalid.detail_width, DetailWidth::default());
     }
 
     #[test]

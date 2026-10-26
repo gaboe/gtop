@@ -41,6 +41,8 @@ components:
     width: 300px
   detail-panel:
     width: 380px
+    minWidth: 280px
+    maxWidth: 560px
 ---
 
 # Design system: gtop Rack
@@ -94,11 +96,11 @@ Other characters remain real font text.
 
 The default native content size is 1480 by 930 px. The minimum is 1200 by 720 px.
 The root has 10 px padding and an 8 px gap. The system tower stays 300 px wide and scrolls vertically.
-The process or history area fills the remaining width. A selected detail panel or the palette editor takes 380 px beside it.
+The process or history area fills the remaining width. A selected detail panel or disk explorer uses the persisted 280–560 px width beside it. Drag the left edge to resize; double-click it to restore 380 px. The palette editor uses 380 px.
 There is no mobile breakpoint or stacked mobile layout.
 
 The tower has 12 px horizontal padding, 14 px top padding, 12 px bottom padding, and 8 px gaps.
-Recessed panels use 12 px horizontal padding and 10 px vertical padding.
+Recessed panels use 12 px horizontal padding and 10 px vertical padding. Detail sections and the disk explorer use the same inset. Their long headings, identity lines, and values stay on one line and truncate with an ellipsis when space is short. The exited-process marker has its own inset row. The process identity and switch hint use separate rows. Detail rows use a 96 px label column, an 8 px column gap, and 4 px vertical padding. Labels and values share a baseline.
 Their default gap is 6 px. The CPU panel uses a 2 px gap.
 Process rows are normally 22 px high. Priority rows are 30 px high.
 History rows are 22 px high, beneath a 29 px header. Columns can resize and scroll horizontally.

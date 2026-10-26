@@ -1961,6 +1961,7 @@ impl Monitor {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings_open = !this.settings_open;
                                 if this.settings_open {
+                                    this.panel_resize.finish();
                                     if let Some(disk) = &mut this.disk {
                                         disk.close();
                                     }
@@ -2007,12 +2008,58 @@ impl Monitor {
         } else if self.moment.is_some() {
             root = root.child(self.moment_panel(&t, cx));
         } else if let Some(disk) = self.disk_panel(cx) {
-            root = root.child(disk);
+            root = root.child(disk.w(px(self.settings.detail_width.pixels())).h_full());
         } else if let Some(details) = self.details(cx) {
-            root = root.child(details.w(px(380.)).h_full());
+            root = root.child(details.h_full());
         }
         root
     }
+
+    pub(super) fn panel_resize_handle(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        crate::column_widths::handle_left().on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                if event.click_count == 2 {
+                    this.settings.detail_width = this
+                        .panel_resize
+                        .begin(true, event.position.x.into(), this.settings.detail_width)
+                        .unwrap();
+                    this.persist_settings(window, cx);
+                } else {
+                    this.panel_resize.begin(
+                        false,
+                        event.position.x.into(),
+                        this.settings.detail_width,
+                    );
+                }
+                cx.notify();
+            }),
+        )
+    }
+
+    pub(super) fn panel_resize_events(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::column_widths::events(
+            cx,
+            self.panel_resize.is_dragging(),
+            |_, _, _, _| {},
+            |this, event, _, cx| {
+                if let Some(width) = this.panel_resize.width_at(event.position.x.into()) {
+                    this.settings.detail_width = width;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            },
+            |this, _, window, cx| {
+                if this.panel_resize.finish() {
+                    this.persist_settings(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            },
+        )
+    }
+
     pub fn apply_palette(&mut self, cx: &mut Context<Self>) {
         let base = self.draft.unwrap_or(self.settings.base());
         crate::theme::apply(base, cx);
@@ -2259,6 +2306,7 @@ impl Monitor {
             "s" => {
                 self.settings_open = !self.settings_open;
                 if self.settings_open {
+                    self.panel_resize.finish();
                     if let Some(disk) = &mut self.disk {
                         disk.close();
                     }
@@ -2275,6 +2323,7 @@ impl Monitor {
                 if self.settings_open {
                     self.settings_open = false;
                 } else {
+                    self.panel_resize.finish();
                     crate::details::close_details(&mut self.details);
                 }
             }
