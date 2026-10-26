@@ -51,7 +51,7 @@ impl Column {
             Self::User => 60.,
             Self::Cpu => 145.,
             Self::Memory => 80.,
-            Self::Age => 85.,
+            Self::Age => 88.,
             Self::Gpu => 60.,
             Self::Ports => 65.,
             Self::Command => 100.,
@@ -256,8 +256,7 @@ mod tests {
             .chars()
             .map(|character| {
                 let glyph = font.glyph_index(character).expect("duration glyph");
-                f32::from(font.glyph_hor_advance(glyph).expect("glyph advance"))
-                    / units_per_em
+                f32::from(font.glyph_hor_advance(glyph).expect("glyph advance")) / units_per_em
                     * 14.
             })
             .sum::<f32>();

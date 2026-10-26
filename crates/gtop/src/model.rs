@@ -186,7 +186,13 @@ impl ProcessColumn {
             Self::User => p.user.clone(),
             Self::Cpu => format!("{:.1}", p.cpu_usage),
             Self::Memory => bytes(p.memory_usage),
-            Self::Age => compact_duration(p.run_time),
+            Self::Age => {
+                if p.start_time == 0 {
+                    "·".into()
+                } else {
+                    compact_duration(p.run_time)
+                }
+            }
             Self::Gpu => p
                 .gpu_usage
                 .filter(|v| *v >= 0.05)
@@ -215,13 +221,21 @@ pub fn process_order(
         .filter_map(|(index, process)| search.matches(process).then_some(index))
         .collect();
     order.sort_unstable_by(|a, b| {
-        let comparison = column.compare(&processes[*a], &processes[*b]);
-        (if descending {
-            comparison.reverse()
-        } else {
-            comparison
-        })
-        .then_with(|| processes[*a].pid.cmp(&processes[*b].pid))
+        let a = &processes[*a];
+        let b = &processes[*b];
+        let comparison = match (column, a.start_time == 0, b.start_time == 0) {
+            (ProcessColumn::Age, true, false) => Ordering::Greater,
+            (ProcessColumn::Age, false, true) => Ordering::Less,
+            _ => {
+                let comparison = column.compare(a, b);
+                if descending {
+                    comparison.reverse()
+                } else {
+                    comparison
+                }
+            }
+        };
+        comparison.then_with(|| a.pid.cmp(&b.pid))
     });
     order
 }
