@@ -411,7 +411,7 @@ pub fn screws(t: &Tokens, section: &str) -> Div {
                 .border_1()
                 .border_color(rgb(t.rule_hi))
                 .when(right, |d| d.right(px(5.)))
-                .when(!right, |d| d.left(px(5.)))
+                .when(!right, |d| d.left(px(2.)))
                 .when(bottom, |d| d.bottom(px(5.)))
                 .when(!bottom, |d| d.top(px(5.)))
                 .child(
@@ -1468,6 +1468,10 @@ impl Monitor {
     }
     pub fn rack(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
+        let panel_width = self
+            .settings
+            .detail_width
+            .for_window(f32::from(window.bounds().size.width));
         let compact = self.settings_open || self.details.is_some() || self.moment.is_some();
         if self.table.read(cx).compact != compact {
             self.table.update(cx, |p, cx| {
@@ -2018,9 +2022,9 @@ impl Monitor {
             root = root.child(self.palette_panel(&t, window, cx));
         } else if self.moment.is_some() {
             root = root.child(self.moment_panel(&t, cx));
-        } else if let Some(disk) = self.disk_panel(cx) {
-            root = root.child(disk.w(px(self.settings.detail_width.pixels())).h_full());
-        } else if let Some(details) = self.details(cx) {
+        } else if let Some(disk) = self.disk_panel(panel_width, cx) {
+            root = root.child(disk.h_full());
+        } else if let Some(details) = self.details(panel_width, cx) {
             root = root.child(details.h_full());
         }
         root
@@ -2030,18 +2034,19 @@ impl Monitor {
             MouseButton::Left,
             cx.listener(|this, event: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
+                let width = this
+                    .settings
+                    .detail_width
+                    .for_window(f32::from(window.bounds().size.width));
                 if event.click_count == 2 {
                     this.settings.detail_width = this
                         .panel_resize
-                        .begin(true, event.position.x.into(), this.settings.detail_width)
+                        .begin(true, event.position.x.into(), width)
                         .unwrap();
                     this.persist_settings(window, cx);
                 } else {
-                    this.panel_resize.begin(
-                        false,
-                        event.position.x.into(),
-                        this.settings.detail_width,
-                    );
+                    this.panel_resize
+                        .begin(false, event.position.x.into(), width);
                 }
                 cx.notify();
             }),
@@ -2053,8 +2058,12 @@ impl Monitor {
             cx,
             self.panel_resize.is_dragging(),
             |_, _, _, _| {},
-            |this, event, _, cx| {
-                if let Some(width) = this.panel_resize.width_at(event.position.x.into()) {
+            |this, event, window, cx| {
+                if let Some(width) = this
+                    .panel_resize
+                    .width_at(event.position.x.into())
+                    .map(|width| width.for_window(f32::from(window.bounds().size.width)))
+                {
                     this.settings.detail_width = width;
                     cx.stop_propagation();
                     cx.notify();

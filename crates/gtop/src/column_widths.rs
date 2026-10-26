@@ -242,7 +242,7 @@ pub fn events<T: 'static>(
             });
             let finish = std::rc::Rc::new(finish);
             window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-                if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                if phase == DispatchPhase::Capture {
                     finish(event, window, cx);
                 }
             });

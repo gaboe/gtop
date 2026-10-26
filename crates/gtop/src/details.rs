@@ -15,6 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub(super) const DETAIL_WIDTH_MIN: f32 = 280.;
 pub(super) const DETAIL_WIDTH_MAX: f32 = 560.;
 pub(super) const DETAIL_WIDTH_DEFAULT: f32 = 380.;
+const DETAIL_WINDOW_RESERVED_WIDTH: f32 = 820.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -31,6 +32,12 @@ impl DetailWidth {
 
     pub(super) fn pixels(self) -> f32 {
         self.0
+    }
+
+    pub(super) fn for_window(self, window_width: f32) -> Self {
+        let maximum =
+            (window_width - DETAIL_WINDOW_RESERVED_WIDTH).clamp(DETAIL_WIDTH_MIN, DETAIL_WIDTH_MAX);
+        Self(self.0.min(maximum))
     }
 }
 
@@ -414,7 +421,7 @@ impl Monitor {
                 ),
         )
     }
-    pub(super) fn details(&self, cx: &mut Context<Self>) -> Option<Div> {
+    pub(super) fn details(&self, panel_width: DetailWidth, cx: &mut Context<Self>) -> Option<Div> {
         let details = self.details.as_ref()?;
         let key = details.key;
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
@@ -424,7 +431,7 @@ impl Monitor {
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .w(px(self.settings.detail_width.pixels()))
+            .w(px(panel_width.pixels()))
             .h_full()
             .min_h_0()
             .overflow_hidden()
@@ -526,33 +533,21 @@ impl Monitor {
                                         &t,
                                     )),
                             )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(10.))
-                                    .child(detail_readout(
-                                        "DISK READ",
-                                        format!(
-                                            "{:.1} MB/s",
-                                            p.disk_usage.0 as f64
-                                                / p.disk_sample_seconds
-                                                    .unwrap_or(self.sample_seconds)
-                                                / 1e6
-                                        ),
-                                        &t,
-                                    ))
-                                    .child(detail_readout(
-                                        "DISK WRITE",
-                                        format!(
-                                            "{:.1} MB/s",
-                                            p.disk_usage.1 as f64
-                                                / p.disk_sample_seconds
-                                                    .unwrap_or(self.sample_seconds)
-                                                / 1e6
-                                        ),
-                                        &t,
-                                    )),
-                            ),
+                            .child(disk_rate_readouts(
+                                format!(
+                                    "{:.1} MB/s",
+                                    p.disk_usage.0 as f64
+                                        / p.disk_sample_seconds.unwrap_or(self.sample_seconds)
+                                        / 1e6
+                                ),
+                                format!(
+                                    "{:.1} MB/s",
+                                    p.disk_usage.1 as f64
+                                        / p.disk_sample_seconds.unwrap_or(self.sample_seconds)
+                                        / 1e6
+                                ),
+                                &t,
+                            )),
                     )
                     .child(
                         detail_line(
@@ -622,6 +617,7 @@ impl Monitor {
                 .max_h(px(240.))
                 .flex_shrink_0()
                 .overflow_y_scroll()
+                .overflow_x_scroll()
                 .px(px(12.))
                 .py(px(10.))
                 .child(
@@ -944,9 +940,12 @@ fn selectable(id: &'static str, text: &str) -> gpui_component::text::TextView {
     gpui_component::text::TextView::html(id, format!("<pre>{escaped}</pre>"))
         .selectable(true)
         .scrollable(false)
+        .whitespace_nowrap()
 }
-fn detail_readout(name: &str, value: String, t: &crate::palette::Tokens) -> Div {
+fn detail_readout(name: &'static str, value: String, t: &crate::palette::Tokens) -> Stateful<Div> {
     div()
+        .id(name)
+        .debug_selector(move || format!("detail-readout-{name}"))
         .flex_1()
         .min_w_0()
         .child(
@@ -955,11 +954,24 @@ fn detail_readout(name: &str, value: String, t: &crate::palette::Tokens) -> Div 
                 .whitespace_nowrap()
                 .truncate(),
         )
-        .child(if let Some(number) = value.strip_suffix('%') {
-            crate::rack::lit_unit(number.to_string(), '%', 22., false, t)
-        } else {
-            crate::rack::lit(value, 22., false, t)
-        })
+        .child(
+            div()
+                .whitespace_nowrap()
+                .child(if let Some(number) = value.strip_suffix('%') {
+                    crate::rack::lit_unit(number.to_string(), '%', 22., false, t)
+                } else {
+                    crate::rack::lit(value, 22., false, t)
+                }),
+        )
+}
+
+fn disk_rate_readouts(read: String, write: String, t: &crate::palette::Tokens) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(detail_readout("DISK READ", read, t))
+        .child(detail_readout("DISK WRITE", write, t))
 }
 
 fn detail_line(label: &str, value: String) -> Div {
@@ -994,7 +1006,8 @@ fn detail_line(label: &str, value: String) -> Div {
 mod tests {
     use super::{kill_completed, Details, Environment, KillState};
     use crate::model::ProcessKey;
-    use gpui::ScrollHandle;
+    use gpui::{prelude::*, *};
+    use std::prelude::v1::test;
 
     fn selected(key: ProcessKey) -> Details {
         let process = crate::test_data::process(key.pid, "builder", 42.);
@@ -1012,6 +1025,52 @@ mod tests {
             body_scroll: ScrollHandle::new(),
             kill: KillState::Ready,
         }
+    }
+
+    struct SelectableLayoutTest;
+
+    impl Render for SelectableLayoutTest {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let token = "some_long_project_name_".repeat(6);
+            div()
+                .w(px(220.))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id("command-text")
+                        .debug_selector(|| "command-text".into())
+                        .w_full()
+                        .child(super::selectable("command-value", &token)),
+                )
+                .child(
+                    div()
+                        .id("environment-text")
+                        .debug_selector(|| "environment-text".into())
+                        .w_full()
+                        .child(super::selectable(
+                            "environment-value",
+                            &format!("KEY={token}\nNEXT={token}"),
+                        )),
+                )
+        }
+    }
+
+    #[gpui::test]
+    async fn selectable_values_do_not_wrap_inside_long_tokens(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, visual) = cx.add_window_view(|_, _| SelectableLayoutTest);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let command = visual.debug_bounds("command-text").unwrap();
+        let environment = visual.debug_bounds("environment-text").unwrap();
+        assert!(
+            command.size.height <= px(30.),
+            "command bounds: {command:?}"
+        );
+        assert!(
+            environment.size.height <= px(52.),
+            "environment bounds: {environment:?}"
+        );
     }
 
     #[test]
@@ -1100,14 +1159,16 @@ mod tests {
             .unwrap();
         assert_eq!(scroll.offset().y, px(-740.));
         detail_panel_layout::assert_minimum_width(cx);
+        detail_panel_layout::assert_disk_rates_do_not_wrap(cx);
+        detail_panel_layout::assert_window_resize_only_clamps_rendered_width(cx);
         detail_panel_layout::resize_state_clamps_resets_and_persists();
         detail_panel_layout::resize_interaction(cx);
     }
 
     mod detail_panel_layout {
         use super::super::{
-            detail_header, DetailWidth, PanelResize, DETAIL_WIDTH_DEFAULT, DETAIL_WIDTH_MAX,
-            DETAIL_WIDTH_MIN,
+            detail_header, disk_rate_readouts, DetailWidth, PanelResize, DETAIL_WIDTH_DEFAULT,
+            DETAIL_WIDTH_MAX, DETAIL_WIDTH_MIN,
         };
         use gpui::{prelude::*, *};
 
@@ -1115,11 +1176,28 @@ mod tests {
 
         impl Render for HeaderLayoutTest {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().w(px(280.)).h(px(180.)).child(detail_header(
-                    74412,
-                    "gabrielecegi",
-                    "Rust test or build binary of mini_speed_is_a_long_process_name",
-                    Some("EXITED · last seen 12:34:56"),
+                div()
+                    .relative()
+                    .w(px(280.))
+                    .h(px(180.))
+                    .child(crate::rack::screws(&self.0, "details"))
+                    .child(detail_header(
+                        74412,
+                        "gabrielecegi",
+                        "Rust test or build binary of mini_speed_is_a_long_process_name",
+                        Some("EXITED · last seen 12:34:56"),
+                        &self.0,
+                    ))
+            }
+        }
+
+        struct DiskReadoutLayoutTest(crate::palette::Tokens);
+
+        impl Render for DiskReadoutLayoutTest {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(256.)).child(disk_rate_readouts(
+                    "1500.0 MB/s".into(),
+                    "3000.0 MB/s".into(),
                     &self.0,
                 ))
             }
@@ -1129,6 +1207,21 @@ mod tests {
             width: DetailWidth,
             resize: PanelResize,
             persisted: Option<DetailWidth>,
+        }
+
+        struct WindowClampLayoutTest {
+            saved: DetailWidth,
+        }
+
+        impl Render for WindowClampLayoutTest {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let visible = self.saved.for_window(f32::from(window.bounds().size.width));
+                div()
+                    .id("responsive-detail-panel")
+                    .debug_selector(|| "responsive-detail-panel".into())
+                    .w(px(visible.pixels()))
+                    .h(px(100.))
+            }
         }
 
         impl Render for ResizeLayoutTest {
@@ -1192,6 +1285,7 @@ mod tests {
 
             let panel = visual.debug_bounds("detail-panel-header").unwrap();
             let exit = visual.debug_bounds("detail-exit-marker").unwrap();
+            let screw = visual.debug_bounds("details-screw-top-left").unwrap();
             let identity = visual.debug_bounds("detail-identity").unwrap();
             let hint = visual.debug_bounds("detail-switch-hint").unwrap();
             let title = visual.debug_bounds("detail-process-title").unwrap();
@@ -1204,6 +1298,40 @@ mod tests {
             assert!(identity.size.height <= px(16.));
             assert!(hint.size.height <= px(16.));
             assert!(title.size.height <= px(50.));
+            assert!(exit.origin.x >= screw.origin.x + screw.size.width + px(2.));
+        }
+
+        pub(super) fn assert_disk_rates_do_not_wrap(cx: &mut TestAppContext) {
+            let tokens = crate::palette::presets()[0].base.tokens();
+            let (_, visual) = cx.add_window_view(|_, _| DiskReadoutLayoutTest(tokens));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            for readout in ["DISK READ", "DISK WRITE"] {
+                let selector = match readout {
+                    "DISK READ" => "detail-readout-DISK READ",
+                    _ => "detail-readout-DISK WRITE",
+                };
+                let bounds = visual.debug_bounds(selector).unwrap();
+                assert!(
+                    bounds.size.width >= px(250.),
+                    "{readout} bounds: {bounds:?}"
+                );
+            }
+        }
+
+        pub(super) fn assert_window_resize_only_clamps_rendered_width(cx: &mut TestAppContext) {
+            let (panel, visual) = cx.add_window_view(|_, _| WindowClampLayoutTest {
+                saved: DetailWidth::new(560.),
+            });
+            for (window_width, panel_width) in [(1480., 560.), (1200., 380.), (1480., 560.)] {
+                visual.simulate_resize(size(px(window_width), px(400.)));
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+                let bounds = visual.debug_bounds("responsive-detail-panel").unwrap();
+                assert_eq!(bounds.size.width, px(panel_width));
+                assert_eq!(
+                    panel.read_with(visual, |panel, _| panel.saved.pixels()),
+                    560.
+                );
+            }
         }
 
         pub(super) fn resize_state_clamps_resets_and_persists() {
@@ -1233,6 +1361,11 @@ mod tests {
             .unwrap();
             assert_eq!(stored.detail_width.pixels(), 455.);
             assert_eq!(initial.pixels(), DETAIL_WIDTH_DEFAULT);
+
+            let saved = DetailWidth::new(560.);
+            assert_eq!(saved.for_window(1200.).pixels(), 380.);
+            assert_eq!(saved.for_window(1480.).pixels(), 560.);
+            assert_eq!(saved.pixels(), 560.);
         }
 
         pub(super) fn resize_interaction(cx: &mut TestAppContext) {
@@ -1259,6 +1392,11 @@ mod tests {
 
             dispatch_click(visual, 1);
             let (_, _, is_dragging) = panel_state(&panel, visual);
+            assert!(!is_dragging);
+
+            dispatch_right_release_after_left_down(visual);
+            let (width, _, is_dragging) = panel_state(&panel, visual);
+            assert_eq!(width.pixels(), DETAIL_WIDTH_DEFAULT);
             assert!(!is_dragging);
         }
 
@@ -1329,6 +1467,34 @@ mod tests {
                         position,
                         button: MouseButton::Left,
                         click_count,
+                        modifiers: Modifiers::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+
+        fn dispatch_right_release_after_left_down(cx: &mut VisualTestContext) {
+            let position = point(px(3.), px(20.));
+            cx.update(|window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        click_count: 1,
+                        modifiers: Modifiers::default(),
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position,
+                        button: MouseButton::Right,
+                        click_count: 1,
                         modifiers: Modifiers::default(),
                     }
                     .to_platform_input(),

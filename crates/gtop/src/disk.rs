@@ -627,7 +627,11 @@ impl Monitor {
         window.focus(&self.focus, cx);
         cx.notify();
     }
-    pub(super) fn disk_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+    pub(super) fn disk_panel(
+        &self,
+        panel_width: crate::details::DetailWidth,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
         let disk = self.disk.as_ref().filter(|d| d.open)?;
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
         let mut body = div().flex().flex_col().gap(px(6.)).px(px(12.)).py(px(10.));
@@ -657,13 +661,7 @@ impl Monitor {
                     .text_size(px(10.))
                     .child("Attributed blocks · hard links counted once · one volume")
                     .into_any_element(),
-                div()
-                    .text_size(px(10.))
-                    .min_w_0()
-                    .whitespace_nowrap()
-                    .truncate()
-                    .child(folder.path.display().to_string())
-                    .into_any_element(),
+                current_path(folder.path.display().to_string()).into_any_element(),
             ];
             let mut crumbs = div().flex().flex_wrap().gap(px(4.));
             let mut ancestors: Vec<_> = folder
@@ -871,7 +869,7 @@ impl Monitor {
             .child(crate::rack::screws(&t, "disk"))
             .flex()
             .flex_col()
-            .w(px(self.settings.detail_width.pixels()))
+            .w(px(panel_width.pixels()))
             .flex_shrink_0()
             .h_full()
             .min_h_0()
@@ -986,6 +984,18 @@ impl Monitor {
     }
 }
 
+fn current_path(path: String) -> Stateful<Div> {
+    div()
+        .id("disk-current-path")
+        .debug_selector(|| "disk-current-path".into())
+        .flex_shrink_0()
+        .text_size(px(10.))
+        .min_w_0()
+        .whitespace_nowrap()
+        .truncate()
+        .child(path)
+}
+
 #[cfg(test)]
 impl Monitor {
     pub(super) fn prepare_disk_scroll_test(&mut self, home: PathBuf) {
@@ -1051,6 +1061,36 @@ mod tests {
         fs,
         time::{Duration, Instant},
     };
+
+    struct CurrentPathLayout;
+
+    impl Render for CurrentPathLayout {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(354.))
+                .h(px(120.))
+                .flex()
+                .flex_col()
+                .child(current_path(
+                    "/a/long/current/folder/path/that/stays/visible".into(),
+                ))
+                .children((0..128).map(|index| {
+                    div()
+                        .h(px(22.))
+                        .flex_shrink_0()
+                        .child(format!("file-{index}"))
+                }))
+        }
+    }
+
+    #[gpui::test]
+    async fn current_folder_path_keeps_one_visible_line(cx: &mut TestAppContext) {
+        let (_, visual) = cx.add_window_view(|_, _| CurrentPathLayout);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let path = visual.debug_bounds("disk-current-path").unwrap();
+        assert!(path.size.height >= px(12.), "path bounds: {path:?}");
+    }
+
     fn scratch() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "gtop-disk-service-{}-{:?}",

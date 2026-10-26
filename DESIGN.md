@@ -117,7 +117,7 @@ Other characters remain real font text.
 
 The default native content size is 1480 by 930 px. The minimum is 1200 by 720 px.
 The root has 10 px padding and an 8 px gap. The system tower stays 300 px wide and scrolls vertically.
-The process or history area fills the remaining width. A selected detail panel or disk explorer uses the persisted 280–560 px width beside it. Drag the left edge to resize; double-click it to restore 380 px. The palette editor uses 380 px.
+The process or history area fills the remaining width. A selected detail panel or disk explorer uses a persisted 280–560 px width beside it. The visible width is capped at the window width minus 820 px. This keeps at least 492 px for the tower and navigation at the 1200 px minimum window width. A smaller window can reduce the visible width without changing the saved preference. Drag the left edge to resize; double-click it to restore 380 px. The palette editor uses 380 px.
 There is no mobile breakpoint or stacked mobile layout.
 
 The tower has 12 px horizontal padding, 14 px top padding, 12 px bottom padding, and 8 px gaps.
