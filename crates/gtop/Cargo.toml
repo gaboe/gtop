@@ -27,6 +27,7 @@ image = { version = "=0.25.10", default-features = false }
 rusqlite = { version = "=0.41.0", features = ["bundled"] }
 
 [dev-dependencies]
+tempfile = "3"
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
 
 [lints.rust]
@@ -34,3 +35,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(gtop_draw_benchmark)'] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui-apple = { package = "gpui-pre-apple", version = "=0.3.9", features = ["font-kit"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.5"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSApplication", "NSWindow"] }

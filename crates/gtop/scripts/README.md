@@ -1,4 +1,17 @@
-# Full Monitor draw benchmark
+# gtop scripts
+
+## Performance telemetry report
+
+Run the performance telemetry report with a copy of the app database.
+
+```sh
+rtk proxy python3 crates/gtop/scripts/perf-report.py "$HOME/Library/Application Support/gtop/perf.sqlite"
+rtk proxy python3 -m unittest discover -s crates/gtop/scripts -p 'test_perf_report.py' -v
+```
+
+The report opens the source database read-only, copies it to a temporary SQLite file, and reads the copy. It prints median, p90, and p95 CPU use of one core for each UTC hour, app version, and window state.
+
+## Full Monitor draw benchmark
 
 Run on macOS from the repository root. Fetch pinned dependencies before the first run.
 

@@ -5,7 +5,7 @@ gtop_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$gtop_root"
 cargo_output=$(mktemp)
 trap 'rm -f "$cargo_output"' EXIT HUP INT TERM
-cargo build --release -p gtop --message-format=json-render-diagnostics >"$cargo_output"
+GTOP_GIT_COMMIT="${GTOP_GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}" cargo build --release -p gtop --message-format=json-render-diagnostics >"$cargo_output"
 
 gtop_target=${CARGO_TARGET_DIR:-"$gtop_root/target"}
 gtop_executable=$(python3 - "$cargo_output" <<'PY'
