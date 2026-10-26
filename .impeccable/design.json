@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-26T04:58:32Z",
+  "title": "Design system: gtop Rack",
+  "extensions": {
+    "shadows": [
+      {
+        "name": "display-glow",
+        "value": "0 0 8px rgba(255,176,0,0.60)",
+        "purpose": "Cached Doto glyph halo in dark palettes."
+      },
+      {
+        "name": "segment-glow",
+        "value": "0 0 4px rgba(255,176,0,0.60)",
+        "purpose": "Active meter segments in dark palettes."
+      }
+    ],
+    "breakpoints": []
+  },
+  "components": [
+    {
+      "name": "Rack button",
+      "kind": "button",
+      "refersTo": "rack-button",
+      "description": "Square outlined control with printed lettering. Native GPUI remains the source.",
+      "html": "<button class=\"ds-rack\">PAUSE</button>",
+      "css": ".ds-rack{background:color-mix(in oklab,#020303 30%,transparent);color:#e8e6df;border:1px solid #434545;border-radius:0;font:700 10px \"Archivo Labels\",sans-serif;padding:4px 8px}.ds-rack:hover{background:color-mix(in oklab,#020303 50%,transparent)}.ds-rack:active{background:color-mix(in oklab,#020303 70%,transparent)}.ds-rack:focus-visible{outline:2px solid #ffb000;outline-offset:2px}"
+    },
+    {
+      "name": "Find control",
+      "kind": "input",
+      "description": "The persistent FIND wrapper contains the unadorned search input.",
+      "html": "<div class=\"ds-find\"><span>FIND</span><input aria-label=\"Search\" placeholder=\"name, pid, command or port\"></div>",
+      "css": ".ds-find{display:flex;align-items:center;gap:10px;padding:0 12px;background:#020303;border:1px solid #2c2e2f;color:color-mix(in oklab,#e8e6df 58%,#141618);font:700 10px \"Archivo Labels\",sans-serif}.ds-find input{flex:1;min-width:0;background:transparent;border:0;outline:0;color:#e8e6df;font:12px \"JetBrains Mono\",monospace}.ds-find input:focus-visible{outline:0}"
+    },
+    {
+      "name": "VFD well",
+      "kind": "custom",
+      "description": "Recessed panel containing printed labels and luminous data.",
+      "html": "<div class=\"ds-well\">CPU</div>",
+      "css": ".ds-well{background:#060607;color:#e8e6df;border:1px solid #000;padding:10px 12px;border-radius:0;font:700 10px \"Archivo Labels\",sans-serif}"
+    },
+    {
+      "name": "Status lamp",
+      "kind": "custom",
+      "description": "Small active square lamp in a dark palette.",
+      "html": "<span class=\"ds-lamp\" role=\"img\" aria-label=\"Active\"></span>",
+      "css": ".ds-lamp{display:inline-block;width:6px;height:6px;background:#38ff8b;box-shadow:0 0 6px 1px #38ff8b88}"
+    },
+    {
+      "name": "Meter segments",
+      "kind": "custom",
+      "description": "Rectangular active segments with the shipped two-pixel gap.",
+      "html": "<div class=\"ds-meter\" role=\"img\" aria-label=\"Three active segments\"><i></i><i></i><i></i></div>",
+      "css": ".ds-meter{display:flex;gap:2px;height:8px}.ds-meter i{flex:1;background:#ffb000;box-shadow:0 0 4px #ffb00099}"
+    }
+  ],
+  "narrative": {
+    "northStar": "VFD Rack",
+    "overview": "Dense native monitoring with recessed readouts and printed labels. HTML snippets illustrate native components. Derived colors in snippets are Amber snapshots; Rust Base::tokens owns exact values.",
+    "keyCharacteristics": [
+      "Square panels",
+      "Exact data",
+      "Cached glyph glow"
+    ],
+    "rules": [],
+    "dos": [
+      "Use derived palette roles.",
+      "Keep data units visible."
+    ],
+    "donts": [
+      "Do not enable glow in light palettes."
+    ]
+  }
+}
