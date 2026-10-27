@@ -22,6 +22,19 @@ pub fn running_history_process<'a>(
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryRowAction {
+    SelectOnly,
+    OpenDetail(ProcessKey),
+}
+
+pub fn history_row_action(name: &str, processes: &[ProcessInfo]) -> HistoryRowAction {
+    running_history_process(name, processes)
+        .map(ProcessKey::from)
+        .map(HistoryRowAction::OpenDetail)
+        .unwrap_or(HistoryRowAction::SelectOnly)
+}
+
 impl From<&ProcessInfo> for ProcessKey {
     fn from(process: &ProcessInfo) -> Self {
         Self {
@@ -273,6 +286,23 @@ mod history_process_tests {
             Some(ProcessKey::from(best))
         );
         assert!(running_history_process("process-that-exited", &processes).is_none());
+    }
+
+    #[test]
+    fn history_row_action_opens_running_processes_and_only_selects_exited_processes() {
+        let processes = crate::test_data::snapshot().processes;
+        let running_name = processes[0].name.clone();
+        let running_key = running_history_process(&running_name, &processes)
+            .map(ProcessKey::from)
+            .unwrap();
+        assert_eq!(
+            history_row_action(&running_name, &processes),
+            HistoryRowAction::OpenDetail(running_key)
+        );
+        assert_eq!(
+            history_row_action("process-that-exited", &processes),
+            HistoryRowAction::SelectOnly
+        );
     }
 }
 
