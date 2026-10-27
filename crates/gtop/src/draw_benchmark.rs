@@ -1204,7 +1204,9 @@ async fn history_enter_opens_running_selection_and_keeps_exited_selection(
         assert_eq!(monitor.history_selected.as_deref(), Some("process-0002"));
         assert_eq!(
             monitor.details.as_ref().map(|details| details.key),
-            Some(ProcessKey::from(&monitor.snapshot.as_ref().unwrap().processes[1]))
+            Some(ProcessKey::from(
+                &monitor.snapshot.as_ref().unwrap().processes[1]
+            ))
         );
         assert!(monitor.moment.is_none());
     });
