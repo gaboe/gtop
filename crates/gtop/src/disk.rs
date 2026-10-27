@@ -1180,22 +1180,7 @@ mod tests {
         let (generation, proposal, result) = receive_proposal(&disk);
         assert!(disk.apply_proposal(generation, proposal, result));
         disk.confirm(disk.proposal_id);
-        let folder = receive(&mut disk, ScanState::Complete);
-        let start = Instant::now();
-        let status = loop {
-            if let Some(status) = disk
-                .mailbox
-                .lock()
-                .unwrap()
-                .status
-                .clone()
-                .filter(|s| !s.contains("Rescanning"))
-            {
-                break status;
-            }
-            assert!(start.elapsed() < Duration::from_secs(10));
-            std::thread::sleep(Duration::from_millis(5));
-        };
+        let (status, folder) = receive_cleanup_refresh(&disk);
         let destination = home.join(".Trash/node_modules");
         assert_eq!(status, format!("Moved to {}.", destination.display()));
         assert!(!folder.cleanable.iter().any(|item| item.path == row.path));
