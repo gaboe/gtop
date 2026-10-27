@@ -2478,7 +2478,7 @@ impl Monitor {
             return;
         }
         match k {
-            "enter" | "left" | "right" if self.view.is_some() => {
+            "left" | "right" if self.view.is_some() => {
                 let view = &self.history[self.view.unwrap()];
                 if let Some(selection) = crate::history::newest_moment(view) {
                     self.select_moment(selection, cx);

@@ -1148,6 +1148,87 @@ async fn history_headers_sort_rows_and_history_clicks_follow_process_liveness(
     );
 }
 
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn history_enter_opens_running_selection_and_keeps_exited_selection(
+    _cx: &mut TestAppContext,
+) {
+    use gpui::{px, size, Modifiers, TestAppContext, TestDispatcher, VisualTestContext};
+    use gpui_component::Root;
+
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("history-enter-selection"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |monitor, cx| {
+            monitor.view = Some(0);
+            monitor.history[0].rows.push((
+                "exited-process".into(),
+                history::ProcessTotal {
+                    cpu_seconds: 1.,
+                    ..Default::default()
+                },
+            ));
+            window.focus(&monitor.focus, cx);
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+    let mut visual = VisualTestContext::from_window(handle.into(), &cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+
+    let name_header = visual.debug_bounds("history-header-0").unwrap();
+    visual.simulate_click(name_header.center(), Modifiers::default());
+    cx.simulate_keystrokes(handle.into(), "j");
+    cx.simulate_keystrokes(handle.into(), "enter");
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let monitor = monitor.read(cx);
+        assert_eq!(monitor.history_selected.as_deref(), Some("process-0002"));
+        assert_eq!(
+            monitor.details.as_ref().map(|details| details.key),
+            Some(ProcessKey::from(&monitor.snapshot.as_ref().unwrap().processes[1]))
+        );
+        assert!(monitor.moment.is_none());
+    });
+
+    monitor.update(&mut visual, |monitor, cx| {
+        monitor.details = None;
+        monitor.history_selected = Some("exited-process".into());
+        cx.notify();
+    });
+    cx.simulate_keystrokes(handle.into(), "enter");
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let monitor = monitor.read(cx);
+        assert_eq!(monitor.history_selected.as_deref(), Some("exited-process"));
+        assert!(monitor.details.is_none());
+        assert!(monitor.moment.is_none());
+    });
+}
+
+#[cfg(target_os = "macos")]
 #[gpui::test]
 async fn tower_title_stays_clear_of_the_upper_left_screw(cx: &mut TestAppContext) {
     use gpui::{prelude::*, px, size, VisualTestContext};

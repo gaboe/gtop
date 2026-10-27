@@ -978,6 +978,31 @@ mod tests {
         assert_eq!(selected_after, 2);
         assert_eq!(rows[sorted_order[selected_after]].0, "zulu");
     }
+
+    #[test]
+    fn history_sort_breaks_equal_numeric_values_by_name_in_both_directions() {
+        let rows = vec![
+            (
+                "zulu".into(),
+                ProcessTotal {
+                    cpu_seconds: 2.,
+                    ..Default::default()
+                },
+            ),
+            (
+                "alpha".into(),
+                ProcessTotal {
+                    cpu_seconds: 2.,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let mut sort = HistorySort::default();
+        assert_eq!(sorted_names(sort, &rows), ["alpha", "zulu"]);
+        sort.click(HistorySortColumn::CoreTime);
+        assert_eq!(sorted_names(sort, &rows), ["alpha", "zulu"]);
+    }
+
     #[test]
     fn keyboard_entry_selects_newest_displayed_column() {
         for (minutes, step) in [(60, 1), (480, 5), (1440, 10)] {
