@@ -51,6 +51,115 @@ impl ProcessTotal {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistorySortColumn {
+    Name,
+    CoreTime,
+    Share,
+    CpuShare,
+    GpuTime,
+    PeakMemory,
+    PeakCpu,
+}
+
+impl HistorySortColumn {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "PROCESS",
+            Self::CoreTime => "CORE TIME",
+            Self::Share => "PEAK CPU GRAPH",
+            Self::CpuShare => "OF ALL CPU",
+            Self::GpuTime => "GPU TIME",
+            Self::PeakMemory => "PEAK MEMORY",
+            Self::PeakCpu => "PEAK CPU %",
+        }
+    }
+
+    fn is_text(self) -> bool {
+        self == Self::Name
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    fn reverse(self) -> Self {
+        match self {
+            Self::Ascending => Self::Descending,
+            Self::Descending => Self::Ascending,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistorySort {
+    pub column: HistorySortColumn,
+    pub direction: SortDirection,
+}
+
+impl Default for HistorySort {
+    fn default() -> Self {
+        Self {
+            column: HistorySortColumn::CoreTime,
+            direction: SortDirection::Descending,
+        }
+    }
+}
+
+impl HistorySort {
+    pub fn click(&mut self, column: HistorySortColumn) {
+        self.direction = if self.column == column {
+            self.direction.reverse()
+        } else if column.is_text() {
+            SortDirection::Ascending
+        } else {
+            SortDirection::Descending
+        };
+        self.column = column;
+    }
+
+    pub fn order(self, rows: &[(String, ProcessTotal)]) -> Vec<usize> {
+        let mut order: Vec<_> = (0..rows.len()).collect();
+        order.sort_by(|&a, &b| {
+            let (name_a, total_a) = &rows[a];
+            let (name_b, total_b) = &rows[b];
+            let value_order = match self.column {
+                HistorySortColumn::Name => name_a.cmp(name_b),
+                HistorySortColumn::CoreTime | HistorySortColumn::CpuShare => {
+                    total_a.cpu_seconds.total_cmp(&total_b.cpu_seconds)
+                }
+                HistorySortColumn::Share | HistorySortColumn::PeakCpu => {
+                    total_a.peak_cpu.total_cmp(&total_b.peak_cpu)
+                }
+                HistorySortColumn::GpuTime => total_a.gpu_seconds.total_cmp(&total_b.gpu_seconds),
+                HistorySortColumn::PeakMemory => total_a.peak_memory.cmp(&total_b.peak_memory),
+            };
+            let value_order = if self.direction == SortDirection::Descending {
+                value_order.reverse()
+            } else {
+                value_order
+            };
+            value_order.then_with(|| name_a.cmp(name_b))
+        });
+        order
+    }
+
+    pub fn selected_index_in_order(
+        self,
+        rows: &[(String, ProcessTotal)],
+        order: &[usize],
+        selected: Option<&str>,
+    ) -> usize {
+        selected
+            .and_then(|name| order.iter().position(|&index| rows[index].0 == name))
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Bucket {
@@ -744,6 +853,156 @@ pub fn support_path(file: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sort_rows() -> Vec<(String, ProcessTotal)> {
+        vec![
+            (
+                "beta".into(),
+                ProcessTotal {
+                    cpu_seconds: 2.,
+                    gpu_seconds: 3.,
+                    peak_memory: 20,
+                    peak_cpu: 30.,
+                },
+            ),
+            (
+                "alpha".into(),
+                ProcessTotal {
+                    cpu_seconds: 1.,
+                    gpu_seconds: 1.,
+                    peak_memory: 10,
+                    peak_cpu: 10.,
+                },
+            ),
+            (
+                "gamma".into(),
+                ProcessTotal {
+                    cpu_seconds: 3.,
+                    gpu_seconds: 2.,
+                    peak_memory: 30,
+                    peak_cpu: 20.,
+                },
+            ),
+        ]
+    }
+
+    fn sorted_names(sort: HistorySort, rows: &[(String, ProcessTotal)]) -> Vec<&str> {
+        sort.order(rows)
+            .into_iter()
+            .map(|index| rows[index].0.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn history_sort_orders_each_column_in_its_initial_direction() {
+        let rows = sort_rows();
+        let expected = [
+            (HistorySortColumn::Name, vec!["alpha", "beta", "gamma"]),
+            (HistorySortColumn::CoreTime, vec!["gamma", "beta", "alpha"]),
+            (HistorySortColumn::Share, vec!["beta", "gamma", "alpha"]),
+            (HistorySortColumn::CpuShare, vec!["gamma", "beta", "alpha"]),
+            (HistorySortColumn::GpuTime, vec!["beta", "gamma", "alpha"]),
+            (
+                HistorySortColumn::PeakMemory,
+                vec!["gamma", "beta", "alpha"],
+            ),
+            (HistorySortColumn::PeakCpu, vec!["beta", "gamma", "alpha"]),
+        ];
+        for (column, names) in expected {
+            let mut sort = HistorySort::default();
+            if column != HistorySortColumn::CoreTime {
+                sort.click(column);
+            }
+            assert_eq!(sorted_names(sort, &rows), names);
+            sort.click(column);
+            let reversed = match column {
+                HistorySortColumn::Name => vec!["gamma", "beta", "alpha"],
+                HistorySortColumn::CoreTime | HistorySortColumn::CpuShare => {
+                    vec!["alpha", "beta", "gamma"]
+                }
+                HistorySortColumn::Share
+                | HistorySortColumn::GpuTime
+                | HistorySortColumn::PeakCpu => vec!["alpha", "gamma", "beta"],
+                HistorySortColumn::PeakMemory => vec!["alpha", "beta", "gamma"],
+            };
+            assert_eq!(sorted_names(sort, &rows), reversed);
+        }
+    }
+
+    #[test]
+    fn history_sort_click_sets_initial_direction_and_toggles_active_column() {
+        let mut sort = HistorySort::default();
+        sort.click(HistorySortColumn::Name);
+        assert_eq!(sort.direction, SortDirection::Ascending);
+        sort.click(HistorySortColumn::Name);
+        assert_eq!(sort.direction, SortDirection::Descending);
+        sort.click(HistorySortColumn::PeakMemory);
+        assert_eq!(sort.direction, SortDirection::Descending);
+        sort.click(HistorySortColumn::PeakMemory);
+        assert_eq!(sort.direction, SortDirection::Ascending);
+    }
+
+    #[test]
+    fn history_sort_breaks_ties_by_name_and_keeps_selection_after_resort() {
+        let rows = vec![
+            (
+                "zulu".into(),
+                ProcessTotal {
+                    cpu_seconds: 3.,
+                    ..Default::default()
+                },
+            ),
+            (
+                "alpha".into(),
+                ProcessTotal {
+                    cpu_seconds: 1.,
+                    ..Default::default()
+                },
+            ),
+            (
+                "mike".into(),
+                ProcessTotal {
+                    cpu_seconds: 2.,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let mut sort = HistorySort::default();
+        assert_eq!(sorted_names(sort, &rows), ["zulu", "mike", "alpha"]);
+        let first_order = sort.order(&rows);
+        let selected_before = sort.selected_index_in_order(&rows, &first_order, Some("zulu"));
+        sort.click(HistorySortColumn::Name);
+        let sorted_order = sort.order(&rows);
+        let selected_after = sort.selected_index_in_order(&rows, &sorted_order, Some("zulu"));
+        assert_eq!(selected_before, 0);
+        assert_eq!(selected_after, 2);
+        assert_eq!(rows[sorted_order[selected_after]].0, "zulu");
+    }
+
+    #[test]
+    fn history_sort_breaks_equal_numeric_values_by_name_in_both_directions() {
+        let rows = vec![
+            (
+                "zulu".into(),
+                ProcessTotal {
+                    cpu_seconds: 2.,
+                    ..Default::default()
+                },
+            ),
+            (
+                "alpha".into(),
+                ProcessTotal {
+                    cpu_seconds: 2.,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let mut sort = HistorySort::default();
+        assert_eq!(sorted_names(sort, &rows), ["alpha", "zulu"]);
+        sort.click(HistorySortColumn::CoreTime);
+        assert_eq!(sorted_names(sort, &rows), ["alpha", "zulu"]);
+    }
+
     #[test]
     fn keyboard_entry_selects_newest_displayed_column() {
         for (minutes, step) in [(60, 1), (480, 5), (1440, 10)] {

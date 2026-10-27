@@ -189,6 +189,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         history_selected: None,
         history_scroll: UniformListScrollHandle::new(),
         history_columns: crate::column_widths::TableState::default(),
+        history_sort: crate::history::HistorySort::default(),
         metric: history::Metric::Cpu,
         settings,
         settings_writes: None,
@@ -1065,6 +1066,168 @@ fn deleting_a_saved_palette_while_amber_is_active_queues_settings() {
     let queued = futures::executor::block_on(palette::next_settings(&mut receiver)).unwrap();
     assert_eq!(queued.active, 0);
     assert!(queued.saved.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn history_headers_sort_rows_and_history_clicks_follow_process_liveness(
+    cx: &mut TestAppContext,
+) {
+    use gpui::{point, px, Modifiers, MouseButton};
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let (monitor, visual) = cx.add_window_view(fixture);
+    visual.simulate_resize(gpui::size(px(1480.), px(960.)));
+    monitor.update(visual, |monitor, cx| {
+        monitor.view = Some(0);
+        monitor.history[0].rows.push((
+            "exited-process".into(),
+            history::ProcessTotal {
+                cpu_seconds: 1.,
+                ..Default::default()
+            },
+        ));
+        cx.notify();
+    });
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let name_header = visual.debug_bounds("history-header-0").unwrap();
+    let initial_sort = history::HistorySort::default();
+    let handle = point(name_header.right() - px(1.), name_header.center().y);
+    visual.simulate_mouse_down(handle, MouseButton::Left, Modifiers::default());
+    let moved = point(handle.x + px(24.), handle.y);
+    visual.simulate_mouse_move(moved, MouseButton::Left, Modifiers::default());
+    visual.simulate_mouse_up(moved, MouseButton::Left, Modifiers::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        monitor.read_with(visual, |monitor, _| monitor.history_sort),
+        initial_sort
+    );
+
+    let name_header = visual.debug_bounds("history-header-0").unwrap();
+    visual.simulate_click(name_header.center(), Modifiers::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        monitor.read_with(visual, |monitor, _| monitor.history_sort),
+        history::HistorySort {
+            column: history::HistorySortColumn::Name,
+            direction: history::SortDirection::Ascending,
+        }
+    );
+    assert_eq!(
+        monitor.read_with(visual, |monitor, _| monitor.history_selected.clone()),
+        Some("process-0001".into())
+    );
+
+    let exited_row = visual.debug_bounds("history-row-0").unwrap();
+    visual.simulate_click(exited_row.center(), Modifiers::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        monitor.read_with(visual, |monitor, _| monitor.history_selected.clone()),
+        Some("exited-process".into())
+    );
+    assert!(monitor.read_with(visual, |monitor, _| monitor.details.is_none()));
+
+    let core_time_header = visual.debug_bounds("history-header-1").unwrap();
+    visual.simulate_click(core_time_header.center(), Modifiers::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        monitor.read_with(visual, |monitor, _| monitor.history_selected.clone()),
+        Some("exited-process".into())
+    );
+    let running_row = visual.debug_bounds("history-row-0").unwrap();
+    visual.simulate_click(running_row.center(), Modifiers::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(monitor.read_with(visual, |monitor, _| monitor.details.is_some()));
+    assert_eq!(
+        monitor.read_with(visual, |monitor, _| monitor.history_selected.clone()),
+        Some("process-0001".into())
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn history_enter_opens_running_selection_and_keeps_exited_selection(
+    _cx: &mut TestAppContext,
+) {
+    use gpui::{px, size, Modifiers, TestAppContext, TestDispatcher, VisualTestContext};
+    use gpui_component::Root;
+
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("history-enter-selection"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |monitor, cx| {
+            monitor.view = Some(0);
+            monitor.history[0].rows.push((
+                "exited-process".into(),
+                history::ProcessTotal {
+                    cpu_seconds: 1.,
+                    ..Default::default()
+                },
+            ));
+            window.focus(&monitor.focus, cx);
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+    let mut visual = VisualTestContext::from_window(handle.into(), &cx);
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+
+    let name_header = visual.debug_bounds("history-header-0").unwrap();
+    visual.simulate_click(name_header.center(), Modifiers::default());
+    cx.simulate_keystrokes(handle.into(), "j");
+    cx.simulate_keystrokes(handle.into(), "enter");
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let monitor = monitor.read(cx);
+        assert_eq!(monitor.history_selected.as_deref(), Some("process-0002"));
+        assert_eq!(
+            monitor.details.as_ref().map(|details| details.key),
+            Some(ProcessKey::from(
+                &monitor.snapshot.as_ref().unwrap().processes[1]
+            ))
+        );
+        assert!(monitor.moment.is_none());
+    });
+
+    monitor.update(&mut visual, |monitor, cx| {
+        monitor.details = None;
+        monitor.history_selected = Some("exited-process".into());
+        cx.notify();
+    });
+    cx.simulate_keystrokes(handle.into(), "enter");
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let monitor = monitor.read(cx);
+        assert_eq!(monitor.history_selected.as_deref(), Some("exited-process"));
+        assert!(monitor.details.is_none());
+        assert!(monitor.moment.is_none());
+    });
 }
 
 #[cfg(target_os = "macos")]

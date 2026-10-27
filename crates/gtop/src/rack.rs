@@ -1,5 +1,5 @@
 use crate::{
-    history::{HistoryView, Metric},
+    history::{HistorySortColumn, HistoryView, Metric, SortDirection},
     model::{bytes, duration, ProcessColumn},
     palette::{self, Tokens},
     DrawMetrics, Monitor,
@@ -1592,6 +1592,7 @@ impl Monitor {
             .child(nav);
         if let Some(index) = self.view {
             let h = &self.history[index];
+            let row_order = self.history_sort.order(&h.rows);
             let axis = div()
                 .flex()
                 .justify_between()
@@ -1661,21 +1662,37 @@ impl Monitor {
                 .child(div().w(px(22.)).flex_shrink_0())
                 .children(
                     [
-                        ("PROCESS", Column::Name, false),
-                        ("CORE TIME ▼", Column::CoreTime, true),
-                        ("PEAK CPU %", Column::Share, false),
-                        ("OF ALL CPU", Column::CpuShare, true),
-                        ("GPU TIME", Column::GpuTime, true),
-                        ("PEAK MEMORY", Column::PeakMemory, true),
-                        ("PEAK CPU %", Column::PeakCpu, true),
+                        (HistorySortColumn::Name, Column::Name, false),
+                        (HistorySortColumn::CoreTime, Column::CoreTime, true),
+                        (HistorySortColumn::Share, Column::Share, false),
+                        (HistorySortColumn::CpuShare, Column::CpuShare, true),
+                        (HistorySortColumn::GpuTime, Column::GpuTime, true),
+                        (HistorySortColumn::PeakMemory, Column::PeakMemory, true),
+                        (HistorySortColumn::PeakCpu, Column::PeakCpu, true),
                     ]
                     .into_iter()
                     .enumerate()
-                    .map(|(index, (name, column, right))| {
-                        history_cell(widths[index + 1], right)
+                    .map(|(column_index, (sort_column, column, right))| {
+                        let active = self.history_sort.column == sort_column;
+                        let arrow = match self.history_sort.direction {
+                            SortDirection::Ascending => " ▲",
+                            SortDirection::Descending => " ▼",
+                        };
+                        history_cell(widths[column_index + 1], right)
+                            .id(format!("history-header-{column_index}"))
+                            .debug_selector(move || format!("history-header-{column_index}"))
                             .relative()
+                            .cursor_pointer()
                             .child(
-                                label(name, &t).text_color(rgb(if column == Column::CoreTime {
+                                label(
+                                    format!(
+                                        "{}{}",
+                                        sort_column.label(),
+                                        if active { arrow } else { "" }
+                                    ),
+                                    &t,
+                                )
+                                .text_color(rgb(if active {
                                     t.base.led
                                 } else {
                                     t.silk_dim
@@ -1697,12 +1714,28 @@ impl Monitor {
                                         this.history_columns.drag = Some(Drag {
                                             column,
                                             start_x: event.position.x.into(),
-                                            start_width: widths[index + 1],
+                                            start_width: widths[column_index + 1],
                                         });
                                     }
                                     cx.notify();
                                 }),
                             ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let history = &this.history[index];
+                                let selection_exists =
+                                    this.history_selected.as_ref().is_some_and(|selected| {
+                                        history.rows.iter().any(|(name, _)| name == selected)
+                                    });
+                                if !selection_exists {
+                                    let order = this.history_sort.order(&history.rows);
+                                    this.history_selected = order
+                                        .first()
+                                        .and_then(|row| history.rows.get(*row))
+                                        .map(|(name, _)| name.clone());
+                                }
+                                this.history_sort.click(sort_column);
+                                cx.notify();
+                            }))
                     }),
                 );
             right = right
@@ -1733,7 +1766,7 @@ impl Monitor {
                                 .child(
                                     uniform_list(
                                         "history-rows",
-                                        h.rows.len(),
+                                        row_order.len(),
                                         cx.processor(
                                             move |this, range: std::ops::Range<usize>, _, cx| {
                                                 let widths = this.settings.history_widths.compute(
@@ -1741,17 +1774,28 @@ impl Monitor {
                                                     this.history_columns.viewport,
                                                 );
                                                 let h = &this.history[index];
+                                                let selected_name_exists = this
+                                                    .history_selected
+                                                    .as_ref()
+                                                    .is_some_and(|selected| {
+                                                        h.rows.iter().any(|(name, _)| name == selected)
+                                                    });
                                                 let t = this
                                                     .draft
                                                     .unwrap_or(this.settings.base())
                                                     .tokens();
                                                 range
                                                     .filter_map(|row| {
-                                                        let (name, p) = h.rows.get(row)?;
+                                                        let source_row = *row_order.get(row)?;
+                                                        let (name, p) = h.rows.get(source_row)?;
                                                         let selected = this
                                                             .history_selected
                                                             .as_ref()
-                                                            .map(|n| n == name)
+                                                            .map(|n| {
+                                                                n == name
+                                                                    || (!selected_name_exists
+                                                                        && row == 0)
+                                                            })
                                                             .unwrap_or(row == 0);
                                                         let key = name.clone();
                                                         let row_text = |text: String| {
@@ -1765,6 +1809,9 @@ impl Monitor {
                                                         Some(
                                                             history_row()
                                                                 .id(("history-row", row))
+                                                                .debug_selector(move || {
+                                                                    format!("history-row-{row}")
+                                                                })
                                                                 .bg(rgb(if selected {
                                                                     t.plate2
                                                                 } else {
@@ -1774,6 +1821,21 @@ impl Monitor {
                                                                     move |this, _, _, cx| {
                                                                         this.history_selected =
                                                                             Some(key.clone());
+                                                                        if let Some(process) = this
+                                                                            .snapshot
+                                                                            .as_ref()
+                                                                            .and_then(|snapshot| {
+                                                                                match crate::model::history_row_action(
+                                                                                    &key,
+                                                                                    &snapshot.processes,
+                                                                                ) {
+                                                                                    crate::model::HistoryRowAction::OpenDetail(key) => Some(key),
+                                                                                    crate::model::HistoryRowAction::SelectOnly => None,
+                                                                                }
+                                                                            })
+                                                                        {
+                                                                            this.select(process, cx);
+                                                                        }
                                                                         cx.notify();
                                                                     },
                                                                 ))
@@ -2416,7 +2478,7 @@ impl Monitor {
             return;
         }
         match k {
-            "enter" | "left" | "right" if self.view.is_some() => {
+            "left" | "right" if self.view.is_some() => {
                 let view = &self.history[self.view.unwrap()];
                 if let Some(selection) = crate::history::newest_moment(view) {
                     self.select_moment(selection, cx);
@@ -2485,6 +2547,29 @@ impl Monitor {
                     }
                 }
             }
+            "enter" if self.view.is_some() => {
+                let index = self.view.unwrap();
+                let h = &self.history[index];
+                let order = self.history_sort.order(&h.rows);
+                let selected = self.history_sort.selected_index_in_order(
+                    &h.rows,
+                    &order,
+                    self.history_selected.as_deref(),
+                );
+                if let Some(source_row) = order.get(selected) {
+                    if let Some((name, _)) = h.rows.get(*source_row) {
+                        self.history_selected = Some(name.clone());
+                        if let Some(process) = self.snapshot.as_ref().and_then(|snapshot| {
+                            match crate::model::history_row_action(name, &snapshot.processes) {
+                                crate::model::HistoryRowAction::OpenDetail(key) => Some(key),
+                                crate::model::HistoryRowAction::SelectOnly => None,
+                            }
+                        }) {
+                            self.select(process, cx);
+                        }
+                    }
+                }
+            }
             "c" | "m" | "g" | "p" => {
                 self.table.update(cx, |table, cx| {
                     let rows = &mut *table;
@@ -2501,17 +2586,19 @@ impl Monitor {
             }
             "j" | "k" | "down" | "up" if self.view.is_some() => {
                 let h = &self.history[self.view.unwrap()];
-                let current = self
-                    .history_selected
-                    .as_ref()
-                    .and_then(|name| h.rows.iter().position(|r| &r.0 == name))
-                    .unwrap_or(0);
+                let order = self.history_sort.order(&h.rows);
+                let current = self.history_sort.selected_index_in_order(
+                    &h.rows,
+                    &order,
+                    self.history_selected.as_deref(),
+                );
                 let next = if k == "j" || k == "down" {
-                    (current + 1).min(h.rows.len().saturating_sub(1))
+                    (current + 1).min(order.len().saturating_sub(1))
                 } else {
                     current.saturating_sub(1)
                 };
-                if let Some((name, _)) = h.rows.get(next) {
+                if let Some(source_row) = order.get(next) {
+                    let (name, _) = &h.rows[*source_row];
                     self.history_selected = Some(name.clone());
                     self.history_scroll
                         .scroll_to_item(next, ScrollStrategy::Top);
