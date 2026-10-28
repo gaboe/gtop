@@ -424,7 +424,7 @@ impl Monitor {
     }
     pub(super) fn details(
         &self,
-        window: &Window,
+        window: &mut Window,
         panel_width: DetailWidth,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
@@ -589,7 +589,7 @@ impl Monitor {
                         &t,
                         cx,
                     ))
-                    .child(executable_value(&p.executable, key, &t))
+                    .child(executable_value(&p.executable, key, &t, window, cx))
                     .child(detail_section_header(
                         &format!(
                             "ARGUMENTS · {}",
@@ -604,6 +604,8 @@ impl Monitor {
                         detail_arguments(&p.argv, &p.executable),
                         key,
                         &t,
+                        window,
+                        cx,
                     )),
             );
             if !command_is_duplicate(&p.executable, &p.argv, &p.command) {
@@ -632,6 +634,8 @@ impl Monitor {
                                     window,
                                     format!("command-text-{}-{}", key.pid, key.start_time),
                                     &p.command,
+                                    &t,
+                                    cx,
                                 )),
                         ),
                 );
@@ -1015,31 +1019,32 @@ fn selectable_content(window: &Window, id: &'static str, text: &str) -> Div {
     div().w(width).child(selectable(id, text))
 }
 
-fn selectable_wrapped_content(window: &Window, id: impl Into<ElementId>, text: &str) -> Div {
-    let escaped = text
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    div()
-        .w_full()
-        .min_w_0()
-        .font_family("JetBrains Mono")
-        .text_size(px(12.))
-        .child(
-            gpui_component::text::TextView::html(id, format!("<pre>{escaped}</pre>"))
-                .selectable(true)
-                .scrollable(false)
-                .whitespace_normal(),
-        )
-        .text_color(window.text_style().color)
+fn selectable_wrapped_content(
+    window: &mut Window,
+    id: impl Into<ElementId>,
+    text: &str,
+    tokens: &crate::palette::Tokens,
+    cx: &mut App,
+) -> Stateful<Div> {
+    selectable_styled_text(
+        id,
+        text.to_string(),
+        tokens.cmd,
+        tokens.selection,
+        [],
+        window,
+        cx,
+    )
+    .font_family("JetBrains Mono")
+    .text_size(px(12.))
 }
 
-fn detail_section_header(
+fn detail_section_header<T: 'static>(
     label: &str,
     button_id: &'static str,
     copy_text: String,
     tokens: &crate::palette::Tokens,
-    cx: &mut Context<Monitor>,
+    cx: &mut Context<T>,
 ) -> Div {
     div()
         .flex()
@@ -1049,6 +1054,7 @@ fn detail_section_header(
         .child(crate::rack::label(label, tokens).whitespace_nowrap())
         .child(
             Button::new(button_id)
+                .debug_selector(move || button_id.into())
                 .label("COPY")
                 .rack(tokens)
                 .small()
@@ -1075,7 +1081,14 @@ fn selectable_styled_text(
     base_color: u32,
     selection_color: u32,
     highlights: impl IntoIterator<Item = (Range<usize>, u32)>,
-) -> DetailSelectableText {
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    let id = id.into();
+    let focus = window
+        .use_keyed_state(id.clone(), cx, |_, cx| cx.focus_handle())
+        .read(cx)
+        .clone();
     let highlights = highlights.into_iter().map(|(range, color)| {
         (
             range,
@@ -1085,17 +1098,28 @@ fn selectable_styled_text(
             },
         )
     });
-    DetailSelectableText {
-        id: id.into(),
-        text: text.clone().into(),
-        styled_text: StyledText::new(text).with_highlights(highlights),
-        base_color,
-        selection_color,
-    }
+    div()
+        .id(id.clone())
+        .w_full()
+        .min_w_0()
+        .track_focus(&focus)
+        .on_action(|_: &gpui_base::input::Copy, window, cx| {
+            let text = gpui_base::TextSelection::selected_text(window, cx);
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        })
+        .child(DetailSelectableText {
+            id,
+            focus,
+            text: text.clone().into(),
+            styled_text: StyledText::new(text).with_highlights(highlights),
+            base_color,
+            selection_color,
+        })
 }
 
 struct DetailSelectableText {
     id: ElementId,
+    focus: FocusHandle,
     text: SharedString,
     styled_text: StyledText,
     base_color: u32,
@@ -1131,9 +1155,13 @@ impl Element for DetailSelectableText {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let handle = window.with_element_state(
             global_id.expect("DetailSelectableText must have a stable element id"),
-            |retained: Option<gpui_base::TextSelectionHandle>, _| {
+            |retained: Option<gpui_base::TextSelectionHandle>, window| {
                 let handle = retained.unwrap_or_else(|| {
-                    gpui_base::TextSelectionHandle::new(self.text.to_string(), cx)
+                    let handle = gpui_base::TextSelectionHandle::new(self.text.to_string(), cx);
+                    handle.refresh_window_on_change(window, cx).detach();
+                    let focus = self.focus.clone();
+                    handle.focus_with(move |window, cx| focus.focus(window, cx), cx);
+                    handle
                 });
                 (handle.clone(), handle)
             },
@@ -1256,6 +1284,8 @@ fn executable_value(
     executable: &str,
     key: ProcessKey,
     tokens: &crate::palette::Tokens,
+    window: &mut Window,
+    cx: &mut App,
 ) -> Stateful<Div> {
     let (directory, _) = path_parts(executable);
     let base_color = if directory.is_empty() {
@@ -1281,6 +1311,8 @@ fn executable_value(
             base_color,
             tokens.selection,
             highlights,
+            window,
+            cx,
         ))
 }
 
@@ -1288,6 +1320,8 @@ fn arguments_value(
     arguments: &[String],
     key: ProcessKey,
     tokens: &crate::palette::Tokens,
+    window: &mut Window,
+    cx: &mut App,
 ) -> Stateful<Div> {
     let text = if arguments.is_empty() {
         "none".to_string()
@@ -1313,6 +1347,8 @@ fn arguments_value(
             tokens.cmd,
             tokens.selection,
             highlights,
+            window,
+            cx,
         ))
 }
 
@@ -1642,7 +1678,7 @@ mod tests {
     }
 
     impl Render for WrappedDetailLayoutTest {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let tokens = crate::palette::presets()[self.palette].base.tokens();
             let key = ProcessKey {
                 pid: 1,
@@ -1663,8 +1699,8 @@ mod tests {
                         .debug_selector(|| "minimum-detail-panel".into())
                         .w_full()
                         .min_w_0()
-                        .child(executable_value(&self.executable, key, &tokens))
-                        .child(arguments_value(&self.arguments, key, &tokens)),
+                        .child(executable_value(&self.executable, key, &tokens, window, cx))
+                        .child(arguments_value(&self.arguments, key, &tokens, window, cx)),
                 )
         }
     }
@@ -1737,6 +1773,155 @@ mod tests {
                 });
             }
         }
+    }
+
+    struct CopyDetailTest {
+        search: Entity<gpui_component::input::InputState>,
+    }
+
+    impl Render for CopyDetailTest {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let tokens = crate::palette::presets()[0].base.tokens();
+            let key = ProcessKey {
+                pid: 9,
+                start_time: 1,
+            };
+            div()
+                .key_context("Root")
+                .w(px(400.))
+                .flex()
+                .flex_col()
+                .child(gpui_base::TextSelectionLayer)
+                .child(gpui_component::input::Input::new(&self.search))
+                .child(super::detail_section_header(
+                    "EXECUTABLE",
+                    "copy-executable",
+                    " /bin/worker ".into(),
+                    &tokens,
+                    cx,
+                ))
+                .child(executable_value(" /bin/worker ", key, &tokens, window, cx))
+                .child(arguments_value(
+                    &[" alpha beta ".into()],
+                    key,
+                    &tokens,
+                    window,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .id("command-test")
+                        .debug_selector(|| "command-test".into())
+                        .child(super::selectable_wrapped_content(
+                            window,
+                            "command",
+                            "\nalpha beta",
+                            &tokens,
+                            cx,
+                        )),
+                )
+        }
+    }
+
+    #[gpui::test]
+    async fn detail_selection_focus_refresh_and_exact_copy(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
+            search: cx.new(|cx| {
+                gpui_component::input::InputState::new(window, cx).default_value("search text")
+            }),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        for selector in ["executable-value", "arguments-value"] {
+            let search_focus = visual.update(|window, cx| {
+                let search = view.read(cx).search.clone();
+                let focus = search.read(cx).focus_handle(cx);
+                focus.focus(window, cx);
+                focus
+            });
+            visual.simulate_keystrokes("cmd-a");
+            let bounds = visual.debug_bounds(selector).unwrap();
+            let start = bounds.origin + point(px(1.), px(5.));
+            let end = bounds.origin + point(px(46.), px(5.));
+            visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+            visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+            visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+            visual.update(|window, cx| assert_ne!(window.focused(cx), Some(search_focus)));
+            visual.run_until_parked();
+            visual.simulate_keystrokes("cmd-c");
+            visual.update(|window, cx| {
+                let selected = gpui_base::TextSelection::selected_text(window, cx);
+                assert!(!selected.is_empty());
+                assert!(selected.len() < 12, "partial selection: {selected:?}");
+                assert!(selected.starts_with(' '), "leading space: {selected:?}");
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), selected);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn detail_partial_selection_refreshes_without_forced_draw(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
+            search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = visual.debug_bounds("executable-value").unwrap();
+        let start = bounds.origin + point(px(1.), px(5.));
+        let end = bounds.origin + point(px(46.), px(5.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            let selected = gpui_base::TextSelection::selected_text(window, cx);
+            assert!(!selected.is_empty());
+            assert!(selected.len() < 12, "partial selection: {selected:?}");
+        });
+    }
+
+    #[gpui::test]
+    async fn detail_command_preserves_leading_newline(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
+            search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = visual.debug_bounds("command-test").unwrap();
+        let start = bounds.origin + point(px(1.), px(1.));
+        let end = bounds.bottom_right() - point(px(1.), px(1.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            assert_eq!(
+                gpui_base::TextSelection::selected_text(window, cx),
+                "\nalpha beta"
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn detail_copy_button_writes_source_text(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
+            search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let position = visual.debug_bounds("copy-executable").unwrap().center();
+        visual.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(position, MouseButton::Left, Modifiers::default());
+        visual.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                " /bin/worker "
+            )
+        });
     }
 
     #[test]
