@@ -262,8 +262,8 @@ fn thread_cpu_ns() -> u64 {
 
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "release-only detail stress draw benchmark"]
-fn very_long_detail_open_and_redraw_benchmark() {
+#[ignore = "release-only detail stress draw outlier check"]
+fn very_long_detail_open_and_redraw_outlier_check() {
     struct ClockGuard;
     impl Drop for ClockGuard {
         fn drop(&mut self) {
@@ -276,7 +276,7 @@ fn very_long_detail_open_and_redraw_benchmark() {
     DETAIL_STRESS_REVIEW.with(|value| value.set(true));
     let mut cx = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
-        Some("very_long_detail_open_and_redraw_benchmark"),
+        Some("very_long_detail_open_and_redraw_outlier_check"),
         Arc::new(gpui_apple::AppleTextSystem::new()),
     );
     cx.update(|cx| {
@@ -329,9 +329,12 @@ fn very_long_detail_open_and_redraw_benchmark() {
     let median = (samples[(samples.len() - 1) / 2] + samples[samples.len() / 2]) / 2.;
     let minimum = samples[0];
     let maximum = samples[samples.len() - 1];
-    assert!(maximum <= median * 5., "stress draw outlier: {samples:?}");
+    assert!(
+        maximum <= median * 5.,
+        "stress draw outlier check: {samples:?}"
+    );
     println!(
-        "detail_stress arguments=10000 command_bytes=200000 min_ms={minimum:.3} median_ms={median:.3} max_ms={maximum:.3} runs={} bound=5x_median errors=0",
+        "detail_stress_outlier_check arguments=10000 command_bytes=200000 min_ms={minimum:.3} median_ms={median:.3} max_ms={maximum:.3} runs={} bound=5x_median uniform_slowdown_detection=false errors=0",
         samples.len()
     );
 }
@@ -1662,6 +1665,125 @@ async fn detail_kill_confirmation_restores_monitor_focus_after_text_selection(
     cx: &mut TestAppContext,
 ) {
     detail_button_focus_transition(cx, "confirm-kill");
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_kill_completion_restores_focus_and_reaps_owned_child(cx: &mut TestAppContext) {
+    use gpui::{point, px, size, Modifiers, MouseButton};
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    let mut child = ChildGuard(
+        std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+    );
+    let core = Arc::new(gtop_core::AppState::new());
+    let snapshot = core.snapshot(false, false).unwrap();
+    let process = snapshot
+        .processes
+        .iter()
+        .find(|process| process.pid == child.0.id())
+        .unwrap()
+        .clone();
+    let key = ProcessKey::from(&process);
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let (root, visual) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| {
+            let mut monitor = fixture(window, cx);
+            monitor.core = Some(core.clone());
+            monitor.snapshot = Some(Rc::new(snapshot));
+            monitor.select(key, cx);
+            monitor
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let _root = root;
+    let monitor = monitor.unwrap();
+    visual.simulate_resize(size(px(1480.), px(960.)));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let bounds = visual.debug_bounds("executable-value").unwrap();
+    let start = bounds.origin + point(px(1.), px(5.));
+    let end = bounds.origin + point(px(46.), px(5.));
+    visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    visual.update(|window, cx| {
+        assert!(!gpui_base::TextSelection::selected_text(window, cx).is_empty());
+    });
+
+    let kill = visual.debug_bounds("kill").unwrap();
+    visual.simulate_click(kill.center(), Modifiers::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let confirm = visual.debug_bounds("confirm-kill").unwrap();
+    visual.simulate_click(confirm.center(), Modifiers::default());
+    visual.run_until_parked();
+
+    visual.update(|window, cx| {
+        assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        assert_eq!(monitor.read(cx).pending_kill, Some(key));
+        assert!(monitor.read(cx).status.starts_with("Kill signal sent"));
+    });
+    assert!(!child.0.wait().unwrap().success());
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_copy_state_releases_after_close(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let (root, visual) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| {
+            let mut monitor = fixture(window, cx);
+            let key = ProcessKey::from(&monitor.snapshot.as_ref().unwrap().processes[0]);
+            monitor.select(key, cx);
+            monitor
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let _root = root;
+    let monitor = monitor.unwrap();
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let participant_alive = monitor.read_with(visual, |monitor, _| {
+        monitor
+            .details
+            .as_ref()
+            .unwrap()
+            .copy_selection
+            .participant_alive_check(details::DetailTextSection::Executable)
+    });
+
+    monitor.update(visual, |monitor, cx| {
+        monitor.details = None;
+        cx.notify();
+    });
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.run_until_parked();
+    assert!(!participant_alive());
 }
 
 #[cfg(target_os = "macos")]

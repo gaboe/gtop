@@ -127,6 +127,7 @@ pub(super) struct Details {
     environment: Environment,
     environment_open: bool,
     body_scroll: ScrollHandle,
+    pub(super) copy_selection: Rc<DetailCopySelection>,
     pub(super) kill: KillState,
 }
 
@@ -161,6 +162,7 @@ impl Details {
             environment: Environment::Unrequested,
             environment_open: false,
             body_scroll: ScrollHandle::new(),
+            copy_selection: Rc::new(DetailCopySelection::default()),
             kill: KillState::Ready,
         }
     }
@@ -448,6 +450,7 @@ impl Monitor {
             .border_color(rgb(t.rule_hi));
         let mut panel = div().flex().flex_col().flex_shrink_0();
         if let Some(p) = self.selected_process() {
+            details.copy_selection.begin_frame();
             let exit_marker = self.process_exited().then(|| details.exit_marker());
             frame = frame.child(detail_header(
                 p.pid,
@@ -591,7 +594,14 @@ impl Monitor {
                         &t,
                         cx,
                     ))
-                    .child(executable_value(&p.executable, key, &t, window, cx))
+                    .child(executable_value(
+                        &p.executable,
+                        key,
+                        &t,
+                        details.copy_selection.clone(),
+                        window,
+                        cx,
+                    ))
                     .child(detail_section_header(
                         &format!(
                             "ARGUMENTS · {}",
@@ -606,6 +616,7 @@ impl Monitor {
                         detail_arguments(&p.argv, &p.executable),
                         key,
                         &t,
+                        details.copy_selection.clone(),
                         window,
                         cx,
                     )),
@@ -637,14 +648,22 @@ impl Monitor {
                                     format!("command-text-{}-{}", key.pid, key.start_time),
                                     &p.command,
                                     &t,
+                                    details.copy_selection.clone(),
+                                    DetailTextSection::Command,
                                     cx,
                                 )),
                         ),
                 );
             }
         }
-        let environment =
-            environment_content(window, &details.environment, details.environment_open, &t);
+        let environment = environment_content(
+            window,
+            &details.environment,
+            details.environment_open,
+            &t,
+            details.copy_selection.clone(),
+            cx,
+        );
         panel = panel.child(environment_section(
             div()
                 .flex()
@@ -718,10 +737,12 @@ fn detail_body(content: Div, scroll: &ScrollHandle) -> Stateful<Div> {
 }
 
 fn environment_content(
-    window: &Window,
+    window: &mut Window,
     environment: &Environment,
     open: bool,
     tokens: &crate::palette::Tokens,
+    copy_selection: Rc<DetailCopySelection>,
+    cx: &mut App,
 ) -> Div {
     match environment {
         Environment::Unrequested => div(),
@@ -731,7 +752,14 @@ fn environment_content(
             if values.is_empty() {
                 div().child("This process exposes no environment variables.")
             } else {
-                selectable_content(window, "environment-text", &values.join("\n"))
+                selectable_content(
+                    window,
+                    "environment-text",
+                    &values.join("\n"),
+                    tokens,
+                    copy_selection,
+                    cx,
+                )
             }
         }
         Environment::Loaded(_) => div().child("Environment hidden"),
@@ -990,18 +1018,14 @@ fn analysis_panel(
     panel.child(history_panel)
 }
 
-fn selectable(id: &'static str, text: &str) -> gpui_component::text::TextView {
-    let escaped = text
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    gpui_component::text::TextView::html(id, format!("<pre>{escaped}</pre>"))
-        .selectable(true)
-        .scrollable(false)
-        .whitespace_nowrap()
-}
-
-fn selectable_content(window: &Window, id: &'static str, text: &str) -> Div {
+fn selectable_content(
+    window: &mut Window,
+    id: &'static str,
+    text: &str,
+    tokens: &crate::palette::Tokens,
+    copy_selection: Rc<DetailCopySelection>,
+    cx: &mut App,
+) -> Div {
     let font = font("JetBrains Mono");
     let font_size = px(12.);
     let width = text
@@ -1020,7 +1044,109 @@ fn selectable_content(window: &Window, id: &'static str, text: &str) -> Div {
         })
         .fold(px(0.), Pixels::max)
         + px(1.);
-    div().w(width).child(selectable(id, text))
+    div().w(width).child(selectable_styled_text(
+        id,
+        text.to_string(),
+        SelectableTextConfig {
+            base_color: tokens.cmd,
+            selection_color: tokens.selection,
+            copy: copy_selection,
+            section: DetailTextSection::Environment,
+        },
+        [],
+        window,
+        cx,
+    ))
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DetailTextSection {
+    Executable,
+    Arguments,
+    Command,
+    Environment,
+}
+
+impl DetailTextSection {
+    fn index(self) -> usize {
+        match self {
+            Self::Executable => 0,
+            Self::Arguments => 1,
+            Self::Command => 2,
+            Self::Environment => 3,
+        }
+    }
+}
+
+struct DetailTextParticipant {
+    handle: gpui_base::TextSelectionHandle,
+    run: Option<gpui_base::TextSelectionRun>,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct DetailCopySelection(
+    Rc<RefCell<[Option<std::rc::Weak<RefCell<DetailTextParticipant>>>; 4]>>,
+);
+
+impl DetailCopySelection {
+    fn begin_frame(&self) {
+        *self.0.borrow_mut() = std::array::from_fn(|_| None);
+    }
+
+    fn register(
+        &self,
+        section: DetailTextSection,
+        participant: &Rc<RefCell<DetailTextParticipant>>,
+    ) {
+        self.0.borrow_mut()[section.index()] = Some(Rc::downgrade(participant));
+    }
+
+    fn selected_text(&self, cx: &mut App) -> Option<String> {
+        let participants = self
+            .0
+            .borrow()
+            .iter()
+            .flatten()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect::<Vec<_>>();
+        let mut selected = Vec::new();
+        for participant in participants {
+            let (handle, run) = {
+                let participant = participant.borrow();
+                (participant.handle.clone(), participant.run.clone())
+            };
+            let Some(run) = run else { continue };
+            let projection = handle.update_runs(std::slice::from_ref(&run), cx);
+            selected.extend(
+                projection
+                    .ranges()
+                    .iter()
+                    .flatten()
+                    .filter(|range| !range.is_empty())
+                    .map(|range| run.text()[range.clone()].to_string()),
+            );
+        }
+        (!selected.is_empty()).then(|| selected.join("\n"))
+    }
+
+    #[cfg(test)]
+    pub(super) fn participant_alive_check(
+        &self,
+        section: DetailTextSection,
+    ) -> impl Fn() -> bool + 'static {
+        let participant = self.0.borrow()[section.index()]
+            .as_ref()
+            .expect("detail text participant must be registered")
+            .clone();
+        move || participant.upgrade().is_some()
+    }
+}
+
+struct SelectableTextConfig {
+    base_color: u32,
+    selection_color: u32,
+    copy: Rc<DetailCopySelection>,
+    section: DetailTextSection,
 }
 
 fn selectable_wrapped_content(
@@ -1028,13 +1154,19 @@ fn selectable_wrapped_content(
     id: impl Into<ElementId>,
     text: &str,
     tokens: &crate::palette::Tokens,
+    copy: Rc<DetailCopySelection>,
+    section: DetailTextSection,
     cx: &mut App,
 ) -> Stateful<Div> {
     selectable_styled_text(
         id,
         text.to_string(),
-        tokens.cmd,
-        tokens.selection,
+        SelectableTextConfig {
+            base_color: tokens.cmd,
+            selection_color: tokens.selection,
+            copy,
+            section,
+        },
         [],
         window,
         cx,
@@ -1082,8 +1214,7 @@ fn path_parts(path: &str) -> (&str, &str) {
 fn selectable_styled_text(
     id: impl Into<ElementId>,
     text: String,
-    base_color: u32,
-    selection_color: u32,
+    config: SelectableTextConfig,
     highlights: impl IntoIterator<Item = (Range<usize>, u32)>,
     window: &mut Window,
     cx: &mut App,
@@ -1093,11 +1224,7 @@ fn selectable_styled_text(
         .use_keyed_state(id.clone(), cx, |_, cx| cx.focus_handle())
         .read(cx)
         .clone();
-    let copy_state = Rc::new(RefCell::new((
-        None::<gpui_base::TextSelectionHandle>,
-        String::new(),
-    )));
-    let action_copy_state = copy_state.clone();
+    let action_copy = config.copy.clone();
     let highlights = highlights.into_iter().map(|(range, color)| {
         (
             range,
@@ -1112,21 +1239,9 @@ fn selectable_styled_text(
         .w_full()
         .min_w_0()
         .track_focus(&focus)
-        .on_action(move |_: &gpui_base::input::Copy, window, cx| {
-            let (handle, text) = {
-                let copy_state = action_copy_state.borrow();
-                (copy_state.0.clone(), copy_state.1.clone())
-            };
-            let selected = gpui_base::TextSelection::selected_text(window, cx);
-            let has_exact_selection = handle.is_some_and(|handle| {
-                handle.snapshot(cx).is_some() || handle.has_local_selection(cx)
-            });
-            if !selected.is_empty() || has_exact_selection {
-                cx.write_to_clipboard(ClipboardItem::new_string(if selected.is_empty() {
-                    text
-                } else {
-                    selected
-                }));
+        .on_action(move |_: &gpui_base::input::Copy, _, cx| {
+            if let Some(selected) = action_copy.selected_text(cx) {
+                cx.write_to_clipboard(ClipboardItem::new_string(selected));
                 cx.stop_propagation();
             }
         })
@@ -1135,9 +1250,10 @@ fn selectable_styled_text(
             focus,
             text: text.clone().into(),
             styled_text: StyledText::new(text).with_highlights(highlights),
-            copy_state,
-            base_color,
-            selection_color,
+            copy_selection: config.copy,
+            section: config.section,
+            base_color: config.base_color,
+            selection_color: config.selection_color,
         })
 }
 
@@ -1146,7 +1262,8 @@ struct DetailSelectableText {
     focus: FocusHandle,
     text: SharedString,
     styled_text: StyledText,
-    copy_state: Rc<RefCell<(Option<gpui_base::TextSelectionHandle>, String)>>,
+    copy_selection: Rc<DetailCopySelection>,
+    section: DetailTextSection,
     base_color: u32,
     selection_color: u32,
 }
@@ -1160,7 +1277,7 @@ impl IntoElement for DetailSelectableText {
 }
 
 impl Element for DetailSelectableText {
-    type RequestLayoutState = gpui_base::TextSelectionHandle;
+    type RequestLayoutState = Rc<RefCell<DetailTextParticipant>>;
     type PrepaintState = Hitbox;
 
     fn id(&self) -> Option<ElementId> {
@@ -1178,20 +1295,18 @@ impl Element for DetailSelectableText {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let handle = window.with_element_state(
+        let participant = window.with_element_state(
             global_id.expect("DetailSelectableText must have a stable element id"),
-            |retained: Option<gpui_base::TextSelectionHandle>, window| {
-                let handle = retained.unwrap_or_else(|| {
+            |retained: Option<Rc<RefCell<DetailTextParticipant>>>, window| {
+                let participant = retained.unwrap_or_else(|| {
                     let handle = gpui_base::TextSelectionHandle::new(self.text.to_string(), cx);
                     handle.refresh_window_on_change(window, cx).detach();
                     let focus = self.focus.clone();
                     handle.focus_with(move |window, cx| focus.focus(window, cx), cx);
-                    handle
+                    Rc::new(RefCell::new(DetailTextParticipant { handle, run: None }))
                 });
-                let copy_state = self.copy_state.clone();
-                handle.copy_with(move |_| copy_state.borrow().1.clone(), cx);
-                self.copy_state.borrow_mut().0 = Some(handle.clone());
-                (handle.clone(), handle)
+                self.copy_selection.register(self.section, &participant);
+                (participant.clone(), participant)
             },
         );
         let (layout_id, ()) = window.with_text_style(
@@ -1204,7 +1319,7 @@ impl Element for DetailSelectableText {
                     .request_layout(global_id, inspector_id, window, cx)
             },
         );
-        (layout_id, handle)
+        (layout_id, participant)
     }
 
     fn prepaint(
@@ -1212,16 +1327,17 @@ impl Element for DetailSelectableText {
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        handle: &mut Self::RequestLayoutState,
+        participant: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
         self.styled_text
             .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let handle = participant.borrow().handle.clone();
         let registration = gpui_base::TextSelectionRegistration::new(hitbox.clone(), bounds)
             .with_text_bounds(vec![bounds])
-            .with_rendered_element(handle, window, cx);
+            .with_rendered_element(&handle, window, cx);
         handle.register(registration, window, cx);
         hitbox
     }
@@ -1231,27 +1347,20 @@ impl Element for DetailSelectableText {
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        handle: &mut Self::RequestLayoutState,
+        participant: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         let layout = self.styled_text.layout().clone();
         let selected_before = gpui_base::TextSelection::selected_text(window, cx);
-        let projection = handle.update_runs(
-            &[gpui_base::TextSelectionRun::new(
-                self.text.clone(),
-                layout.clone(),
-                bounds,
-            )],
-            cx,
-        );
-        self.copy_state.borrow_mut().1 = projection
-            .ranges()
-            .iter()
-            .flatten()
-            .map(|range| self.text[range.clone()].to_string())
-            .collect();
+        let run = gpui_base::TextSelectionRun::new(self.text.clone(), layout.clone(), bounds);
+        let handle = {
+            let mut participant = participant.borrow_mut();
+            participant.run = Some(run.clone());
+            participant.handle.clone()
+        };
+        let projection = handle.update_runs(&[run], cx);
         if selected_before != gpui_base::TextSelection::selected_text(window, cx) {
             window.refresh();
         }
@@ -1318,6 +1427,7 @@ fn executable_value(
     executable: &str,
     key: ProcessKey,
     tokens: &crate::palette::Tokens,
+    copy: Rc<DetailCopySelection>,
     window: &mut Window,
     cx: &mut App,
 ) -> Stateful<Div> {
@@ -1342,8 +1452,12 @@ fn executable_value(
         .child(selectable_styled_text(
             format!("executable-{}-{}", key.pid, key.start_time),
             executable.to_string(),
-            base_color,
-            tokens.selection,
+            SelectableTextConfig {
+                base_color,
+                selection_color: tokens.selection,
+                copy,
+                section: DetailTextSection::Executable,
+            },
             highlights,
             window,
             cx,
@@ -1354,6 +1468,7 @@ fn arguments_value(
     arguments: &[String],
     key: ProcessKey,
     tokens: &crate::palette::Tokens,
+    copy: Rc<DetailCopySelection>,
     window: &mut Window,
     cx: &mut App,
 ) -> Stateful<Div> {
@@ -1378,8 +1493,12 @@ fn arguments_value(
         .child(selectable_styled_text(
             format!("arguments-{}-{}", key.pid, key.start_time),
             text,
-            tokens.cmd,
-            tokens.selection,
+            SelectableTextConfig {
+                base_color: tokens.cmd,
+                selection_color: tokens.selection,
+                copy,
+                section: DetailTextSection::Arguments,
+            },
             highlights,
             window,
             cx,
@@ -1501,7 +1620,8 @@ mod tests {
     use super::{
         arguments_value, command_is_duplicate, detail_arguments, detail_section_header,
         environment_content, environment_section, executable_value, is_flag_argument,
-        kill_completed, path_parts, shell_arguments, Details, Environment, KillState,
+        kill_completed, path_parts, selectable_styled_text, shell_arguments, DetailCopySelection,
+        DetailTextSection, Details, Environment, KillState, SelectableTextConfig,
     };
     use crate::model::ProcessKey;
     use crate::rack::RackButton;
@@ -1523,6 +1643,7 @@ mod tests {
             environment: Environment::Unrequested,
             environment_open: false,
             body_scroll: ScrollHandle::new(),
+            copy_selection: std::rc::Rc::new(DetailCopySelection::default()),
             kill: KillState::Ready,
         }
     }
@@ -1616,17 +1737,19 @@ mod tests {
     }
 
     impl Render for SelectableLayoutTest {
-        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let token = format!(
                 "{} END_OF_ENVIRONMENT",
                 "some_long_project_name_".repeat(60)
             );
             let tokens = crate::palette::presets()[1].base.tokens();
+            let copy_selection = std::rc::Rc::new(DetailCopySelection::default());
             let environment = Environment::Loaded(vec![
                 format!("KEY={token}"),
                 format!("NEXT={token} END_OF_ENVIRONMENT"),
             ]);
             div()
+                .child(gpui_base::TextSelectionLayer)
                 .w(px(220.))
                 .flex()
                 .flex_col()
@@ -1645,7 +1768,14 @@ mod tests {
                                     .rack(&tokens)
                                     .small(),
                             ),
-                        environment_content(window, &environment, true, &tokens),
+                        environment_content(
+                            window,
+                            &environment,
+                            true,
+                            &tokens,
+                            copy_selection,
+                            cx,
+                        ),
                     )
                     .debug_selector(|| "environment-scroll".into())
                     .w_full()
@@ -1718,6 +1848,7 @@ mod tests {
                 pid: 1,
                 start_time: 1,
             };
+            let copy_selections = std::rc::Rc::new(DetailCopySelection::default());
             div()
                 .key_context("Root")
                 .w(px(self.width))
@@ -1734,7 +1865,14 @@ mod tests {
                         .debug_selector(|| "minimum-detail-panel".into())
                         .w_full()
                         .min_w_0()
-                        .child(executable_value(&self.executable, key, &tokens, window, cx))
+                        .child(executable_value(
+                            &self.executable,
+                            key,
+                            &tokens,
+                            copy_selections.clone(),
+                            window,
+                            cx,
+                        ))
                         .child(detail_section_header(
                             "ARGUMENTS",
                             "copy-arguments",
@@ -1742,7 +1880,14 @@ mod tests {
                             &tokens,
                             cx,
                         ))
-                        .child(arguments_value(&self.arguments, key, &tokens, window, cx)),
+                        .child(arguments_value(
+                            &self.arguments,
+                            key,
+                            &tokens,
+                            copy_selections,
+                            window,
+                            cx,
+                        )),
                 )
         }
     }
@@ -1922,6 +2067,7 @@ mod tests {
                 pid: 9,
                 start_time: 1,
             };
+            let copy_selections = std::rc::Rc::new(DetailCopySelection::default());
             div()
                 .key_context("Root")
                 .w(px(400.))
@@ -1936,11 +2082,19 @@ mod tests {
                     &tokens,
                     cx,
                 ))
-                .child(executable_value(" /bin/worker ", key, &tokens, window, cx))
+                .child(executable_value(
+                    " /bin/worker ",
+                    key,
+                    &tokens,
+                    copy_selections.clone(),
+                    window,
+                    cx,
+                ))
                 .child(arguments_value(
                     &[" alpha beta ".into()],
                     key,
                     &tokens,
+                    copy_selections.clone(),
                     window,
                     cx,
                 ))
@@ -1953,10 +2107,96 @@ mod tests {
                             "command",
                             &self.command,
                             &tokens,
+                            copy_selections,
+                            DetailTextSection::Command,
                             cx,
                         )),
                 )
         }
+    }
+
+    struct CrossSectionCopyTest;
+
+    impl Render for CrossSectionCopyTest {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let copy_selections = std::rc::Rc::new(DetailCopySelection::default());
+            div()
+                .key_context("Root")
+                .w(px(400.))
+                .flex()
+                .flex_col()
+                .text_size(px(12.))
+                .child(gpui_base::TextSelectionLayer)
+                .children(
+                    ["A   ", "B", "C"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, text)| {
+                            div()
+                                .id(("row", index))
+                                .debug_selector(move || format!("row-{index}"))
+                                .child(selectable_styled_text(
+                                    format!("text-{index}"),
+                                    text.to_string(),
+                                    SelectableTextConfig {
+                                        base_color: 0xffffff,
+                                        selection_color: 0xaaaaaa,
+                                        copy: copy_selections.clone(),
+                                        section: match index {
+                                            0 => DetailTextSection::Executable,
+                                            1 => DetailTextSection::Arguments,
+                                            _ => DetailTextSection::Environment,
+                                        },
+                                    },
+                                    [],
+                                    window,
+                                    cx,
+                                ))
+                        }),
+                )
+        }
+    }
+
+    #[gpui::test]
+    async fn detail_copy_keeps_whitespace_across_selected_sections(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, visual) = cx.add_window_view(|_, _| CrossSectionCopyTest);
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let first = visual.debug_bounds("row-0").unwrap();
+        let second = visual.debug_bounds("row-1").unwrap();
+        let start = first.origin + point(px(9.), px(5.));
+        let end = second.bottom_right() - point(px(1.), px(2.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        visual.run_until_parked();
+        view.update(visual, |_, cx| cx.notify());
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.simulate_keystrokes("cmd-c");
+        visual.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                "   \nB\nC"
+            );
+        });
+
+        let first = visual.debug_bounds("row-0").unwrap();
+        let third = visual.debug_bounds("row-2").unwrap();
+        let start = third.bottom_right() - point(px(1.), px(2.));
+        let end = first.origin + point(px(9.), px(5.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        visual.run_until_parked();
+        visual.simulate_keystrokes("cmd-c");
+        visual.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                "   \nB\nC"
+            );
+        });
     }
 
     #[gpui::test]
@@ -2101,6 +2341,43 @@ mod tests {
 
         let command = visual.debug_bounds("command-test").unwrap();
         visual.simulate_click(command.center(), Modifiers::default());
+        visual.simulate_keystrokes("cmd-c");
+        visual.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                "keep this"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn detail_copy_does_not_replace_clipboard_for_empty_drag(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
+            search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+            command: "A   B".into(),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = visual.debug_bounds("command-test").unwrap();
+        let selection_start = bounds.origin + point(px(1.), px(5.));
+        let selection_end = bounds.origin + point(px(7.), px(5.));
+        visual.simulate_mouse_down(selection_start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(selection_end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(selection_end, MouseButton::Left, Modifiers::default());
+        visual.run_until_parked();
+        visual.simulate_keystrokes("cmd-c");
+        visual.update(|_, cx| {
+            assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "A");
+        });
+        visual.update(|_, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("keep this".into()));
+        });
+        let start = bounds.origin + point(px(1.), px(5.));
+        let end = bounds.origin + point(px(2.), px(5.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
         visual.simulate_keystrokes("cmd-c");
         visual.update(|_, cx| {
             assert_eq!(
