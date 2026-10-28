@@ -2903,8 +2903,8 @@ mod tests {
     use super::{
         cpu_segments, div, draw_readout_text, history_cell, lit_unit, purgeable_label,
         vfd_digit_width, Bounds, DrawMetrics, Path, Pixels, Tokens, UNIT_GLYPHS,
-        UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES, WIN_DOT_CACHE_MAX_ENTRY_VERTICES,
-        WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
+        DIGIT_GHOST_TEST_TEXTS, UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES,
+        WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
     };
     use gpui::{prelude::*, px, TestAppContext, Window};
 
@@ -4016,6 +4016,32 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn digit_ghost_capture_is_isolated_between_threads() {
+        DIGIT_GHOST_TEST_TEXTS.lock().unwrap().clear();
+        let tokens = crate::palette::presets()[0].base.tokens();
+        let interleaved = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = interleaved.clone();
+        let worker = std::thread::spawn(move || {
+            super::lit("42".into(), 22., false, &tokens);
+            super::lit_unit("42".into(), '%', 22., false, &tokens);
+            worker_barrier.wait();
+            worker_barrier.wait();
+            std::mem::take(&mut *DIGIT_GHOST_TEST_TEXTS.lock().unwrap())
+        });
+
+        interleaved.wait();
+        let owner_recordings = std::mem::take(&mut *DIGIT_GHOST_TEST_TEXTS.lock().unwrap());
+        interleaved.wait();
+        let worker_recordings = worker.join().unwrap();
+
+        assert!(
+            owner_recordings.is_empty(),
+            "other thread's producers contaminated the owner's capture: {owner_recordings:?}"
+        );
+        assert_eq!(worker_recordings, ["88", "888"]);
     }
 
     #[gpui::test]
