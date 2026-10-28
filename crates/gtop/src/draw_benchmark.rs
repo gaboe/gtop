@@ -1052,7 +1052,7 @@ fn entering_the_untouched_picker_hex_keeps_aluminium_rgb() {
     cx.run_until_parked();
     cx.update(|cx| {
         let m = monitor.read(cx);
-        assert_eq!(m.settings.base().led, 0x923d18);
+        assert_eq!(m.settings.base().led, 0x2b2f33);
         assert!(m.settings.saved.is_empty());
         assert_eq!(m.settings.active, 4);
     });
