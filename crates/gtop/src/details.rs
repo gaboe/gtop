@@ -1075,7 +1075,11 @@ fn selectable_colored_text(id: String, text: &str, color: u32) -> gpui_base::Sel
     })
 }
 
-fn executable_value(executable: &str, key: ProcessKey, tokens: &crate::palette::Tokens) -> Div {
+fn executable_value(
+    executable: &str,
+    key: ProcessKey,
+    tokens: &crate::palette::Tokens,
+) -> Stateful<Div> {
     let (directory, filename) = path_parts(executable);
     let mut value = div()
         .id("executable-value")
@@ -1100,7 +1104,11 @@ fn executable_value(executable: &str, key: ProcessKey, tokens: &crate::palette::
     )))
 }
 
-fn arguments_value(arguments: &[String], key: ProcessKey, tokens: &crate::palette::Tokens) -> Div {
+fn arguments_value(
+    arguments: &[String],
+    key: ProcessKey,
+    tokens: &crate::palette::Tokens,
+) -> Stateful<Div> {
     if arguments.is_empty() {
         return div()
             .id("arguments-value")
@@ -1140,7 +1148,7 @@ fn arguments_value(arguments: &[String], key: ProcessKey, tokens: &crate::palett
     rows
 }
 
-fn detail_arguments(argv: &[String], executable: &str) -> &[String] {
+fn detail_arguments<'a>(argv: &'a [String], executable: &str) -> &'a [String] {
     let executable_name = executable_name(executable);
     if argv.first().is_some_and(|first| {
         first == executable || (!executable_name.is_empty() && first == executable_name)

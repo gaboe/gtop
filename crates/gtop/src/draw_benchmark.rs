@@ -4,6 +4,7 @@ use super::*;
 use std::prelude::v1::test;
 thread_local! {
     static FIXED_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LONG_DETAIL_REVIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -75,7 +76,16 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
                 } else {
                     0.
                 };
-                test_data::process(pid, &format!("process-{pid:04}"), cpu)
+                let mut process = test_data::process(pid, &format!("process-{pid:04}"), cpu);
+                if pid == 1 && LONG_DETAIL_REVIEW.with(std::cell::Cell::get) {
+                    process.executable =
+                        format!("/Users/gtop/{}worker", "long_directory_name/".repeat(20));
+                    let long_argument = format!("https://example.invalid/{}", "token".repeat(65));
+                    process.argv =
+                        vec![process.executable.clone(), "--config".into(), long_argument];
+                    process.command = format!("kernel_task/{}", "renamed_process".repeat(30));
+                }
+                process
             })
             .collect::<Vec<_>>()
             .into();
@@ -247,6 +257,7 @@ fn full_monitor_draw_benchmark() {
     }
     let _clock = ClockGuard;
     FIXED_CLOCK.with(|v| v.set(true));
+    LONG_DETAIL_REVIEW.with(|v| v.set(true));
     let text_system = Arc::new(gpui_apple::AppleTextSystem::new());
     let mut cx = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
@@ -755,22 +766,6 @@ fn aluminium_offscreen_review() {
                     table.base = base;
                     cx.notify();
                 });
-                let mut snapshot = m.snapshot.as_ref().unwrap().as_ref().clone();
-                let mut processes = (*snapshot.processes).clone();
-                let process = &mut processes[0];
-                process.executable =
-                    format!("/Users/gtop/{}worker", "long_directory_name/".repeat(20));
-                let long_argument = format!("https://example.invalid/{}", "token".repeat(65));
-                process.argv = vec![process.executable.clone(), "--config".into(), long_argument];
-                process.command = format!("kernel_task/{}", "renamed_process".repeat(30));
-                snapshot.processes = Arc::new(processes);
-                let snapshot = Rc::new(snapshot);
-                m.snapshot = Some(snapshot.clone());
-                m.table.update(cx, |table, cx| {
-                    table.snapshot = Some(snapshot);
-                    table.reorder();
-                    cx.notify();
-                });
                 m.view = None;
                 m.settings_open = false;
                 m.details = None;
@@ -792,6 +787,7 @@ fn aluminium_offscreen_review() {
             .unwrap();
     }
     FIXED_CLOCK.with(|v| v.set(false));
+    LONG_DETAIL_REVIEW.with(|v| v.set(false));
 }
 
 #[cfg(target_os = "macos")]
