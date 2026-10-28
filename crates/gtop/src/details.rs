@@ -252,10 +252,10 @@ impl Monitor {
             self.snapshot.as_ref().unwrap().process_observed_at,
         ));
         self.wake();
-        self.table.update(cx, |table, _cx| {
-            table.selected = Some(key);
-            if let Some(row) = table.row_for(key) {
-                table.selected = table.process(row).map(ProcessKey::from);
+        self.table.update(cx, |table, cx| {
+            if table.selected != Some(key) {
+                table.selected = Some(key);
+                cx.notify();
             }
         });
         cx.notify();

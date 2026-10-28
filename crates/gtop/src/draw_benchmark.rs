@@ -180,7 +180,15 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
     let color_pickers = palette::ColorField::ALL.map(|field| {
         cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb(field.get(base))))
     });
-    let subscriptions = Monitor::palette_subscriptions(&colors, &color_pickers, window, cx);
+    let mut subscriptions = Monitor::palette_subscriptions(&colors, &color_pickers, window, cx);
+    subscriptions.push(
+        cx.subscribe_in(&table, window, |this, _, event, window, cx| {
+            window.focus(&this.focus, cx);
+            let process_table::SelectProcess(key) = event;
+            this.settings_open = false;
+            this.select(*key, cx);
+        }),
+    );
     Monitor {
         core: None,
         snapshot: Some(snapshot.clone()),
@@ -243,6 +251,237 @@ fn thread_cpu_ns() -> u64 {
     }
     // Darwin CLOCK_THREAD_CPUTIME_ID.
     unsafe { clock_gettime_nsec_np(16) }
+}
+
+#[cfg(all(target_os = "macos", gtop_draw_benchmark))]
+#[test]
+#[ignore = "release-only headless interaction CPU benchmark"]
+fn monitor_interaction_benchmark() {
+    use gpui::InputEvent;
+    FIXED_CLOCK.with(|v| v.set(true));
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("monitor_interaction_benchmark"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        cx.draw_benchmark_assets(gpui_kit_assets::Assets);
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    for bytes in [
+        include_bytes!("../assets/fonts/DotoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/JetBrainsMono.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoLabels.ttf").as_slice(),
+        include_bytes!("../assets/fonts/Silkscreen.ttf").as_slice(),
+    ] {
+        cx.text_system()
+            .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
+            .unwrap();
+    }
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+    let n = dimension("GTOP_DRAW_N", 31);
+    let mut visual = VisualTestContext::from_window(handle.into(), &cx);
+    gpui::draw_benchmark_observe(false);
+    println!(
+        "interaction_benchmark pid={} timer=Darwin_CLOCK_THREAD_CPUTIME_ID errors=0 size=1480x960",
+        std::process::id()
+    );
+    for view in ["live", "detail", "history", "palette"] {
+        cx.update(|cx| {
+            monitor.update(cx, |m, cx| {
+                m.view = (view == "history").then_some(2);
+                m.details = None;
+                m.settings_open = view == "palette";
+                if view == "detail" {
+                    m.select(
+                        ProcessKey::from(&m.snapshot.as_ref().unwrap().processes[0]),
+                        cx,
+                    );
+                }
+                cx.notify();
+            });
+        });
+        for _ in 0..5 {
+            cx.update_window(handle.into(), |_, w, cx| w.draw(cx).clear(cx))
+                .unwrap();
+        }
+        let viewport = visual
+            .debug_bounds(if view == "history" {
+                "interaction-history-viewport"
+            } else {
+                "interaction-process-viewport"
+            })
+            .unwrap();
+        let button = visual
+            .debug_bounds(if view == "detail" {
+                "copy-executable"
+            } else {
+                "interaction-view-0"
+            })
+            .unwrap();
+        println!("interaction_bounds view={view} viewport={viewport:?} button={button:?}");
+        for action in [
+            "stationary",
+            "rows",
+            "headers",
+            "buttons",
+            "scroll",
+            "text_drag",
+            "select",
+        ] {
+            if action == "select" && view != "live" {
+                continue;
+            }
+            if action == "text_drag" && view != "detail" {
+                continue;
+            }
+            let text = if action == "text_drag" {
+                Some(visual.debug_bounds("executable-value").unwrap())
+            } else {
+                None
+            };
+            let mut events_ns = 0;
+            let scene_before = cx
+                .update_window(handle.into(), |_, w, _| w.draw_benchmark_scene().5)
+                .unwrap();
+            let before_renders = RENDERS.with(|v| v.get());
+            gpui::draw_benchmark_record_draws(true);
+            for i in 0..n {
+                let position = match action {
+                    "text_drag" => {
+                        text.unwrap().origin + point(px(4. + (i % 2) as f32 * 40.), px(6.))
+                    }
+                    "headers" => viewport.origin + point(px(30. + (i % 5) as f32 * 60.), px(14.)),
+                    "buttons" if i % 2 == 0 => button.center(),
+                    "buttons" => viewport.origin + point(px(60.), px(45.)),
+                    "stationary" => viewport.origin + point(px(60.), px(45.)),
+                    "scroll" => viewport.origin + point(px(60.), viewport.size.height - px(2.)),
+                    _ => viewport.origin + point(px(60.), px(45. + (i % 8) as f32 * 30.)),
+                };
+                let start = thread_cpu_ns();
+                cx.update_window(handle.into(), |_, w, cx| {
+                    if action == "text_drag" && i == 0 {
+                        w.dispatch_event(
+                            MouseDownEvent {
+                                position,
+                                button: MouseButton::Left,
+                                click_count: 1,
+                                modifiers: Modifiers::default(),
+                                first_mouse: false,
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                    }
+                    w.dispatch_event(
+                        MouseMoveEvent {
+                            position,
+                            pressed_button: (action == "text_drag").then_some(MouseButton::Left),
+                            modifiers: Modifiers::default(),
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    if action == "scroll" {
+                        w.dispatch_event(
+                            ScrollWheelEvent {
+                                position,
+                                delta: ScrollDelta::Pixels(point(px(0.), px(-44.))),
+                                ..Default::default()
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                    }
+                    if action == "select" {
+                        w.dispatch_event(
+                            MouseDownEvent {
+                                position,
+                                button: MouseButton::Left,
+                                click_count: 1,
+                                modifiers: Modifiers::default(),
+                                first_mouse: false,
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                        w.dispatch_event(
+                            MouseUpEvent {
+                                position,
+                                button: MouseButton::Left,
+                                click_count: 1,
+                                modifiers: Modifiers::default(),
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                    }
+                })
+                .unwrap();
+                events_ns += thread_cpu_ns() - start;
+                if action == "text_drag" && i % 2 == 1 {
+                    assert!(
+                        !cx.update_window(handle.into(), |_, w, cx| {
+                            gpui_base::TextSelection::selected_text(w, cx)
+                        })
+                        .unwrap()
+                        .is_empty(),
+                        "drag must select text"
+                    );
+                }
+            }
+            let timings = gpui::draw_benchmark_take_draws();
+            gpui::draw_benchmark_record_draws(false);
+            let draws = timings.len();
+            let draws_ns: u64 = timings.iter().sum();
+            assert!(events_ns >= draws_ns);
+            let scene = cx
+                .update_window(handle.into(), |_, w, _| w.draw_benchmark_scene().5)
+                .unwrap();
+            let changed_scenes = usize::from(scene != scene_before);
+            if action == "select" {
+                assert!(
+                    cx.read(|cx| monitor.read(cx).details.is_some()),
+                    "row click must open detail"
+                );
+            }
+            if action == "scroll" {
+                assert!(
+                    changed_scenes > 0,
+                    "scroll must change rendered content in {view}"
+                );
+            }
+            let renders = RENDERS.with(|v| v.get()) - before_renders;
+            if action == "text_drag" {
+                cx.update_window(handle.into(), |_, w, cx| {
+                    w.dispatch_event(
+                        MouseUpEvent {
+                            position: text.unwrap().center(),
+                            button: MouseButton::Left,
+                            click_count: 1,
+                            modifiers: Modifiers::default(),
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    w.draw(cx).clear(cx);
+                })
+                .unwrap();
+            }
+            println!("interaction view={view} action={action} events={n} draws={draws} renders={renders} changed_scenes={changed_scenes} scene={scene:016x} event_cpu_ms={:.6} draw_cpu_ms={:.6} cpu_ms_per_draw={:.6} errors=0",
+                (events_ns - draws_ns) as f64 / 1e6, draws_ns as f64 / 1e6,
+                draws_ns as f64 / 1e6 / draws.max(1) as f64);
+        }
+    }
+    FIXED_CLOCK.with(|v| v.set(false));
 }
 
 #[test]

@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import multiprocessing
 import os
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("draw_benchmark", Path(__file__).with_name("draw-benchmark.py"))
@@ -29,6 +31,21 @@ def overlap(root):
 
 
 class StateTests(unittest.TestCase):
+    def test_failed_build_prints_diagnostic_and_restores_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = root / "Cargo.lock"
+            lock.write_bytes(LOCK)
+            def failed(*args, **kwargs):
+                lock.write_bytes(bench.patched_lock(LOCK))
+                diagnostic = {"reason": "compiler-message", "message": {"rendered": "error: benchmark fixture failed"}}
+                return bench.subprocess.CompletedProcess([], 101, stdout=json.dumps(diagnostic))
+            output = io.StringIO()
+            with patch.object(bench.subprocess, "run", failed), redirect_stdout(output), self.assertRaises(bench.subprocess.CalledProcessError):
+                bench.run_child([], root, {}, capture=True)
+            self.assertIn("error: benchmark fixture failed", output.getvalue())
+            self.assertEqual(lock.read_bytes(), LOCK)
+
     def test_child_success_failure_and_conflict(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
