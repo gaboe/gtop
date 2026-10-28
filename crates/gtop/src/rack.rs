@@ -1385,7 +1385,16 @@ impl Monitor {
                     stats.disk_used_bytes as f32 / stats.disk_total_bytes.max(1) as f32 * 100.,
                     40,
                     t,
-                )),
+                ))
+                .children((stats.disk_purgeable_bytes > 0).then(|| {
+                    label(
+                        format!(
+                            "+{:.0} GB PURGEABLE",
+                            stats.disk_purgeable_bytes as f64 / 1e9
+                        ),
+                        t,
+                    )
+                })),
         );
         let gpu = stats.gpus.first();
         let util = gpu.and_then(|g| g.utilization);

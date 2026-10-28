@@ -9,6 +9,24 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use sysinfo::{Disk, DiskRefreshKind, Disks, Networks, System};
 
+#[cfg(target_os = "macos")]
+use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+#[derive(Clone, Copy)]
+struct DiskCapacity {
+    total_bytes: u64,
+    free_bytes: u64,
+    important_free_bytes: u64,
+}
+
+#[derive(Default)]
+struct DiskStats {
+    total_bytes: u64,
+    used_bytes: u64,
+    free_bytes: u64,
+    purgeable_bytes: u64,
+}
+
 /// Monitors system-wide statistics
 #[derive(Debug)]
 pub struct SystemMonitor {
@@ -58,7 +76,7 @@ impl SystemMonitor {
         disks: &Disks,
     ) -> SystemStats {
         let (network_rx, network_tx) = self.calculate_network_stats(networks);
-        let (disk_total, disk_used, disk_free) = self.calculate_disk_stats(disks);
+        let disk_stats = self.calculate_disk_stats(disks);
         let load_average = System::load_average();
 
         SystemStats {
@@ -73,9 +91,10 @@ impl SystemMonitor {
             load_avg: [load_average.one, load_average.five, load_average.fifteen],
             network_rx_bytes: network_rx,
             network_tx_bytes: network_tx,
-            disk_total_bytes: disk_total,
-            disk_used_bytes: disk_used,
-            disk_free_bytes: disk_free,
+            disk_total_bytes: disk_stats.total_bytes,
+            disk_used_bytes: disk_stats.used_bytes,
+            disk_free_bytes: disk_stats.free_bytes,
+            disk_purgeable_bytes: disk_stats.purgeable_bytes,
             gpus: self.gpu_monitor.collect(),
             temperatures: self.temperature_monitor.collect(),
         }
@@ -128,19 +147,55 @@ impl SystemMonitor {
         (rx_rate, tx_rate)
     }
 
-    /// Calculates disk usage statistics and returns `(total, used, free)`.
-    fn calculate_disk_stats(&self, disks: &Disks) -> (u64, u64, u64) {
-        disks.iter().filter(|disk| Self::is_shown(disk)).fold(
-            (0, 0, 0),
-            |(total, used, free), disk| {
-                (
-                    total + disk.total_space(),
-                    used + (disk.total_space() - disk.available_space()),
-                    free + disk.available_space(),
-                )
-            },
+    /// Calculates disk usage statistics for the displayed volumes.
+    fn calculate_disk_stats(&self, disks: &Disks) -> DiskStats {
+        aggregate_disk_capacities(
+            disks
+                .iter()
+                .filter(|disk| Self::is_shown(disk))
+                .map(|disk| {
+                    let important_free_bytes = disk.available_space();
+                    #[cfg(target_os = "macos")]
+                    let free_bytes =
+                        macos_free_bytes(disk.mount_point()).unwrap_or(important_free_bytes);
+                    #[cfg(not(target_os = "macos"))]
+                    let free_bytes = important_free_bytes;
+
+                    DiskCapacity {
+                        total_bytes: disk.total_space(),
+                        free_bytes,
+                        important_free_bytes,
+                    }
+                }),
         )
     }
+}
+
+fn aggregate_disk_capacities(capacities: impl IntoIterator<Item = DiskCapacity>) -> DiskStats {
+    capacities
+        .into_iter()
+        .fold(DiskStats::default(), |mut stats, disk| {
+            stats.total_bytes += disk.total_bytes;
+            stats.free_bytes += disk.free_bytes;
+            stats.used_bytes += disk.total_bytes.saturating_sub(disk.free_bytes);
+            stats.purgeable_bytes += disk.important_free_bytes.saturating_sub(disk.free_bytes);
+            stats
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_free_bytes(mount_point: &Path) -> Option<u64> {
+    let path = CString::new(mount_point.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let result = unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: `statfs` initializes the structure when it returns success.
+    let stats = unsafe { stats.assume_init() };
+    let available_blocks = stats.f_bavail;
+    let block_size = u64::from(stats.f_bsize);
+    Some(available_blocks.saturating_mul(block_size))
 }
 
 #[cfg(test)]
@@ -189,6 +244,64 @@ mod tests {
         });
         assert_eq!(reads, 1);
         assert!(monitor.disks_refreshed_at >= initial);
+    }
+
+    #[test]
+    fn disk_stats_separate_space_free_now_from_purgeable_space() {
+        let stats = aggregate_disk_capacities([DiskCapacity {
+            total_bytes: 1000,
+            free_bytes: 120,
+            important_free_bytes: 300,
+        }]);
+
+        assert_eq!(stats.total_bytes, 1000);
+        assert_eq!(stats.used_bytes, 880);
+        assert_eq!(stats.free_bytes, 120);
+        assert_eq!(stats.purgeable_bytes, 180);
+    }
+
+    #[test]
+    fn purgeable_space_never_goes_below_zero() {
+        let stats = aggregate_disk_capacities([DiskCapacity {
+            total_bytes: 1000,
+            free_bytes: 120,
+            important_free_bytes: 100,
+        }]);
+
+        assert_eq!(stats.purgeable_bytes, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_volume_free_space_matches_df_avail() {
+        let df_free_bytes = || {
+            let output = std::process::Command::new("df")
+                .args(["-k", "/"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .nth(3)
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                * 1024
+        };
+        let before = df_free_bytes();
+        let free_bytes = macos_free_bytes(Path::new("/")).unwrap();
+        let after = df_free_bytes();
+        let lower = before.min(after).saturating_sub(1024);
+        let upper = before.max(after).saturating_add(1024);
+
+        assert!(
+            (lower..=upper).contains(&free_bytes),
+            "statfs reported {free_bytes} bytes between df readings {before} and {after}"
+        );
     }
 
     #[cfg(target_os = "macos")]

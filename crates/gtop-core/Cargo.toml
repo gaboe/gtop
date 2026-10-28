@@ -13,5 +13,6 @@ sysinfo = { version = "0.39", features = ["component", "disk", "network", "syste
 sysinfo = { version = "0.39", features = ["multithread"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 objc2-core-foundation = "0.3.2"
 objc2-io-kit = { version = "0.3.2", features = ["libc"] }
