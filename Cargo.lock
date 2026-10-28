@@ -2557,6 +2557,7 @@ version = "1.2.0"
 dependencies = [
  "chrono",
  "futures",
+ "gpui-base",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",

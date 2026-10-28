@@ -11,6 +11,7 @@ use gpui_component::{
 };
 use gtop_core::ProcessInfo;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::ops::Range;
 
 pub(super) const DETAIL_WIDTH_MIN: f32 = 280.;
 pub(super) const DETAIL_WIDTH_MAX: f32 = 560.;
@@ -423,7 +424,7 @@ impl Monitor {
     }
     pub(super) fn details(
         &self,
-        window: &Window,
+        window: &mut Window,
         panel_width: DetailWidth,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
@@ -581,27 +582,64 @@ impl Monitor {
                     .py(px(10.))
                     .border_b_1()
                     .border_color(rgb(t.rule))
-                    .child(detail_line("Executable", p.executable.clone()))
-                    .child(detail_line("Arguments", p.argv.join(" "))),
+                    .child(detail_section_header(
+                        "EXECUTABLE",
+                        "copy-executable",
+                        p.executable.clone(),
+                        &t,
+                        cx,
+                    ))
+                    .child(executable_value(&p.executable, key, &t, window, cx))
+                    .child(detail_section_header(
+                        &format!(
+                            "ARGUMENTS · {}",
+                            detail_arguments(&p.argv, &p.executable).len()
+                        ),
+                        "copy-arguments",
+                        shell_arguments(detail_arguments(&p.argv, &p.executable)),
+                        &t,
+                        cx,
+                    ))
+                    .child(arguments_value(
+                        detail_arguments(&p.argv, &p.executable),
+                        key,
+                        &t,
+                        window,
+                        cx,
+                    )),
             );
-            panel = panel.child(
-                div()
-                    .px(px(12.))
-                    .py(px(10.))
-                    .border_b_1()
-                    .border_color(rgb(t.rule))
-                    .child(crate::rack::label("COMMAND", &t))
-                    .child(
-                        div()
-                            .id("command-value")
-                            .max_h(px(64.))
-                            .overflow_y_scroll()
-                            .overflow_x_scroll()
-                            .p_2()
-                            .bg(rgb(t.well))
-                            .child(selectable_content(window, "command-text", &p.command)),
-                    ),
-            );
+            if !command_is_duplicate(&p.executable, &p.argv, &p.command) {
+                panel = panel.child(
+                    div()
+                        .px(px(12.))
+                        .py(px(10.))
+                        .border_b_1()
+                        .border_color(rgb(t.rule))
+                        .child(detail_section_header(
+                            "COMMAND",
+                            "copy-command",
+                            p.command.clone(),
+                            &t,
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .id("command-value")
+                                .max_h(px(192.))
+                                .overflow_y_scroll()
+                                .min_w_0()
+                                .p_2()
+                                .bg(rgb(t.well))
+                                .child(selectable_wrapped_content(
+                                    window,
+                                    format!("command-text-{}-{}", key.pid, key.start_time),
+                                    &p.command,
+                                    &t,
+                                    cx,
+                                )),
+                        ),
+                );
+            }
         }
         let environment =
             environment_content(window, &details.environment, details.environment_open, &t);
@@ -980,6 +1018,390 @@ fn selectable_content(window: &Window, id: &'static str, text: &str) -> Div {
         + px(1.);
     div().w(width).child(selectable(id, text))
 }
+
+fn selectable_wrapped_content(
+    window: &mut Window,
+    id: impl Into<ElementId>,
+    text: &str,
+    tokens: &crate::palette::Tokens,
+    cx: &mut App,
+) -> Stateful<Div> {
+    selectable_styled_text(
+        id,
+        text.to_string(),
+        tokens.cmd,
+        tokens.selection,
+        [],
+        window,
+        cx,
+    )
+    .font_family("JetBrains Mono")
+    .text_size(px(12.))
+}
+
+fn detail_section_header<T: 'static>(
+    label: &str,
+    button_id: &'static str,
+    copy_text: String,
+    tokens: &crate::palette::Tokens,
+    cx: &mut Context<T>,
+) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(8.))
+        .child(crate::rack::label(label, tokens).whitespace_nowrap())
+        .child(
+            Button::new(button_id)
+                .debug_selector(move || button_id.into())
+                .label("COPY")
+                .rack(tokens)
+                .small()
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                    cx.notify();
+                })),
+        )
+}
+
+fn path_parts(path: &str) -> (&str, &str) {
+    let path_without_trailing_slashes = path.trim_end_matches('/');
+    let Some(separator) = path_without_trailing_slashes.rfind('/') else {
+        return ("", path);
+    };
+    let filename = &path[separator + 1..];
+    let directory = &path[..separator + 1];
+    (directory, filename)
+}
+
+fn selectable_styled_text(
+    id: impl Into<ElementId>,
+    text: String,
+    base_color: u32,
+    selection_color: u32,
+    highlights: impl IntoIterator<Item = (Range<usize>, u32)>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    let id = id.into();
+    let focus = window
+        .use_keyed_state(id.clone(), cx, |_, cx| cx.focus_handle())
+        .read(cx)
+        .clone();
+    let highlights = highlights.into_iter().map(|(range, color)| {
+        (
+            range,
+            HighlightStyle {
+                color: Some(rgb(color).into()),
+                ..Default::default()
+            },
+        )
+    });
+    div()
+        .id(id.clone())
+        .w_full()
+        .min_w_0()
+        .track_focus(&focus)
+        .on_action(|_: &gpui_base::input::Copy, window, cx| {
+            let text = gpui_base::TextSelection::selected_text(window, cx);
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        })
+        .child(DetailSelectableText {
+            id,
+            focus,
+            text: text.clone().into(),
+            styled_text: StyledText::new(text).with_highlights(highlights),
+            base_color,
+            selection_color,
+        })
+}
+
+struct DetailSelectableText {
+    id: ElementId,
+    focus: FocusHandle,
+    text: SharedString,
+    styled_text: StyledText,
+    base_color: u32,
+    selection_color: u32,
+}
+
+impl IntoElement for DetailSelectableText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for DetailSelectableText {
+    type RequestLayoutState = gpui_base::TextSelectionHandle;
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let handle = window.with_element_state(
+            global_id.expect("DetailSelectableText must have a stable element id"),
+            |retained: Option<gpui_base::TextSelectionHandle>, window| {
+                let handle = retained.unwrap_or_else(|| {
+                    let handle = gpui_base::TextSelectionHandle::new(self.text.to_string(), cx);
+                    handle.refresh_window_on_change(window, cx).detach();
+                    let focus = self.focus.clone();
+                    handle.focus_with(move |window, cx| focus.focus(window, cx), cx);
+                    handle
+                });
+                (handle.clone(), handle)
+            },
+        );
+        let (layout_id, ()) = window.with_text_style(
+            Some(TextStyleRefinement {
+                color: Some(rgb(self.base_color).into()),
+                ..Default::default()
+            }),
+            |window| {
+                self.styled_text
+                    .request_layout(global_id, inspector_id, window, cx)
+            },
+        );
+        (layout_id, handle)
+    }
+
+    fn prepaint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        handle: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.styled_text
+            .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let registration = gpui_base::TextSelectionRegistration::new(hitbox.clone(), bounds)
+            .with_text_bounds(vec![bounds])
+            .with_rendered_element(handle, window, cx);
+        handle.register(registration, window, cx);
+        hitbox
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        handle: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let layout = self.styled_text.layout().clone();
+        let selected_before = gpui_base::TextSelection::selected_text(window, cx);
+        let projection = handle.update_runs(
+            &[gpui_base::TextSelectionRun::new(
+                self.text.clone(),
+                layout.clone(),
+                bounds,
+            )],
+            cx,
+        );
+        if selected_before != gpui_base::TextSelection::selected_text(window, cx) {
+            window.refresh();
+        }
+        for range in projection.ranges().iter().flatten() {
+            if let (Some(start), Some(end)) = (
+                layout.position_for_index(range.start),
+                layout.position_for_index(range.end),
+            ) {
+                let bounds = layout.bounds();
+                for row in selection_row_bounds(start, end, bounds, layout.line_height()) {
+                    window.paint_quad(PaintQuad {
+                        bounds: row,
+                        background: rgb(self.selection_color).into(),
+                        corner_radii: Corners::default(),
+                        border_widths: Edges::default(),
+                        border_color: transparent_black(),
+                        border_style: BorderStyle::default(),
+                    });
+                }
+            }
+        }
+        self.styled_text.paint(
+            global_id,
+            inspector_id,
+            bounds,
+            &mut (),
+            &mut (),
+            window,
+            cx,
+        );
+    }
+}
+
+fn selection_row_bounds(
+    start: Point<Pixels>,
+    end: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    line_height: Pixels,
+) -> Vec<Bounds<Pixels>> {
+    if start.y == end.y {
+        return vec![Bounds::from_corners(
+            start,
+            Point::new(end.x, end.y + line_height),
+        )];
+    }
+    let mut rows = vec![Bounds::from_corners(
+        start,
+        Point::new(bounds.right(), start.y + line_height),
+    )];
+    if end.y > start.y + line_height {
+        rows.push(Bounds::from_corners(
+            Point::new(bounds.left(), start.y + line_height),
+            Point::new(bounds.right(), end.y),
+        ));
+    }
+    rows.push(Bounds::from_corners(
+        Point::new(bounds.left(), end.y),
+        Point::new(end.x, end.y + line_height),
+    ));
+    rows
+}
+
+fn executable_value(
+    executable: &str,
+    key: ProcessKey,
+    tokens: &crate::palette::Tokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    let (directory, _) = path_parts(executable);
+    let base_color = if directory.is_empty() {
+        tokens.base.led
+    } else {
+        tokens.silk_dim
+    };
+    let highlights = if directory.is_empty() {
+        Vec::new()
+    } else {
+        vec![(directory.len()..executable.len(), tokens.base.led)]
+    };
+    div()
+        .id("executable-value")
+        .debug_selector(|| "executable-value".into())
+        .w_full()
+        .min_w_0()
+        .font_family("JetBrains Mono")
+        .text_size(px(12.))
+        .child(selectable_styled_text(
+            format!("executable-{}-{}", key.pid, key.start_time),
+            executable.to_string(),
+            base_color,
+            tokens.selection,
+            highlights,
+            window,
+            cx,
+        ))
+}
+
+fn arguments_value(
+    arguments: &[String],
+    key: ProcessKey,
+    tokens: &crate::palette::Tokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<Div> {
+    let text = if arguments.is_empty() {
+        "none".to_string()
+    } else {
+        arguments.join("\n")
+    };
+    let mut offset = 0;
+    let highlights = arguments.iter().filter_map(|argument| {
+        let range = offset..offset + argument.len();
+        offset = range.end + 1;
+        is_flag_argument(argument).then_some((range, tokens.base.led))
+    });
+    div()
+        .id("arguments-value")
+        .debug_selector(|| "arguments-value".into())
+        .w_full()
+        .min_w_0()
+        .font_family("JetBrains Mono")
+        .text_size(px(12.))
+        .child(selectable_styled_text(
+            format!("arguments-{}-{}", key.pid, key.start_time),
+            text,
+            tokens.cmd,
+            tokens.selection,
+            highlights,
+            window,
+            cx,
+        ))
+}
+
+fn detail_arguments<'a>(argv: &'a [String], executable: &str) -> &'a [String] {
+    let executable_name = executable_name(executable);
+    if argv.first().is_some_and(|first| {
+        first == executable || (!executable_name.is_empty() && first == executable_name)
+    }) {
+        &argv[1..]
+    } else {
+        argv
+    }
+}
+
+fn executable_name(executable: &str) -> &str {
+    path_parts(executable).1.trim_end_matches('/')
+}
+
+fn is_flag_argument(argument: &str) -> bool {
+    argument.starts_with('-')
+}
+
+fn shell_arguments(arguments: &[String]) -> String {
+    arguments
+        .iter()
+        .map(|argument| {
+            if !argument.is_empty()
+                && argument
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_./:=,+-%@".contains(&byte))
+            {
+                argument.clone()
+            } else {
+                format!("'{}'", argument.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn command_is_duplicate(executable: &str, argv: &[String], command: &str) -> bool {
+    let arguments = detail_arguments(argv, executable);
+    let argv_starts_with_executable = argv.first().is_some_and(|first| {
+        let executable_name = executable_name(executable);
+        first == executable || (!executable_name.is_empty() && first == executable_name)
+    });
+    let executable_and_arguments = std::iter::once(executable)
+        .chain(arguments.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    command == executable_and_arguments
+        || (argv_starts_with_executable && command == argv.join(" "))
+}
 fn detail_readout(name: &'static str, value: String, t: &crate::palette::Tokens) -> Stateful<Div> {
     div()
         .id(name)
@@ -1043,7 +1465,9 @@ fn detail_line(label: &str, value: String) -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        environment_content, environment_section, kill_completed, Details, Environment, KillState,
+        arguments_value, command_is_duplicate, detail_arguments, environment_content,
+        environment_section, executable_value, is_flag_argument, kill_completed, path_parts,
+        shell_arguments, Details, Environment, KillState,
     };
     use crate::model::ProcessKey;
     use crate::rack::RackButton;
@@ -1069,14 +1493,100 @@ mod tests {
         }
     }
 
+    #[test]
+    fn argument_rows_skip_only_an_executable_argv_zero() {
+        let argv = vec![
+            "/usr/local/bin/worker".to_string(),
+            "--jobs".to_string(),
+            "4".to_string(),
+        ];
+        assert_eq!(
+            detail_arguments(&argv, "/usr/local/bin/worker"),
+            &["--jobs", "4"]
+        );
+        assert!(is_flag_argument(&argv[1]));
+        assert!(!is_flag_argument(&argv[2]));
+
+        let argv = vec!["worker".to_string(), "--quiet".to_string()];
+        assert_eq!(
+            detail_arguments(&argv, "/usr/local/bin/worker"),
+            &["--quiet"]
+        );
+
+        let argv = vec!["bin".to_string(), "--quiet".to_string()];
+        assert_eq!(detail_arguments(&argv, "/usr/local/bin/"), &["--quiet"]);
+
+        let argv = vec!["launch-wrapper".to_string(), "--quiet".to_string()];
+        assert_eq!(
+            detail_arguments(&argv, "/usr/local/bin/worker"),
+            &["launch-wrapper", "--quiet"]
+        );
+        assert!(detail_arguments(&[], "/usr/local/bin/worker").is_empty());
+    }
+
+    #[test]
+    fn arguments_copy_as_shell_safe_words() {
+        let arguments = vec![
+            "--color=always".to_string(),
+            "two words".to_string(),
+            "it's safe".to_string(),
+            String::new(),
+        ];
+        assert_eq!(
+            shell_arguments(&arguments),
+            "--color=always 'two words' 'it'\\''s safe' ''"
+        );
+        assert_eq!(shell_arguments(&[]), "");
+    }
+
+    #[test]
+    fn command_visibility_collapses_duplicate_process_strings() {
+        let argv = vec!["worker".to_string(), "--jobs".to_string(), "4".to_string()];
+        assert!(command_is_duplicate(
+            "/usr/bin/worker",
+            &argv,
+            "worker --jobs 4"
+        ));
+        assert!(command_is_duplicate(
+            "/usr/bin/worker",
+            &argv,
+            "/usr/bin/worker --jobs 4"
+        ));
+        assert!(!command_is_duplicate(
+            "/usr/bin/worker",
+            &argv,
+            "renamed-process --jobs 4"
+        ));
+        let renamed_argv = vec![
+            "renamed-process".to_string(),
+            "--jobs".to_string(),
+            "4".to_string(),
+        ];
+        assert!(!command_is_duplicate(
+            "/usr/bin/worker",
+            &renamed_argv,
+            "renamed-process --jobs 4"
+        ));
+    }
+
+    #[test]
+    fn path_parts_preserve_all_source_text() {
+        for path in ["/opt/a very long directory/bin/worker", "/usr/local/", "/"] {
+            let (directory, filename) = path_parts(path);
+            assert_eq!(format!("{directory}{filename}"), path);
+        }
+    }
+
     struct SelectableLayoutTest {
-        command_scroll: ScrollHandle,
         environment_scroll: ScrollHandle,
     }
 
     impl Render for SelectableLayoutTest {
         fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let token = format!("{} END_OF_COMMAND", "some_long_project_name_".repeat(60));
+            let token = format!(
+                "{} END_OF_ENVIRONMENT",
+                "some_long_project_name_".repeat(60)
+            );
             let tokens = crate::palette::presets()[1].base.tokens();
             let environment = Environment::Loaded(vec![
                 format!("KEY={token}"),
@@ -1088,16 +1598,6 @@ mod tests {
                 .flex_col()
                 .font_family("JetBrains Mono")
                 .text_size(px(12.))
-                .child(
-                    div()
-                        .id("command-scroll")
-                        .debug_selector(|| "command-scroll".into())
-                        .w_full()
-                        .max_h(px(30.))
-                        .overflow_x_scroll()
-                        .track_scroll(&self.command_scroll)
-                        .child(super::selectable_content(window, "command-text", &token)),
-                )
                 .child(
                     environment_section(
                         div()
@@ -1121,30 +1621,18 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn selectable_values_do_not_wrap_and_scroll_to_line_ends(cx: &mut gpui::TestAppContext) {
+    async fn environment_values_keep_horizontal_scroll(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let command_scroll = ScrollHandle::new();
         let environment_scroll = ScrollHandle::new();
         let (_, visual) = cx.add_window_view(|_, _| SelectableLayoutTest {
-            command_scroll: command_scroll.clone(),
             environment_scroll: environment_scroll.clone(),
         });
         visual.run_until_parked();
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        let command = visual.debug_bounds("command-scroll").unwrap();
         let environment = visual.debug_bounds("environment-scroll").unwrap();
-        assert!(
-            command.size.height <= px(30.),
-            "command bounds: {command:?}"
-        );
         assert!(
             environment.size.height <= px(240.),
             "environment bounds: {environment:?}"
-        );
-        assert!(
-            command_scroll.max_offset().x > px(100.),
-            "command line end is not reachable: {:?}",
-            command_scroll.max_offset()
         );
         assert!(
             environment_scroll.max_offset().x > px(100.),
@@ -1152,38 +1640,288 @@ mod tests {
             environment_scroll.max_offset()
         );
 
-        for (position, scroll) in [
-            (command.center(), &command_scroll),
-            (environment.center(), &environment_scroll),
-        ] {
-            visual.update(|window, cx| {
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position,
-                        pressed_button: None,
-                        modifiers: Modifiers::default(),
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                window.dispatch_event(
-                    ScrollWheelEvent {
-                        position,
-                        delta: ScrollDelta::Pixels(point(px(-20_000.), px(0.))),
-                        modifiers: Modifiers::default(),
-                        touch_phase: TouchPhase::Moved,
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-            });
-            visual.update(|window, cx| window.draw(cx).clear(cx));
-            assert_eq!(
-                scroll.offset().x,
-                -scroll.max_offset().x,
-                "scroll input did not reach the end of {position:?}"
+        let position = environment.center();
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position,
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
             );
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Pixels(point(px(-20_000.), px(0.))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Moved,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            environment_scroll.offset().x,
+            -environment_scroll.max_offset().x,
+            "scroll input did not reach the end of {position:?}"
+        );
+    }
+
+    struct WrappedDetailLayoutTest {
+        palette: usize,
+        width: f32,
+        executable: String,
+        arguments: Vec<String>,
+    }
+
+    impl Render for WrappedDetailLayoutTest {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let tokens = crate::palette::presets()[self.palette].base.tokens();
+            let key = ProcessKey {
+                pid: 1,
+                start_time: 1,
+            };
+            div()
+                .w(px(self.width))
+                .h_full()
+                .child(gpui_base::TextSelectionLayer)
+                .px(px(12.))
+                .flex()
+                .flex_col()
+                .font_family("JetBrains Mono")
+                .text_size(px(12.))
+                .child(
+                    div()
+                        .id("minimum-detail-panel")
+                        .debug_selector(|| "minimum-detail-panel".into())
+                        .w_full()
+                        .min_w_0()
+                        .child(executable_value(&self.executable, key, &tokens, window, cx))
+                        .child(arguments_value(&self.arguments, key, &tokens, window, cx)),
+                )
         }
+    }
+
+    #[gpui::test]
+    async fn long_paths_and_arguments_wrap_within_minimum_panel_in_both_palettes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let executable = format!("/opt/{}worker", "segment/".repeat(55));
+        let argument = format!("https://example.invalid/{}", "token".repeat(80));
+        let arguments = vec![argument.clone(), "--tail".to_string()];
+        for palette in [0, 4] {
+            for width in [280., 560.] {
+                let (_, visual) = cx.add_window_view(|_, _| WrappedDetailLayoutTest {
+                    palette,
+                    width,
+                    executable: executable.clone(),
+                    arguments: arguments.clone(),
+                });
+                visual.run_until_parked();
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+                let panel = visual.debug_bounds("minimum-detail-panel").unwrap();
+                let path = visual.debug_bounds("executable-value").unwrap();
+                let argument_bounds = visual.debug_bounds("arguments-value").unwrap();
+                assert_eq!(panel.size.width, px(width - 24.));
+                assert!(path.size.width <= panel.size.width, "path bounds: {path:?}");
+                assert!(
+                    argument_bounds.size.width <= panel.size.width,
+                    "argument bounds: {argument_bounds:?}"
+                );
+                assert!(path.size.height >= px(64.), "path was truncated: {path:?}");
+                assert!(
+                    argument_bounds.size.height >= px(64.),
+                    "argument was truncated: {argument_bounds:?}"
+                );
+
+                let path_start = path.origin + point(px(2.), px(2.));
+                let path_end = path.bottom_right() - point(px(2.), px(2.));
+                visual.simulate_mouse_down(path_start, MouseButton::Left, Modifiers::default());
+                visual.simulate_mouse_move(path_end, Some(MouseButton::Left), Modifiers::default());
+                visual.simulate_mouse_up(path_end, MouseButton::Left, Modifiers::default());
+                visual.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    assert_eq!(
+                        gpui_base::TextSelection::selected_text(window, cx),
+                        executable
+                    );
+                });
+
+                let arguments_start = argument_bounds.origin + point(px(2.), px(2.));
+                let arguments_end = argument_bounds.bottom_right() - point(px(2.), px(2.));
+                visual.simulate_mouse_down(
+                    arguments_start,
+                    MouseButton::Left,
+                    Modifiers::default(),
+                );
+                visual.simulate_mouse_move(
+                    arguments_end,
+                    Some(MouseButton::Left),
+                    Modifiers::default(),
+                );
+                visual.simulate_mouse_up(arguments_end, MouseButton::Left, Modifiers::default());
+                visual.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    assert_eq!(
+                        gpui_base::TextSelection::selected_text(window, cx),
+                        arguments.join("\n")
+                    );
+                });
+            }
+        }
+    }
+
+    struct CopyDetailTest {
+        search: Entity<gpui_component::input::InputState>,
+    }
+
+    impl Render for CopyDetailTest {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let tokens = crate::palette::presets()[0].base.tokens();
+            let key = ProcessKey {
+                pid: 9,
+                start_time: 1,
+            };
+            div()
+                .key_context("Root")
+                .w(px(400.))
+                .flex()
+                .flex_col()
+                .child(gpui_base::TextSelectionLayer)
+                .child(gpui_component::input::Input::new(&self.search))
+                .child(super::detail_section_header(
+                    "EXECUTABLE",
+                    "copy-executable",
+                    " /bin/worker ".into(),
+                    &tokens,
+                    cx,
+                ))
+                .child(executable_value(" /bin/worker ", key, &tokens, window, cx))
+                .child(arguments_value(
+                    &[" alpha beta ".into()],
+                    key,
+                    &tokens,
+                    window,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .id("command-test")
+                        .debug_selector(|| "command-test".into())
+                        .child(super::selectable_wrapped_content(
+                            window,
+                            "command",
+                            "\nalpha beta",
+                            &tokens,
+                            cx,
+                        )),
+                )
+        }
+    }
+
+    #[gpui::test]
+    async fn detail_selection_focus_refresh_and_exact_copy(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
+            search: cx.new(|cx| {
+                gpui_component::input::InputState::new(window, cx).default_value("search text")
+            }),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        for selector in ["executable-value", "arguments-value"] {
+            let search_focus = visual.update(|window, cx| {
+                let search = view.read(cx).search.clone();
+                let focus = search.read(cx).focus_handle(cx);
+                focus.focus(window, cx);
+                focus
+            });
+            visual.simulate_keystrokes("cmd-a");
+            let bounds = visual.debug_bounds(selector).unwrap();
+            let start = bounds.origin + point(px(1.), px(5.));
+            let end = bounds.origin + point(px(46.), px(5.));
+            visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+            visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+            visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+            visual.update(|window, cx| assert_ne!(window.focused(cx), Some(search_focus)));
+            visual.run_until_parked();
+            visual.simulate_keystrokes("cmd-c");
+            visual.update(|window, cx| {
+                let selected = gpui_base::TextSelection::selected_text(window, cx);
+                assert!(!selected.is_empty());
+                assert!(selected.len() < 12, "partial selection: {selected:?}");
+                assert!(selected.starts_with(' '), "leading space: {selected:?}");
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), selected);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn detail_partial_selection_refreshes_without_forced_draw(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
+            search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = visual.debug_bounds("executable-value").unwrap();
+        let start = bounds.origin + point(px(1.), px(5.));
+        let end = bounds.origin + point(px(46.), px(5.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            let selected = gpui_base::TextSelection::selected_text(window, cx);
+            assert!(!selected.is_empty());
+            assert!(selected.len() < 12, "partial selection: {selected:?}");
+        });
+    }
+
+    #[gpui::test]
+    async fn detail_command_preserves_leading_newline(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
+            search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = visual.debug_bounds("command-test").unwrap();
+        let start = bounds.origin + point(px(1.), px(1.));
+        let end = bounds.bottom_right() - point(px(1.), px(1.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            assert_eq!(
+                gpui_base::TextSelection::selected_text(window, cx),
+                "\nalpha beta"
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn detail_copy_button_writes_source_text(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
+            search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let position = visual.debug_bounds("copy-executable").unwrap().center();
+        visual.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(position, MouseButton::Left, Modifiers::default());
+        visual.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                " /bin/worker "
+            )
+        });
     }
 
     #[test]

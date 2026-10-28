@@ -4,6 +4,7 @@ use super::*;
 use std::prelude::v1::test;
 thread_local! {
     static FIXED_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LONG_DETAIL_REVIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -75,7 +76,16 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
                 } else {
                     0.
                 };
-                test_data::process(pid, &format!("process-{pid:04}"), cpu)
+                let mut process = test_data::process(pid, &format!("process-{pid:04}"), cpu);
+                if pid == 1 && LONG_DETAIL_REVIEW.with(std::cell::Cell::get) {
+                    process.executable =
+                        format!("/Users/gtop/{}worker", "long_directory_name/".repeat(8));
+                    let long_argument = format!("https://example.invalid/{}", "token".repeat(25));
+                    process.argv =
+                        vec![process.executable.clone(), "--config".into(), long_argument];
+                    process.command = format!("kernel_task/{}", "renamed_process".repeat(8));
+                }
+                process
             })
             .collect::<Vec<_>>()
             .into();
@@ -217,6 +227,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         pending_kill: None,
         wake: mpsc::channel(1).0,
         _subscriptions: subscriptions,
+        focus_restore: None,
         _refresh: Some(Task::ready(())),
         shutdown: None,
         _ports: Task::ready(()),
@@ -648,6 +659,7 @@ fn aluminium_offscreen_review() {
         std::fs::write(disk_home.join(format!("file-{i:03}")), [1u8; 4096]).unwrap();
     }
     FIXED_CLOCK.with(|v| v.set(true));
+    LONG_DETAIL_REVIEW.with(|v| v.set(true));
     let mut cx = HeadlessAppContext::with_platform(
         Arc::new(gpui_apple::AppleTextSystem::new()),
         Arc::new(gpui_kit_assets::Assets),
@@ -675,7 +687,7 @@ fn aluminium_offscreen_review() {
 
     let mut monitor = None;
     let handle = cx
-        .open_window(size(px(1480.), px(960.)), |window, cx| {
+        .open_window(size(px(1480.), px(1200.)), |window, cx| {
             let entity = cx.new(|cx| fixture(window, cx));
             entity.update(cx, |m, cx| {
                 m.settings.active = 4;
@@ -744,7 +756,39 @@ fn aluminium_offscreen_review() {
             .save(directory.join(format!("{name}.png")))
             .unwrap();
     }
+
+    for (palette_name, palette_index) in [("amber", 0), ("aluminium", 4)] {
+        cx.update(|cx| {
+            monitor.update(cx, |m, cx| {
+                m.settings.active = palette_index;
+                let base = m.settings.base();
+                theme::apply(base, cx);
+                m.table.update(cx, |table, cx| {
+                    table.base = base;
+                    cx.notify();
+                });
+                m.view = None;
+                m.settings_open = false;
+                m.details = None;
+                m.select(
+                    ProcessKey::from(&m.snapshot.as_ref().unwrap().processes[0]),
+                    cx,
+                );
+                cx.notify();
+            });
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        cx.capture_screenshot(handle.into())
+            .unwrap()
+            .save(directory.join(format!("{palette_name}-detail-long.png")))
+            .unwrap();
+    }
     FIXED_CLOCK.with(|v| v.set(false));
+    LONG_DETAIL_REVIEW.with(|v| v.set(false));
 }
 
 #[cfg(target_os = "macos")]
@@ -1263,5 +1307,107 @@ async fn tower_title_stays_clear_of_the_upper_left_screw(cx: &mut TestAppContext
             title.origin.x >= screw.origin.x + screw.size.width,
             "preset {index}: title {title:?} overlaps screw {screw:?}"
         );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_focus_returns_after_escape(cx: &mut TestAppContext) {
+    detail_focus_transition(cx, "escape");
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_focus_returns_after_navigation(cx: &mut TestAppContext) {
+    detail_focus_transition(cx, "j");
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_focus_returns_after_settings(cx: &mut TestAppContext) {
+    detail_focus_transition(cx, "s");
+}
+
+#[cfg(target_os = "macos")]
+fn detail_focus_transition(cx: &mut TestAppContext, key: &str) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let (root, visual) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| {
+            let mut monitor = fixture(window, cx);
+            let key = ProcessKey::from(&monitor.snapshot.as_ref().unwrap().processes[0]);
+            monitor.select(key, cx);
+            monitor
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let _root = root;
+    let monitor = monitor.unwrap();
+    visual.simulate_resize(size(px(1480.), px(960.)));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let bounds = visual.debug_bounds("executable-value").unwrap();
+    let start = bounds.origin + point(px(1.), px(5.));
+    let end = bounds.origin + point(px(46.), px(5.));
+    visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    visual.update(|window, cx| {
+        assert!(window.focused(cx).is_some());
+        assert_ne!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        assert!(!gpui_base::TextSelection::selected_text(window, cx).is_empty());
+    });
+    let before = monitor.read_with(visual, |monitor, cx| monitor.table.read(cx).selected);
+    visual.simulate_keystrokes(key);
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        assert_eq!(
+            window.focused(cx),
+            Some(monitor.read(cx).focus.clone()),
+            "focus after {key}"
+        );
+    });
+    match key {
+        "escape" => {
+            assert!(monitor.read_with(visual, |monitor, _| monitor.details.is_none()));
+            visual.simulate_keystrokes("j");
+            assert_ne!(
+                monitor.read_with(visual, |monitor, cx| monitor.table.read(cx).selected),
+                before
+            );
+            visual.simulate_keystrokes("/");
+            visual.update(|window, cx| {
+                assert_eq!(
+                    window.focused(cx),
+                    Some(monitor.read(cx).search.read(cx).focus_handle(cx))
+                )
+            });
+        }
+        "j" => {
+            let first = monitor.read_with(visual, |monitor, cx| monitor.table.read(cx).selected);
+            assert_ne!(first, before);
+            visual.simulate_keystrokes("j");
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            assert_ne!(
+                monitor.read_with(visual, |monitor, cx| monitor.table.read(cx).selected),
+                first
+            );
+        }
+        "s" => {
+            assert!(monitor.read_with(visual, |monitor, _| monitor.settings_open));
+            visual.simulate_keystrokes("escape");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            assert!(!monitor.read_with(visual, |monitor, _| monitor.settings_open));
+        }
+        _ => unreachable!(),
     }
 }
