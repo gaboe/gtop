@@ -4,14 +4,13 @@
 //! including CPU, memory, network, and disk usage.
 
 use super::{GpuMonitor, SystemStats, TemperatureMonitor};
-use std::collections::HashMap;
 use std::fmt::Debug;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use sysinfo::{Disk, DiskRefreshKind, Disks, Networks, System};
 
 #[cfg(target_os = "macos")]
-use std::{ffi::CString, os::unix::ffi::OsStrExt};
+use std::{collections::HashMap, ffi::CString, os::unix::ffi::OsStrExt, path::PathBuf};
 
 #[derive(Clone, Copy)]
 struct DiskCapacity {
@@ -28,12 +27,14 @@ struct DiskStats {
     purgeable_bytes: u64,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Default)]
 struct DiskSample {
     real_free_bytes: Option<u64>,
     purgeable_bytes: Option<u64>,
 }
 
+#[cfg(target_os = "macos")]
 impl DiskSample {
     fn paired(important_free_bytes: u64, real_free_bytes: u64) -> Self {
         Self {
@@ -68,6 +69,7 @@ pub struct SystemMonitor {
     /// Reads the temperature sensors
     temperature_monitor: TemperatureMonitor,
     disks_refreshed_at: Option<Instant>,
+    #[cfg(target_os = "macos")]
     disk_samples: HashMap<PathBuf, DiskSample>,
 }
 
@@ -93,6 +95,7 @@ impl SystemMonitor {
             gpu_monitor: GpuMonitor::new(),
             temperature_monitor: TemperatureMonitor::new(),
             disks_refreshed_at: None,
+            #[cfg(target_os = "macos")]
             disk_samples: HashMap::new(),
         }
     }
@@ -146,7 +149,7 @@ impl SystemMonitor {
         &mut self,
         disks: &mut Disks,
         refresh: impl FnOnce() -> Disks,
-        mut read_free: impl FnMut(&Path) -> Option<u64>,
+        read_free: impl FnMut(&Path) -> Option<u64>,
     ) {
         if self
             .disks_refreshed_at
@@ -155,16 +158,22 @@ impl SystemMonitor {
             return;
         }
         *disks = refresh();
-        let mut samples = HashMap::new();
-        for disk in disks.iter().filter(|disk| Self::is_shown(disk)) {
-            let path = disk.mount_point().to_path_buf();
-            let real_free_bytes = read_free(&path);
-            let previous = self.disk_samples.get(&path).copied().unwrap_or_default();
-            let mut sample = previous;
-            sample.refresh_pair(disk.available_space(), real_free_bytes);
-            samples.insert(path, sample);
+        #[cfg(target_os = "macos")]
+        {
+            let mut read_free = read_free;
+            let mut samples = HashMap::new();
+            for disk in disks.iter().filter(|disk| Self::is_shown(disk)) {
+                let path = disk.mount_point().to_path_buf();
+                let real_free_bytes = read_free(&path);
+                let previous = self.disk_samples.get(&path).copied().unwrap_or_default();
+                let mut sample = previous;
+                sample.refresh_pair(disk.available_space(), real_free_bytes);
+                samples.insert(path, sample);
+            }
+            self.disk_samples = samples;
         }
-        self.disk_samples = samples;
+        #[cfg(not(target_os = "macos"))]
+        let _ = read_free;
         self.disks_refreshed_at = Some(Instant::now());
     }
 
@@ -208,10 +217,12 @@ impl SystemMonitor {
     fn calculate_disk_stats_with(
         &mut self,
         disks: &Disks,
-        mut read_free: impl FnMut(&Path) -> Option<u64>,
+        read_free: impl FnMut(&Path) -> Option<u64>,
     ) -> DiskStats {
+        #[cfg(target_os = "macos")]
+        let mut read_free = read_free;
         #[cfg(not(target_os = "macos"))]
-        let _ = &mut read_free;
+        let _ = read_free;
 
         let mut capacities = Vec::new();
         for disk in disks.iter().filter(|disk| Self::is_shown(disk)) {
@@ -240,6 +251,7 @@ impl SystemMonitor {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn disk_capacity(total_bytes: u64, sample: &DiskSample) -> Option<DiskCapacity> {
     Some(DiskCapacity {
         total_bytes,
@@ -287,7 +299,7 @@ fn real_free_bytes(mount_point: &Path) -> Option<u64> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn sample_disk_stats(total_bytes: u64, sample: &DiskSample) -> Option<DiskStats> {
     Some(aggregate_disk_capacities([disk_capacity(
         total_bytes,
@@ -360,6 +372,45 @@ mod tests {
         assert!(monitor.disks_refreshed_at.is_some());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn storage_tick_uses_the_paired_purgeable_value_and_last_good_live_free() {
+        let mut monitor = SystemMonitor::new(&Networks::new());
+        let mut disks = Disks::new();
+        let important_free_bytes = std::cell::Cell::new(0);
+
+        monitor.refresh_disks_with(
+            &mut disks,
+            || {
+                let refreshed = Disks::new_with_refreshed_list_specifics(
+                    DiskRefreshKind::nothing().with_storage(),
+                );
+                let important = refreshed
+                    .iter()
+                    .find(|disk| disk.mount_point() == Path::new("/"))
+                    .expect("system volume is present")
+                    .available_space();
+                important_free_bytes.set(important);
+                refreshed
+            },
+            |_| Some(important_free_bytes.get().saturating_sub(200)),
+        );
+
+        let important = important_free_bytes.get();
+        assert!(important > 220, "system volume has enough free space");
+        let tick_free = important - 220;
+        let tick = monitor.calculate_disk_stats_with(&disks, |_| Some(tick_free));
+        assert!(tick.total_bytes > 0);
+        assert_eq!(tick.free_bytes, tick_free);
+        assert_eq!(tick.used_bytes, tick.total_bytes - tick_free);
+        assert_eq!(tick.purgeable_bytes, 200);
+
+        let failed_read = monitor.calculate_disk_stats_with(&disks, |_| None);
+        assert_eq!(failed_read.free_bytes, tick_free);
+        assert_eq!(failed_read.used_bytes, tick.total_bytes - tick_free);
+        assert_eq!(failed_read.purgeable_bytes, 200);
+    }
+
     #[test]
     fn disk_stats_separate_space_free_now_from_purgeable_space() {
         let stats = aggregate_disk_capacities([DiskCapacity {
@@ -374,6 +425,7 @@ mod tests {
         assert_eq!(stats.purgeable_bytes, 180);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn paired_purgeable_stays_fixed_between_refreshes() {
         let mut sample = DiskSample::paired(130, 100);
@@ -392,6 +444,7 @@ mod tests {
         assert_eq!(after_paired_refresh.purgeable_bytes, 20);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn failed_free_read_keeps_last_good_capacity_or_reports_unknown() {
         let mut sample = DiskSample::paired(130, 100);
@@ -409,6 +462,7 @@ mod tests {
         assert_eq!(after_failed_pair.purgeable_bytes, 0);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn purgeable_saturates_when_real_free_exceeds_important_free() {
         let sample = DiskSample::paired(100, 120);
