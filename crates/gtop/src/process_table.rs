@@ -9,6 +9,7 @@ use gtop_core::{ProcessInfo, Snapshot};
 use std::rc::Rc;
 
 const TOP_ROWS: usize = 10;
+const BLINK_CPU: f32 = 400.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowTier {
@@ -89,6 +90,12 @@ impl Processes {
     }
     pub fn process(&self, row: usize) -> Option<&ProcessInfo> {
         self.snapshot.as_ref()?.processes.get(*self.order.get(row)?)
+    }
+    pub fn has_blinking_lamp(&self) -> bool {
+        (0..self.order.len()).any(|row| {
+            self.process(row)
+                .is_some_and(|process| process.cpu_usage > BLINK_CPU)
+        })
     }
     pub fn row_for(&self, key: ProcessKey) -> Option<usize> {
         self.order.iter().position(|index| {
@@ -196,7 +203,7 @@ impl Processes {
                         .when(kind == ProcessColumn::Age, |d| d.text_right());
                     if kind == ProcessColumn::Lamp {
                         return cell.child(div().w(px(7.)).h(px(12.)).bg(rgb(
-                            if p.cpu_usage > 400. {
+                            if p.cpu_usage > BLINK_CPU {
                                 if now_blink() {
                                     t.base.hot
                                 } else {
@@ -361,6 +368,7 @@ impl Render for Processes {
         );
         div()
             .id("process-table-viewport")
+            .debug_selector(|| "interaction-process-viewport".into())
             .relative()
             .size_full()
             .min_w_0()
@@ -404,6 +412,27 @@ mod tests {
     use super::{row_tier, Processes, RowTier, SelectProcess, TOP_ROWS};
     use crate::model::{ProcessColumn, ProcessKey, Search};
     use std::rc::Rc;
+
+    #[test]
+    fn filtered_or_cooled_processes_do_not_require_a_blinking_lamp() {
+        let mut snapshot = crate::test_data::snapshot();
+        std::sync::Arc::make_mut(&mut snapshot.processes)[0].cpu_usage = 401.;
+        let mut table = Processes {
+            snapshot: Some(Rc::new(snapshot)),
+            ..Default::default()
+        };
+        table.reorder();
+        assert!(table.has_blinking_lamp());
+        table.search = Search::new("quiet");
+        table.reorder();
+        assert!(!table.has_blinking_lamp());
+        table.search = Search::default();
+        table.reorder();
+        let snapshot = Rc::get_mut(table.snapshot.as_mut().unwrap()).unwrap();
+        std::sync::Arc::make_mut(&mut snapshot.processes)[0].cpu_usage = 400.;
+        assert!(!table.has_blinking_lamp());
+    }
+
     #[gpui::test]
     async fn name_handle_resizes_and_resets_without_sort_or_selection(
         cx: &mut gpui::TestAppContext,

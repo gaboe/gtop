@@ -1518,6 +1518,7 @@ impl Monitor {
             nav = nav.child(
                 div()
                     .id(("view", i))
+                    .debug_selector(move || format!("interaction-view-{i}"))
                     .role(Role::Button)
                     .cursor_pointer()
                     .flex()
@@ -1754,6 +1755,7 @@ impl Monitor {
                 .child(
                     div()
                         .id("history-table-viewport")
+                        .debug_selector(|| "interaction-history-viewport".into())
                         .relative()
                         .flex_1()
                         .min_h_0()
@@ -2011,7 +2013,16 @@ impl Monitor {
                         )
                         .child(tape(h, self.metric, 54., mem, &t, self.moment, cx)),
                 )
-                .child(div().flex_1().min_h_0().child(self.table.clone()));
+                .child(div().flex_1().min_h_0().child(
+                    if self.table.read(cx).has_blinking_lamp() {
+                        self.table.clone().into_any_element()
+                    } else {
+                        self.table
+                            .clone()
+                            .cached(StyleRefinement::default().size_full().min_w_0())
+                            .into_any_element()
+                    },
+                ));
         }
         let operation_status =
             !self.status.starts_with("Reading") && self.status != "Select a process for details";

@@ -19,6 +19,7 @@ Run on macOS from the repository root. Fetch pinned dependencies before the firs
 rtk proxy cargo fetch --locked
 rtk proxy python3 crates/gtop/scripts/draw-benchmark.py --mode validate
 rtk proxy python3 crates/gtop/scripts/draw-benchmark.py --mode clean
+rtk proxy python3 crates/gtop/scripts/draw-benchmark.py --mode clean --interactions
 ```
 
 No native window opens. The release profile stays at opt-level 3, fat LTO, one codegen unit, and no incremental compilation. Each state gets five warmup draws and 31 measured draws. Use `--samples 5` for a short run. Use `--debug` only to check the tool.
@@ -36,7 +37,11 @@ Process counts must be 1 through 100000. Core counts must be 1 through 256. View
 
 The timer measures Darwin thread CPU around `Window::draw`. The test forces a full refresh and asserts one Monitor render inside each timed draw. Arena cleanup, scene observation, fixture construction, presentation and GPU execution stay outside timing. AppleTextSystem and bundled fonts provide production text shaping. Collectors and settings writers stay inactive.
 
-Clean mode disables AnyElement increments and per-frame scene formatting. It retains a thread-local enabled check per AnyElement allocation, one counter reset per draw, two timer calls and one Monitor render-counter increment. Both modes disable the existing unit-glyph test bounds recorder. Validation mode records work counts and scene digests after each measured draw. Use clean mode for performance claims. Alternate clean and validation runs to measure observer effects. Changing runtime modes does not rebuild dependencies.
+Clean mode disables AnyElement increments and per-frame scene formatting. It retains a thread-local enabled check per AnyElement allocation, one counter reset per draw, two timer calls, a disabled interaction-timer check, and one Monitor render-counter increment. The copied GPUI records debug selector bounds in release builds so interactions can target the rendered controls. Both modes disable the existing unit-glyph test bounds recorder. Validation mode records work counts and scene digests after each measured draw. Use clean mode for performance claims. Alternate clean and validation runs to measure observer effects. Changing runtime modes does not rebuild dependencies.
+
+Interaction mode uses the same fixture at 1480x960 and the test platform's scale factor of 2. It visits Live, Detail, 24-hour history, and the palette panel. It sends stationary moves, row and header moves, button enter and leave, wheel scroll, row clicks, and text selection drags. The `events` field counts interaction steps. A wheel step sends a move and a wheel event. A row-click step sends a move, press, and release. Views that do not support an action skip it.
+
+The interaction timer runs inside `Window::draw`. It counts draws that GPUI's test context performs while it flushes event effects. `draws` counts actual frames. `renders` counts Monitor renders. `draw_cpu_ms` excludes arena cleanup. `event_cpu_ms` measures the remaining thread CPU for the event step, including effects and arena cleanup. Scene hashes run once before and after each action, outside the timed steps. Assertions require scroll to change the scene, row clicks to open Detail, and a drag to select text. No native window opens.
 
 The script copies pinned GPUI into ignored `target/draw-benchmark`. It checks all upstream bytes, its own bytes and all generated copy bytes. A damaged copy is reconstructed. Registry files stay unchanged. A script-private cfg enables access to copied instrumentation methods. Stock Cargo features do not depend on those methods.
 
@@ -54,4 +59,4 @@ Run isolated state probes with this command.
 rtk proxy python3 -m unittest discover -s crates/gtop/scripts -p 'test_draw_benchmark.py' -v
 ```
 
-For a separate symbolized profile, use `--symbols`. This adds debuginfo and retains symbols for the final test executable. Dependency line tables may be absent. All optimization settings stay unchanged. Sample only the owned test process. Discard profiled timings.
+For a separate symbolized profile, use `--symbols`. This adds debuginfo and retains symbols through `RUSTFLAGS`, including dependency symbols. All optimization settings stay unchanged. Sample only the owned test process. Discard profiled timings.

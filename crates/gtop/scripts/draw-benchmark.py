@@ -39,10 +39,36 @@ def prepare(source, scratch):
         shutil.rmtree(scratch)
     shutil.copytree(source, scratch)
     element = scratch / "src/element.rs"
+    div = scratch / "src/elements/div.rs"
+    selectors = div.read_text()
+    selector_cfg = 'all(debug_assertions, feature = "test-support")'
+    if selectors.count(selector_cfg) != 4:
+        raise SystemExit("Pinned debug selector configuration changed")
+    div.write_text(selectors.replace(selector_cfg, 'feature = "test-support"'))
     element.write_text(element.read_text() + """
     thread_local! {
         pub(crate) static DRAW_BENCH_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub(crate) static DRAW_BENCH_ELEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(crate) static DRAW_BENCH_TIMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(crate) static DRAW_BENCH_TIMES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn draw_benchmark_cpu_ns() -> u64 {
+        unsafe extern "C" { fn clock_gettime_nsec_np(clock_id: u32) -> u64; }
+        unsafe { clock_gettime_nsec_np(16) }
+    }
+    pub(crate) struct DrawBenchmarkTimer(Option<u64>);
+    impl DrawBenchmarkTimer {
+        pub(crate) fn new() -> Self {
+            Self(DRAW_BENCH_TIMING.with(|enabled| enabled.get()).then(draw_benchmark_cpu_ns))
+        }
+    }
+    impl Drop for DrawBenchmarkTimer {
+        fn drop(&mut self) {
+            if let Some(start) = self.0 {
+                let elapsed = draw_benchmark_cpu_ns() - start;
+                DRAW_BENCH_TIMES.with(|times| times.borrow_mut().push(elapsed));
+            }
+        }
     }
     """)
     replace_once(element,
@@ -51,7 +77,7 @@ def prepare(source, scratch):
     window = scratch / "src/window.rs"
     replace_once(window,
         "    pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {",
-        "    pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {\n        crate::element::DRAW_BENCH_ELEMENTS.with(|count| count.set(0));")
+        "    pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {\n        let _draw_benchmark_timer = crate::element::DrawBenchmarkTimer::new();\n        crate::element::DRAW_BENCH_ELEMENTS.with(|count| count.set(0));")
     window.write_text(window.read_text() + """
     impl Window {
         #[allow(missing_docs)]
@@ -157,6 +183,15 @@ thread_local! {
 pub fn draw_benchmark_observe(enabled: bool) {
     element::DRAW_BENCH_ENABLED.with(|flag| flag.set(enabled));
 }
+#[allow(missing_docs)]
+pub fn draw_benchmark_record_draws(enabled: bool) {
+    element::DRAW_BENCH_TIMING.with(|flag| flag.set(enabled));
+    element::DRAW_BENCH_TIMES.with(|times| times.borrow_mut().clear());
+}
+#[allow(missing_docs)]
+pub fn draw_benchmark_take_draws() -> Vec<u64> {
+    element::DRAW_BENCH_TIMES.with(|times| std::mem::take(&mut *times.borrow_mut()))
+}
 """)
     marker.write_text(json.dumps({"input": identity, "output": tree_digest(scratch)}))
     return identity
@@ -177,7 +212,14 @@ def run_child(command, root, env, capture=False):
     expected = patched_lock(original)
     try:
         if capture:
-            return subprocess.run(command, cwd=root, env=env, stdout=subprocess.PIPE, text=True, check=True)
+            result = subprocess.run(command, cwd=root, env=env, stdout=subprocess.PIPE, text=True)
+            if result.returncode:
+                for line in result.stdout.splitlines():
+                    message = json.loads(line)
+                    if message.get("reason") == "compiler-message":
+                        print(message["message"].get("rendered", line), flush=True)
+                result.check_returncode()
+            return result
         return subprocess.call(command, cwd=root, env=env)
     finally:
         current = lock.read_bytes()
@@ -191,6 +233,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--symbols", action="store_true", help="retain test executable symbols for a separate profile")
+    parser.add_argument("--interactions", action="store_true", help="dispatch real headless mouse, scroll and selection events")
     parser.add_argument("--samples", type=int, default=31)
     parser.add_argument("--mode", choices=["validate", "clean"], default="validate")
     args = parser.parse_args()
@@ -212,18 +255,19 @@ def main():
         scratch = directory / "gpui-pre-0.3.9"
         identity = prepare(matches[0], scratch)
         print(f"GPUI source={matches[0]} instrumentation_sha256={identity} mode={args.mode}", flush=True)
-        command = ["cargo", "--config", f'patch.crates-io.gpui-pre.path="{scratch}"', "rustc", "-p", "gtop", "--tests", "--message-format=json"]
+        command = ["cargo", "--config", f'patch.crates-io.gpui-pre.path="{scratch}"', "test", "-p", "gtop", "--bin", "gtop", "--no-run", "--message-format=json"]
         if not args.debug:
             command.append("--release")
-        command += ["--", "--cfg", "gtop_draw_benchmark"]
+        flags = os.environ.get("RUSTFLAGS", "") + " --cfg gtop_draw_benchmark"
         if args.symbols:
-            command += ["-C", "debuginfo=1", "-C", "strip=none"]
-        env = dict(os.environ, GTOP_DRAW_N=str(args.samples), GTOP_DRAW_MODE=args.mode)
+            flags += " -C debuginfo=1 -C strip=none"
+        env = dict(os.environ, RUSTFLAGS=flags, GTOP_DRAW_N=str(args.samples), GTOP_DRAW_MODE=args.mode)
         built = run_child(command, root, env, capture=True)
         executables = [item["executable"] for line in built.stdout.splitlines() if (item := json.loads(line)).get("executable") and item.get("profile", {}).get("test")]
         if len(executables) != 1:
             raise RuntimeError(f"expected one test executable, got {executables}")
-        return subprocess.call([executables[0], "full_monitor_draw_benchmark", "--ignored", "--nocapture", "--test-threads=1"], cwd=root, env=env)
+        test = "monitor_interaction_benchmark" if args.interactions else "full_monitor_draw_benchmark"
+        return subprocess.call([executables[0], test, "--ignored", "--nocapture", "--test-threads=1"], cwd=root, env=env)
 
 
 if __name__ == "__main__":
