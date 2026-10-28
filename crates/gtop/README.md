@@ -22,7 +22,7 @@ Select a process to show its command, root directory, resources, parent, and chi
 
 Choose a refresh interval from 1, 2, 3, 5, or 10 seconds. The default is 3 seconds. Pause stops sampling. GPUI visibility events also stop sampling when the window is minimized, hidden, fully covered, or on a sleeping display. One snapshot that already started can finish after the window becomes hidden.
 
-The SSD panel shows system-volume storage in decimal GB. The app reads free space on every sample. It refreshes total capacity and the paired purgeable-space estimate every 60 seconds while sampling runs. On macOS, purgeable space is the difference between `NSURLVolumeAvailableCapacityForImportantUsageKey` and free space from the same refresh. The APFS volumes share the container capacity.
+The SSD panel shows system-volume storage in decimal GB. On macOS, the app reads free space on every sample and refreshes total capacity and the paired purgeable-space estimate every 60 seconds while sampling runs. Purgeable space is the difference between `NSURLVolumeAvailableCapacityForImportantUsageKey` and free space from the same refresh. APFS volumes share the container capacity. On other platforms, gtop uses sysinfo's available-space value, which updates during the 60-second disk refresh. It reports no purgeable space.
 
 To log sampling and visible UI ticks, run:
 
