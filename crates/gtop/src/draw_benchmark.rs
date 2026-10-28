@@ -327,10 +327,11 @@ fn very_long_detail_open_and_redraw_benchmark() {
     }
     samples.sort_by(f64::total_cmp);
     let median = (samples[(samples.len() - 1) / 2] + samples[samples.len() / 2]) / 2.;
+    let minimum = samples[0];
     let maximum = samples[samples.len() - 1];
     assert!(maximum <= median * 5., "stress draw outlier: {samples:?}");
     println!(
-        "detail_stress arguments=10000 command_bytes=200000 median_ms={median:.3} max_ms={maximum:.3} runs={} bound=5x_median errors=0",
+        "detail_stress arguments=10000 command_bytes=200000 min_ms={minimum:.3} median_ms={median:.3} max_ms={maximum:.3} runs={} bound=5x_median errors=0",
         samples.len()
     );
 }
