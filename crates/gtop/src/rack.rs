@@ -695,6 +695,30 @@ struct DotViewEntry {
 }
 impl Global for DotViews {}
 
+#[cfg(all(test, target_os = "macos", gtop_draw_benchmark))]
+pub(super) fn clear_dot_views(cx: &mut App) {
+    cx.default_global::<DotViews>().0.clear();
+}
+
+#[cfg(all(test, target_os = "macos", gtop_draw_benchmark))]
+pub(super) fn assert_dot_view_bounds(window: &mut Window, cx: &mut App) {
+    clear_dot_views(cx);
+    let bounds = Bounds::new(point(px(0.), px(0.)), size(px(30.), px(30.)));
+    let _ = dot_view(bounds, 0xffb000, window, cx);
+    let _ = dot_view(
+        Bounds::new(point(px(40.), px(0.)), bounds.size),
+        0xffb000,
+        window,
+        cx,
+    );
+    assert_eq!(
+        cx.default_global::<DotViews>().0.len(),
+        2,
+        "distinct bounds must retain distinct dot views"
+    );
+    clear_dot_views(cx);
+}
+
 fn dot_view(bounds: Bounds<Pixels>, color: u32, window: &mut Window, cx: &mut App) -> AnyElement {
     let key = WinDotKey::from_bounds(bounds);
     let id = window.window_handle().window_id();
