@@ -11,6 +11,7 @@ use gpui_component::{
 };
 use gtop_core::ProcessInfo;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::ops::Range;
 
 pub(super) const DETAIL_WIDTH_MIN: f32 = 280.;
 pub(super) const DETAIL_WIDTH_MAX: f32 = 560.;
@@ -1068,11 +1069,187 @@ fn path_parts(path: &str) -> (&str, &str) {
     (directory, filename)
 }
 
-fn selectable_colored_text(id: String, text: &str, color: u32) -> gpui_base::SelectableText {
-    gpui_base::SelectableText::new(id, text.to_string()).text_style(TextStyleRefinement {
-        color: Some(rgb(color).into()),
-        ..Default::default()
-    })
+fn selectable_styled_text(
+    id: impl Into<ElementId>,
+    text: String,
+    base_color: u32,
+    selection_color: u32,
+    highlights: impl IntoIterator<Item = (Range<usize>, u32)>,
+) -> DetailSelectableText {
+    let highlights = highlights.into_iter().map(|(range, color)| {
+        (
+            range,
+            HighlightStyle {
+                color: Some(rgb(color).into()),
+                ..Default::default()
+            },
+        )
+    });
+    DetailSelectableText {
+        id: id.into(),
+        text: text.clone().into(),
+        styled_text: StyledText::new(text).with_highlights(highlights),
+        base_color,
+        selection_color,
+    }
+}
+
+struct DetailSelectableText {
+    id: ElementId,
+    text: SharedString,
+    styled_text: StyledText,
+    base_color: u32,
+    selection_color: u32,
+}
+
+impl IntoElement for DetailSelectableText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for DetailSelectableText {
+    type RequestLayoutState = gpui_base::TextSelectionHandle;
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let handle = window.with_element_state(
+            global_id.expect("DetailSelectableText must have a stable element id"),
+            |retained: Option<gpui_base::TextSelectionHandle>, _| {
+                let handle = retained.unwrap_or_else(|| {
+                    gpui_base::TextSelectionHandle::new(self.text.to_string(), cx)
+                });
+                (handle.clone(), handle)
+            },
+        );
+        let (layout_id, ()) = window.with_text_style(
+            Some(TextStyleRefinement {
+                color: Some(rgb(self.base_color).into()),
+                ..Default::default()
+            }),
+            |window| {
+                self.styled_text
+                    .request_layout(global_id, inspector_id, window, cx)
+            },
+        );
+        (layout_id, handle)
+    }
+
+    fn prepaint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        handle: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.styled_text
+            .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let registration = gpui_base::TextSelectionRegistration::new(hitbox.clone(), bounds)
+            .with_text_bounds(vec![bounds])
+            .with_rendered_element(handle, window, cx);
+        handle.register(registration, window, cx);
+        hitbox
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        handle: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let layout = self.styled_text.layout().clone();
+        let selected_before = gpui_base::TextSelection::selected_text(window, cx);
+        let projection = handle.update_runs(
+            &[gpui_base::TextSelectionRun::new(
+                self.text.clone(),
+                layout.clone(),
+                bounds,
+            )],
+            cx,
+        );
+        if selected_before != gpui_base::TextSelection::selected_text(window, cx) {
+            window.refresh();
+        }
+        for range in projection.ranges().iter().flatten() {
+            if let (Some(start), Some(end)) = (
+                layout.position_for_index(range.start),
+                layout.position_for_index(range.end),
+            ) {
+                let bounds = layout.bounds();
+                for row in selection_row_bounds(start, end, bounds, layout.line_height()) {
+                    window.paint_quad(PaintQuad {
+                        bounds: row,
+                        background: rgb(self.selection_color).into(),
+                        corner_radii: Corners::default(),
+                        border_widths: Edges::default(),
+                        border_color: transparent_black(),
+                        border_style: BorderStyle::default(),
+                    });
+                }
+            }
+        }
+        self.styled_text.paint(
+            global_id,
+            inspector_id,
+            bounds,
+            &mut (),
+            &mut (),
+            window,
+            cx,
+        );
+    }
+}
+
+fn selection_row_bounds(
+    start: Point<Pixels>,
+    end: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    line_height: Pixels,
+) -> Vec<Bounds<Pixels>> {
+    if start.y == end.y {
+        return vec![Bounds::from_corners(
+            start,
+            Point::new(end.x, end.y + line_height),
+        )];
+    }
+    let mut rows = vec![Bounds::from_corners(
+        start,
+        Point::new(bounds.right(), start.y + line_height),
+    )];
+    if end.y > start.y + line_height {
+        rows.push(Bounds::from_corners(
+            Point::new(bounds.left(), start.y + line_height),
+            Point::new(bounds.right(), end.y),
+        ));
+    }
+    rows.push(Bounds::from_corners(
+        Point::new(bounds.left(), end.y),
+        Point::new(end.x, end.y + line_height),
+    ));
+    rows
 }
 
 fn executable_value(
@@ -1080,28 +1257,31 @@ fn executable_value(
     key: ProcessKey,
     tokens: &crate::palette::Tokens,
 ) -> Stateful<Div> {
-    let (directory, filename) = path_parts(executable);
-    let mut value = div()
+    let (directory, _) = path_parts(executable);
+    let base_color = if directory.is_empty() {
+        tokens.base.led
+    } else {
+        tokens.silk_dim
+    };
+    let highlights = if directory.is_empty() {
+        Vec::new()
+    } else {
+        vec![(directory.len()..executable.len(), tokens.base.led)]
+    };
+    div()
         .id("executable-value")
         .debug_selector(|| "executable-value".into())
         .w_full()
         .min_w_0()
-        .flex()
-        .flex_col()
         .font_family("JetBrains Mono")
-        .text_size(px(12.));
-    if !directory.is_empty() {
-        value = value.child(div().w_full().min_w_0().child(selectable_colored_text(
-            format!("executable-directory-{}-{}", key.pid, key.start_time),
-            directory,
-            tokens.silk_dim,
-        )));
-    }
-    value.child(div().w_full().min_w_0().child(selectable_colored_text(
-        format!("executable-name-{}-{}", key.pid, key.start_time),
-        filename,
-        tokens.base.led,
-    )))
+        .text_size(px(12.))
+        .child(selectable_styled_text(
+            format!("executable-{}-{}", key.pid, key.start_time),
+            executable.to_string(),
+            base_color,
+            tokens.selection,
+            highlights,
+        ))
 }
 
 fn arguments_value(
@@ -1109,43 +1289,31 @@ fn arguments_value(
     key: ProcessKey,
     tokens: &crate::palette::Tokens,
 ) -> Stateful<Div> {
-    if arguments.is_empty() {
-        return div()
-            .id("arguments-value")
-            .child(gpui_base::SelectableText::new(
-                format!("arguments-none-{}-{}", key.pid, key.start_time),
-                "none",
-            ));
-    }
-    let mut rows = div()
+    let text = if arguments.is_empty() {
+        "none".to_string()
+    } else {
+        arguments.join("\n")
+    };
+    let mut offset = 0;
+    let highlights = arguments.iter().filter_map(|argument| {
+        let range = offset..offset + argument.len();
+        offset = range.end + 1;
+        is_flag_argument(argument).then_some((range, tokens.base.led))
+    });
+    div()
         .id("arguments-value")
         .debug_selector(|| "arguments-value".into())
         .w_full()
         .min_w_0()
-        .flex()
-        .flex_col()
-        .gap(px(2.));
-    for (index, argument) in arguments.iter().enumerate() {
-        let color = if is_flag_argument(argument) {
-            tokens.base.led
-        } else {
-            tokens.cmd
-        };
-        let row = div()
-            .id(format!("argument-{index}"))
-            .debug_selector(move || format!("argument-{index}"))
-            .w_full()
-            .min_w_0()
-            .font_family("JetBrains Mono")
-            .text_size(px(12.))
-            .child(selectable_colored_text(
-                format!("argument-{}-{}-{index}", key.pid, key.start_time),
-                argument,
-                color,
-            ));
-        rows = rows.child(row);
-    }
-    rows
+        .font_family("JetBrains Mono")
+        .text_size(px(12.))
+        .child(selectable_styled_text(
+            format!("arguments-{}-{}", key.pid, key.start_time),
+            text,
+            tokens.cmd,
+            tokens.selection,
+            highlights,
+        ))
 }
 
 fn detail_arguments<'a>(argv: &'a [String], executable: &str) -> &'a [String] {
@@ -1470,19 +1638,20 @@ mod tests {
         palette: usize,
         width: f32,
         executable: String,
-        argument: String,
+        arguments: Vec<String>,
     }
 
     impl Render for WrappedDetailLayoutTest {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let tokens = crate::palette::presets()[self.palette].base.tokens();
-            let argument = vec![self.argument.clone()];
             let key = ProcessKey {
                 pid: 1,
                 start_time: 1,
             };
             div()
                 .w(px(self.width))
+                .h_full()
+                .child(gpui_base::TextSelectionLayer)
                 .px(px(12.))
                 .flex()
                 .flex_col()
@@ -1495,7 +1664,7 @@ mod tests {
                         .w_full()
                         .min_w_0()
                         .child(executable_value(&self.executable, key, &tokens))
-                        .child(arguments_value(&argument, key, &tokens)),
+                        .child(arguments_value(&self.arguments, key, &tokens)),
                 )
         }
     }
@@ -1507,30 +1676,65 @@ mod tests {
         cx.update(gpui_component::init);
         let executable = format!("/opt/{}worker", "segment/".repeat(55));
         let argument = format!("https://example.invalid/{}", "token".repeat(80));
+        let arguments = vec![argument.clone(), "--tail".to_string()];
         for palette in [0, 4] {
             for width in [280., 560.] {
                 let (_, visual) = cx.add_window_view(|_, _| WrappedDetailLayoutTest {
                     palette,
                     width,
                     executable: executable.clone(),
-                    argument: argument.clone(),
+                    arguments: arguments.clone(),
                 });
                 visual.run_until_parked();
                 visual.update(|window, cx| window.draw(cx).clear(cx));
                 let panel = visual.debug_bounds("minimum-detail-panel").unwrap();
                 let path = visual.debug_bounds("executable-value").unwrap();
-                let argument_row = visual.debug_bounds("argument-0").unwrap();
+                let argument_bounds = visual.debug_bounds("arguments-value").unwrap();
                 assert_eq!(panel.size.width, px(width - 24.));
                 assert!(path.size.width <= panel.size.width, "path bounds: {path:?}");
                 assert!(
-                    argument_row.size.width <= panel.size.width,
-                    "argument bounds: {argument_row:?}"
+                    argument_bounds.size.width <= panel.size.width,
+                    "argument bounds: {argument_bounds:?}"
                 );
                 assert!(path.size.height >= px(64.), "path was truncated: {path:?}");
                 assert!(
-                    argument_row.size.height >= px(64.),
-                    "argument was truncated: {argument_row:?}"
+                    argument_bounds.size.height >= px(64.),
+                    "argument was truncated: {argument_bounds:?}"
                 );
+
+                let path_start = path.origin + point(px(2.), px(2.));
+                let path_end = path.bottom_right() - point(px(2.), px(2.));
+                visual.simulate_mouse_down(path_start, MouseButton::Left, Modifiers::default());
+                visual.simulate_mouse_move(path_end, Some(MouseButton::Left), Modifiers::default());
+                visual.simulate_mouse_up(path_end, MouseButton::Left, Modifiers::default());
+                visual.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    assert_eq!(
+                        gpui_base::TextSelection::selected_text(window, cx),
+                        executable
+                    );
+                });
+
+                let arguments_start = argument_bounds.origin + point(px(2.), px(2.));
+                let arguments_end = argument_bounds.bottom_right() - point(px(2.), px(2.));
+                visual.simulate_mouse_down(
+                    arguments_start,
+                    MouseButton::Left,
+                    Modifiers::default(),
+                );
+                visual.simulate_mouse_move(
+                    arguments_end,
+                    Some(MouseButton::Left),
+                    Modifiers::default(),
+                );
+                visual.simulate_mouse_up(arguments_end, MouseButton::Left, Modifiers::default());
+                visual.update(|window, cx| {
+                    window.draw(cx).clear(cx);
+                    assert_eq!(
+                        gpui_base::TextSelection::selected_text(window, cx),
+                        arguments.join("\n")
+                    );
+                });
             }
         }
     }
