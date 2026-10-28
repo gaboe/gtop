@@ -581,27 +581,60 @@ impl Monitor {
                     .py(px(10.))
                     .border_b_1()
                     .border_color(rgb(t.rule))
-                    .child(detail_line("Executable", p.executable.clone()))
-                    .child(detail_line("Arguments", p.argv.join(" "))),
+                    .child(detail_section_header(
+                        "EXECUTABLE",
+                        "copy-executable",
+                        p.executable.clone(),
+                        &t,
+                        cx,
+                    ))
+                    .child(executable_value(&p.executable, key, &t))
+                    .child(detail_section_header(
+                        &format!(
+                            "ARGUMENTS · {}",
+                            detail_arguments(&p.argv, &p.executable).len()
+                        ),
+                        "copy-arguments",
+                        shell_arguments(detail_arguments(&p.argv, &p.executable)),
+                        &t,
+                        cx,
+                    ))
+                    .child(arguments_value(
+                        detail_arguments(&p.argv, &p.executable),
+                        key,
+                        &t,
+                    )),
             );
-            panel = panel.child(
-                div()
-                    .px(px(12.))
-                    .py(px(10.))
-                    .border_b_1()
-                    .border_color(rgb(t.rule))
-                    .child(crate::rack::label("COMMAND", &t))
-                    .child(
-                        div()
-                            .id("command-value")
-                            .max_h(px(64.))
-                            .overflow_y_scroll()
-                            .overflow_x_scroll()
-                            .p_2()
-                            .bg(rgb(t.well))
-                            .child(selectable_content(window, "command-text", &p.command)),
-                    ),
-            );
+            if !command_is_duplicate(&p.executable, &p.argv, &p.command) {
+                panel = panel.child(
+                    div()
+                        .px(px(12.))
+                        .py(px(10.))
+                        .border_b_1()
+                        .border_color(rgb(t.rule))
+                        .child(detail_section_header(
+                            "COMMAND",
+                            "copy-command",
+                            p.command.clone(),
+                            &t,
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .id("command-value")
+                                .max_h(px(192.))
+                                .overflow_y_scroll()
+                                .min_w_0()
+                                .p_2()
+                                .bg(rgb(t.well))
+                                .child(selectable_wrapped_content(
+                                    window,
+                                    format!("command-text-{}-{}", key.pid, key.start_time),
+                                    &p.command,
+                                )),
+                        ),
+                );
+            }
         }
         let environment =
             environment_content(window, &details.environment, details.environment_open, &t);
@@ -980,6 +1013,183 @@ fn selectable_content(window: &Window, id: &'static str, text: &str) -> Div {
         + px(1.);
     div().w(width).child(selectable(id, text))
 }
+
+fn selectable_wrapped_content(window: &Window, id: impl Into<ElementId>, text: &str) -> Div {
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    div()
+        .w_full()
+        .min_w_0()
+        .font_family("JetBrains Mono")
+        .text_size(px(12.))
+        .child(
+            gpui_component::text::TextView::html(id, format!("<pre>{escaped}</pre>"))
+                .selectable(true)
+                .scrollable(false)
+                .whitespace_normal(),
+        )
+        .text_color(window.text_style().color)
+}
+
+fn detail_section_header(
+    label: &str,
+    button_id: &'static str,
+    copy_text: String,
+    tokens: &crate::palette::Tokens,
+    cx: &mut Context<Monitor>,
+) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(8.))
+        .child(crate::rack::label(label, tokens).whitespace_nowrap())
+        .child(
+            Button::new(button_id)
+                .label("COPY")
+                .rack(tokens)
+                .small()
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                    cx.notify();
+                })),
+        )
+}
+
+fn path_parts(path: &str) -> (&str, &str) {
+    let path_without_trailing_slashes = path.trim_end_matches('/');
+    let Some(separator) = path_without_trailing_slashes.rfind('/') else {
+        return ("", path);
+    };
+    let filename = &path[separator + 1..];
+    let directory = &path[..separator + 1];
+    (directory, filename)
+}
+
+fn selectable_colored_text(id: String, text: &str, color: u32) -> gpui_base::SelectableText {
+    gpui_base::SelectableText::new(id, text.to_string()).text_style(TextStyleRefinement {
+        color: Some(rgb(color).into()),
+        ..Default::default()
+    })
+}
+
+fn executable_value(executable: &str, key: ProcessKey, tokens: &crate::palette::Tokens) -> Div {
+    let (directory, filename) = path_parts(executable);
+    let mut value = div()
+        .id("executable-value")
+        .debug_selector(|| "executable-value".into())
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .font_family("JetBrains Mono")
+        .text_size(px(12.));
+    if !directory.is_empty() {
+        value = value.child(div().w_full().min_w_0().child(selectable_colored_text(
+            format!("executable-directory-{}-{}", key.pid, key.start_time),
+            directory,
+            tokens.silk_dim,
+        )));
+    }
+    value.child(div().w_full().min_w_0().child(selectable_colored_text(
+        format!("executable-name-{}-{}", key.pid, key.start_time),
+        filename,
+        tokens.base.led,
+    )))
+}
+
+fn arguments_value(arguments: &[String], key: ProcessKey, tokens: &crate::palette::Tokens) -> Div {
+    if arguments.is_empty() {
+        return div()
+            .id("arguments-value")
+            .child(gpui_base::SelectableText::new(
+                format!("arguments-none-{}-{}", key.pid, key.start_time),
+                "none",
+            ));
+    }
+    let mut rows = div()
+        .id("arguments-value")
+        .debug_selector(|| "arguments-value".into())
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(2.));
+    for (index, argument) in arguments.iter().enumerate() {
+        let color = if is_flag_argument(argument) {
+            tokens.base.led
+        } else {
+            tokens.cmd
+        };
+        let row = div()
+            .id(format!("argument-{index}"))
+            .debug_selector(move || format!("argument-{index}"))
+            .w_full()
+            .min_w_0()
+            .font_family("JetBrains Mono")
+            .text_size(px(12.))
+            .child(selectable_colored_text(
+                format!("argument-{}-{}-{index}", key.pid, key.start_time),
+                argument,
+                color,
+            ));
+        rows = rows.child(row);
+    }
+    rows
+}
+
+fn detail_arguments(argv: &[String], executable: &str) -> &[String] {
+    let executable_name = executable_name(executable);
+    if argv.first().is_some_and(|first| {
+        first == executable || (!executable_name.is_empty() && first == executable_name)
+    }) {
+        &argv[1..]
+    } else {
+        argv
+    }
+}
+
+fn executable_name(executable: &str) -> &str {
+    path_parts(executable).1.trim_end_matches('/')
+}
+
+fn is_flag_argument(argument: &str) -> bool {
+    argument.starts_with('-')
+}
+
+fn shell_arguments(arguments: &[String]) -> String {
+    arguments
+        .iter()
+        .map(|argument| {
+            if !argument.is_empty()
+                && argument
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_./:=,+-%@".contains(&byte))
+            {
+                argument.clone()
+            } else {
+                format!("'{}'", argument.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn command_is_duplicate(executable: &str, argv: &[String], command: &str) -> bool {
+    let arguments = detail_arguments(argv, executable);
+    let argv_starts_with_executable = argv.first().is_some_and(|first| {
+        let executable_name = executable_name(executable);
+        first == executable || (!executable_name.is_empty() && first == executable_name)
+    });
+    let executable_and_arguments = std::iter::once(executable)
+        .chain(arguments.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    command == executable_and_arguments
+        || (argv_starts_with_executable && command == argv.join(" "))
+}
 fn detail_readout(name: &'static str, value: String, t: &crate::palette::Tokens) -> Stateful<Div> {
     div()
         .id(name)
@@ -1043,7 +1253,9 @@ fn detail_line(label: &str, value: String) -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        environment_content, environment_section, kill_completed, Details, Environment, KillState,
+        arguments_value, command_is_duplicate, detail_arguments, environment_content,
+        environment_section, executable_value, is_flag_argument, kill_completed, path_parts,
+        shell_arguments, Details, Environment, KillState,
     };
     use crate::model::ProcessKey;
     use crate::rack::RackButton;
@@ -1069,14 +1281,100 @@ mod tests {
         }
     }
 
+    #[test]
+    fn argument_rows_skip_only_an_executable_argv_zero() {
+        let argv = vec![
+            "/usr/local/bin/worker".to_string(),
+            "--jobs".to_string(),
+            "4".to_string(),
+        ];
+        assert_eq!(
+            detail_arguments(&argv, "/usr/local/bin/worker"),
+            &["--jobs", "4"]
+        );
+        assert!(is_flag_argument(&argv[1]));
+        assert!(!is_flag_argument(&argv[2]));
+
+        let argv = vec!["worker".to_string(), "--quiet".to_string()];
+        assert_eq!(
+            detail_arguments(&argv, "/usr/local/bin/worker"),
+            &["--quiet"]
+        );
+
+        let argv = vec!["bin".to_string(), "--quiet".to_string()];
+        assert_eq!(detail_arguments(&argv, "/usr/local/bin/"), &["--quiet"]);
+
+        let argv = vec!["launch-wrapper".to_string(), "--quiet".to_string()];
+        assert_eq!(
+            detail_arguments(&argv, "/usr/local/bin/worker"),
+            &["launch-wrapper", "--quiet"]
+        );
+        assert!(detail_arguments(&[], "/usr/local/bin/worker").is_empty());
+    }
+
+    #[test]
+    fn arguments_copy_as_shell_safe_words() {
+        let arguments = vec![
+            "--color=always".to_string(),
+            "two words".to_string(),
+            "it's safe".to_string(),
+            String::new(),
+        ];
+        assert_eq!(
+            shell_arguments(&arguments),
+            "--color=always 'two words' 'it'\\''s safe' ''"
+        );
+        assert_eq!(shell_arguments(&[]), "");
+    }
+
+    #[test]
+    fn command_visibility_collapses_duplicate_process_strings() {
+        let argv = vec!["worker".to_string(), "--jobs".to_string(), "4".to_string()];
+        assert!(command_is_duplicate(
+            "/usr/bin/worker",
+            &argv,
+            "worker --jobs 4"
+        ));
+        assert!(command_is_duplicate(
+            "/usr/bin/worker",
+            &argv,
+            "/usr/bin/worker --jobs 4"
+        ));
+        assert!(!command_is_duplicate(
+            "/usr/bin/worker",
+            &argv,
+            "renamed-process --jobs 4"
+        ));
+        let renamed_argv = vec![
+            "renamed-process".to_string(),
+            "--jobs".to_string(),
+            "4".to_string(),
+        ];
+        assert!(!command_is_duplicate(
+            "/usr/bin/worker",
+            &renamed_argv,
+            "renamed-process --jobs 4"
+        ));
+    }
+
+    #[test]
+    fn path_parts_preserve_all_source_text() {
+        for path in ["/opt/a very long directory/bin/worker", "/usr/local/", "/"] {
+            let (directory, filename) = path_parts(path);
+            assert_eq!(format!("{directory}{filename}"), path);
+        }
+    }
+
     struct SelectableLayoutTest {
-        command_scroll: ScrollHandle,
         environment_scroll: ScrollHandle,
     }
 
     impl Render for SelectableLayoutTest {
         fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let token = format!("{} END_OF_COMMAND", "some_long_project_name_".repeat(60));
+            let token = format!(
+                "{} END_OF_ENVIRONMENT",
+                "some_long_project_name_".repeat(60)
+            );
             let tokens = crate::palette::presets()[1].base.tokens();
             let environment = Environment::Loaded(vec![
                 format!("KEY={token}"),
@@ -1088,16 +1386,6 @@ mod tests {
                 .flex_col()
                 .font_family("JetBrains Mono")
                 .text_size(px(12.))
-                .child(
-                    div()
-                        .id("command-scroll")
-                        .debug_selector(|| "command-scroll".into())
-                        .w_full()
-                        .max_h(px(30.))
-                        .overflow_x_scroll()
-                        .track_scroll(&self.command_scroll)
-                        .child(super::selectable_content(window, "command-text", &token)),
-                )
                 .child(
                     environment_section(
                         div()
@@ -1121,30 +1409,18 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn selectable_values_do_not_wrap_and_scroll_to_line_ends(cx: &mut gpui::TestAppContext) {
+    async fn environment_values_keep_horizontal_scroll(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let command_scroll = ScrollHandle::new();
         let environment_scroll = ScrollHandle::new();
         let (_, visual) = cx.add_window_view(|_, _| SelectableLayoutTest {
-            command_scroll: command_scroll.clone(),
             environment_scroll: environment_scroll.clone(),
         });
         visual.run_until_parked();
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        let command = visual.debug_bounds("command-scroll").unwrap();
         let environment = visual.debug_bounds("environment-scroll").unwrap();
-        assert!(
-            command.size.height <= px(30.),
-            "command bounds: {command:?}"
-        );
         assert!(
             environment.size.height <= px(240.),
             "environment bounds: {environment:?}"
-        );
-        assert!(
-            command_scroll.max_offset().x > px(100.),
-            "command line end is not reachable: {:?}",
-            command_scroll.max_offset()
         );
         assert!(
             environment_scroll.max_offset().x > px(100.),
@@ -1152,37 +1428,102 @@ mod tests {
             environment_scroll.max_offset()
         );
 
-        for (position, scroll) in [
-            (command.center(), &command_scroll),
-            (environment.center(), &environment_scroll),
-        ] {
-            visual.update(|window, cx| {
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position,
-                        pressed_button: None,
-                        modifiers: Modifiers::default(),
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                window.dispatch_event(
-                    ScrollWheelEvent {
-                        position,
-                        delta: ScrollDelta::Pixels(point(px(-20_000.), px(0.))),
-                        modifiers: Modifiers::default(),
-                        touch_phase: TouchPhase::Moved,
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-            });
-            visual.update(|window, cx| window.draw(cx).clear(cx));
-            assert_eq!(
-                scroll.offset().x,
-                -scroll.max_offset().x,
-                "scroll input did not reach the end of {position:?}"
+        let position = environment.center();
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position,
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
             );
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Pixels(point(px(-20_000.), px(0.))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Moved,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            environment_scroll.offset().x,
+            -environment_scroll.max_offset().x,
+            "scroll input did not reach the end of {position:?}"
+        );
+    }
+
+    struct WrappedDetailLayoutTest {
+        palette: usize,
+        width: f32,
+        executable: String,
+        argument: String,
+    }
+
+    impl Render for WrappedDetailLayoutTest {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let tokens = crate::palette::presets()[self.palette].base.tokens();
+            let argument = vec![self.argument.clone()];
+            let key = ProcessKey {
+                pid: 1,
+                start_time: 1,
+            };
+            div()
+                .w(px(self.width))
+                .px(px(12.))
+                .flex()
+                .flex_col()
+                .font_family("JetBrains Mono")
+                .text_size(px(12.))
+                .child(
+                    div()
+                        .id("minimum-detail-panel")
+                        .debug_selector(|| "minimum-detail-panel".into())
+                        .w_full()
+                        .min_w_0()
+                        .child(executable_value(&self.executable, key, &tokens))
+                        .child(arguments_value(&argument, key, &tokens)),
+                )
+        }
+    }
+
+    #[gpui::test]
+    async fn long_paths_and_arguments_wrap_within_minimum_panel_in_both_palettes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let executable = format!("/opt/{}worker", "segment/".repeat(55));
+        let argument = format!("https://example.invalid/{}", "token".repeat(80));
+        for palette in [0, 4] {
+            for width in [280., 560.] {
+                let (_, visual) = cx.add_window_view(|_, _| WrappedDetailLayoutTest {
+                    palette,
+                    width,
+                    executable: executable.clone(),
+                    argument: argument.clone(),
+                });
+                visual.run_until_parked();
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+                let panel = visual.debug_bounds("minimum-detail-panel").unwrap();
+                let path = visual.debug_bounds("executable-value").unwrap();
+                let argument_row = visual.debug_bounds("argument-0").unwrap();
+                assert_eq!(panel.size.width, px(width - 24.));
+                assert!(path.size.width <= panel.size.width, "path bounds: {path:?}");
+                assert!(
+                    argument_row.size.width <= panel.size.width,
+                    "argument bounds: {argument_row:?}"
+                );
+                assert!(path.size.height >= px(64.), "path was truncated: {path:?}");
+                assert!(
+                    argument_row.size.height >= px(64.),
+                    "argument was truncated: {argument_row:?}"
+                );
+            }
         }
     }
 

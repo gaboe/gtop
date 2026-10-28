@@ -744,6 +744,53 @@ fn aluminium_offscreen_review() {
             .save(directory.join(format!("{name}.png")))
             .unwrap();
     }
+
+    for (palette_name, palette_index) in [("amber", 0), ("aluminium", 4)] {
+        cx.update(|cx| {
+            monitor.update(cx, |m, cx| {
+                m.settings.active = palette_index;
+                let base = m.settings.base();
+                theme::apply(base, cx);
+                m.table.update(cx, |table, cx| {
+                    table.base = base;
+                    cx.notify();
+                });
+                let mut snapshot = m.snapshot.as_ref().unwrap().as_ref().clone();
+                let mut processes = (*snapshot.processes).clone();
+                let process = &mut processes[0];
+                process.executable =
+                    format!("/Users/gtop/{}worker", "long_directory_name/".repeat(20));
+                let long_argument = format!("https://example.invalid/{}", "token".repeat(65));
+                process.argv = vec![process.executable.clone(), "--config".into(), long_argument];
+                process.command = format!("kernel_task/{}", "renamed_process".repeat(30));
+                snapshot.processes = Arc::new(processes);
+                let snapshot = Rc::new(snapshot);
+                m.snapshot = Some(snapshot.clone());
+                m.table.update(cx, |table, cx| {
+                    table.snapshot = Some(snapshot);
+                    table.reorder();
+                    cx.notify();
+                });
+                m.view = None;
+                m.settings_open = false;
+                m.details = None;
+                m.select(
+                    ProcessKey::from(&m.snapshot.as_ref().unwrap().processes[0]),
+                    cx,
+                );
+                cx.notify();
+            });
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        cx.capture_screenshot(handle.into())
+            .unwrap()
+            .save(directory.join(format!("{palette_name}-detail-long.png")))
+            .unwrap();
+    }
     FIXED_CLOCK.with(|v| v.set(false));
 }
 
