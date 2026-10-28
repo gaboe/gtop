@@ -227,6 +227,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         pending_kill: None,
         wake: mpsc::channel(1).0,
         _subscriptions: subscriptions,
+        focus_restore: None,
         _refresh: Some(Task::ready(())),
         shutdown: None,
         _ports: Task::ready(()),
@@ -1306,5 +1307,107 @@ async fn tower_title_stays_clear_of_the_upper_left_screw(cx: &mut TestAppContext
             title.origin.x >= screw.origin.x + screw.size.width,
             "preset {index}: title {title:?} overlaps screw {screw:?}"
         );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_focus_returns_after_escape(cx: &mut TestAppContext) {
+    detail_focus_transition(cx, "escape");
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_focus_returns_after_navigation(cx: &mut TestAppContext) {
+    detail_focus_transition(cx, "j");
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_focus_returns_after_settings(cx: &mut TestAppContext) {
+    detail_focus_transition(cx, "s");
+}
+
+#[cfg(target_os = "macos")]
+fn detail_focus_transition(cx: &mut TestAppContext, key: &str) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let (root, visual) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| {
+            let mut monitor = fixture(window, cx);
+            let key = ProcessKey::from(&monitor.snapshot.as_ref().unwrap().processes[0]);
+            monitor.select(key, cx);
+            monitor
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let _root = root;
+    let monitor = monitor.unwrap();
+    visual.simulate_resize(size(px(1480.), px(960.)));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let bounds = visual.debug_bounds("executable-value").unwrap();
+    let start = bounds.origin + point(px(1.), px(5.));
+    let end = bounds.origin + point(px(46.), px(5.));
+    visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    visual.update(|window, cx| {
+        assert!(window.focused(cx).is_some());
+        assert_ne!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        assert!(!gpui_base::TextSelection::selected_text(window, cx).is_empty());
+    });
+    let before = monitor.read_with(visual, |monitor, cx| monitor.table.read(cx).selected);
+    visual.simulate_keystrokes(key);
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        assert_eq!(
+            window.focused(cx),
+            Some(monitor.read(cx).focus.clone()),
+            "focus after {key}"
+        );
+    });
+    match key {
+        "escape" => {
+            assert!(monitor.read_with(visual, |monitor, _| monitor.details.is_none()));
+            visual.simulate_keystrokes("j");
+            assert_ne!(
+                monitor.read_with(visual, |monitor, cx| monitor.table.read(cx).selected),
+                before
+            );
+            visual.simulate_keystrokes("/");
+            visual.update(|window, cx| {
+                assert_eq!(
+                    window.focused(cx),
+                    Some(monitor.read(cx).search.read(cx).focus_handle(cx))
+                )
+            });
+        }
+        "j" => {
+            let first = monitor.read_with(visual, |monitor, cx| monitor.table.read(cx).selected);
+            assert_ne!(first, before);
+            visual.simulate_keystrokes("j");
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            assert_ne!(
+                monitor.read_with(visual, |monitor, cx| monitor.table.read(cx).selected),
+                first
+            );
+        }
+        "s" => {
+            assert!(monitor.read_with(visual, |monitor, _| monitor.settings_open));
+            visual.simulate_keystrokes("escape");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            assert!(!monitor.read_with(visual, |monitor, _| monitor.settings_open));
+        }
+        _ => unreachable!(),
     }
 }

@@ -136,6 +136,7 @@ struct Monitor {
     pending_kill: Option<ProcessKey>,
     wake: mpsc::Sender<()>,
     _subscriptions: Vec<Subscription>,
+    focus_restore: Option<Subscription>,
     _refresh: Option<Task<()>>,
     shutdown: Option<ShutdownDrains>,
     _ports: Task<()>,
@@ -666,6 +667,7 @@ impl Monitor {
             pending_kill: None,
             wake,
             _subscriptions: subscriptions,
+            focus_restore: None,
             _refresh: Some(refresh),
             shutdown: Some(ShutdownDrains {
                 stopping,

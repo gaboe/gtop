@@ -1494,6 +1494,11 @@ impl Monitor {
             )
     }
     pub fn rack(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        self.focus_restore.get_or_insert_with(|| {
+            cx.on_focus_lost(window, |this, window, cx| {
+                window.focus(&this.focus, cx);
+            })
+        });
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
         let panel_width = self
             .settings
