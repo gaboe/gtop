@@ -329,6 +329,7 @@ fn monitor_interaction_benchmark() {
             .unwrap();
         println!("interaction_bounds view={view} viewport={viewport:?} button={button:?}");
         for action in [
+            "notify",
             "stationary",
             "rows",
             "headers",
@@ -368,6 +369,10 @@ fn monitor_interaction_benchmark() {
                 };
                 let start = thread_cpu_ns();
                 cx.update_window(handle.into(), |_, w, cx| {
+                    if action == "notify" {
+                        monitor.update(cx, |_, cx| cx.notify());
+                        return;
+                    }
                     if action == "text_drag" && i == 0 {
                         w.dispatch_event(
                             MouseDownEvent {
@@ -460,6 +465,11 @@ fn monitor_interaction_benchmark() {
                 );
             }
             let renders = RENDERS.with(|v| v.get()) - before_renders;
+            if action == "notify" {
+                assert_eq!(draws, n, "each notification must draw once");
+                assert_eq!(renders, n, "each notification must render Monitor once");
+                assert_eq!(changed_scenes, 0, "unchanged data must preserve the scene");
+            }
             if action == "text_drag" {
                 cx.update_window(handle.into(), |_, w, cx| {
                     w.dispatch_event(

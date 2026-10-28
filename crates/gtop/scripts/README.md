@@ -41,6 +41,8 @@ Clean mode disables AnyElement increments and per-frame scene formatting. It ret
 
 Interaction mode uses the same fixture at 1480x960 and the test platform's scale factor of 2. It visits Live, Detail, 24-hour history, and the palette panel. It sends stationary moves, row and header moves, button enter and leave, wheel scroll, row clicks, and text selection drags. The `events` field counts interaction steps. A wheel step sends a move and a wheel event. A row-click step sends a move, press, and release. Views that do not support an action skip it.
 
+The `notify` action sends one Monitor notification per sample without forcing a full window refresh. It models unchanged live data. Assertions require one draw and one Monitor render per notification, with the same scene before and after. This separates regular redraws from the full-refresh test, which deliberately disables GPUI view caches.
+
 The interaction timer runs inside `Window::draw`. It counts draws that GPUI's test context performs while it flushes event effects. `draws` counts actual frames. `renders` counts Monitor renders. `draw_cpu_ms` excludes arena cleanup. `event_cpu_ms` measures the remaining thread CPU for the event step, including effects and arena cleanup. Scene hashes run once before and after each action, outside the timed steps. Assertions require scroll to change the scene, row clicks to open Detail, and a drag to select text. No native window opens.
 
 The script copies pinned GPUI into ignored `target/draw-benchmark`. It checks all upstream bytes, its own bytes and all generated copy bytes. A damaged copy is reconstructed. Registry files stay unchanged. A script-private cfg enables access to copied instrumentation methods. Stock Cargo features do not depend on those methods.
