@@ -726,6 +726,7 @@ struct GhostLayerReview {
 #[derive(Clone, Copy)]
 enum GhostLayerContent {
     Full,
+    Dots,
     Unit(char),
 }
 
@@ -749,6 +750,9 @@ impl Render for GhostLayerReview {
                         &self.tokens,
                     )),
             ),
+            GhostLayerContent::Dots => {
+                content.child(crate::rack::win(&self.tokens).w(px(160.)).h(px(80.)))
+            }
             GhostLayerContent::Unit(unit) => content.child(crate::rack::unit_glyph_for_test(
                 unit,
                 42.,
@@ -807,10 +811,15 @@ fn headless_ghost_layers_match_palette_mode() {
     ] {
         for (layer, content) in [
             ("full", GhostLayerContent::Full),
+            ("dots", GhostLayerContent::Dots),
             ("percent", GhostLayerContent::Unit('%')),
             ("degree", GhostLayerContent::Unit('°')),
         ] {
-            let tokens = base.tokens();
+            let mut tokens = base.tokens();
+            // A chromatic probe separates unit ghosts from antialiased graphite ink.
+            if matches!(content, GhostLayerContent::Unit(_)) {
+                tokens.base.led = 0xff00ff;
+            }
             cx.update(|cx| {
                 view.update(cx, |view, _| {
                     view.tokens = tokens;
@@ -830,26 +839,18 @@ fn headless_ghost_layers_match_palette_mode() {
                 .save(directory.join(format!("{name}-{layer}.png")))
                 .unwrap();
             if let GhostLayerContent::Unit(_) = content {
-                let ghost = palette::mix(base.led, base.ground, 0.18);
+                let ghost = palette::mix(tokens.base.led, tokens.base.ground, 0.18);
                 let ghost_rgba = [
                     ((ghost >> 16) & 0xff) as u8,
                     ((ghost >> 8) & 0xff) as u8,
                     (ghost & 0xff) as u8,
                     0xff,
                 ];
-                let ghost_pixels = image
-                    .pixels()
-                    .filter(|pixel| {
-                        pixel
-                            .0
-                            .iter()
-                            .zip(ghost_rgba)
-                            .all(|(actual, expected)| actual.abs_diff(expected) <= 12)
-                    })
-                    .count();
+                let ghost_pixels = image.pixels().filter(|pixel| pixel.0 == ghost_rgba).count();
+                println!("{name} {layer} ghost pixel count was {ghost_pixels}");
                 assert!(
                     (ghost_pixels > 0) == expect_ghost,
-                    "{name} {layer} ghost pixel count near {ghost_rgba:?} was {ghost_pixels}"
+                    "{name} {layer} ghost pixel count matching {ghost_rgba:?} was {ghost_pixels}"
                 );
             }
 
@@ -866,6 +867,10 @@ fn headless_ghost_layers_match_palette_mode() {
                     expect_ghost,
                     "{name} lit_unit digit ghost layers were {rendered_ghosts:?}"
                 );
+            }
+
+            // Text antialiasing can match the dot colour, so inspect an empty readout.
+            if matches!(content, GhostLayerContent::Dots) {
                 let dots = palette::mix(base.led, tokens.readout, 0.07);
                 let dots_rgba = [
                     ((dots >> 16) & 0xff) as u8,
@@ -874,6 +879,7 @@ fn headless_ghost_layers_match_palette_mode() {
                     0xff,
                 ];
                 let dot_pixels = image.pixels().filter(|pixel| pixel.0 == dots_rgba).count();
+                println!("{name} readout dot pixel count was {dot_pixels}");
                 assert_eq!(
                     dot_pixels > 0,
                     expect_ghost,
