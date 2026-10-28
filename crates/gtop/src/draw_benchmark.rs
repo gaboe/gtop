@@ -79,11 +79,11 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
                 let mut process = test_data::process(pid, &format!("process-{pid:04}"), cpu);
                 if pid == 1 && LONG_DETAIL_REVIEW.with(std::cell::Cell::get) {
                     process.executable =
-                        format!("/Users/gtop/{}worker", "long_directory_name/".repeat(10));
-                    let long_argument = format!("https://example.invalid/{}", "token".repeat(35));
+                        format!("/Users/gtop/{}worker", "long_directory_name/".repeat(8));
+                    let long_argument = format!("https://example.invalid/{}", "token".repeat(25));
                     process.argv =
                         vec![process.executable.clone(), "--config".into(), long_argument];
-                    process.command = format!("kernel_task/{}", "renamed_process".repeat(12));
+                    process.command = format!("kernel_task/{}", "renamed_process".repeat(8));
                 }
                 process
             })
@@ -686,7 +686,7 @@ fn aluminium_offscreen_review() {
 
     let mut monitor = None;
     let handle = cx
-        .open_window(size(px(1480.), px(960.)), |window, cx| {
+        .open_window(size(px(1480.), px(1200.)), |window, cx| {
             let entity = cx.new(|cx| fixture(window, cx));
             entity.update(cx, |m, cx| {
                 m.settings.active = 4;
