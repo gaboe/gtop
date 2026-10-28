@@ -111,6 +111,8 @@ pub struct SystemStats {
     pub disk_used_bytes: u64,
     /// Free disk space in bytes
     pub disk_free_bytes: u64,
+    /// Space macOS can reclaim, beyond space free now
+    pub disk_purgeable_bytes: u64,
     /// Per-GPU statistics; empty when no supported GPU was found
     pub gpus: Vec<GpuInfo>,
     /// Hottest reading per component group; empty when no sensor is readable

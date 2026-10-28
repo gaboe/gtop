@@ -46,9 +46,10 @@ pub fn snapshot() -> Snapshot {
             load_avg: [0.; 3],
             network_rx_bytes: 0,
             network_tx_bytes: 0,
-            disk_total_bytes: 0,
-            disk_used_bytes: 0,
-            disk_free_bytes: 0,
+            disk_total_bytes: 994_000_000_000,
+            disk_used_bytes: 982_000_000_000,
+            disk_free_bytes: 12_000_000_000,
+            disk_purgeable_bytes: 181_000_000_000,
             gpus: vec![],
             temperatures: vec![gtop_core::monitoring::Temperature {
                 name: "CPU".into(),

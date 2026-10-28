@@ -2582,6 +2582,7 @@ dependencies = [
 name = "gtop-core"
 version = "1.2.0"
 dependencies = [
+ "libc",
  "listeners",
  "objc2-core-foundation",
  "objc2-io-kit",
