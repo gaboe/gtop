@@ -1386,15 +1386,7 @@ impl Monitor {
                     40,
                     t,
                 ))
-                .children((stats.disk_purgeable_bytes > 0).then(|| {
-                    label(
-                        format!(
-                            "+{:.0} GB PURGEABLE",
-                            stats.disk_purgeable_bytes as f64 / 1e9
-                        ),
-                        t,
-                    )
-                })),
+                .children(purgeable_label(stats.disk_purgeable_bytes).map(|text| label(text, t))),
         );
         let gpu = stats.gpus.first();
         let util = gpu.and_then(|g| g.utilization);
@@ -2883,15 +2875,36 @@ impl Monitor {
     }
 }
 
+fn purgeable_label(bytes: u64) -> Option<String> {
+    if bytes == 0 {
+        None
+    } else if bytes < 1_000_000_000 {
+        Some("+<1 GB PURGEABLE".into())
+    } else {
+        Some(format!("+{:.0} GB PURGEABLE", bytes as f64 / 1e9))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        cpu_segments, div, draw_readout_text, history_cell, lit_unit, vfd_digit_width, Bounds,
-        DrawMetrics, Path, Pixels, Tokens, UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS,
-        WIN_DOT_CACHE_MAX_BYTES, WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES,
-        WIN_DOT_CACHE_SLOTS,
+        cpu_segments, div, draw_readout_text, history_cell, lit_unit, purgeable_label,
+        vfd_digit_width, Bounds, DrawMetrics, Path, Pixels, Tokens, UNIT_GLYPHS,
+        UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES, WIN_DOT_CACHE_MAX_ENTRY_VERTICES,
+        WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
     };
     use gpui::{prelude::*, px, TestAppContext, Window};
+
+    #[test]
+    fn purgeable_label_hides_zero_and_shows_small_positive_values() {
+        assert_eq!(purgeable_label(0), None);
+        assert_eq!(purgeable_label(1), Some("+<1 GB PURGEABLE".into()));
+        assert_eq!(purgeable_label(27_926_528), Some("+<1 GB PURGEABLE".into()));
+        assert_eq!(
+            purgeable_label(1_000_000_000),
+            Some("+1 GB PURGEABLE".into())
+        );
+    }
 
     struct UnitLayoutTestView {
         tokens: Tokens,
