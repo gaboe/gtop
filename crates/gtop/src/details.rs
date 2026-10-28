@@ -11,7 +11,7 @@ use gpui_component::{
 };
 use gtop_core::ProcessInfo;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::ops::Range;
+use std::{cell::RefCell, ops::Range, rc::Rc};
 
 pub(super) const DETAIL_WIDTH_MIN: f32 = 280.;
 pub(super) const DETAIL_WIDTH_MAX: f32 = 560.;
@@ -333,6 +333,7 @@ impl Monitor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        window.focus(&self.focus, cx);
         if self.process_exited() {
             return;
         }
@@ -402,6 +403,7 @@ impl Monitor {
                 ))
                 .child(
                     Button::new("confirm-kill")
+                        .debug_selector(|| "confirm-kill".into())
                         .label("Kill · Y")
                         .rack(&t)
                         .danger()
@@ -672,6 +674,7 @@ impl Monitor {
                 .py(px(10.))
                 .child(
                     Button::new("close-details")
+                        .debug_selector(|| "close-details".into())
                         .flex_1()
                         .label("Close · Esc")
                         .rack(&t)
@@ -683,6 +686,7 @@ impl Monitor {
                 )
                 .child(
                     Button::new("kill")
+                        .debug_selector(|| "kill".into())
                         .flex_1()
                         .label("Kill · X")
                         .rack(&t)
@@ -1089,6 +1093,11 @@ fn selectable_styled_text(
         .use_keyed_state(id.clone(), cx, |_, cx| cx.focus_handle())
         .read(cx)
         .clone();
+    let copy_state = Rc::new(RefCell::new((
+        None::<gpui_base::TextSelectionHandle>,
+        String::new(),
+    )));
+    let action_copy_state = copy_state.clone();
     let highlights = highlights.into_iter().map(|(range, color)| {
         (
             range,
@@ -1103,15 +1112,30 @@ fn selectable_styled_text(
         .w_full()
         .min_w_0()
         .track_focus(&focus)
-        .on_action(|_: &gpui_base::input::Copy, window, cx| {
-            let text = gpui_base::TextSelection::selected_text(window, cx);
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        .on_action(move |_: &gpui_base::input::Copy, window, cx| {
+            let (handle, text) = {
+                let copy_state = action_copy_state.borrow();
+                (copy_state.0.clone(), copy_state.1.clone())
+            };
+            let selected = gpui_base::TextSelection::selected_text(window, cx);
+            let has_exact_selection = handle.is_some_and(|handle| {
+                handle.snapshot(cx).is_some() || handle.has_local_selection(cx)
+            });
+            if !selected.is_empty() || has_exact_selection {
+                cx.write_to_clipboard(ClipboardItem::new_string(if selected.is_empty() {
+                    text
+                } else {
+                    selected
+                }));
+                cx.stop_propagation();
+            }
         })
         .child(DetailSelectableText {
             id,
             focus,
             text: text.clone().into(),
             styled_text: StyledText::new(text).with_highlights(highlights),
+            copy_state,
             base_color,
             selection_color,
         })
@@ -1122,6 +1146,7 @@ struct DetailSelectableText {
     focus: FocusHandle,
     text: SharedString,
     styled_text: StyledText,
+    copy_state: Rc<RefCell<(Option<gpui_base::TextSelectionHandle>, String)>>,
     base_color: u32,
     selection_color: u32,
 }
@@ -1163,6 +1188,9 @@ impl Element for DetailSelectableText {
                     handle.focus_with(move |window, cx| focus.focus(window, cx), cx);
                     handle
                 });
+                let copy_state = self.copy_state.clone();
+                handle.copy_with(move |_| copy_state.borrow().1.clone(), cx);
+                self.copy_state.borrow_mut().0 = Some(handle.clone());
                 (handle.clone(), handle)
             },
         );
@@ -1218,6 +1246,12 @@ impl Element for DetailSelectableText {
             )],
             cx,
         );
+        self.copy_state.borrow_mut().1 = projection
+            .ranges()
+            .iter()
+            .flatten()
+            .map(|range| self.text[range.clone()].to_string())
+            .collect();
         if selected_before != gpui_base::TextSelection::selected_text(window, cx) {
             window.refresh();
         }
@@ -1685,6 +1719,7 @@ mod tests {
                 start_time: 1,
             };
             div()
+                .key_context("Root")
                 .w(px(self.width))
                 .h_full()
                 .child(gpui_base::TextSelectionLayer)
@@ -1805,6 +1840,7 @@ mod tests {
         visual.simulate_mouse_down(path_start, MouseButton::Left, Modifiers::default());
         visual.simulate_mouse_move(path_end, Some(MouseButton::Left), Modifiers::default());
         visual.simulate_mouse_up(path_end, MouseButton::Left, Modifiers::default());
+        visual.run_until_parked();
         visual.update(|window, cx| {
             window.draw(cx).clear(cx);
             assert_eq!(
@@ -1819,7 +1855,9 @@ mod tests {
         visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
         visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
         visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        visual.run_until_parked();
         visual.simulate_keystrokes("cmd-c");
+        visual.run_until_parked();
         visual.update(|window, cx| {
             window.draw(cx).clear(cx);
             assert_eq!(
@@ -2014,19 +2052,20 @@ mod tests {
         cx.update(gpui_component::init);
         let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
             search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
-            command: "\n".into(),
+            command: "\nalpha beta".into(),
         });
         visual.run_until_parked();
         visual.update(|window, cx| window.draw(cx).clear(cx));
         let bounds = visual.debug_bounds("command-test").unwrap();
         let start = bounds.origin + point(px(1.), px(1.));
-        let end = bounds.bottom_right() - point(px(1.), px(1.));
+        let end = bounds.origin + point(px(1.), px(22.));
         visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
         visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
         visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        visual.run_until_parked();
         visual.simulate_keystrokes("cmd-c");
         visual.update(|window, cx| {
-            assert_eq!(gpui_base::TextSelection::selected_text(window, cx), "\n");
+            assert!(gpui_base::TextSelection::has_selection(window, cx));
             assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "\n");
         });
     }

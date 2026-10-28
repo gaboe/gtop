@@ -1671,12 +1671,20 @@ fn detail_button_focus_transition(cx: &mut TestAppContext, button: &str) {
         gpui_component::init(cx);
         theme::init(cx);
     });
-    let (monitor, visual) = cx.add_window_view(fixture);
-    visual.simulate_resize(size(px(1480.), px(960.)));
-    let key = monitor.read_with(visual, |monitor, _| {
-        ProcessKey::from(&monitor.snapshot.as_ref().unwrap().processes[0])
+    let mut monitor = None;
+    let (root, visual) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| {
+            let mut monitor = fixture(window, cx);
+            let key = ProcessKey::from(&monitor.snapshot.as_ref().unwrap().processes[0]);
+            monitor.select(key, cx);
+            monitor
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
     });
-    monitor.update(visual, |monitor, cx| monitor.select(key, cx));
+    let _root = root;
+    let monitor = monitor.unwrap();
+    visual.simulate_resize(size(px(1480.), px(960.)));
     visual.run_until_parked();
     visual.update(|window, cx| window.draw(cx).clear(cx));
 
