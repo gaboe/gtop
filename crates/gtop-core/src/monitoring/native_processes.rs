@@ -670,7 +670,9 @@ impl Collector {
 mod tests {
     use super::*;
     use std::{
-        process::{Child, Command},
+        io::Read,
+        os::fd::AsRawFd,
+        process::{Child, Command, Stdio},
         time::Duration,
     };
 
@@ -700,13 +702,27 @@ mod tests {
             Command::new("/usr/bin/python3")
                 .args([
                     "-c",
-                    "import time; x=bytearray(16*1024*1024); x[:]=b'x'*len(x); time.sleep(30)",
+                    "import time; x=bytearray(16*1024*1024); x[:]=b'x'*len(x); print('ready', flush=True); time.sleep(30)",
                 ])
                 .env("GTOP_NATIVE_MARKER", "owned-child")
+                .stdout(Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
-        std::thread::sleep(Duration::from_millis(500));
+        let mut stdout = child.0.stdout.take().unwrap();
+        let mut ready = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut ready, 1, 10_000) },
+            1,
+            "owned child did not finish touching its memory"
+        );
+        let mut message = [0; 6];
+        stdout.read_exact(&mut message).unwrap();
+        assert_eq!(&message, b"ready\n");
         let users = sysinfo::Users::new_with_refreshed_list();
         let mut unseen = Collector {
             unavailable_identity: Some(child.0.id()),
