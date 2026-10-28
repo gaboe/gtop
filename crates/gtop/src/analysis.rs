@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn now_sentence_uses_cpu_scale_and_includes_zero() {
-        let snapshot = crate::test_data::snapshot();
+        let mut snapshot = crate::test_data::snapshot();
         assert_eq!(super::current_cpu(&snapshot.processes, "rustc"), 350.);
         assert_eq!(
             super::now_sentence(350., 350., 14, crate::palette::CpuScale::Mac),
@@ -398,8 +398,16 @@ mod tests {
             super::now_sentence(350., 350., 14, crate::palette::CpuScale::Core),
             "Now 350.0 %, about its usual busy load."
         );
+        for process in std::sync::Arc::make_mut(&mut snapshot.processes)
+            .iter_mut()
+            .filter(|process| process.name == "rustc")
+        {
+            process.cpu_usage = 0.;
+        }
+        let current_cpu = super::current_cpu(&snapshot.processes, "rustc");
+        assert_eq!(current_cpu, 0.);
         assert!(
-            super::now_sentence(0., 350., 14, crate::palette::CpuScale::Mac,)
+            super::now_sentence(current_cpu, 350., 14, crate::palette::CpuScale::Mac,)
                 .contains("below its usual")
         );
     }

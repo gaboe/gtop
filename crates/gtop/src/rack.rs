@@ -2914,6 +2914,7 @@ impl Monitor {
                                 .label(text)
                                 .rack(t)
                                 .small()
+                                .toggled(self.settings.cpu_scale == scale)
                                 .when(self.settings.cpu_scale == scale, |button| button.primary())
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     if this.settings.cpu_scale != scale {

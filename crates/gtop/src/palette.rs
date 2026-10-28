@@ -328,7 +328,7 @@ pub enum CpuScale {
 pub struct Settings {
     pub active: usize,
     pub saved: Vec<Palette>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "read_cpu_scale")]
     pub cpu_scale: CpuScale,
     #[serde(default, deserialize_with = "read_detail_width")]
     pub detail_width: crate::details::DetailWidth,
@@ -337,6 +337,11 @@ pub struct Settings {
     #[serde(default, deserialize_with = "read_widths")]
     pub history_widths: crate::column_widths::Widths,
 }
+fn read_cpu_scale<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<CpuScale, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 fn read_detail_width<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<crate::details::DetailWidth, D::Error> {
@@ -666,6 +671,15 @@ mod tests {
         settings.save_to(&path).unwrap();
 
         assert_eq!(Settings::load_from(&path).cpu_scale, CpuScale::Core);
+    }
+
+    #[test]
+    fn unknown_cpu_scale_keeps_other_settings() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"active":2,"saved":[],"cpu_scale":"Thread"}"#).unwrap();
+
+        assert_eq!(settings.active, 2);
+        assert_eq!(settings.cpu_scale, CpuScale::Mac);
     }
 
     #[test]

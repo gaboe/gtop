@@ -1832,7 +1832,7 @@ async fn detail_kill_completion_restores_focus_and_reaps_owned_child(cx: &mut Te
 
     let mut child = ChildGuard(
         std::process::Command::new("/bin/sleep")
-            .arg("30")
+            .arg("600")
             .spawn()
             .unwrap(),
     );
@@ -1887,7 +1887,12 @@ async fn detail_kill_completion_restores_focus_and_reaps_owned_child(cx: &mut Te
 
     visual.update(|window, cx| {
         assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
-        assert_eq!(monitor.read(cx).pending_kill, Some(key));
+        assert_eq!(
+            monitor.read(cx).pending_kill,
+            Some(key),
+            "kill status: {}",
+            monitor.read(cx).status
+        );
         assert!(monitor.read(cx).status.starts_with("Kill signal sent"));
     });
     assert!(!child.0.wait().unwrap().success());
