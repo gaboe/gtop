@@ -814,6 +814,7 @@ fn full_monitor_draw_benchmark() {
                             "/bin/process-0001",
                             1.,
                             30_000_000,
+                            m.snapshot.as_ref().unwrap().stats.cpu_usage.len(),
                             [],
                         );
                         analysis.history = Some(analysis::ProcessHistory {

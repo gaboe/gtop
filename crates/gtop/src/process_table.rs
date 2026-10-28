@@ -153,6 +153,11 @@ impl Processes {
         cx: &mut Context<Self>,
     ) -> Option<Stateful<Div>> {
         let p = self.process(row)?;
+        let logical_cpus = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.stats.cpu_usage.len())
+            .unwrap_or(1);
         let key = ProcessKey::from(p);
         let priority = row_tier(row) == RowTier::Priority;
         let culprit = p.cpu_usage > 100. && row < 4;
@@ -163,12 +168,12 @@ impl Processes {
                 .id(("process", row))
                 .role(Role::Row)
                 .aria_label(format!(
-                    "{} PID {} CPU {:.1}% memory {} ports {}",
+                    "{} PID {} CPU {}% memory {} ports {}",
                     p.name,
                     p.pid,
-                    p.cpu_usage,
+                    crate::model::format_cpu_share(p.cpu_usage as f64, logical_cpus),
                     crate::model::bytes(p.memory_usage),
-                    ProcessColumn::Ports.text(p)
+                    ProcessColumn::Ports.text(p, logical_cpus)
                 ))
                 .h(px(height))
                 .flex()
@@ -233,9 +238,10 @@ impl Processes {
                         if (selected || priority && culprit)
                             && !(culprit && kind == ProcessColumn::Command)
                         {
-                            crate::glow::text(kind.text(p), false, t).into_any_element()
+                            crate::glow::text(kind.text(p, logical_cpus), false, t)
+                                .into_any_element()
                         } else {
-                            kind.text(p).into_any_element()
+                            kind.text(p, logical_cpus).into_any_element()
                         },
                     )
                 }))

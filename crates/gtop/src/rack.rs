@@ -22,6 +22,11 @@ fn settings_escape_closes(key: &str, settings_open: bool, editing: bool) -> bool
     key == "escape" && settings_open && !editing
 }
 
+fn gtop_self_cpu(cpu: Option<f32>, logical_cpus: usize) -> String {
+    cpu.map(|value| crate::model::format_cpu_share(value as f64, logical_cpus))
+        .unwrap_or_else(|| "N/A".into())
+}
+
 pub trait RackButton {
     fn rack(self, t: &Tokens) -> Self;
 }
@@ -1555,8 +1560,10 @@ impl Monitor {
                             .gap(px(10.))
                             .child(cost(
                                 "CPU",
-                                own.map(|p| format!("{:.2}", p.cpu_usage))
-                                    .unwrap_or_else(|| "N/A".into()),
+                                gtop_self_cpu(
+                                    own.map(|process| process.cpu_usage),
+                                    stats.cpu_usage.len(),
+                                ),
                                 "%",
                             ))
                             .child(cost(
@@ -1873,6 +1880,11 @@ impl Monitor {
                                                     this.history_columns.viewport,
                                                 );
                                                 let h = &this.history[index];
+                                                let logical_cpus = this
+                                                    .snapshot
+                                                    .as_ref()
+                                                    .map(|snapshot| snapshot.stats.cpu_usage.len())
+                                                    .unwrap_or(1);
                                                 let selected_name_exists = this
                                                     .history_selected
                                                     .as_ref()
@@ -2018,10 +2030,12 @@ impl Monitor {
                                                                 )
                                                                 .child(
                                                                     history_cell(widths[7], true)
-                                                                        .child(row_text(format!(
-                                                                            "{:.1}",
-                                                                            p.peak_cpu
-                                                                        ))),
+                                                                        .child(row_text(
+                                                                            crate::model::format_cpu_share(
+                                                                                p.peak_cpu as f64,
+                                                                                logical_cpus,
+                                                                            )
+                                                                        )),
                                                                 ),
                                                         )
                                                     })
@@ -2990,12 +3004,18 @@ fn purgeable_label(bytes: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cpu_segments, div, draw_readout_text, history_cell, lit_unit, purgeable_label,
-        vfd_digit_width, Bounds, DrawMetrics, Path, Pixels, Tokens, DIGIT_GHOST_TEST_TEXTS,
-        UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES,
+        cpu_segments, div, draw_readout_text, gtop_self_cpu, history_cell, lit_unit,
+        purgeable_label, vfd_digit_width, Bounds, DrawMetrics, Path, Pixels, Tokens,
+        DIGIT_GHOST_TEST_TEXTS, UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES,
         WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
     };
     use gpui::{prelude::*, px, TestAppContext, Window};
+
+    #[test]
+    fn gtop_self_cpu_shows_whole_mac_share() {
+        assert_eq!(gtop_self_cpu(Some(350.), 14), "25.0");
+        assert_eq!(gtop_self_cpu(None, 14), "N/A");
+    }
 
     #[test]
     fn purgeable_label_hides_zero_and_shows_small_positive_values() {

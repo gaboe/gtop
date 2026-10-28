@@ -8,6 +8,15 @@ pub struct ProcessKey {
     pub start_time: u64,
 }
 
+pub fn format_cpu_share(per_core: f64, logical_cpus: usize) -> String {
+    let share = per_core / logical_cpus.max(1) as f64;
+    if share < 10. {
+        format!("{share:.2}")
+    } else {
+        format!("{share:.1}")
+    }
+}
+
 pub fn running_history_process<'a>(
     name: &str,
     processes: &'a [ProcessInfo],
@@ -195,13 +204,13 @@ impl ProcessColumn {
             Self::Command => a.command.cmp(&b.command),
         }
     }
-    pub fn text(self, p: &ProcessInfo) -> String {
+    pub fn text(self, p: &ProcessInfo, logical_cpus: usize) -> String {
         match self {
             Self::Lamp => String::new(),
             Self::Name => p.name.clone(),
             Self::Pid => p.pid.to_string(),
             Self::User => p.user.clone(),
-            Self::Cpu => format!("{:.1}", p.cpu_usage),
+            Self::Cpu => format_cpu_share(p.cpu_usage as f64, logical_cpus),
             Self::Memory => bytes(p.memory_usage),
             Self::Age => {
                 if p.start_time == 0 {
@@ -391,8 +400,16 @@ mod tests {
         ] {
             let mut process = process(1, "age", 0., vec![]);
             process.run_time = seconds;
-            assert_eq!(ProcessColumn::Age.text(&process), expected);
+            assert_eq!(ProcessColumn::Age.text(&process, 1), expected);
         }
+    }
+
+    #[test]
+    fn cpu_column_shows_whole_mac_share() {
+        let process = process(1, "builder", 350., vec![]);
+        assert_eq!(ProcessColumn::Cpu.text(&process, 14), "25.0");
+        assert_eq!(format_cpu_share(2.5, 14), "0.18");
+        assert_eq!(format_cpu_share(350., 0), "350.0");
     }
 
     #[test]
@@ -540,7 +557,7 @@ mod tests {
         unknown.start_time = 0;
         unknown.run_time = 0;
 
-        assert_eq!(ProcessColumn::Age.text(&unknown), "·");
+        assert_eq!(ProcessColumn::Age.text(&unknown, 1), "·");
     }
 
     #[test]

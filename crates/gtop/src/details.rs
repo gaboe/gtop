@@ -503,7 +503,13 @@ impl Monitor {
                                 .justify_between()
                                 .child(crate::rack::label("CPU · LAST 90 S", &t))
                                 .child(crate::rack::lit_unit(
-                                    format!("{:3.0}", p.cpu_usage),
+                                    crate::model::format_cpu_share(
+                                        p.cpu_usage as f64,
+                                        self.snapshot
+                                            .as_ref()
+                                            .map(|snapshot| snapshot.stats.cpu_usage.len())
+                                            .unwrap_or(1),
+                                    ),
                                     '%',
                                     22.,
                                     p.cpu_usage > 400.,
@@ -782,11 +788,12 @@ fn environment_section(header: Div, content: Div) -> Stateful<Div> {
 fn analysis_sample(
     history: &crate::analysis::ProcessHistory,
     last_seen_cpu: Option<f32>,
+    logical_cpus: usize,
 ) -> (&'static str, String) {
     match last_seen_cpu {
         Some(cpu) => (
             "LAST SEEN",
-            crate::analysis::sample_sentence("Last seen", cpu, history.busy_average),
+            crate::analysis::sample_sentence("Last seen", cpu, history.busy_average, logical_cpus),
         ),
         None => ("NOW", history.now.clone()),
     }
@@ -948,7 +955,7 @@ fn analysis_panel(
             }),
     );
     if let Some(history) = &analysis.history {
-        let (sample_label, sample_text) = analysis_sample(history, last_seen_cpu);
+        let (sample_label, sample_text) = analysis_sample(history, last_seen_cpu, cores);
         history_panel =
             history_panel.child(div().flex().items_end().gap(px(1.)).h(px(40.)).children(
                 history.columns.iter().map(|value| match value {
@@ -993,19 +1000,26 @@ fn analysis_panel(
             ))
             .child(detail_line(
                 "Busy average",
-                format!("{:.0} %", history.busy_average),
+                format!(
+                    "{} %",
+                    crate::model::format_cpu_share(history.busy_average, cores)
+                ),
             ))
             .child(detail_line(
                 "Peak CPU",
                 format!(
-                    "{:.0} % at {}",
-                    history.peak_cpu,
+                    "{} % at {}",
+                    crate::model::format_cpu_share(history.peak_cpu, cores),
                     crate::rack::timestamp(history.peak_minute * 60, "%H:%M")
                 ),
             ))
             .child(detail_line(
                 "Longest busy run",
-                format!("{} min over 50 %", history.longest_busy_minutes),
+                format!(
+                    "{} min over {} %",
+                    history.longest_busy_minutes,
+                    crate::model::format_cpu_share(50., cores)
+                ),
             ))
             .child(detail_line("Peak memory", bytes(history.peak_memory)));
     } else {
@@ -2435,7 +2449,7 @@ mod tests {
         history.record(&snapshot, 6000., 3.).unwrap();
         history.record(&snapshot, 6003., 3.).unwrap();
         let analysis = history
-            .analyze_process("builder", "builder", 814., 100)
+            .analyze_process("builder", "builder", 814., 100, 4)
             .unwrap();
         let history = analysis.history.unwrap();
         let processes = vec![process];
@@ -2444,17 +2458,19 @@ mod tests {
             details
                 .exited(&processes)
                 .then_some(details.process(&processes).cpu_usage),
+            4,
         );
         assert_eq!(live.0, "NOW");
-        assert_eq!(live.1, "Now 814 %, 5.8× its usual busy load.");
+        assert_eq!(live.1, "Now 203.5 %, 5.8× its usual busy load.");
         let exited = super::analysis_sample(
             &history,
             details
                 .exited(&[])
                 .then_some(details.process(&[]).cpu_usage),
+            4,
         );
         assert_eq!(exited.0, "LAST SEEN");
-        assert_eq!(exited.1, "Last seen 814 %, 5.8× its usual busy load.");
+        assert_eq!(exited.1, "Last seen 203.5 %, 5.8× its usual busy load.");
         assert!(!exited.1.contains("Now"));
     }
 

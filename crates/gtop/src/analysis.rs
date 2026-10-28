@@ -37,11 +37,12 @@ pub fn analyze<'a>(
     command: &str,
     current_cpu: f32,
     now_minute: u64,
+    logical_cpus: usize,
     buckets: impl IntoIterator<Item = &'a crate::history::Bucket>,
 ) -> ProcessAnalysis {
     ProcessAnalysis {
         identity: identity(name, command),
-        history: process_history(name, current_cpu, now_minute, buckets),
+        history: process_history(name, current_cpu, now_minute, logical_cpus, buckets),
     }
 }
 
@@ -49,6 +50,7 @@ fn process_history<'a>(
     name: &str,
     current_cpu: f32,
     now_minute: u64,
+    logical_cpus: usize,
     buckets: impl IntoIterator<Item = &'a crate::history::Bucket>,
 ) -> Option<ProcessHistory> {
     use std::collections::BTreeMap;
@@ -123,7 +125,7 @@ fn process_history<'a>(
             recorded.len()
         )
     };
-    let now = now_sentence(current_cpu, busy_average);
+    let now = now_sentence(current_cpu, busy_average, logical_cpus);
 
     let mut longest_busy_minutes = 0;
     let mut busy_run = 0;
@@ -169,28 +171,28 @@ pub fn current_cpu(processes: &[gtop_core::ProcessInfo], name: &str) -> f32 {
         .sum()
 }
 
-pub fn now_sentence(current_cpu: f32, busy_average: f64) -> String {
-    sample_sentence("Now", current_cpu, busy_average)
+pub fn now_sentence(current_cpu: f32, busy_average: f64, logical_cpus: usize) -> String {
+    sample_sentence("Now", current_cpu, busy_average, logical_cpus)
 }
 
-pub fn sample_sentence(when: &str, current_cpu: f32, busy_average: f64) -> String {
+pub fn sample_sentence(
+    when: &str,
+    current_cpu: f32,
+    busy_average: f64,
+    logical_cpus: usize,
+) -> String {
     let ratio = if busy_average > 0. {
         current_cpu as f64 / busy_average
     } else {
         0.
     };
+    let current_share = crate::model::format_cpu_share(current_cpu as f64, logical_cpus);
     if ratio > 1.5 {
-        format!(
-            "{when} {:.0} %, {:.1}× its usual busy load.",
-            current_cpu, ratio
-        )
+        format!("{when} {current_share} %, {ratio:.1}× its usual busy load.")
     } else if busy_average > 0. && ratio < 0.5 {
-        format!(
-            "{when} {:.0} %, well below its usual busy load.",
-            current_cpu
-        )
+        format!("{when} {current_share} %, well below its usual busy load.")
     } else {
-        format!("{when} {:.0} %, about its usual busy load.", current_cpu)
+        format!("{when} {current_share} %, about its usual busy load.")
     }
 }
 
@@ -390,11 +392,14 @@ mod tests {
     fn now_uses_live_name_total_and_includes_zero() {
         let mut snapshot = crate::test_data::snapshot();
         assert_eq!(super::current_cpu(&snapshot.processes, "rustc"), 350.);
-        assert!(super::now_sentence(350., 350.).contains("about its usual"));
+        assert_eq!(
+            super::now_sentence(350., 350., 14),
+            "Now 25.0 %, about its usual busy load."
+        );
         std::sync::Arc::make_mut(&mut snapshot.processes)[0].cpu_usage = 0.;
         std::sync::Arc::make_mut(&mut snapshot.processes)[1].cpu_usage = 0.;
         assert!(
-            super::now_sentence(super::current_cpu(&snapshot.processes, "rustc"), 350.)
+            super::now_sentence(super::current_cpu(&snapshot.processes, "rustc"), 350., 14)
                 .contains("below its usual")
         );
     }
@@ -455,7 +460,7 @@ mod tests {
 
     #[test]
     fn history_is_absent_when_the_name_was_never_recorded() {
-        assert!(process_history("builder", 20., 1439, std::iter::empty()).is_none());
+        assert!(process_history("builder", 20., 1439, 1, std::iter::empty()).is_none());
     }
 
     #[test]
@@ -464,7 +469,7 @@ mod tests {
             .map(|minute| bucket(minute, if minute < 4 { 20. } else { 0. }))
             .collect::<Vec<_>>();
         assert_eq!(
-            process_history("builder", 20., 1439, &often)
+            process_history("builder", 20., 1439, 1, &often)
                 .unwrap()
                 .pattern,
             "Busy often: 80 % of recorded minutes."
@@ -473,7 +478,7 @@ mod tests {
             .map(|minute| bucket(minute, if minute == 0 { 20. } else { 0. }))
             .collect::<Vec<_>>();
         assert_eq!(
-            process_history("builder", 20., 1439, &bursts)
+            process_history("builder", 20., 1439, 1, &bursts)
                 .unwrap()
                 .pattern,
             "Runs in bursts: busy in 1 of 4 recorded minutes."
@@ -482,7 +487,7 @@ mod tests {
             .map(|minute| bucket(minute, if minute < 5 { 20. } else { 0. }))
             .collect::<Vec<_>>();
         assert_eq!(
-            process_history("builder", 20., 1439, &steady)
+            process_history("builder", 20., 1439, 1, &steady)
                 .unwrap()
                 .pattern,
             "Runs steadily: busy in 83 % of recorded minutes."
@@ -493,20 +498,28 @@ mod tests {
     fn now_sentence_uses_strict_ratio_thresholds() {
         let usual = vec![bucket(0, 40.)];
         assert_eq!(
-            process_history("builder", 60., 1439, &usual).unwrap().now,
-            "Now 60 %, about its usual busy load."
+            process_history("builder", 60., 1439, 1, &usual)
+                .unwrap()
+                .now,
+            "Now 60.0 %, about its usual busy load."
         );
         assert_eq!(
-            process_history("builder", 80., 1439, &usual).unwrap().now,
-            "Now 80 %, 2.0× its usual busy load."
+            process_history("builder", 80., 1439, 1, &usual)
+                .unwrap()
+                .now,
+            "Now 80.0 %, 2.0× its usual busy load."
         );
         assert_eq!(
-            process_history("builder", 10., 1439, &usual).unwrap().now,
-            "Now 10 %, well below its usual busy load."
+            process_history("builder", 10., 1439, 1, &usual)
+                .unwrap()
+                .now,
+            "Now 10.0 %, well below its usual busy load."
         );
         assert_eq!(
-            process_history("builder", 20., 1439, &usual).unwrap().now,
-            "Now 20 %, about its usual busy load."
+            process_history("builder", 20., 1439, 1, &usual)
+                .unwrap()
+                .now,
+            "Now 20.0 %, about its usual busy load."
         );
     }
 
@@ -520,7 +533,7 @@ mod tests {
             bucket(5, 60.),
             bucket(20, 5.),
         ];
-        let history = process_history("builder", 60., 1439, &buckets).unwrap();
+        let history = process_history("builder", 60., 1439, 1, &buckets).unwrap();
         assert_eq!(history.longest_busy_minutes, 3);
         assert_eq!(history.columns.len(), 144);
         assert!(history.columns[0].is_some());
