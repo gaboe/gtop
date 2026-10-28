@@ -1897,8 +1897,7 @@ mod tests {
         visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
         visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
         visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
-        let before =
-            visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx));
+        let before = visual.update(gpui_base::TextSelection::selected_text);
         assert!(!before.is_empty());
 
         view.update(visual, |view, cx| {
