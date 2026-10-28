@@ -666,6 +666,88 @@ fn cached_win_dots(cache: &RefCell<WinDotCache>, bounds: Bounds<Pixels>) -> Opti
     cached_win_dots_with(cache, bounds, build_win_dots)
 }
 
+struct DotMesh(u32);
+
+impl Render for DotMesh {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let color = self.0;
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                if let Some(path) = WIN_DOT_CACHE.with(|cache| cached_win_dots(cache, bounds)) {
+                    window.paint_path(path, rgb(color));
+                }
+            },
+        )
+        .size_full()
+    }
+}
+
+#[derive(Default)]
+struct DotViews(Vec<DotViewEntry>);
+
+struct DotViewEntry {
+    window: WindowId,
+    key: WinDotKey,
+    color: u32,
+    view: Entity<DotMesh>,
+}
+impl Global for DotViews {}
+
+#[cfg(all(test, target_os = "macos", gtop_draw_benchmark))]
+pub(super) fn clear_dot_views(cx: &mut App) {
+    cx.default_global::<DotViews>().0.clear();
+}
+
+#[cfg(all(test, target_os = "macos", gtop_draw_benchmark))]
+pub(super) fn assert_dot_view_bounds(window: &mut Window, cx: &mut App) {
+    clear_dot_views(cx);
+    let bounds = Bounds::new(point(px(0.), px(0.)), size(px(30.), px(30.)));
+    let _ = dot_view(bounds, 0xffb000, window, cx);
+    let _ = dot_view(
+        Bounds::new(point(px(40.), px(0.)), bounds.size),
+        0xffb000,
+        window,
+        cx,
+    );
+    assert_eq!(
+        cx.default_global::<DotViews>().0.len(),
+        2,
+        "distinct bounds must retain distinct dot views"
+    );
+    clear_dot_views(cx);
+}
+
+fn dot_view(bounds: Bounds<Pixels>, color: u32, window: &mut Window, cx: &mut App) -> AnyElement {
+    let key = WinDotKey::from_bounds(bounds);
+    let id = window.window_handle().window_id();
+    let found = key.and_then(|key| {
+        cx.default_global::<DotViews>()
+            .0
+            .iter()
+            .find(|entry| entry.window == id && entry.key == key && entry.color == color)
+            .map(|entry| entry.view.clone())
+    });
+    let view = found.unwrap_or_else(|| {
+        let view = cx.new(|_| DotMesh(color));
+        if let Some(key) = key {
+            let cache = &mut cx.default_global::<DotViews>().0;
+            if cache.len() == WIN_DOT_CACHE_SLOTS {
+                cache.remove(0);
+            }
+            cache.push(DotViewEntry {
+                window: id,
+                key,
+                color,
+                view: view.clone(),
+            });
+        }
+        view
+    });
+    view.cached(StyleRefinement::default().size_full())
+        .into_any_element()
+}
+
 pub fn win(t: &Tokens) -> Div {
     let dots = (!t.light).then(|| palette::mix(t.base.led, t.readout, 0.07));
     div()
@@ -682,13 +764,21 @@ pub fn win(t: &Tokens) -> Div {
         .border_color(rgb(t.well_rule))
         .child(
             canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _| {
-                    if let Some(dots) = dots {
-                        let path = WIN_DOT_CACHE.with(|cache| cached_win_dots(cache, bounds));
-                        if let Some(path) = path {
-                            window.paint_path(path, rgb(dots));
-                        }
+                move |bounds, window, cx| {
+                    dots.map(|color| {
+                        let mut element = dot_view(bounds, color, window, cx);
+                        element.prepaint_as_root(
+                            bounds.origin,
+                            bounds.size.map(AvailableSpace::Definite),
+                            window,
+                            cx,
+                        );
+                        element
+                    })
+                },
+                |_, element, window, cx| {
+                    if let Some(mut element) = element {
+                        element.paint(window, cx);
                     }
                 },
             )

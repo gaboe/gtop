@@ -6,6 +6,7 @@ thread_local! {
     static FIXED_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LONG_DETAIL_REVIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DETAIL_STRESS_REVIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TABLE_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -15,6 +16,10 @@ pub(super) fn fixed_clock() -> bool {
 
 pub(super) fn record_render() {
     RENDERS.with(|count| count.set(count.get() + 1));
+}
+
+pub(super) fn record_table_render() {
+    TABLE_RENDERS.with(|count| count.set(count.get() + 1));
 }
 
 fn view_selected(name: &str, selected_views: Option<&str>) -> bool {
@@ -58,53 +63,58 @@ fn dimension(name: &str, default: usize) -> usize {
 }
 
 #[cfg(target_os = "macos")]
+fn fixed_snapshot() -> Snapshot {
+    let mut s = test_data::snapshot();
+    let processes = dimension("GTOP_DRAW_PROCESSES", 1000);
+    let cores = dimension("GTOP_DRAW_CORES", 14);
+    s.stats.cpu_usage = (0..cores).map(|i| 15. + (i % 14) as f32 * 5.).collect();
+    let total: f32 = s.stats.cpu_usage.iter().sum();
+    let active = processes.min(16);
+    let weight = (active * (active + 1) / 2) as f32;
+    s.processes = (1..=u32::try_from(processes).unwrap())
+        .map(|pid| {
+            let cpu = if pid as usize <= active {
+                total * (active + 1 - pid as usize) as f32 / weight
+            } else {
+                0.
+            };
+            let mut process = test_data::process(pid, &format!("process-{pid:04}"), cpu);
+            if pid == 1 && DETAIL_STRESS_REVIEW.with(std::cell::Cell::get) {
+                process.executable = "/Users/čšž/日本/app".into();
+                process.argv = std::iter::once(process.executable.clone())
+                    .chain((0..10_000).map(|i| format!("argument-{i}")))
+                    .collect();
+                process.command = "x".repeat(200_000);
+            } else if pid == 1 && LONG_DETAIL_REVIEW.with(std::cell::Cell::get) {
+                process.executable =
+                    format!("/Users/gtop/{}worker", "long_directory_name/".repeat(8));
+                let long_argument = format!("https://example.invalid/{}", "token".repeat(25));
+                process.argv = vec![process.executable.clone(), "--config".into(), long_argument];
+                process.command = format!("kernel_task/{}", "renamed_process".repeat(8));
+            }
+            // Keep fixture rows out of the test process cost readout.
+            process.pid += 1_000_000;
+            process
+        })
+        .collect::<Vec<_>>()
+        .into();
+    assert_eq!(s.processes.len(), processes);
+    assert!(s.processes.iter().all(|p| p.pid != std::process::id()));
+    let process_cpu: f32 = s.processes.iter().map(|p| p.cpu_usage).sum();
+    assert!((process_cpu - total).abs() < 0.01);
+    assert!(process_cpu <= cores as f32 * 100. + 0.01);
+    s.stats.memory_total = 32 << 30;
+    s.stats.memory_used = 19 << 30;
+    s.stats.memory_free = 13 << 30;
+    s
+}
+
+#[cfg(target_os = "macos")]
 fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
     let settings = palette::Settings::default();
     let base = settings.base();
     let focus = cx.focus_handle();
-    let snapshot = Rc::new({
-        let mut s = test_data::snapshot();
-        let processes = dimension("GTOP_DRAW_PROCESSES", 1000);
-        let cores = dimension("GTOP_DRAW_CORES", 14);
-        s.stats.cpu_usage = (0..cores).map(|i| 15. + (i % 14) as f32 * 5.).collect();
-        let total: f32 = s.stats.cpu_usage.iter().sum();
-        let active = processes.min(16);
-        let weight = (active * (active + 1) / 2) as f32;
-        s.processes = (1..=u32::try_from(processes).unwrap())
-            .map(|pid| {
-                let cpu = if pid as usize <= active {
-                    total * (active + 1 - pid as usize) as f32 / weight
-                } else {
-                    0.
-                };
-                let mut process = test_data::process(pid, &format!("process-{pid:04}"), cpu);
-                if pid == 1 && DETAIL_STRESS_REVIEW.with(std::cell::Cell::get) {
-                    process.executable = "/Users/čšž/日本/app".into();
-                    process.argv = std::iter::once(process.executable.clone())
-                        .chain((0..10_000).map(|i| format!("argument-{i}")))
-                        .collect();
-                    process.command = "x".repeat(200_000);
-                } else if pid == 1 && LONG_DETAIL_REVIEW.with(std::cell::Cell::get) {
-                    process.executable =
-                        format!("/Users/gtop/{}worker", "long_directory_name/".repeat(8));
-                    let long_argument = format!("https://example.invalid/{}", "token".repeat(25));
-                    process.argv =
-                        vec![process.executable.clone(), "--config".into(), long_argument];
-                    process.command = format!("kernel_task/{}", "renamed_process".repeat(8));
-                }
-                process
-            })
-            .collect::<Vec<_>>()
-            .into();
-        assert_eq!(s.processes.len(), processes);
-        let process_cpu: f32 = s.processes.iter().map(|p| p.cpu_usage).sum();
-        assert!((process_cpu - total).abs() < 0.01);
-        assert!(process_cpu <= cores as f32 * 100. + 0.01);
-        s.stats.memory_total = 32 << 30;
-        s.stats.memory_used = 19 << 30;
-        s.stats.memory_free = 13 << 30;
-        s
-    });
+    let snapshot = Rc::new(fixed_snapshot());
     let table = cx.new(|_| {
         let mut table = Processes::default();
         table.snapshot = Some(snapshot.clone());
@@ -373,6 +383,10 @@ fn monitor_interaction_benchmark() {
         Root::new(entity, window, cx)
     });
     let monitor = monitor.unwrap();
+    cx.update_window(handle.into(), |_, w, cx| {
+        monitor.update(cx, |m, cx| m.accept(fixed_snapshot(), w, cx));
+    })
+    .unwrap();
     let n = dimension("GTOP_DRAW_N", 31);
     let mut visual = VisualTestContext::from_window(handle.into(), &cx);
     gpui::draw_benchmark_observe(false);
@@ -415,6 +429,8 @@ fn monitor_interaction_benchmark() {
             .unwrap();
         println!("interaction_bounds view={view} viewport={viewport:?} button={button:?}");
         for action in [
+            "notify",
+            "live_sample",
             "stationary",
             "rows",
             "headers",
@@ -423,6 +439,9 @@ fn monitor_interaction_benchmark() {
             "text_drag",
             "select",
         ] {
+            if action == "live_sample" && view != "live" {
+                continue;
+            }
             if action == "select" && view != "live" {
                 continue;
             }
@@ -439,6 +458,13 @@ fn monitor_interaction_benchmark() {
                 .update_window(handle.into(), |_, w, _| w.draw_benchmark_scene().5)
                 .unwrap();
             let before_renders = RENDERS.with(|v| v.get());
+            let before_table_renders = TABLE_RENDERS.with(|v| v.get());
+            let mut samples = if action == "live_sample" {
+                (0..n).map(|_| fixed_snapshot()).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+            .into_iter();
             gpui::draw_benchmark_record_draws(true);
             for i in 0..n {
                 let position = match action {
@@ -454,6 +480,14 @@ fn monitor_interaction_benchmark() {
                 };
                 let start = thread_cpu_ns();
                 cx.update_window(handle.into(), |_, w, cx| {
+                    if action == "live_sample" {
+                        monitor.update(cx, |m, cx| m.accept(samples.next().unwrap(), w, cx));
+                        return;
+                    }
+                    if action == "notify" {
+                        monitor.update(cx, |_, cx| cx.notify());
+                        return;
+                    }
                     if action == "text_drag" && i == 0 {
                         w.dispatch_event(
                             MouseDownEvent {
@@ -546,6 +580,18 @@ fn monitor_interaction_benchmark() {
                 );
             }
             let renders = RENDERS.with(|v| v.get()) - before_renders;
+            let table_renders = TABLE_RENDERS.with(|v| v.get()) - before_table_renders;
+            if action == "live_sample" {
+                assert_eq!(
+                    table_renders, n,
+                    "each accepted sample must render Processes once"
+                );
+            }
+            if matches!(action, "notify" | "live_sample") {
+                assert_eq!(draws, n, "each notification must draw once");
+                assert_eq!(renders, n, "each notification must render Monitor once");
+                assert_eq!(changed_scenes, 0, "unchanged data must preserve the scene");
+            }
             if action == "text_drag" {
                 cx.update_window(handle.into(), |_, w, cx| {
                     w.dispatch_event(
@@ -562,11 +608,113 @@ fn monitor_interaction_benchmark() {
                 })
                 .unwrap();
             }
-            println!("interaction view={view} action={action} events={n} draws={draws} renders={renders} changed_scenes={changed_scenes} scene={scene:016x} event_cpu_ms={:.6} draw_cpu_ms={:.6} cpu_ms_per_draw={:.6} errors=0",
+            println!("interaction view={view} action={action} events={n} draws={draws} renders={renders} table_renders={table_renders} changed_scenes={changed_scenes} scene={scene:016x} event_cpu_ms={:.6} draw_cpu_ms={:.6} cpu_ms_per_draw={:.6} errors=0",
                 (events_ns - draws_ns) as f64 / 1e6, draws_ns as f64 / 1e6,
                 draws_ns as f64 / 1e6 / draws.max(1) as f64);
         }
     }
+    FIXED_CLOCK.with(|v| v.set(false));
+}
+
+#[cfg(all(target_os = "macos", gtop_draw_benchmark))]
+#[test]
+#[ignore = "headless warm-cache scene comparison; use draw-benchmark instrumentation"]
+fn warm_dot_cache_transitions() {
+    FIXED_CLOCK.with(|v| v.set(true));
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("warm_dot_cache_transitions"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        cx.draw_benchmark_assets(gpui_kit_assets::Assets);
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    for bytes in [
+        include_bytes!("../assets/fonts/DotoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/JetBrainsMono.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoLabels.ttf").as_slice(),
+        include_bytes!("../assets/fonts/Silkscreen.ttf").as_slice(),
+    ] {
+        cx.text_system()
+            .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
+            .unwrap();
+    }
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+    cx.simulate_window_scale_factor_change(handle.into(), 1.);
+    for _ in 0..5 {
+        cx.update_window(handle.into(), |_, w, cx| w.draw(cx).clear(cx))
+            .unwrap();
+    }
+    for transition in [
+        "led",
+        "background",
+        "aluminium",
+        "amber",
+        "resize",
+        "scale1.5",
+        "scale2",
+        "scale1",
+    ] {
+        match transition {
+            "resize" => cx.simulate_window_resize(handle.into(), size(px(1300.), px(880.))),
+            "scale1.5" => cx.simulate_window_scale_factor_change(handle.into(), 1.5),
+            "scale2" => cx.simulate_window_scale_factor_change(handle.into(), 2.),
+            "scale1" => cx.simulate_window_scale_factor_change(handle.into(), 1.),
+            _ => cx.update(|cx| {
+                monitor.update(cx, |m, cx| {
+                    match transition {
+                        "led" => {
+                            let mut base = m.settings.base();
+                            base.led = 0x43d6ff;
+                            m.settings.edit_base(base);
+                        }
+                        "background" => {
+                            let mut base = m.settings.base();
+                            base.ground = 0x142536;
+                            m.settings.edit_base(base);
+                        }
+                        "aluminium" => m.settings.active = 4,
+                        "amber" => m.settings.active = 0,
+                        _ => unreachable!(),
+                    }
+                    let base = m.settings.base();
+                    m.table.update(cx, |table, cx| {
+                        table.base = base;
+                        cx.notify();
+                    });
+                    theme::apply(base, cx);
+                    cx.notify();
+                })
+            }),
+        }
+        cx.update_window(handle.into(), |_, w, cx| {
+            w.draw(cx).clear(cx);
+            let cached = w.draw_benchmark_scene().5;
+            rack::clear_dot_views(cx);
+            w.refresh();
+            w.draw(cx).clear(cx);
+            assert_eq!(
+                cached,
+                w.draw_benchmark_scene().5,
+                "warm transition {transition}"
+            );
+            println!("transition={transition} scene={cached:016x} parity=true");
+        })
+        .unwrap();
+    }
+    cx.update_window(handle.into(), |_, w, cx| {
+        rack::assert_dot_view_bounds(w, cx)
+    })
+    .unwrap();
     FIXED_CLOCK.with(|v| v.set(false));
 }
 

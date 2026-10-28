@@ -249,6 +249,8 @@ impl Processes {
 }
 impl Render for Processes {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        crate::draw_benchmark::record_table_render();
         let t = self.base.tokens();
         let columns = self.columns();
         self.resolved = columns.into_iter().zip(self.computed_widths()).collect();

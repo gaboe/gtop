@@ -24,7 +24,7 @@ rtk proxy python3 crates/gtop/scripts/draw-benchmark.py --mode clean --interacti
 
 No native window opens. The release profile stays at opt-level 3, fat LTO, one codegen unit, and no incremental compilation. Each state gets five warmup draws and 31 measured draws. Use `--samples 5` for a short run. Use `--debug` only to check the tool.
 
-The fixture has 1000 processes, 14 cores, a 1480x960 viewport, populated history and process detail. Sixteen processes share the supplied per-core CPU total. The remaining rows are idle. History rows use production sorting and leader rules. The fixture retains the single-bank topology and unavailable-GPU branch from test data. It does not cover every hardware layout.
+The fixture has 1000 processes, 14 cores, a 1480x960 viewport, populated history and process detail. It adds 1,000,000 to each synthetic PID and rejects any match to the test process. This keeps the gtop cost readout constant across runs. Sixteen processes share the supplied per-core CPU total. The remaining rows are idle. History rows use production sorting and leader rules. The fixture retains the single-bank topology and unavailable-GPU branch from test data. It does not cover every hardware layout.
 
 Select the realistic smaller control with these variables.
 
@@ -40,6 +40,8 @@ The timer measures Darwin thread CPU around `Window::draw`. The test forces a fu
 Clean mode disables AnyElement increments and per-frame scene formatting. It retains a thread-local enabled check per AnyElement allocation, one counter reset per draw, two timer calls, a disabled interaction-timer check, and one Monitor render-counter increment. The copied GPUI records debug selector bounds in release builds so interactions can target the rendered controls. Both modes disable the existing unit-glyph test bounds recorder. Validation mode records work counts and scene digests after each measured draw. Use clean mode for performance claims. Alternate clean and validation runs to measure observer effects. Changing runtime modes does not rebuild dependencies.
 
 Interaction mode uses the same fixture at 1480x960 and the test platform's scale factor of 2. It visits Live, Detail, 24-hour history, and the palette panel. It sends stationary moves, row and header moves, button enter and leave, wheel scroll, row clicks, and text selection drags. The `events` field counts interaction steps. A wheel step sends a move and a wheel event. A row-click step sends a move, press, and release. Views that do not support an action skip it.
+
+The `notify` action sends one Monitor notification per sample without forcing a full window refresh. It measures a parent-only notification. Assertions require one draw and one Monitor render per notification, with the same scene before and after. This separates regular redraws from the full-refresh test, which deliberately disables GPUI view caches.
 
 The interaction timer runs inside `Window::draw`. It counts draws that GPUI's test context performs while it flushes event effects. `draws` counts actual frames. `renders` counts Monitor renders. `draw_cpu_ms` excludes arena cleanup. `event_cpu_ms` measures the remaining thread CPU for the event step, including effects and arena cleanup. Scene hashes run once before and after each action, outside the timed steps. Assertions require scroll to change the scene, row clicks to open Detail, and a drag to select text. No native window opens.
 
@@ -60,3 +62,11 @@ rtk proxy python3 -m unittest discover -s crates/gtop/scripts -p 'test_draw_benc
 ```
 
 For a separate symbolized profile, use `--symbols`. This adds debuginfo and retains symbols through `RUSTFLAGS`, including dependency symbols. All optimization settings stay unchanged. Sample only the owned test process. Discard profiled timings.
+
+`notify` only notifies Monitor. `live_sample` accepts a fixed snapshot through
+`Monitor::accept`, reorders Processes, and notifies both entities. It asserts one
+Processes render per sample. Only `live_sample` represents an accepted live sample.
+
+The ignored `warm_dot_cache_transitions` test uses the same instrumented binary.
+It compares warm scenes with a fresh dot-view cache and `window.refresh()` after
+colour edits, palette switches, resize, and scale changes.
