@@ -818,7 +818,7 @@ fn headless_ghost_layers_match_palette_mode() {
                 })
             });
             if matches!(content, GhostLayerContent::Full) {
-                crate::rack::DIGIT_GHOST_TEST_TEXTS.lock().unwrap().clear();
+                crate::rack::DIGIT_GHOST_TEST_TEXTS.with(|recorded| recorded.borrow_mut().clear());
             }
             cx.update_window(handle.into(), |_, window, cx| {
                 window.refresh();
@@ -854,8 +854,8 @@ fn headless_ghost_layers_match_palette_mode() {
             }
 
             if matches!(content, GhostLayerContent::Full) {
-                let rendered_ghosts =
-                    std::mem::take(&mut *crate::rack::DIGIT_GHOST_TEST_TEXTS.lock().unwrap());
+                let rendered_ghosts = crate::rack::DIGIT_GHOST_TEST_TEXTS
+                    .with(|recorded| std::mem::take(&mut *recorded.borrow_mut()));
                 assert_eq!(
                     rendered_ghosts.contains(&"88".into()),
                     expect_ghost,

@@ -124,9 +124,8 @@ static UNIT_PATHS: OnceLock<Mutex<HashMap<UnitCacheKey, UnitPaths>>> = OnceLock:
 #[cfg(test)]
 thread_local! {
     static UNIT_GLYPH_TEST_BOUNDS: RefCell<Vec<Bounds<Pixels>>> = const { RefCell::new(Vec::new()) };
+    pub(crate) static DIGIT_GHOST_TEST_TEXTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
-#[cfg(test)]
-pub(crate) static DIGIT_GHOST_TEST_TEXTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn core_time(seconds: f64) -> String {
     let minutes = seconds / 60.;
@@ -205,7 +204,7 @@ pub fn lit(text: String, size: f32, hot: bool, t: &Tokens) -> Div {
             .collect::<String>();
         #[cfg(test)]
         if !crate::draw_benchmark::fixed_clock() {
-            DIGIT_GHOST_TEST_TEXTS.lock().unwrap().push(ghost.clone());
+            DIGIT_GHOST_TEST_TEXTS.with(|recorded| recorded.borrow_mut().push(ghost.clone()));
         }
         readout = readout.child(
             div()
@@ -365,7 +364,7 @@ pub fn lit_unit(value: String, unit: char, size: f32, hot: bool, t: &Tokens) -> 
             .collect::<String>();
         #[cfg(test)]
         if !crate::draw_benchmark::fixed_clock() {
-            DIGIT_GHOST_TEST_TEXTS.lock().unwrap().push(ghost.clone());
+            DIGIT_GHOST_TEST_TEXTS.with(|recorded| recorded.borrow_mut().push(ghost.clone()));
         }
         digits = digits.child(
             div()
@@ -2902,9 +2901,9 @@ fn purgeable_label(bytes: u64) -> Option<String> {
 mod tests {
     use super::{
         cpu_segments, div, draw_readout_text, history_cell, lit_unit, purgeable_label,
-        vfd_digit_width, Bounds, DrawMetrics, Path, Pixels, Tokens, UNIT_GLYPHS,
-        UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES, WIN_DOT_CACHE_MAX_ENTRY_VERTICES,
-        WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
+        vfd_digit_width, Bounds, DrawMetrics, Path, Pixels, Tokens, DIGIT_GHOST_TEST_TEXTS,
+        UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES,
+        WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
     };
     use gpui::{prelude::*, px, TestAppContext, Window};
 
@@ -4016,6 +4015,33 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn digit_ghost_capture_is_isolated_between_threads() {
+        DIGIT_GHOST_TEST_TEXTS.with(|recorded| recorded.borrow_mut().clear());
+        let tokens = crate::palette::presets()[0].base.tokens();
+        let interleaved = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = interleaved.clone();
+        let worker = std::thread::spawn(move || {
+            super::lit("42".into(), 22., false, &tokens);
+            super::lit_unit("42".into(), '%', 22., false, &tokens);
+            worker_barrier.wait();
+            worker_barrier.wait();
+            DIGIT_GHOST_TEST_TEXTS.with(|recorded| std::mem::take(&mut *recorded.borrow_mut()))
+        });
+
+        interleaved.wait();
+        let owner_recordings =
+            DIGIT_GHOST_TEST_TEXTS.with(|recorded| std::mem::take(&mut *recorded.borrow_mut()));
+        interleaved.wait();
+        let worker_recordings = worker.join().unwrap();
+
+        assert!(
+            owner_recordings.is_empty(),
+            "other thread's producers contaminated the owner's capture: {owner_recordings:?}"
+        );
+        assert_eq!(worker_recordings, ["88", "888"]);
     }
 
     #[gpui::test]
