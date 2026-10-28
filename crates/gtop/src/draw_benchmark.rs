@@ -85,11 +85,14 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
                         vec![process.executable.clone(), "--config".into(), long_argument];
                     process.command = format!("kernel_task/{}", "renamed_process".repeat(8));
                 }
+                // Keep fixture rows out of the test process cost readout.
+                process.pid += 1_000_000;
                 process
             })
             .collect::<Vec<_>>()
             .into();
         assert_eq!(s.processes.len(), processes);
+        assert!(s.processes.iter().all(|p| p.pid != std::process::id()));
         let process_cpu: f32 = s.processes.iter().map(|p| p.cpu_usage).sum();
         assert!((process_cpu - total).abs() < 0.01);
         assert!(process_cpu <= cores as f32 * 100. + 0.01);

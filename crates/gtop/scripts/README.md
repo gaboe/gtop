@@ -24,7 +24,7 @@ rtk proxy python3 crates/gtop/scripts/draw-benchmark.py --mode clean --interacti
 
 No native window opens. The release profile stays at opt-level 3, fat LTO, one codegen unit, and no incremental compilation. Each state gets five warmup draws and 31 measured draws. Use `--samples 5` for a short run. Use `--debug` only to check the tool.
 
-The fixture has 1000 processes, 14 cores, a 1480x960 viewport, populated history and process detail. Sixteen processes share the supplied per-core CPU total. The remaining rows are idle. History rows use production sorting and leader rules. The fixture retains the single-bank topology and unavailable-GPU branch from test data. It does not cover every hardware layout.
+The fixture has 1000 processes, 14 cores, a 1480x960 viewport, populated history and process detail. It adds 1,000,000 to each synthetic PID and rejects any match to the test process. This keeps the gtop cost readout constant across runs. Sixteen processes share the supplied per-core CPU total. The remaining rows are idle. History rows use production sorting and leader rules. The fixture retains the single-bank topology and unavailable-GPU branch from test data. It does not cover every hardware layout.
 
 Select the realistic smaller control with these variables.
 
