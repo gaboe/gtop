@@ -1465,9 +1465,9 @@ fn detail_line(label: &str, value: String) -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        arguments_value, command_is_duplicate, detail_arguments, environment_content,
-        environment_section, executable_value, is_flag_argument, kill_completed, path_parts,
-        shell_arguments, Details, Environment, KillState,
+        arguments_value, command_is_duplicate, detail_arguments, detail_section_header,
+        environment_content, environment_section, executable_value, is_flag_argument,
+        kill_completed, path_parts, shell_arguments, Details, Environment, KillState,
     };
     use crate::model::ProcessKey;
     use crate::rack::RackButton;
@@ -1700,6 +1700,13 @@ mod tests {
                         .w_full()
                         .min_w_0()
                         .child(executable_value(&self.executable, key, &tokens, window, cx))
+                        .child(detail_section_header(
+                            "ARGUMENTS",
+                            "copy-arguments",
+                            shell_arguments(&self.arguments),
+                            &tokens,
+                            cx,
+                        ))
                         .child(arguments_value(&self.arguments, key, &tokens, window, cx)),
                 )
         }
@@ -1775,8 +1782,100 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    async fn multibyte_paths_and_arguments_wrap_select_and_copy_exactly(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let executable = format!("/Users/čšž/日本/{}/app", "segment/".repeat(12));
+        let arguments = vec!["--label=😀".into(), executable.clone(), "two words".into()];
+        let (_, visual) = cx.add_window_view(|_, _| WrappedDetailLayoutTest {
+            palette: 0,
+            width: 280.,
+            executable: executable.clone(),
+            arguments: arguments.clone(),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        let path = visual.debug_bounds("executable-value").unwrap();
+        assert!(path.size.height > px(20.), "path did not wrap: {path:?}");
+        let path_start = path.origin + point(px(1.), px(2.));
+        let path_end = path.bottom_right() - point(px(1.), px(2.));
+        visual.simulate_mouse_down(path_start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(path_end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(path_end, MouseButton::Left, Modifiers::default());
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                gpui_base::TextSelection::selected_text(window, cx),
+                executable
+            );
+        });
+
+        let arguments_bounds = visual.debug_bounds("arguments-value").unwrap();
+        let start = arguments_bounds.origin + point(px(1.), px(2.));
+        let end = arguments_bounds.bottom_right() - point(px(1.), px(2.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        visual.simulate_keystrokes("cmd-c");
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                gpui_base::TextSelection::selected_text(window, cx),
+                arguments.join("\n")
+            );
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                arguments.join("\n")
+            );
+        });
+
+        let copy_arguments = visual.debug_bounds("copy-arguments").unwrap();
+        visual.simulate_click(copy_arguments.center(), Modifiers::default());
+        visual.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                format!("'--label=😀' '{executable}' 'two words'")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn wrapped_text_selection_survives_resize(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, visual) = cx.add_window_view(|_, _| WrappedDetailLayoutTest {
+            palette: 0,
+            width: 280.,
+            executable: "/Users/čšž/日本/app".into(),
+            arguments: vec!["--label=😀 and a long value".into()],
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = visual.debug_bounds("arguments-value").unwrap();
+        let start = bounds.origin + point(px(1.), px(2.));
+        let end = bounds.origin + point(px(72.), px(2.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        let before =
+            visual.update(|window, cx| gpui_base::TextSelection::selected_text(window, cx));
+        assert!(!before.is_empty());
+
+        view.update(visual, |view, cx| {
+            view.width = 560.;
+            cx.notify();
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.update(|window, cx| {
+            assert_eq!(gpui_base::TextSelection::selected_text(window, cx), before);
+        });
+    }
+
     struct CopyDetailTest {
         search: Entity<gpui_component::input::InputState>,
+        command: String,
     }
 
     impl Render for CopyDetailTest {
@@ -1815,7 +1914,7 @@ mod tests {
                         .child(super::selectable_wrapped_content(
                             window,
                             "command",
-                            "\nalpha beta",
+                            &self.command,
                             &tokens,
                             cx,
                         )),
@@ -1830,6 +1929,7 @@ mod tests {
             search: cx.new(|cx| {
                 gpui_component::input::InputState::new(window, cx).default_value("search text")
             }),
+            command: "\nalpha beta".into(),
         });
         visual.run_until_parked();
         visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -1865,6 +1965,7 @@ mod tests {
         cx.update(gpui_component::init);
         let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
             search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+            command: "\nalpha beta".into(),
         });
         visual.run_until_parked();
         visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -1887,6 +1988,7 @@ mod tests {
         cx.update(gpui_component::init);
         let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
             search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+            command: "\nalpha beta".into(),
         });
         visual.run_until_parked();
         visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -1906,10 +2008,76 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn detail_copy_preserves_a_selection_of_only_the_leading_newline(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
+            search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+            command: "\n".into(),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = visual.debug_bounds("command-test").unwrap();
+        let start = bounds.origin + point(px(1.), px(1.));
+        let end = bounds.bottom_right() - point(px(1.), px(1.));
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        visual.simulate_keystrokes("cmd-c");
+        visual.update(|window, cx| {
+            assert_eq!(gpui_base::TextSelection::selected_text(window, cx), "\n");
+            assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "\n");
+        });
+    }
+
+    #[gpui::test]
+    async fn detail_copy_keeps_whitespace_and_does_not_replace_clipboard_for_empty_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
+            search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+            command: "A   B".into(),
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        let bounds = visual.debug_bounds("command-test").unwrap();
+        visual.update(|_, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("previous".into()));
+        });
+        let start = bounds.origin + point(px(9.), bounds.size.height / 2.);
+        let end = bounds.origin + point(px(28.), bounds.size.height / 2.);
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        visual.update(|window, cx| {
+            assert!(gpui_base::TextSelection::has_selection(window, cx));
+        });
+        visual.simulate_keystrokes("cmd-c");
+        visual.update(|_, cx| {
+            assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "   ");
+            cx.write_to_clipboard(ClipboardItem::new_string("keep this".into()));
+        });
+
+        let command = visual.debug_bounds("command-test").unwrap();
+        visual.simulate_click(command.center(), Modifiers::default());
+        visual.simulate_keystrokes("cmd-c");
+        visual.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().unwrap(),
+                "keep this"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn detail_copy_button_writes_source_text(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let (_, visual) = cx.add_window_view(|window, cx| CopyDetailTest {
             search: cx.new(|cx| gpui_component::input::InputState::new(window, cx)),
+            command: "\nalpha beta".into(),
         });
         visual.run_until_parked();
         visual.update(|window, cx| window.draw(cx).clear(cx));
