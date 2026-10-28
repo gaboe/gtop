@@ -5,6 +5,7 @@ use std::prelude::v1::test;
 thread_local! {
     static FIXED_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LONG_DETAIL_REVIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DETAIL_STRESS_REVIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TABLE_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -78,7 +79,13 @@ fn fixed_snapshot() -> Snapshot {
                 0.
             };
             let mut process = test_data::process(pid, &format!("process-{pid:04}"), cpu);
-            if pid == 1 && LONG_DETAIL_REVIEW.with(std::cell::Cell::get) {
+            if pid == 1 && DETAIL_STRESS_REVIEW.with(std::cell::Cell::get) {
+                process.executable = "/Users/čšž/日本/app".into();
+                process.argv = std::iter::once(process.executable.clone())
+                    .chain((0..10_000).map(|i| format!("argument-{i}")))
+                    .collect();
+                process.command = "x".repeat(200_000);
+            } else if pid == 1 && LONG_DETAIL_REVIEW.with(std::cell::Cell::get) {
                 process.executable =
                     format!("/Users/gtop/{}worker", "long_directory_name/".repeat(8));
                 let long_argument = format!("https://example.invalid/{}", "token".repeat(25));
@@ -261,6 +268,85 @@ fn thread_cpu_ns() -> u64 {
     }
     // Darwin CLOCK_THREAD_CPUTIME_ID.
     unsafe { clock_gettime_nsec_np(16) }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "release-only detail stress draw outlier check"]
+fn very_long_detail_open_and_redraw_outlier_check() {
+    struct ClockGuard;
+    impl Drop for ClockGuard {
+        fn drop(&mut self) {
+            FIXED_CLOCK.with(|value| value.set(false));
+            DETAIL_STRESS_REVIEW.with(|value| value.set(false));
+        }
+    }
+    let _clock = ClockGuard;
+    FIXED_CLOCK.with(|value| value.set(true));
+    DETAIL_STRESS_REVIEW.with(|value| value.set(true));
+    let mut cx = TestAppContext::build_with_text_system(
+        TestDispatcher::new(0),
+        Some("very_long_detail_open_and_redraw_outlier_check"),
+        Arc::new(gpui_apple::AppleTextSystem::new()),
+    );
+    cx.update(|cx| {
+        #[cfg(gtop_draw_benchmark)]
+        cx.draw_benchmark_assets(gpui_kit_assets::Assets);
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    for bytes in [
+        include_bytes!("../assets/fonts/DotoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoDisplay.ttf").as_slice(),
+        include_bytes!("../assets/fonts/JetBrainsMono.ttf").as_slice(),
+        include_bytes!("../assets/fonts/ArchivoLabels.ttf").as_slice(),
+        include_bytes!("../assets/fonts/Silkscreen.ttf").as_slice(),
+    ] {
+        cx.text_system()
+            .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
+            .unwrap();
+    }
+    let mut monitor = None;
+    let handle = cx.open_window(size(px(1480.), px(960.)), |window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+    let key =
+        cx.read(|cx| ProcessKey::from(&monitor.read(cx).snapshot.as_ref().unwrap().processes[0]));
+    let mut samples = Vec::new();
+    for i in 0..16 {
+        let start = thread_cpu_ns();
+        cx.update(|cx| {
+            monitor.update(cx, |monitor, _| monitor.details = None);
+        });
+        cx.update(|cx| {
+            monitor.update(cx, |monitor, cx| monitor.select(key, cx));
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let elapsed = thread_cpu_ns() - start;
+        assert!(elapsed > 0);
+        if i >= 5 {
+            samples.push(elapsed as f64 / 1_000_000.);
+        }
+    }
+    samples.sort_by(f64::total_cmp);
+    let median = (samples[(samples.len() - 1) / 2] + samples[samples.len() / 2]) / 2.;
+    let minimum = samples[0];
+    let maximum = samples[samples.len() - 1];
+    assert!(
+        maximum <= median * 5.,
+        "stress draw outlier check: {samples:?}"
+    );
+    println!(
+        "detail_stress_outlier_check arguments=10000 command_bytes=200000 min_ms={minimum:.3} median_ms={median:.3} max_ms={maximum:.3} runs={} bound=5x_median uniform_slowdown_detection=false errors=0",
+        samples.len()
+    );
 }
 
 #[cfg(all(target_os = "macos", gtop_draw_benchmark))]
@@ -874,6 +960,7 @@ struct GhostLayerReview {
 #[derive(Clone, Copy)]
 enum GhostLayerContent {
     Full,
+    Dots,
     Unit(char),
 }
 
@@ -897,6 +984,9 @@ impl Render for GhostLayerReview {
                         &self.tokens,
                     )),
             ),
+            GhostLayerContent::Dots => {
+                content.child(crate::rack::win(&self.tokens).w(px(160.)).h(px(80.)))
+            }
             GhostLayerContent::Unit(unit) => content.child(crate::rack::unit_glyph_for_test(
                 unit,
                 42.,
@@ -955,10 +1045,15 @@ fn headless_ghost_layers_match_palette_mode() {
     ] {
         for (layer, content) in [
             ("full", GhostLayerContent::Full),
+            ("dots", GhostLayerContent::Dots),
             ("percent", GhostLayerContent::Unit('%')),
             ("degree", GhostLayerContent::Unit('°')),
         ] {
-            let tokens = base.tokens();
+            let mut tokens = base.tokens();
+            // A chromatic probe separates unit ghosts from antialiased graphite ink.
+            if matches!(content, GhostLayerContent::Unit(_)) {
+                tokens.base.led = 0xff00ff;
+            }
             cx.update(|cx| {
                 view.update(cx, |view, _| {
                     view.tokens = tokens;
@@ -966,7 +1061,7 @@ fn headless_ghost_layers_match_palette_mode() {
                 })
             });
             if matches!(content, GhostLayerContent::Full) {
-                crate::rack::DIGIT_GHOST_TEST_TEXTS.lock().unwrap().clear();
+                crate::rack::DIGIT_GHOST_TEST_TEXTS.with(|recorded| recorded.borrow_mut().clear());
             }
             cx.update_window(handle.into(), |_, window, cx| {
                 window.refresh();
@@ -978,32 +1073,24 @@ fn headless_ghost_layers_match_palette_mode() {
                 .save(directory.join(format!("{name}-{layer}.png")))
                 .unwrap();
             if let GhostLayerContent::Unit(_) = content {
-                let ghost = palette::mix(base.led, base.ground, 0.18);
+                let ghost = palette::mix(tokens.base.led, tokens.base.ground, 0.18);
                 let ghost_rgba = [
                     ((ghost >> 16) & 0xff) as u8,
                     ((ghost >> 8) & 0xff) as u8,
                     (ghost & 0xff) as u8,
                     0xff,
                 ];
-                let ghost_pixels = image
-                    .pixels()
-                    .filter(|pixel| {
-                        pixel
-                            .0
-                            .iter()
-                            .zip(ghost_rgba)
-                            .all(|(actual, expected)| actual.abs_diff(expected) <= 12)
-                    })
-                    .count();
+                let ghost_pixels = image.pixels().filter(|pixel| pixel.0 == ghost_rgba).count();
+                println!("{name} {layer} ghost pixel count was {ghost_pixels}");
                 assert!(
                     (ghost_pixels > 0) == expect_ghost,
-                    "{name} {layer} ghost pixel count near {ghost_rgba:?} was {ghost_pixels}"
+                    "{name} {layer} ghost pixel count matching {ghost_rgba:?} was {ghost_pixels}"
                 );
             }
 
             if matches!(content, GhostLayerContent::Full) {
-                let rendered_ghosts =
-                    std::mem::take(&mut *crate::rack::DIGIT_GHOST_TEST_TEXTS.lock().unwrap());
+                let rendered_ghosts = crate::rack::DIGIT_GHOST_TEST_TEXTS
+                    .with(|recorded| std::mem::take(&mut *recorded.borrow_mut()));
                 assert_eq!(
                     rendered_ghosts.contains(&"88".into()),
                     expect_ghost,
@@ -1014,6 +1101,10 @@ fn headless_ghost_layers_match_palette_mode() {
                     expect_ghost,
                     "{name} lit_unit digit ghost layers were {rendered_ghosts:?}"
                 );
+            }
+
+            // Text antialiasing can match the dot colour, so inspect an empty readout.
+            if matches!(content, GhostLayerContent::Dots) {
                 let dots = palette::mix(base.led, tokens.readout, 0.07);
                 let dots_rgba = [
                     ((dots >> 16) & 0xff) as u8,
@@ -1022,6 +1113,7 @@ fn headless_ghost_layers_match_palette_mode() {
                     0xff,
                 ];
                 let dot_pixels = image.pixels().filter(|pixel| pixel.0 == dots_rgba).count();
+                println!("{name} readout dot pixel count was {dot_pixels}");
                 assert_eq!(
                     dot_pixels > 0,
                     expect_ghost,
@@ -1713,6 +1805,193 @@ async fn detail_focus_returns_after_navigation(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn detail_focus_returns_after_settings(cx: &mut TestAppContext) {
     detail_focus_transition(cx, "s");
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_close_button_restores_monitor_focus_after_text_selection(cx: &mut TestAppContext) {
+    detail_button_focus_transition(cx, "close-details");
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_kill_confirmation_restores_monitor_focus_after_text_selection(
+    cx: &mut TestAppContext,
+) {
+    detail_button_focus_transition(cx, "confirm-kill");
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_kill_completion_restores_focus_and_reaps_owned_child(cx: &mut TestAppContext) {
+    use gpui::{point, px, size, Modifiers, MouseButton};
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    let mut child = ChildGuard(
+        std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+    );
+    let core = Arc::new(gtop_core::AppState::new());
+    let snapshot = core.snapshot(false, false).unwrap();
+    let process = snapshot
+        .processes
+        .iter()
+        .find(|process| process.pid == child.0.id())
+        .unwrap()
+        .clone();
+    let key = ProcessKey::from(&process);
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let (root, visual) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| {
+            let mut monitor = fixture(window, cx);
+            monitor.core = Some(core.clone());
+            monitor.snapshot = Some(Rc::new(snapshot));
+            monitor.select(key, cx);
+            monitor
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let _root = root;
+    let monitor = monitor.unwrap();
+    visual.simulate_resize(size(px(1480.), px(960.)));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let bounds = visual.debug_bounds("executable-value").unwrap();
+    let start = bounds.origin + point(px(1.), px(5.));
+    let end = bounds.origin + point(px(46.), px(5.));
+    visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    visual.update(|window, cx| {
+        assert!(!gpui_base::TextSelection::selected_text(window, cx).is_empty());
+    });
+
+    let kill = visual.debug_bounds("kill").unwrap();
+    visual.simulate_click(kill.center(), Modifiers::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let confirm = visual.debug_bounds("confirm-kill").unwrap();
+    visual.simulate_click(confirm.center(), Modifiers::default());
+    visual.run_until_parked();
+
+    visual.update(|window, cx| {
+        assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        assert_eq!(monitor.read(cx).pending_kill, Some(key));
+        assert!(monitor.read(cx).status.starts_with("Kill signal sent"));
+    });
+    assert!(!child.0.wait().unwrap().success());
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn detail_copy_state_releases_after_close(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let (root, visual) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| {
+            let mut monitor = fixture(window, cx);
+            let key = ProcessKey::from(&monitor.snapshot.as_ref().unwrap().processes[0]);
+            monitor.select(key, cx);
+            monitor
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let _root = root;
+    let monitor = monitor.unwrap();
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let participant_alive = monitor.read_with(visual, |monitor, _| {
+        monitor
+            .details
+            .as_ref()
+            .unwrap()
+            .copy_selection
+            .participant_alive_check(details::DetailTextSection::Executable)
+    });
+
+    monitor.update(visual, |monitor, cx| {
+        monitor.details = None;
+        cx.notify();
+    });
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.run_until_parked();
+    assert!(!participant_alive());
+}
+
+#[cfg(target_os = "macos")]
+fn detail_button_focus_transition(cx: &mut TestAppContext, button: &str) {
+    use gpui::{px, size, MouseButton};
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let (root, visual) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| {
+            let mut monitor = fixture(window, cx);
+            let key = ProcessKey::from(&monitor.snapshot.as_ref().unwrap().processes[0]);
+            monitor.select(key, cx);
+            monitor
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let _root = root;
+    let monitor = monitor.unwrap();
+    visual.simulate_resize(size(px(1480.), px(960.)));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let bounds = visual.debug_bounds("executable-value").unwrap();
+    let start = bounds.origin + point(px(1.), px(5.));
+    let end = bounds.origin + point(px(46.), px(5.));
+    visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    visual.update(|window, cx| {
+        assert!(!gpui_base::TextSelection::selected_text(window, cx).is_empty());
+    });
+
+    if button == "confirm-kill" {
+        let kill = visual.debug_bounds("kill").unwrap();
+        visual.simulate_click(kill.center(), Modifiers::default());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let confirm = visual.debug_bounds("confirm-kill").unwrap();
+        visual.simulate_click(confirm.center(), Modifiers::default());
+    } else {
+        let close = visual.debug_bounds("close-details").unwrap();
+        visual.simulate_click(close.center(), Modifiers::default());
+    }
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+    });
+    if button == "close-details" {
+        assert!(monitor.read_with(visual, |monitor, _| monitor.details.is_none()));
+    }
 }
 
 #[cfg(target_os = "macos")]

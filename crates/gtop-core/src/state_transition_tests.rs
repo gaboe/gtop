@@ -12,13 +12,14 @@ struct OwnedChild {
     input: ChildStdin,
     output: BufReader<ChildStdout>,
     file: PathBuf,
+    cpu_seconds: f64,
 }
 
 impl OwnedChild {
     fn new() -> Self {
         let script = r#"import os, sys, time
 f = open(sys.argv[1] + str(os.getpid()), 'wb', buffering=0)
-print('ready', flush=True)
+print('ready', time.process_time(), flush=True)
 for line in sys.stdin:
     size, busy = map(int, line.split())
     f.write(b'x' * size)
@@ -26,7 +27,7 @@ for line in sys.stdin:
     end = time.process_time() + busy / 1000
     while time.process_time() < end:
         pass
-    print('done', flush=True)
+    print('done', time.process_time(), flush=True)
 "#;
         let prefix = std::env::temp_dir().join("gtop-transition-");
         let mut child = Command::new("/usr/bin/python3")
@@ -39,28 +40,36 @@ for line in sys.stdin:
         let mut output = BufReader::new(child.stdout.take().unwrap());
         let mut ready = String::new();
         output.read_line(&mut ready).unwrap();
-        assert_eq!(ready.trim(), "ready");
+        let cpu_seconds = ready
+            .trim()
+            .strip_prefix("ready ")
+            .unwrap()
+            .parse()
+            .unwrap();
         let file = PathBuf::from(format!("{}{}", prefix.display(), child.id()));
         Self {
             child,
             input,
             output,
             file,
+            cpu_seconds,
         }
     }
 
-    fn work(&mut self, bytes: usize, cpu_ms: usize) {
+    fn work(&mut self, bytes: usize, cpu_ms: usize) -> f64 {
         writeln!(self.input, "{bytes} {cpu_ms}").unwrap();
         self.input.flush().unwrap();
         let mut done = String::new();
         self.output.read_line(&mut done).unwrap();
-        assert_eq!(done.trim(), "done");
+        let cpu_seconds = done.trim().strip_prefix("done ").unwrap().parse().unwrap();
+        cpu_seconds - std::mem::replace(&mut self.cpu_seconds, cpu_seconds)
     }
 
-    fn interval(&mut self, bytes: usize, cpu_ms: usize) {
+    fn interval(&mut self, bytes: usize, cpu_ms: usize) -> f64 {
         let start = Instant::now();
-        self.work(bytes, cpu_ms);
+        let cpu_seconds = self.work(bytes, cpu_ms);
         std::thread::sleep(Duration::from_secs(1).saturating_sub(start.elapsed()));
+        cpu_seconds
     }
 
     fn row(&self, state: &AppState, failed: bool) -> ProcessInfo {
@@ -93,30 +102,41 @@ impl Drop for OwnedChild {
     }
 }
 
+fn assert_cpu_work(row: &ProcessInfo, expected_seconds: f64) {
+    // Scheduling delays change the percentage, not the completed CPU work.
+    let seconds = row.cpu_usage as f64 * row.cpu_sample_seconds.unwrap() / 100.;
+    assert!(
+        (seconds - expected_seconds).abs() < 0.02,
+        "expected {expected_seconds}s CPU work, got {seconds}s from {}% over {:?}s",
+        row.cpu_usage,
+        row.cpu_sample_seconds
+    );
+}
+
 #[test]
 fn snapshots_keep_stale_rows_and_recover_exact_counter_intervals() {
     const BYTES: usize = 8 * 1024 * 1024;
     let mut child = OwnedChild::new();
     child.work(BYTES, 100);
     let state = AppState::new();
-    child.interval(BYTES, 200);
+    let first_work = child.interval(BYTES, 200);
     let first = child.row(&state, false);
     assert_eq!(first.disk_usage.1, BYTES as u64);
-    assert!(first.cpu_usage > 1.);
-    child.interval(BYTES, 200);
+    assert_cpu_work(&first, first_work);
+    let stale_work = child.interval(BYTES, 200);
     let stale = child.row(&state, true);
     assert_eq!(stale.disk_usage, first.disk_usage);
     assert_eq!(stale.cpu_usage, first.cpu_usage);
-    child.interval(BYTES, 200);
+    let recovery_work = child.interval(BYTES, 200);
     let recovered = child.row(&state, false);
     assert_eq!(recovered.disk_usage.1, 2 * BYTES as u64);
-    assert!(recovered.cpu_usage > 1.);
+    assert_cpu_work(&recovered, stale_work + recovery_work);
     for failed in [true, true, false] {
         child.interval(0, 0);
         let row = child.row(&state, failed);
         if !failed {
             assert_eq!(row.disk_usage.1, 0);
-            assert!(row.cpu_usage < 2.);
+            assert_cpu_work(&row, 0.);
         }
     }
     child.child.kill().unwrap();
@@ -170,8 +190,8 @@ fn unavailable_counters_preserve_last_valid_samples_and_startup_baselines() {
     let idle = child.row(&state, false);
     let last_valid_after = std::time::Instant::now();
     assert_eq!(idle.disk_usage.1, 0);
-    assert!(idle.cpu_usage < 2.);
-    child.interval(BYTES, 200);
+    assert_cpu_work(&idle, 0.);
+    let unavailable_work = child.interval(BYTES, 200);
     state
         .process_monitor
         .lock()
@@ -183,7 +203,7 @@ fn unavailable_counters_preserve_last_valid_samples_and_startup_baselines() {
     assert!(unavailable.cpu_sample_seconds.is_none());
     assert_eq!(unavailable.cpu_usage, 0.);
     assert_eq!(unavailable.memory_usage, 0);
-    child.interval(BYTES, 0);
+    let recovery_work = child.interval(BYTES, 0);
     let recovery_before = std::time::Instant::now();
     let recovery = child.row(&state, false);
     let recovery_after = std::time::Instant::now();
@@ -198,9 +218,9 @@ fn unavailable_counters_preserve_last_valid_samples_and_startup_baselines() {
         .as_secs_f64();
     assert!((shortest..=longest).contains(&span));
     assert!(span > 1.9);
-    assert!(recovery.cpu_usage > 1.);
+    assert_cpu_work(&recovery, unavailable_work + recovery_work);
     child.interval(0, 0);
     let idle = child.row(&state, false);
     assert_eq!(idle.disk_usage.1, 0);
-    assert!(idle.cpu_usage < 2.);
+    assert_cpu_work(&idle, 0.);
 }
