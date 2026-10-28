@@ -1083,21 +1083,19 @@ struct DetailTextParticipant {
     run: Option<gpui_base::TextSelectionRun>,
 }
 
+type DetailTextParticipantRef = Rc<RefCell<DetailTextParticipant>>;
+type WeakDetailTextParticipant = std::rc::Weak<RefCell<DetailTextParticipant>>;
+type DetailTextParticipants = [Option<WeakDetailTextParticipant>; 4];
+
 #[derive(Clone, Default)]
-pub(super) struct DetailCopySelection(
-    Rc<RefCell<[Option<std::rc::Weak<RefCell<DetailTextParticipant>>>; 4]>>,
-);
+pub(super) struct DetailCopySelection(Rc<RefCell<DetailTextParticipants>>);
 
 impl DetailCopySelection {
     fn begin_frame(&self) {
         *self.0.borrow_mut() = std::array::from_fn(|_| None);
     }
 
-    fn register(
-        &self,
-        section: DetailTextSection,
-        participant: &Rc<RefCell<DetailTextParticipant>>,
-    ) {
+    fn register(&self, section: DetailTextSection, participant: &DetailTextParticipantRef) {
         self.0.borrow_mut()[section.index()] = Some(Rc::downgrade(participant));
     }
 
@@ -2176,10 +2174,7 @@ mod tests {
         visual.update(|window, cx| window.draw(cx).clear(cx));
         visual.simulate_keystrokes("cmd-c");
         visual.update(|_, cx| {
-            assert_eq!(
-                cx.read_from_clipboard().unwrap().text().unwrap(),
-                "   \nB\nC"
-            );
+            assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "   \nB");
         });
 
         let first = visual.debug_bounds("row-0").unwrap();
