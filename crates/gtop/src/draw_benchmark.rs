@@ -257,7 +257,6 @@ fn full_monitor_draw_benchmark() {
     }
     let _clock = ClockGuard;
     FIXED_CLOCK.with(|v| v.set(true));
-    LONG_DETAIL_REVIEW.with(|v| v.set(true));
     let text_system = Arc::new(gpui_apple::AppleTextSystem::new());
     let mut cx = TestAppContext::build_with_text_system(
         TestDispatcher::new(0),
@@ -659,6 +658,7 @@ fn aluminium_offscreen_review() {
         std::fs::write(disk_home.join(format!("file-{i:03}")), [1u8; 4096]).unwrap();
     }
     FIXED_CLOCK.with(|v| v.set(true));
+    LONG_DETAIL_REVIEW.with(|v| v.set(true));
     let mut cx = HeadlessAppContext::with_platform(
         Arc::new(gpui_apple::AppleTextSystem::new()),
         Arc::new(gpui_kit_assets::Assets),
