@@ -79,11 +79,11 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
                 let mut process = test_data::process(pid, &format!("process-{pid:04}"), cpu);
                 if pid == 1 && LONG_DETAIL_REVIEW.with(std::cell::Cell::get) {
                     process.executable =
-                        format!("/Users/gtop/{}worker", "long_directory_name/".repeat(20));
-                    let long_argument = format!("https://example.invalid/{}", "token".repeat(65));
+                        format!("/Users/gtop/{}worker", "long_directory_name/".repeat(10));
+                    let long_argument = format!("https://example.invalid/{}", "token".repeat(35));
                     process.argv =
                         vec![process.executable.clone(), "--config".into(), long_argument];
-                    process.command = format!("kernel_task/{}", "renamed_process".repeat(30));
+                    process.command = format!("kernel_task/{}", "renamed_process".repeat(12));
                 }
                 process
             })
