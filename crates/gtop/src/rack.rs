@@ -907,7 +907,13 @@ pub fn cpu_segments(value: f32, n: usize, width: f32, height: f32, t: &Tokens) -
 
 #[cfg(test)]
 mod cpu_segment_tests {
-    use super::segment_fill;
+    use super::{core_bank_share, segment_fill};
+
+    #[test]
+    fn hybrid_bank_label_uses_whole_mac_cpu_count() {
+        assert_eq!(core_bank_share(&[(0, 100.), (1, 100.)], 4), 50.);
+        assert_eq!(core_bank_share(&[], 4), 0.);
+    }
 
     #[test]
     fn cpu_bar_fill_uses_one_core_as_full_scale() {
@@ -943,6 +949,10 @@ fn core_label_stride(prefix: &str, count: usize, bank_width: f32) -> usize {
     (label_width / label_center_spacing).ceil().max(1.) as usize
 }
 
+fn core_bank_share(values: &[(usize, f32)], logical_cpus: usize) -> f32 {
+    values.iter().map(|(_, value)| value).sum::<f32>() / logical_cpus.max(1) as f32
+}
+
 fn hybrid_bank_widths(performance_count: usize, efficiency_count: usize) -> (f32, f32) {
     let total_count = (performance_count + efficiency_count).max(1) as f32;
     let available_width = CORE_BANK_ROW_WIDTH - CORE_BANK_GAP;
@@ -966,10 +976,11 @@ fn core_bank(
     name: &str,
     prefix: &str,
     values: &[(usize, f32)],
+    logical_cpus: usize,
     bank_width: f32,
     t: &Tokens,
 ) -> Div {
-    let average = values.iter().map(|(_, value)| value).sum::<f32>() / values.len().max(1) as f32;
+    let average = core_bank_share(values, logical_cpus);
     let label_stride = core_label_stride(prefix, values.len(), bank_width);
     div()
         .flex_1()
@@ -1028,6 +1039,7 @@ fn core_bank(
 
 fn core_banks(usage: &[f32], topology: &CpuTopology, t: &Tokens) -> Div {
     let mut banks = div().flex().gap(px(CORE_BANK_GAP));
+    let logical_cpus = usage.len();
     match topology.banks(usage) {
         CpuBanks::Hybrid {
             performance,
@@ -1040,16 +1052,25 @@ fn core_banks(usage: &[f32], topology: &CpuTopology, t: &Tokens) -> Div {
                     "P CORES",
                     "P",
                     &performance,
+                    logical_cpus,
                     performance_width,
                     t,
                 ))
-                .child(core_bank("E CORES", "E", &efficiency, efficiency_width, t));
+                .child(core_bank(
+                    "E CORES",
+                    "E",
+                    &efficiency,
+                    logical_cpus,
+                    efficiency_width,
+                    t,
+                ));
         }
         CpuBanks::Cores(cores) => {
             banks = banks.child(core_bank(
                 "CORES",
                 "",
                 &cores.iter().copied().enumerate().collect::<Vec<_>>(),
+                logical_cpus,
                 CORE_BANK_ROW_WIDTH,
                 t,
             ))
@@ -1880,11 +1901,11 @@ impl Monitor {
                                                     this.history_columns.viewport,
                                                 );
                                                 let h = &this.history[index];
-                                                let logical_cpus = this
-                                                    .snapshot
-                                                    .as_ref()
-                                                    .map(|snapshot| snapshot.stats.cpu_usage.len())
-                                                    .unwrap_or(1);
+                                                let logical_cpus = crate::model::logical_cpu_count(
+                                                    this.snapshot
+                                                        .as_ref()
+                                                        .map(|snapshot| snapshot.as_ref()),
+                                                );
                                                 let selected_name_exists = this
                                                     .history_selected
                                                     .as_ref()

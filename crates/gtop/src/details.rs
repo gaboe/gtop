@@ -505,10 +505,11 @@ impl Monitor {
                                 .child(crate::rack::lit_unit(
                                     crate::model::format_cpu_share(
                                         p.cpu_usage as f64,
-                                        self.snapshot
-                                            .as_ref()
-                                            .map(|snapshot| snapshot.stats.cpu_usage.len())
-                                            .unwrap_or(1),
+                                        crate::model::logical_cpu_count(
+                                            self.snapshot
+                                                .as_ref()
+                                                .map(|snapshot| snapshot.as_ref()),
+                                        ),
                                     ),
                                     '%',
                                     22.,
@@ -523,10 +524,9 @@ impl Monitor {
                 details.analysis.as_ref(),
                 &details.name,
                 self.process_exited().then_some(p.cpu_usage),
-                self.snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.stats.cpu_usage.len())
-                    .unwrap_or(1),
+                crate::model::logical_cpu_count(
+                    self.snapshot.as_ref().map(|snapshot| snapshot.as_ref()),
+                ),
                 &t,
             ));
             panel = panel.child(

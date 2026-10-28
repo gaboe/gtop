@@ -25,7 +25,7 @@ use gpui_component::{
 };
 use gtop::perf;
 use gtop_core::{AppState, Snapshot};
-use model::{ProcessKey, Search};
+use model::{logical_cpu_count, ProcessKey, Search};
 use process_table::Processes;
 use std::{rc::Rc, sync::Arc, time::Duration};
 
@@ -311,7 +311,9 @@ impl Monitor {
                 let Ok((running, ports, seconds, moment, metric, selected_detail)) = entity.update_in(cx, |this, window, cx| {
                     let selected_detail = this.details.as_ref().map(|details| {
                         let current_cpu = this.snapshot.as_ref().map(|snapshot| crate::analysis::current_cpu(&snapshot.processes, &details.name)).unwrap_or(0.);
-                        let logical_cpus = this.snapshot.as_ref().map(|snapshot| snapshot.stats.cpu_usage.len()).unwrap_or(1);
+                        let logical_cpus = logical_cpu_count(
+                            this.snapshot.as_ref().map(|snapshot| snapshot.as_ref()),
+                        );
                         (
                             details.key,
                             details.name.clone(),

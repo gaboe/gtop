@@ -1,6 +1,6 @@
 use gtop_core::ProcessInfo;
 use regex::{Regex, RegexBuilder};
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::OnceLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProcessKey {
@@ -8,10 +8,25 @@ pub struct ProcessKey {
     pub start_time: u64,
 }
 
+static AVAILABLE_LOGICAL_CPUS: OnceLock<usize> = OnceLock::new();
+
+pub fn logical_cpu_count(snapshot: Option<&gtop_core::Snapshot>) -> usize {
+    snapshot
+        .map(|snapshot| snapshot.stats.cpu_usage.len())
+        .unwrap_or_else(|| {
+            *AVAILABLE_LOGICAL_CPUS.get_or_init(|| {
+                std::thread::available_parallelism()
+                    .map(|count| count.get())
+                    .unwrap_or(1)
+            })
+        })
+}
+
 pub fn format_cpu_share(per_core: f64, logical_cpus: usize) -> String {
     let share = per_core / logical_cpus.max(1) as f64;
-    if share < 10. {
-        format!("{share:.2}")
+    let rounded = (share * 100.).round() / 100.;
+    if rounded < 10. {
+        format!("{rounded:.2}")
     } else {
         format!("{share:.1}")
     }
@@ -410,6 +425,24 @@ mod tests {
         assert_eq!(ProcessColumn::Cpu.text(&process, 14), "25.0");
         assert_eq!(format_cpu_share(2.5, 14), "0.18");
         assert_eq!(format_cpu_share(350., 0), "350.0");
+        assert_eq!(format_cpu_share(9.996, 1), "10.0");
+    }
+
+    #[test]
+    fn history_peak_without_snapshot_uses_available_cpu_count() {
+        let expected = format_cpu_share(
+            350.,
+            std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1),
+        );
+        assert_eq!(
+            logical_cpu_count(None),
+            std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1)
+        );
+        assert_eq!(format_cpu_share(350., logical_cpu_count(None)), expected);
     }
 
     #[test]

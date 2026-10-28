@@ -1,6 +1,6 @@
 use crate::{
     column_widths::{self, Column, Drag, TableState, Widths},
-    model::{process_order, ProcessColumn, ProcessKey, Search},
+    model::{logical_cpu_count, process_order, ProcessColumn, ProcessKey, Search},
     palette::{presets, Base},
     rack,
 };
@@ -153,11 +153,8 @@ impl Processes {
         cx: &mut Context<Self>,
     ) -> Option<Stateful<Div>> {
         let p = self.process(row)?;
-        let logical_cpus = self
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.stats.cpu_usage.len())
-            .unwrap_or(1);
+        let logical_cpus =
+            logical_cpu_count(self.snapshot.as_ref().map(|snapshot| snapshot.as_ref()));
         let key = ProcessKey::from(p);
         let priority = row_tier(row) == RowTier::Priority;
         let culprit = p.cpu_usage > 100. && row < 4;
