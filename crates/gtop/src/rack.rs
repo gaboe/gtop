@@ -122,7 +122,9 @@ type UnitCacheKey = (char, u32, u32, u32, bool);
 static UNIT_PATHS: OnceLock<Mutex<HashMap<UnitCacheKey, UnitPaths>>> = OnceLock::new();
 
 #[cfg(test)]
-static UNIT_GLYPH_TEST_BOUNDS: Mutex<Vec<Bounds<Pixels>>> = Mutex::new(Vec::new());
+thread_local! {
+    static UNIT_GLYPH_TEST_BOUNDS: RefCell<Vec<Bounds<Pixels>>> = const { RefCell::new(Vec::new()) };
+}
 #[cfg(test)]
 pub(crate) static DIGIT_GHOST_TEST_TEXTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -287,7 +289,7 @@ fn unit_glyph(unit: char, size: f32, hot: bool, glow: bool, t: &Tokens) -> Div {
             move |bounds, _, window, _| {
                 #[cfg(test)]
                 if !crate::draw_benchmark::fixed_clock() {
-                    UNIT_GLYPH_TEST_BOUNDS.lock().unwrap().push(bounds);
+                    UNIT_GLYPH_TEST_BOUNDS.with(|recorded| recorded.borrow_mut().push(bounds));
                 }
                 let (lit, ghost_path) = unit_paths(bounds, unit, ghost.is_some());
                 if let (Some(ghost_path), Some(ghost)) = (ghost_path, ghost) {
@@ -4018,13 +4020,14 @@ mod tests {
 
     #[gpui::test]
     async fn vfd_unit_glyph_matches_digit_ink_span_at_supported_sizes(cx: &mut TestAppContext) {
-        UNIT_GLYPH_TEST_BOUNDS.lock().unwrap().clear();
+        UNIT_GLYPH_TEST_BOUNDS.with(|recorded| recorded.borrow_mut().clear());
         let tokens = crate::palette::presets()[0].base.tokens();
         let window = cx.add_window(|_, _| UnitLayoutTestView { tokens });
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
 
-        let mut bounds = std::mem::take(&mut *UNIT_GLYPH_TEST_BOUNDS.lock().unwrap());
+        let mut bounds =
+            UNIT_GLYPH_TEST_BOUNDS.with(|recorded| std::mem::take(&mut *recorded.borrow_mut()));
         assert!(bounds.len() >= 4 && bounds.len().is_multiple_of(4));
         let bounds = bounds.split_off(bounds.len() - 4);
         let mut row_top = 0.;
