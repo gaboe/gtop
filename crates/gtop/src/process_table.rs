@@ -1,7 +1,7 @@
 use crate::{
     column_widths::{self, Column, Drag, TableState, Widths},
     model::{logical_cpu_count, process_order, ProcessColumn, ProcessKey, Search},
-    palette::{presets, Base},
+    palette::{presets, Base, CpuScale},
     rack,
 };
 use gpui::{prelude::*, *};
@@ -53,6 +53,7 @@ pub struct Processes {
     pub column: ProcessColumn,
     pub descending: bool,
     pub base: Base,
+    pub cpu_scale: CpuScale,
     pub compact: bool,
     pub root_focus: Option<FocusHandle>,
     scroll: UniformListScrollHandle,
@@ -71,6 +72,7 @@ impl Default for Processes {
             column: ProcessColumn::Cpu,
             descending: true,
             base: presets()[0].base,
+            cpu_scale: CpuScale::default(),
             compact: false,
             root_focus: None,
             scroll: UniformListScrollHandle::new(),
@@ -168,9 +170,13 @@ impl Processes {
                     "{} PID {} CPU {}% memory {} ports {}",
                     p.name,
                     p.pid,
-                    crate::model::format_cpu_share(p.cpu_usage as f64, logical_cpus),
+                    crate::model::format_cpu_share(
+                        p.cpu_usage as f64,
+                        logical_cpus,
+                        self.cpu_scale,
+                    ),
                     crate::model::bytes(p.memory_usage),
-                    ProcessColumn::Ports.text(p, logical_cpus)
+                    ProcessColumn::Ports.text(p, logical_cpus, self.cpu_scale)
                 ))
                 .h(px(height))
                 .flex()
@@ -235,10 +241,11 @@ impl Processes {
                         if (selected || priority && culprit)
                             && !(culprit && kind == ProcessColumn::Command)
                         {
-                            crate::glow::text(kind.text(p, logical_cpus), false, t)
+                            crate::glow::text(kind.text(p, logical_cpus, self.cpu_scale), false, t)
                                 .into_any_element()
                         } else {
-                            kind.text(p, logical_cpus).into_any_element()
+                            kind.text(p, logical_cpus, self.cpu_scale)
+                                .into_any_element()
                         },
                     )
                 }))

@@ -809,18 +809,11 @@ fn full_monitor_draw_benchmark() {
                             ProcessKey::from(&m.snapshot.as_ref().unwrap().processes[0]),
                             cx,
                         );
-                        let mut analysis = analysis::analyze(
-                            "process-0001",
-                            "/bin/process-0001",
-                            1.,
-                            30_000_000,
-                            m.snapshot.as_ref().unwrap().stats.cpu_usage.len(),
-                            [],
-                        );
+                        let mut analysis =
+                            analysis::analyze("process-0001", "/bin/process-0001", 30_000_000, []);
                         analysis.history = Some(analysis::ProcessHistory {
                             columns: (0..144).map(|i| Some((i % 60) as f32)).collect(),
                             pattern: "Recurring work".into(),
-                            now: "Running".into(),
                             core_minutes: 120.,
                             busy_average: 35.,
                             peak_cpu: 60.,

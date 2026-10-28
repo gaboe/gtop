@@ -22,13 +22,20 @@ pub fn logical_cpu_count(snapshot: Option<&gtop_core::Snapshot>) -> usize {
         })
 }
 
-pub fn format_cpu_share(per_core: f64, logical_cpus: usize) -> String {
-    let share = per_core / logical_cpus.max(1) as f64;
-    let rounded = (share * 100.).round() / 100.;
+pub fn format_cpu_share(
+    per_core: f64,
+    logical_cpus: usize,
+    scale: crate::palette::CpuScale,
+) -> String {
+    let value = match scale {
+        crate::palette::CpuScale::Mac => per_core / logical_cpus.max(1) as f64,
+        crate::palette::CpuScale::Core => per_core,
+    };
+    let rounded = (value * 100.).round() / 100.;
     if rounded < 10. {
         format!("{rounded:.2}")
     } else {
-        format!("{share:.1}")
+        format!("{value:.1}")
     }
 }
 
@@ -219,13 +226,18 @@ impl ProcessColumn {
             Self::Command => a.command.cmp(&b.command),
         }
     }
-    pub fn text(self, p: &ProcessInfo, logical_cpus: usize) -> String {
+    pub fn text(
+        self,
+        p: &ProcessInfo,
+        logical_cpus: usize,
+        scale: crate::palette::CpuScale,
+    ) -> String {
         match self {
             Self::Lamp => String::new(),
             Self::Name => p.name.clone(),
             Self::Pid => p.pid.to_string(),
             Self::User => p.user.clone(),
-            Self::Cpu => format_cpu_share(p.cpu_usage as f64, logical_cpus),
+            Self::Cpu => format_cpu_share(p.cpu_usage as f64, logical_cpus, scale),
             Self::Memory => bytes(p.memory_usage),
             Self::Age => {
                 if p.start_time == 0 {
@@ -415,17 +427,40 @@ mod tests {
         ] {
             let mut process = process(1, "age", 0., vec![]);
             process.run_time = seconds;
-            assert_eq!(ProcessColumn::Age.text(&process, 1), expected);
+            assert_eq!(
+                ProcessColumn::Age.text(&process, 1, crate::palette::CpuScale::Mac),
+                expected
+            );
         }
     }
 
     #[test]
-    fn cpu_column_shows_whole_mac_share() {
+    fn cpu_column_and_formatter_follow_the_selected_scale() {
         let process = process(1, "builder", 350., vec![]);
-        assert_eq!(ProcessColumn::Cpu.text(&process, 14), "25.0");
-        assert_eq!(format_cpu_share(2.5, 14), "0.18");
-        assert_eq!(format_cpu_share(350., 0), "350.0");
-        assert_eq!(format_cpu_share(9.996, 1), "10.0");
+        assert_eq!(
+            ProcessColumn::Cpu.text(&process, 14, crate::palette::CpuScale::Mac),
+            "25.0"
+        );
+        assert_eq!(
+            ProcessColumn::Cpu.text(&process, 14, crate::palette::CpuScale::Core),
+            "350.0"
+        );
+        assert_eq!(
+            format_cpu_share(2.5, 14, crate::palette::CpuScale::Mac),
+            "0.18"
+        );
+        assert_eq!(
+            format_cpu_share(2.5, 14, crate::palette::CpuScale::Core),
+            "2.50"
+        );
+        assert_eq!(
+            format_cpu_share(350., 0, crate::palette::CpuScale::Mac),
+            "350.0"
+        );
+        assert_eq!(
+            format_cpu_share(9.996, 1, crate::palette::CpuScale::Mac),
+            "10.0"
+        );
     }
 
     #[test]
@@ -435,6 +470,7 @@ mod tests {
             std::thread::available_parallelism()
                 .map(|count| count.get())
                 .unwrap_or(1),
+            crate::palette::CpuScale::Mac,
         );
         assert_eq!(
             logical_cpu_count(None),
@@ -442,7 +478,10 @@ mod tests {
                 .map(|count| count.get())
                 .unwrap_or(1)
         );
-        assert_eq!(format_cpu_share(350., logical_cpu_count(None)), expected);
+        assert_eq!(
+            format_cpu_share(350., logical_cpu_count(None), crate::palette::CpuScale::Mac),
+            expected
+        );
     }
 
     #[test]
@@ -590,7 +629,10 @@ mod tests {
         unknown.start_time = 0;
         unknown.run_time = 0;
 
-        assert_eq!(ProcessColumn::Age.text(&unknown, 1), "·");
+        assert_eq!(
+            ProcessColumn::Age.text(&unknown, 1, crate::palette::CpuScale::Mac),
+            "·"
+        );
     }
 
     #[test]

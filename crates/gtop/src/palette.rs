@@ -317,10 +317,19 @@ pub fn random_base(r: [f64; 5]) -> Base {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CpuScale {
+    #[default]
+    Mac,
+    Core,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     pub active: usize,
     pub saved: Vec<Palette>,
+    #[serde(default)]
+    pub cpu_scale: CpuScale,
     #[serde(default, deserialize_with = "read_detail_width")]
     pub detail_width: crate::details::DetailWidth,
     #[serde(default, deserialize_with = "read_widths")]
@@ -388,7 +397,10 @@ impl Settings {
         true
     }
     pub fn load() -> Self {
-        std::fs::read(super::history::support_path("palette.json"))
+        Self::load_from(&super::history::support_path("palette.json"))
+    }
+    fn load_from(path: &std::path::Path) -> Self {
+        std::fs::read(path)
             .ok()
             .and_then(|d| serde_json::from_slice(&d).ok())
             .unwrap_or_default()
@@ -638,6 +650,22 @@ mod tests {
         assert_eq!(narrow.detail_width.pixels(), DETAIL_WIDTH_MIN);
         assert_eq!(wide.detail_width.pixels(), DETAIL_WIDTH_MAX);
         assert_eq!(invalid.detail_width, DetailWidth::default());
+    }
+
+    #[test]
+    fn cpu_scale_defaults_for_old_settings_and_round_trips_on_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("palette.json");
+        std::fs::write(&path, r#"{"active":0,"saved":[]}"#).unwrap();
+        assert_eq!(Settings::load_from(&path).cpu_scale, CpuScale::Mac);
+
+        let settings = Settings {
+            cpu_scale: CpuScale::Core,
+            ..Default::default()
+        };
+        settings.save_to(&path).unwrap();
+
+        assert_eq!(Settings::load_from(&path).cpu_scale, CpuScale::Core);
     }
 
     #[test]

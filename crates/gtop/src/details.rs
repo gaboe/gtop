@@ -510,6 +510,7 @@ impl Monitor {
                                                 .as_ref()
                                                 .map(|snapshot| snapshot.as_ref()),
                                         ),
+                                        self.settings.cpu_scale,
                                     ),
                                     '%',
                                     22.,
@@ -524,9 +525,16 @@ impl Monitor {
                 details.analysis.as_ref(),
                 &details.name,
                 self.process_exited().then_some(p.cpu_usage),
+                self.snapshot
+                    .as_ref()
+                    .map(|snapshot| {
+                        crate::analysis::current_cpu(&snapshot.processes, &details.name)
+                    })
+                    .unwrap_or(p.cpu_usage),
                 crate::model::logical_cpu_count(
                     self.snapshot.as_ref().map(|snapshot| snapshot.as_ref()),
                 ),
+                self.settings.cpu_scale,
                 &t,
             ));
             panel = panel.child(
@@ -788,14 +796,25 @@ fn environment_section(header: Div, content: Div) -> Stateful<Div> {
 fn analysis_sample(
     history: &crate::analysis::ProcessHistory,
     last_seen_cpu: Option<f32>,
+    current_cpu: f32,
     logical_cpus: usize,
+    scale: crate::palette::CpuScale,
 ) -> (&'static str, String) {
     match last_seen_cpu {
         Some(cpu) => (
             "LAST SEEN",
-            crate::analysis::sample_sentence("Last seen", cpu, history.busy_average, logical_cpus),
+            crate::analysis::sample_sentence(
+                "Last seen",
+                cpu,
+                history.busy_average,
+                logical_cpus,
+                scale,
+            ),
         ),
-        None => ("NOW", history.now.clone()),
+        None => (
+            "NOW",
+            crate::analysis::now_sentence(current_cpu, history.busy_average, logical_cpus, scale),
+        ),
     }
 }
 
@@ -882,7 +901,9 @@ fn analysis_panel(
     analysis: Option<&crate::analysis::ProcessAnalysis>,
     name: &str,
     last_seen_cpu: Option<f32>,
+    current_cpu: f32,
     cores: usize,
+    scale: crate::palette::CpuScale,
     t: &crate::palette::Tokens,
 ) -> Div {
     let mut panel = div()
@@ -955,7 +976,8 @@ fn analysis_panel(
             }),
     );
     if let Some(history) = &analysis.history {
-        let (sample_label, sample_text) = analysis_sample(history, last_seen_cpu, cores);
+        let (sample_label, sample_text) =
+            analysis_sample(history, last_seen_cpu, current_cpu, cores, scale);
         history_panel =
             history_panel.child(div().flex().items_end().gap(px(1.)).h(px(40.)).children(
                 history.columns.iter().map(|value| match value {
@@ -1002,14 +1024,14 @@ fn analysis_panel(
                 "Busy average",
                 format!(
                     "{} %",
-                    crate::model::format_cpu_share(history.busy_average, cores)
+                    crate::model::format_cpu_share(history.busy_average, cores, scale)
                 ),
             ))
             .child(detail_line(
                 "Peak CPU",
                 format!(
                     "{} % at {}",
-                    crate::model::format_cpu_share(history.peak_cpu, cores),
+                    crate::model::format_cpu_share(history.peak_cpu, cores, scale),
                     crate::rack::timestamp(history.peak_minute * 60, "%H:%M")
                 ),
             ))
@@ -1018,7 +1040,7 @@ fn analysis_panel(
                 format!(
                     "{} min over {} %",
                     history.longest_busy_minutes,
-                    crate::model::format_cpu_share(50., cores)
+                    crate::model::format_cpu_share(50., cores, scale)
                 ),
             ))
             .child(detail_line("Peak memory", bytes(history.peak_memory)));
@@ -2448,9 +2470,7 @@ mod tests {
         let mut history = crate::history::History::default();
         history.record(&snapshot, 6000., 3.).unwrap();
         history.record(&snapshot, 6003., 3.).unwrap();
-        let analysis = history
-            .analyze_process("builder", "builder", 814., 100, 4)
-            .unwrap();
+        let analysis = history.analyze_process("builder", "builder", 100).unwrap();
         let history = analysis.history.unwrap();
         let processes = vec![process];
         let live = super::analysis_sample(
@@ -2458,7 +2478,9 @@ mod tests {
             details
                 .exited(&processes)
                 .then_some(details.process(&processes).cpu_usage),
+            details.process(&processes).cpu_usage,
             4,
+            crate::palette::CpuScale::Mac,
         );
         assert_eq!(live.0, "NOW");
         assert_eq!(live.1, "Now 203.5 %, 5.8× its usual busy load.");
@@ -2467,7 +2489,9 @@ mod tests {
             details
                 .exited(&[])
                 .then_some(details.process(&[]).cpu_usage),
+            details.process(&[]).cpu_usage,
             4,
+            crate::palette::CpuScale::Mac,
         );
         assert_eq!(exited.0, "LAST SEEN");
         assert_eq!(exited.1, "Last seen 203.5 %, 5.8× its usual busy load.");

@@ -1116,7 +1116,7 @@ mod tests {
         assert_eq!(count, 3);
         let named = s.buckets(100..102, Some("zero")).unwrap();
         assert_eq!(named[0].processes.len(), 1);
-        let analysis = crate::analysis::analyze("zero", "zero", 0., 101, 1, &named)
+        let analysis = crate::analysis::analyze("zero", "zero", 101, &named)
             .history
             .unwrap();
         assert_eq!(analysis.recorded_minutes, 1);
@@ -1233,12 +1233,9 @@ mod tests {
                 .is_err(),
                 "{bytes}"
             );
+            assert!(h.analyze_process("zero", "zero", 100).is_err(), "{bytes}");
             assert!(
-                h.analyze_process("zero", "zero", 0., 100, 1).is_err(),
-                "{bytes}"
-            );
-            assert!(
-                h.analyze_process("absent", "absent", 0., 100, 1).is_err(),
+                h.analyze_process("absent", "absent", 100,).is_err(),
                 "{bytes}"
             );
         }
@@ -1259,7 +1256,7 @@ mod tests {
         assert_eq!(system[0].seconds, 20.);
         assert_eq!(rows["worker"].cpu_seconds, 30.);
         let named = s.buckets(100..102, Some("zero")).unwrap();
-        assert!(crate::analysis::analyze("zero", "zero", 0., 101, 1, &named)
+        assert!(crate::analysis::analyze("zero", "zero", 101, &named)
             .history
             .is_some());
     }
@@ -1418,7 +1415,7 @@ mod tests {
                 step: 1
             })
             .is_err());
-        assert!(h.analyze_process("worker", "worker", 0., 100, 1).is_err());
+        assert!(h.analyze_process("worker", "worker", 100).is_err());
     }
 
     #[test]

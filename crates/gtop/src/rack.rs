@@ -22,8 +22,8 @@ fn settings_escape_closes(key: &str, settings_open: bool, editing: bool) -> bool
     key == "escape" && settings_open && !editing
 }
 
-fn gtop_self_cpu(cpu: Option<f32>, logical_cpus: usize) -> String {
-    cpu.map(|value| crate::model::format_cpu_share(value as f64, logical_cpus))
+fn gtop_self_cpu(cpu: Option<f32>, logical_cpus: usize, scale: palette::CpuScale) -> String {
+    cpu.map(|value| crate::model::format_cpu_share(value as f64, logical_cpus, scale))
         .unwrap_or_else(|| "N/A".into())
 }
 
@@ -911,8 +911,25 @@ mod cpu_segment_tests {
 
     #[test]
     fn hybrid_bank_label_uses_whole_mac_cpu_count() {
-        assert_eq!(core_bank_share(&[(0, 100.), (1, 100.)], 4), 50.);
-        assert_eq!(core_bank_share(&[], 4), 0.);
+        let p_cores = [(0, 100.), (1, 100.)];
+        assert_eq!(
+            core_bank_share(&p_cores, 4, crate::palette::CpuScale::Mac),
+            50.
+        );
+        assert_eq!(
+            core_bank_share(&p_cores, 4, crate::palette::CpuScale::Core),
+            100.
+        );
+        let e_cores = [(2, 0.), (3, 0.)];
+        assert_eq!(
+            core_bank_share(&e_cores, 4, crate::palette::CpuScale::Mac),
+            0.
+        );
+        assert_eq!(
+            core_bank_share(&e_cores, 4, crate::palette::CpuScale::Core),
+            0.
+        );
+        assert_eq!(core_bank_share(&[], 4, crate::palette::CpuScale::Mac), 0.);
     }
 
     #[test]
@@ -949,8 +966,12 @@ fn core_label_stride(prefix: &str, count: usize, bank_width: f32) -> usize {
     (label_width / label_center_spacing).ceil().max(1.) as usize
 }
 
-fn core_bank_share(values: &[(usize, f32)], logical_cpus: usize) -> f32 {
-    values.iter().map(|(_, value)| value).sum::<f32>() / logical_cpus.max(1) as f32
+fn core_bank_share(values: &[(usize, f32)], logical_cpus: usize, scale: palette::CpuScale) -> f32 {
+    let divisor = match scale {
+        palette::CpuScale::Mac => logical_cpus.max(1),
+        palette::CpuScale::Core => values.len().max(1),
+    };
+    values.iter().map(|(_, value)| value).sum::<f32>() / divisor as f32
 }
 
 fn hybrid_bank_widths(performance_count: usize, efficiency_count: usize) -> (f32, f32) {
@@ -977,10 +998,11 @@ fn core_bank(
     prefix: &str,
     values: &[(usize, f32)],
     logical_cpus: usize,
+    scale: palette::CpuScale,
     bank_width: f32,
     t: &Tokens,
 ) -> Div {
-    let average = core_bank_share(values, logical_cpus);
+    let average = core_bank_share(values, logical_cpus, scale);
     let label_stride = core_label_stride(prefix, values.len(), bank_width);
     div()
         .flex_1()
@@ -1037,7 +1059,7 @@ fn core_bank(
         ))
 }
 
-fn core_banks(usage: &[f32], topology: &CpuTopology, t: &Tokens) -> Div {
+fn core_banks(usage: &[f32], topology: &CpuTopology, scale: palette::CpuScale, t: &Tokens) -> Div {
     let mut banks = div().flex().gap(px(CORE_BANK_GAP));
     let logical_cpus = usage.len();
     match topology.banks(usage) {
@@ -1053,6 +1075,7 @@ fn core_banks(usage: &[f32], topology: &CpuTopology, t: &Tokens) -> Div {
                     "P",
                     &performance,
                     logical_cpus,
+                    scale,
                     performance_width,
                     t,
                 ))
@@ -1061,6 +1084,7 @@ fn core_banks(usage: &[f32], topology: &CpuTopology, t: &Tokens) -> Div {
                     "E",
                     &efficiency,
                     logical_cpus,
+                    scale,
                     efficiency_width,
                     t,
                 ));
@@ -1071,6 +1095,7 @@ fn core_banks(usage: &[f32], topology: &CpuTopology, t: &Tokens) -> Div {
                 "",
                 &cores.iter().copied().enumerate().collect::<Vec<_>>(),
                 logical_cpus,
+                palette::CpuScale::Mac,
                 CORE_BANK_ROW_WIDTH,
                 t,
             ))
@@ -1452,7 +1477,12 @@ impl Monitor {
                         .child(label(format!("LOAD {:.1}", stats.load_avg[0]), t)),
                 )
                 .child(lit_unit(format!("{cpu:3.0}"), '%', 42., cpu > 85., t))
-                .child(core_banks(&stats.cpu_usage, &s.cpu_topology, t)),
+                .child(core_banks(
+                    &stats.cpu_usage,
+                    &s.cpu_topology,
+                    self.settings.cpu_scale,
+                    t,
+                )),
         );
         tower = tower.child(
             win(t)
@@ -1584,6 +1614,7 @@ impl Monitor {
                                 gtop_self_cpu(
                                     own.map(|process| process.cpu_usage),
                                     stats.cpu_usage.len(),
+                                    self.settings.cpu_scale,
                                 ),
                                 "%",
                             ))
@@ -1628,6 +1659,12 @@ impl Monitor {
         if self.table.read(cx).compact != compact {
             self.table.update(cx, |p, cx| {
                 p.compact = compact;
+                cx.notify();
+            });
+        }
+        if self.table.read(cx).cpu_scale != self.settings.cpu_scale {
+            self.table.update(cx, |table, cx| {
+                table.cpu_scale = self.settings.cpu_scale;
                 cx.notify();
             });
         }
@@ -1906,6 +1943,7 @@ impl Monitor {
                                                         .as_ref()
                                                         .map(|snapshot| snapshot.as_ref()),
                                                 );
+                                                let cpu_scale = this.settings.cpu_scale;
                                                 let selected_name_exists = this
                                                     .history_selected
                                                     .as_ref()
@@ -2055,6 +2093,7 @@ impl Monitor {
                                                                             crate::model::format_cpu_share(
                                                                                 p.peak_cpu as f64,
                                                                                 logical_cpus,
+                                                                                cpu_scale,
                                                                             )
                                                                         )),
                                                                 ),
@@ -2857,6 +2896,39 @@ impl Monitor {
                 "PRESETS AND SAVED MIXES                         T CYCLES",
                 t,
             ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(label("CPU SCALE", t))
+                    .child(div().flex_1())
+                    .children(
+                        [
+                            (palette::CpuScale::Mac, "% OF MAC", "cpu-scale-mac"),
+                            (palette::CpuScale::Core, "% OF CORE", "cpu-scale-core"),
+                        ]
+                        .into_iter()
+                        .map(|(scale, text, id)| {
+                            Button::new(id)
+                                .label(text)
+                                .rack(t)
+                                .small()
+                                .when(self.settings.cpu_scale == scale, |button| button.primary())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if this.settings.cpu_scale != scale {
+                                        this.settings.cpu_scale = scale;
+                                        this.table.update(cx, |table, cx| {
+                                            table.cpu_scale = scale;
+                                            cx.notify();
+                                        });
+                                        this.persist_settings(window, cx);
+                                        cx.notify();
+                                    }
+                                }))
+                        }),
+                    ),
+            )
             .child(list)
             .child(
                 div()
@@ -3034,8 +3106,18 @@ mod tests {
 
     #[test]
     fn gtop_self_cpu_shows_whole_mac_share() {
-        assert_eq!(gtop_self_cpu(Some(350.), 14), "25.0");
-        assert_eq!(gtop_self_cpu(None, 14), "N/A");
+        assert_eq!(
+            gtop_self_cpu(Some(350.), 14, crate::palette::CpuScale::Mac),
+            "25.0"
+        );
+        assert_eq!(
+            gtop_self_cpu(Some(350.), 14, crate::palette::CpuScale::Core),
+            "350.0"
+        );
+        assert_eq!(
+            gtop_self_cpu(None, 14, crate::palette::CpuScale::Mac),
+            "N/A"
+        );
     }
 
     #[test]

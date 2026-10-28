@@ -453,19 +453,12 @@ impl History {
         &self,
         name: &str,
         command: &str,
-        current_cpu: f32,
         now_minute: u64,
-        logical_cpus: usize,
     ) -> Result<crate::analysis::ProcessAnalysis> {
         let buckets =
             self.read_buckets(now_minute.saturating_sub(1439)..now_minute + 1, Some(name))?;
         Ok(crate::analysis::analyze(
-            name,
-            command,
-            current_cpu,
-            now_minute,
-            logical_cpus,
-            &buckets,
+            name, command, now_minute, &buckets,
         ))
     }
 
