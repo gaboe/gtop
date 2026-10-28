@@ -563,6 +563,7 @@ fn warm_dot_cache_transitions() {
         Root::new(entity, window, cx)
     });
     let monitor = monitor.unwrap();
+    cx.simulate_window_scale_factor_change(handle.into(), 1.);
     for _ in 0..5 {
         cx.update_window(handle.into(), |_, w, cx| w.draw(cx).clear(cx))
             .unwrap();
