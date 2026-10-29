@@ -296,6 +296,7 @@ fn local_manifest(parent: &OwnedFd) -> bool {
     found
 }
 
+#[derive(Clone)]
 struct Entry {
     name: std::ffi::OsString,
     device: u64,
@@ -699,27 +700,20 @@ struct Walker<'a, F> {
     last_tick: &'a mut Instant,
     links: HashSet<(u64, u64)>,
 }
-impl<F: FnMut(&Tree)> Walker<'_, F> {
-    fn walk(&mut self, fd: &OwnedFd, path: &Path, depth: usize) -> (u64, u64, u64) {
-        let mut total = (0u64, 0u64, 0u64);
-        let result = entries(fd, |entry| self.visit(fd, path, depth, entry, &mut total));
-        if result.is_err() {
-            total.2 += 1;
-            self.tree.nodes[0].unreadable += 1;
-        }
-        total
-    }
-    fn visit(
-        &mut self,
-        fd: &OwnedFd,
-        path: &Path,
-        depth: usize,
-        entry: Entry,
-        total: &mut (u64, u64, u64),
-    ) -> bool {
-        if self.cancel.load(Ordering::Relaxed) || matches!(self.tree.state, ScanState::Failed(_)) {
-            return false;
-        }
+struct AcceptedEntry {
+    name: std::ffi::OsString,
+    error: bool,
+    row: Row,
+}
+
+struct Reducer<'a> {
+    tree: &'a mut Tree,
+    device: u64,
+    links: &'a mut HashSet<(u64, u64)>,
+}
+
+impl Reducer<'_> {
+    fn enter(&mut self, path: &Path, entry: Entry) -> Option<AcceptedEntry> {
         self.tree.cloud_items += u64::from(entry.in_cloud);
         let skipped_volume = entry.device != self.device;
         let mut shared = false;
@@ -728,7 +722,7 @@ impl<F: FnMut(&Tree)> Walker<'_, F> {
                 self.tree.state = ScanState::Failed(
                     "Hard-link tracking limit reached. Sizes are incomplete.".into(),
                 );
-                return false;
+                return None;
             }
             shared = !self.links.insert((entry.device, entry.inode));
         }
@@ -738,8 +732,8 @@ impl<F: FnMut(&Tree)> Walker<'_, F> {
             entry.allocated
         };
         let child_path = path.join(&entry.name);
-        let mut row = Row {
-            path: child_path.clone(),
+        let row = Row {
+            path: child_path,
             identity: FileId {
                 device: entry.device,
                 inode: entry.inode,
@@ -756,38 +750,35 @@ impl<F: FnMut(&Tree)> Walker<'_, F> {
         self.tree.nodes[0].allocated = self.tree.nodes[0].allocated.saturating_add(allocated);
         self.tree.nodes[0].descendants += 1;
         self.tree.nodes[0].unreadable += row.unreadable;
-        tick(self.last_tick, self.on_tick);
-        if self.last.elapsed() >= Duration::from_millis(100) {
-            (self.progress)(self.tree);
-            self.last = Instant::now();
-        }
-        if row.directory && !row.in_cloud && !skipped_volume && !entry.error {
-            let opened = if depth >= 256 {
-                Err(io::Error::other("Directory depth limit reached"))
-            } else {
-                open_child(fd, &entry.name, row.identity)
-            };
-            match opened {
-                Ok(child) => {
-                    let (bytes, items, errors) = self.walk(&child, &child_path, depth + 1);
-                    row.allocated = row.allocated.saturating_add(bytes);
-                    row.descendants = items;
-                    row.unreadable += errors;
-                }
-                Err(_) => {
-                    row.unreadable += 1;
-                    self.tree.nodes[0].unreadable += 1;
-                }
+        Some(AcceptedEntry {
+            name: entry.name,
+            error: entry.error,
+            row,
+        })
+    }
+
+    fn read_error(&mut self, total: &mut (u64, u64, u64)) {
+        total.2 += 1;
+        self.tree.nodes[0].unreadable += 1;
+    }
+
+    fn descended(&mut self, accepted: &mut AcceptedEntry, result: io::Result<(u64, u64, u64)>) {
+        let row = &mut accepted.row;
+        match result {
+            Ok((bytes, items, errors)) => {
+                row.allocated = row.allocated.saturating_add(bytes);
+                row.descendants = items;
+                row.unreadable += errors;
+            }
+            Err(_) => {
+                row.unreadable += 1;
+                self.tree.nodes[0].unreadable += 1;
             }
         }
-        row.cleanable = if !row.directory || row.in_cloud || skipped_volume || entry.error {
-            None
-        } else {
-            cleanable_kind(&child_path, self.home).or_else(|| {
-                (entry.name == "target" && child_path.starts_with(self.home) && local_manifest(fd))
-                    .then_some("Cargo build products")
-            })
-        };
+    }
+
+    fn finish(&mut self, accepted: AcceptedEntry, depth: usize, total: &mut (u64, u64, u64)) {
+        let row = accepted.row;
         if row.cleanable.is_some() {
             self.tree.candidates.push(row.clone());
             self.tree
@@ -800,16 +791,16 @@ impl<F: FnMut(&Tree)> Walker<'_, F> {
         total.2 += row.unreadable;
         if depth == 0 {
             let node = Node {
-                name: entry.name,
+                name: accepted.name,
                 identity: row.identity,
-                shared,
+                shared: row.shared,
                 parent: Some(0),
                 children: vec![],
                 directory: row.directory,
                 allocated: row.allocated,
                 descendants: row.descendants,
                 unreadable: row.unreadable,
-                skipped_volume,
+                skipped_volume: row.skipped_volume,
                 in_cloud: row.in_cloud,
                 cleanable: row.cleanable,
             };
@@ -825,6 +816,68 @@ impl<F: FnMut(&Tree)> Walker<'_, F> {
             }
             self.tree.nodes[0].children = (1..self.tree.nodes.len()).collect();
         }
+    }
+}
+
+impl<F: FnMut(&Tree)> Walker<'_, F> {
+    fn reducer(&mut self) -> Reducer<'_> {
+        Reducer {
+            tree: self.tree,
+            device: self.device,
+            links: &mut self.links,
+        }
+    }
+
+    fn walk(&mut self, fd: &OwnedFd, path: &Path, depth: usize) -> (u64, u64, u64) {
+        let mut total = (0u64, 0u64, 0u64);
+        let result = entries(fd, |entry| self.visit(fd, path, depth, entry, &mut total));
+        if result.is_err() {
+            self.reducer().read_error(&mut total);
+        }
+        total
+    }
+    fn visit(
+        &mut self,
+        fd: &OwnedFd,
+        path: &Path,
+        depth: usize,
+        entry: Entry,
+        total: &mut (u64, u64, u64),
+    ) -> bool {
+        if self.cancel.load(Ordering::Relaxed) || matches!(self.tree.state, ScanState::Failed(_)) {
+            return false;
+        }
+        let Some(mut accepted) = self.reducer().enter(path, entry) else {
+            return false;
+        };
+        tick(self.last_tick, self.on_tick);
+        if self.last.elapsed() >= Duration::from_millis(100) {
+            (self.progress)(self.tree);
+            self.last = Instant::now();
+        }
+        if accepted.row.directory
+            && !accepted.row.in_cloud
+            && !accepted.row.skipped_volume
+            && !accepted.error
+        {
+            let opened = if depth >= 256 {
+                Err(io::Error::other("Directory depth limit reached"))
+            } else {
+                open_child(fd, &accepted.name, accepted.row.identity)
+            };
+            let result = opened.map(|child| self.walk(&child, &accepted.row.path, depth + 1));
+            self.reducer().descended(&mut accepted, result);
+        }
+        let row = &mut accepted.row;
+        row.cleanable = if !row.directory || row.in_cloud || row.skipped_volume || accepted.error {
+            None
+        } else {
+            cleanable_kind(&row.path, self.home).or_else(|| {
+                (accepted.name == "target" && row.path.starts_with(self.home) && local_manifest(fd))
+                    .then_some("Cargo build products")
+            })
+        };
+        self.reducer().finish(accepted, depth, total);
         true
     }
 }
@@ -2453,3 +2506,12 @@ mod trash_name_regressions {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "disk_scan/oracle.rs"]
+mod serial_oracle;
+
+#[cfg(test)]
+#[path = "disk_scan/reducer_tests.rs"]
+mod reducer_tests;
