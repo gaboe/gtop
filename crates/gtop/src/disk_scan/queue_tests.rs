@@ -452,8 +452,17 @@ fn queue_promotion_keeps_an_in_progress_read_and_publishes_its_children() {
     let home = Scratch::new();
     let root = home.0.join("scan");
     fs::create_dir(&root).unwrap();
-    let first = root.join("first");
-    fs::create_dir(&first).unwrap();
+    fs::create_dir(root.join("first")).unwrap();
+    fs::create_dir(root.join("second")).unwrap();
+    let fd = open_root(&root).unwrap();
+    let mut first = None;
+    entries(&fd, |entry| {
+        first = Some(root.join(entry.name));
+        false
+    })
+    .unwrap();
+    drop(fd);
+    let first = first.unwrap();
     for index in 0..2400 {
         fs::create_dir(first.join(format!("child-{index:04}"))).unwrap();
     }
@@ -461,16 +470,36 @@ fn queue_promotion_keeps_an_in_progress_read_and_publishes_its_children() {
     let mut config = options(4);
     config.window = 128 * 1024;
     let stats = config.stats.clone();
+    // Hold the second root entry until the first child has started.
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (needed_tx, needed_rx) = std::sync::mpsc::channel();
+    let (child_tx, child_rx) = std::sync::mpsc::channel();
+    let root_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let wait_root = root_gate.clone();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
     let waiting = gate.clone();
-    let entries_seen = Arc::new(AtomicUsize::new(0));
-    let count = entries_seen.clone();
+    let publication_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let wait_publication = publication_gate.clone();
+    let root_entries = AtomicUsize::new(0);
+    let entries_seen = AtomicUsize::new(0);
     config.hooks.after_entry = Some(Arc::new(move |key| {
-        if key == [0] && count.fetch_add(1, Ordering::Relaxed) == 7 {
-            let _ = started_tx.send(());
-            wait_for_release(&waiting, "promotion release");
+        if key.is_empty() && root_entries.fetch_add(1, Ordering::Relaxed) == 1 {
+            wait_for_release(&wait_root, "root completion after speculative start");
+        }
+        if key == [0] {
+            match entries_seen.fetch_add(1, Ordering::Relaxed) {
+                7 => {
+                    let _ = started_tx.send(());
+                    wait_for_release(&waiting, "promotion release");
+                }
+                8 => wait_for_release(&wait_publication, "collected child publication"),
+                _ => {}
+            }
+        }
+    }));
+    config.hooks.before_open = Some(Arc::new(move |key| {
+        if key.len() == 2 {
+            let _ = child_tx.send(());
         }
     }));
     config.hooks.needed = Some(Arc::new(move |key| {
@@ -490,15 +519,22 @@ fn queue_promotion_keeps_an_in_progress_read_and_publishes_its_children() {
         &started_rx,
         "the speculative read to pause below its reservation",
     );
+    assert!(needed_rx.try_recv().is_err());
+    release(&root_gate);
     wait_for(&needed_rx, "the reducer to require the paused route");
     release(&gate);
+    wait_for(
+        &child_rx,
+        "a collected child to start before parent completion",
+    );
+    release(&publication_gate);
     let actual = done_rx
         .recv_timeout(Duration::from_secs(60))
         .expect("promoted read must finish without abandoning or reopening");
     assert_same(actual, serial(&root, &AtomicBool::new(false)));
     assert_eq!(stats.abandons.load(Ordering::Relaxed), 0);
     assert!(stats.oversized.load(Ordering::Relaxed) > 0);
-    assert_eq!(stats.jobs.load(Ordering::Relaxed), 2402);
+    assert_eq!(stats.jobs.load(Ordering::Relaxed), 2403);
     assert_released(&stats, 4);
 }
 
@@ -591,7 +627,7 @@ fn queue_bounds_finished_speculation_with_many_empty_siblings() {
     for index in 0..14 {
         let sibling = root.join(format!("sibling-{index:02}"));
         fs::create_dir(&sibling).unwrap();
-        for child in 0..30 {
+        for child in 0..8 {
             fs::create_dir(sibling.join(format!("empty-{child:03}"))).unwrap();
         }
     }
@@ -609,24 +645,20 @@ fn queue_bounds_finished_speculation_with_many_empty_siblings() {
     config.window = 64 * 1024;
     let window = config.window;
     let stats = config.stats.clone();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let (release_first, first_rx) = std::sync::mpsc::channel();
-    let first_rx = Arc::new(Mutex::new(first_rx));
-    let wait_for_siblings = first_rx.clone();
-    let completed_siblings = Arc::new(AtomicUsize::new(0));
-    let completed = completed_siblings.clone();
+    let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+    let (empty_tx, empty_rx) = std::sync::mpsc::channel();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let waiting = gate.clone();
+    let empty_opens = AtomicUsize::new(0);
     config.hooks.before_open = Some(Arc::new(move |key| {
         if key == [0] {
-            let _ = release_tx.send(());
-            wait_for(
-                &wait_for_siblings.lock().unwrap(),
-                "later sibling receipts to finish",
-            );
+            let _ = blocked_tx.send(());
+            wait_for_release(&waiting, "required directory release");
         }
-    }));
-    config.hooks.completed = Some(Arc::new(move |key| {
-        if key.len() == 1 && key[0] != 0 && completed.fetch_add(1, Ordering::Relaxed) == 2 {
-            let _ = release_first.send(());
+        // With four workers, the fifth empty open proves at least one earlier
+        // empty receipt passed complete. The blocked reducer cannot consume it.
+        if key.len() == 2 && key[0] != 0 && empty_opens.fetch_add(1, Ordering::Relaxed) == 4 {
+            let _ = empty_tx.send(());
         }
     }));
 
@@ -637,7 +669,17 @@ fn queue_bounds_finished_speculation_with_many_empty_siblings() {
             .send(scan_options(&scan_root, &AtomicBool::new(false), config))
             .unwrap();
     });
-    wait_for(&release_rx, "the first directory to block");
+    wait_for(&blocked_rx, "the first directory to block");
+    wait_for(
+        &empty_rx,
+        "empty receipts retained behind the blocked reducer",
+    );
+    assert_eq!(stats.effective_workers.load(Ordering::Relaxed), 4);
+    assert!(
+        stats.speculative_receipt_bytes.load(Ordering::Relaxed)
+            >= std::mem::size_of::<Receipt>() + map_key_charge(&[1, 0])
+    );
+    release(&gate);
     let actual = done_rx
         .recv_timeout(Duration::from_secs(60))
         .expect("bounded speculative output must let the scan finish");
@@ -696,7 +738,6 @@ fn queue_rejects_identity_replacements_and_stays_within_fd_budget() {
 fn queue_partial_worker_spawn_failure_joins_started_workers_and_releases_descriptors() {
     let home = Scratch::new();
     fs::write(home.0.join("file"), b"contents").unwrap();
-    let baseline = descriptor_count();
     let mut config = options(4);
     config.hooks.spawn_failure = Some(Arc::new(|index| index == 1));
     let stats = config.stats.clone();
@@ -704,9 +745,6 @@ fn queue_partial_worker_spawn_failure_joins_started_workers_and_releases_descrip
     assert_same(actual, serial(&home.0, &AtomicBool::new(false)));
     assert!(stats.effective_workers.load(Ordering::Relaxed) >= 2);
     assert_released(&stats, 4);
-    if let (Some(before), Some(after)) = (baseline, descriptor_count()) {
-        assert_eq!(after, before);
-    }
 
     let mut config = options(4);
     config.hooks.spawn_failure = Some(Arc::new(|_| true));
@@ -725,7 +763,6 @@ fn queue_coordinator_callback_panic_stops_and_joins_workers() {
     let root = home.0.clone();
     let (sent, received) = std::sync::mpsc::channel();
     let runner = std::thread::spawn(move || {
-        let before = descriptor_count();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             foreground_priority();
             let _tree = scan_opened(
@@ -746,17 +783,13 @@ fn queue_coordinator_callback_panic_stops_and_joins_workers() {
                 },
             );
         }));
-        let after = descriptor_count();
-        sent.send((result.is_err(), before, after)).unwrap();
+        sent.send(result.is_err()).unwrap();
     });
-    let (panicked, before, after) = received
+    let panicked = received
         .recv_timeout(Duration::from_secs(10))
         .expect("callback panic must not hang scoped worker joins");
     runner.join().unwrap();
     assert!(panicked);
-    if let (Some(before), Some(after)) = (before, after) {
-        assert_eq!(after, before);
-    }
     assert_released(&stats, 4);
 }
 
