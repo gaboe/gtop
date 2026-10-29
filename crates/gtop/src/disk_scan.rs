@@ -12,6 +12,9 @@ use std::{
 
 pub const PAGE_SIZE: usize = 128;
 const MAX_LINKS: usize = 250_000;
+#[path = "disk_scan/queue.rs"]
+mod queue;
+pub(super) use queue::Urgency as ScanUrgency;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileId {
     pub device: u64,
@@ -277,7 +280,11 @@ fn cleanable_kind(path: &Path, home: &Path) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn local_manifest(parent: &OwnedFd) -> bool {
+    local_manifest_while(parent, || true)
+}
+fn local_manifest_while(parent: &OwnedFd, mut keep_going: impl FnMut() -> bool) -> bool {
     let Ok(expected) = identity(parent) else {
         return false;
     };
@@ -286,6 +293,9 @@ fn local_manifest(parent: &OwnedFd) -> bool {
     };
     let mut found = false;
     let _ = entries(&fd, |entry| {
+        if !keep_going() {
+            return false;
+        }
         if entry.name == "Cargo.toml" {
             found = !entry.in_cloud && !entry.error && !entry.directory;
             false
@@ -511,25 +521,56 @@ fn open_directory(root: &OwnedFd, tree: &Tree, id: usize) -> io::Result<OwnedFd>
 }
 
 pub fn scan(root: &Path, home: &Path, cancel: &AtomicBool, progress: impl FnMut(&Tree)) -> Tree {
-    scan_with_hook(root, home, cancel, progress, || {})
+    scan_impl(
+        root,
+        home,
+        cancel,
+        progress,
+        || ScanUrgency::Background,
+        queue::Options {
+            initial_urgency: ScanUrgency::Background,
+            ..queue::Options::default()
+        },
+    )
 }
 
 pub(super) fn scan_with_hook(
     root: &Path,
     home: &Path,
     cancel: &AtomicBool,
+    progress: impl FnMut(&Tree),
+    on_tick: impl FnMut() -> ScanUrgency,
+) -> Tree {
+    scan_impl(
+        root,
+        home,
+        cancel,
+        progress,
+        on_tick,
+        queue::Options::default(),
+    )
+}
+
+fn scan_impl(
+    root: &Path,
+    home: &Path,
+    cancel: &AtomicBool,
     mut progress: impl FnMut(&Tree),
-    mut on_tick: impl FnMut(),
+    mut on_tick: impl FnMut() -> ScanUrgency,
+    options: queue::Options,
 ) -> Tree {
     let mut last_tick = Instant::now() - Duration::from_secs(1);
     scan_opened(
         root,
         home,
         cancel,
-        &mut progress,
-        &mut on_tick,
-        &mut last_tick,
+        queue::Callbacks {
+            progress: &mut progress,
+            on_tick: &mut on_tick,
+            last_tick: &mut last_tick,
+        },
         || open_root(root),
+        options,
     )
 }
 
@@ -539,7 +580,7 @@ pub(super) fn scan_beneath(
     home: &Path,
     cancel: &AtomicBool,
     mut progress: impl FnMut(&Tree),
-    mut on_tick: impl FnMut(),
+    mut on_tick: impl FnMut() -> ScanUrgency,
 ) -> Tree {
     let mut last_tick = Instant::now() - Duration::from_secs(1);
     let opened = (|| {
@@ -586,10 +627,13 @@ pub(super) fn scan_beneath(
             root,
             home,
             cancel,
-            &mut progress,
-            &mut on_tick,
-            &mut last_tick,
+            queue::Callbacks {
+                progress: &mut progress,
+                on_tick: &mut on_tick,
+                last_tick: &mut last_tick,
+            },
             || Ok(fd),
+            queue::Options::default(),
         ),
         Err(error) => {
             let mut tree = Tree::new(root);
@@ -607,10 +651,9 @@ fn scan_opened(
     root: &Path,
     home: &Path,
     cancel: &AtomicBool,
-    mut progress: impl FnMut(&Tree),
-    on_tick: &mut impl FnMut(),
-    last_tick: &mut Instant,
+    callbacks: queue::Callbacks<'_>,
     open: impl FnOnce() -> io::Result<OwnedFd>,
+    options: queue::Options,
 ) -> Tree {
     let scan_home = data_home(home).filter(|alias| {
         root.starts_with("/System/Volumes/Data")
@@ -639,7 +682,7 @@ fn scan_opened(
         tree.nodes[0].in_cloud = true;
         tree.cloud_items = 1;
         tree.state = ScanState::Complete;
-        progress(&tree);
+        (callbacks.progress)(&tree);
         return tree;
     }
     let root_fd = match open() {
@@ -659,18 +702,18 @@ fn scan_opened(
     }
     tree.nodes[0].identity = root_id;
     tree.nodes[0].allocated = metadata.blocks() * 512;
-    let mut walker = Walker {
-        tree: &mut tree,
+    queue::run(
+        &mut tree,
+        &root_fd,
         home,
-        device: metadata.dev(),
         cancel,
-        progress: &mut progress,
-        last: Instant::now() - Duration::from_secs(1),
-        on_tick,
-        last_tick,
-        links: HashSet::new(),
-    };
-    walker.walk(&root_fd, root, 0);
+        queue::Callbacks {
+            progress: callbacks.progress,
+            on_tick: callbacks.on_tick,
+            last_tick: callbacks.last_tick,
+        },
+        options,
+    );
     if tree.state == ScanState::Scanning {
         tree.state = if cancel.load(Ordering::Relaxed) {
             ScanState::Cancelled
@@ -678,17 +721,18 @@ fn scan_opened(
             ScanState::Complete
         };
     }
-    progress(&tree);
+    (callbacks.progress)(&tree);
     tree
 }
 
-fn tick<F: FnMut() + ?Sized>(last_tick: &mut Instant, on_tick: &mut F) {
+fn tick<T, F: FnMut() -> T + ?Sized>(last_tick: &mut Instant, on_tick: &mut F) {
     if last_tick.elapsed() >= Duration::from_millis(100) {
         on_tick();
         *last_tick = Instant::now();
     }
 }
 
+#[cfg(test)]
 struct Walker<'a, F> {
     tree: &'a mut Tree,
     home: &'a Path,
@@ -757,6 +801,21 @@ impl Reducer<'_> {
         })
     }
 
+    fn plain_run(
+        &mut self,
+        allocated: u64,
+        in_cloud: bool,
+        count: u64,
+        total: &mut (u64, u64, u64),
+    ) {
+        let bytes = allocated.saturating_mul(count);
+        self.tree.cloud_items += if in_cloud { count } else { 0 };
+        self.tree.nodes[0].allocated = self.tree.nodes[0].allocated.saturating_add(bytes);
+        self.tree.nodes[0].descendants += count;
+        total.0 = total.0.saturating_add(bytes);
+        total.1 += count;
+    }
+
     fn read_error(&mut self, total: &mut (u64, u64, u64)) {
         total.2 += 1;
         self.tree.nodes[0].unreadable += 1;
@@ -819,6 +878,7 @@ impl Reducer<'_> {
     }
 }
 
+#[cfg(test)]
 impl<F: FnMut(&Tree)> Walker<'_, F> {
     fn reducer(&mut self) -> Reducer<'_> {
         Reducer {
@@ -1823,7 +1883,7 @@ mod tests {
             &home.0,
             &AtomicBool::new(true),
             |_| {},
-            || {},
+            || ScanUrgency::Background,
         );
         assert_eq!(tree.state, ScanState::Cancelled);
         assert_eq!(tree.nodes[0].descendants, 0);
@@ -1839,7 +1899,10 @@ mod tests {
             &home.0,
             &AtomicBool::new(false),
             |_| {},
-            || ticks.set(ticks.get() + 1),
+            || {
+                ticks.set(ticks.get() + 1);
+                ScanUrgency::Background
+            },
         );
         assert_eq!(tree.state, ScanState::Complete);
         assert_eq!(ticks.get(), 1);
@@ -1897,7 +1960,7 @@ mod tests {
                 &home.0,
                 &AtomicBool::new(false),
                 |_| {},
-                || {},
+                || ScanUrgency::Background,
             );
             assert!(matches!(tree.state, ScanState::Failed(_)));
             assert_eq!(tree.nodes[0].descendants, 0);

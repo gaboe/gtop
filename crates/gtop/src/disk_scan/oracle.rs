@@ -234,6 +234,16 @@ pub(super) fn replay(
     at_capacity: bool,
     cut: usize,
 ) -> (Tree, (u64, u64, u64)) {
+    replay_with_device(path, tape, at_capacity, cut, 1)
+}
+
+pub(super) fn replay_with_device(
+    path: &Path,
+    tape: &[(usize, Entry)],
+    at_capacity: bool,
+    cut: usize,
+    device: u64,
+) -> (Tree, (u64, u64, u64)) {
     let mut tree = Tree::new(path);
     tree.nodes[0].allocated = u64::MAX - 8192;
     let cancel = AtomicBool::new(false);
@@ -244,14 +254,14 @@ pub(super) fn replay(
     let mut walker = Walker {
         tree: &mut tree,
         home: path,
-        device: 1,
+        device,
         cancel: &cancel,
         progress: &mut progress,
         last: Instant::now(),
         on_tick: &mut on_tick,
         last_tick: &mut last_tick,
         links: if at_capacity {
-            (0..MAX_LINKS as u64).map(|inode| (1, inode)).collect()
+            (0..MAX_LINKS as u64).map(|inode| (device, inode)).collect()
         } else {
             HashSet::new()
         },
@@ -271,4 +281,42 @@ pub(super) fn replay(
         };
     }
     (tree, total)
+}
+
+thread_local! {
+    static CUT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static VISITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CUT_REACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+fn entries(fd: &OwnedFd, mut visit: impl FnMut(Entry) -> bool) -> io::Result<()> {
+    if CUT.get().is_none() {
+        return super::entries(fd, visit);
+    }
+    super::entries(fd, |entry| {
+        if VISITED.get() >= CUT.get().unwrap() {
+            CUT_REACHED.set(true);
+            return false;
+        }
+        VISITED.set(VISITED.get() + 1);
+        visit(entry)
+    })
+}
+pub(super) fn scan_until(root: &Path, cut: u64) -> Tree {
+    CUT.set(Some(cut));
+    VISITED.set(0);
+    CUT_REACHED.set(false);
+    let mut tree = scan_opened(
+        root,
+        root,
+        &AtomicBool::new(false),
+        |_| {},
+        &mut || {},
+        &mut Instant::now(),
+        || open_root(root),
+    );
+    if CUT_REACHED.get() {
+        tree.state = ScanState::Cancelled;
+    }
+    CUT.set(None);
+    tree
 }

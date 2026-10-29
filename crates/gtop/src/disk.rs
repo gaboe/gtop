@@ -455,8 +455,14 @@ impl ScanPriority {
             applied_foreground: false,
         }
     }
-    fn update(&mut self) {
-        self.set(self.foreground.load(Ordering::Acquire));
+    fn update(&mut self) -> disk_scan::ScanUrgency {
+        let foreground = self.foreground.load(Ordering::Acquire);
+        self.set(foreground);
+        if foreground {
+            disk_scan::ScanUrgency::Foreground
+        } else {
+            disk_scan::ScanUrgency::Background
+        }
     }
     fn restore(&mut self) {
         self.set(false);

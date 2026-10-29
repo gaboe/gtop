@@ -46,10 +46,13 @@ pub(super) fn replay(
     (tree, total)
 }
 
-fn assert_same(mut actual: Tree, mut expected: Tree) {
+pub(super) fn assert_same(mut actual: Tree, mut expected: Tree) {
     actual.observed = SystemTime::UNIX_EPOCH;
     expected.observed = SystemTime::UNIX_EPOCH;
-    assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+    assert_eq!(actual.state, expected.state);
+    let actual_debug = format!("{actual:?}");
+    let expected_debug = format!("{expected:?}");
+    assert!(actual_debug == expected_debug, "tree fields differ");
     for page in [0, 1, 7] {
         for cached in [false, true] {
             assert_eq!(
@@ -67,7 +70,7 @@ fn assert_same(mut actual: Tree, mut expected: Tree) {
     }
 }
 
-fn oracle_scan(path: &Path, cancel: &AtomicBool) -> Tree {
+pub(super) fn oracle_scan(path: &Path, cancel: &AtomicBool) -> Tree {
     serial_oracle::scan_opened(
         path,
         path,
@@ -202,7 +205,10 @@ fn reducer_matches_serial_oracle_when_hook_cancels_an_entered_directory() {
         &home.0,
         &actual_cancel,
         |_| {},
-        || actual_cancel.store(true, Ordering::Relaxed),
+        || {
+            actual_cancel.store(true, Ordering::Relaxed);
+            ScanUrgency::Background
+        },
     );
     let expected_cancel = AtomicBool::new(false);
     let expected = serial_oracle::scan_opened(
