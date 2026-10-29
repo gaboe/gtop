@@ -1,10 +1,12 @@
 use super::*;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{atomic::AtomicUsize, Arc, Condvar, Mutex},
 };
 
 const RECEIPT_WINDOW: usize = 64 * 1024 * 1024;
+// Pending speculative receipts stay within this window plus one reservation per worker.
+// The reducer's required directory may exceed the window to preserve progress.
 const CACHE_FDS: usize = 32;
 const REPORT_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const DEFAULT_WORKERS: usize = 4;
@@ -43,6 +45,9 @@ pub(super) struct Stats {
     pub(super) reopens: AtomicUsize,
     pub(super) cache_hits: AtomicUsize,
     pub(super) oversized: AtomicUsize,
+    pub(super) abandons: AtomicUsize,
+    pub(super) speculative_receipt_bytes: AtomicUsize,
+    pub(super) peak_speculative_receipt_bytes: AtomicUsize,
     pub(super) required_over_window: AtomicUsize,
     pub(super) qos_mismatches: AtomicUsize,
     pub(super) foreground_workers: AtomicUsize,
@@ -56,6 +61,14 @@ impl Stats {
     fn add_bytes(&self, bytes: usize) {
         let live = self.receipt_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         self.peak_receipt_bytes.fetch_max(live, Ordering::Relaxed);
+    }
+    fn add_speculative_bytes(&self, bytes: usize) {
+        let live = self
+            .speculative_receipt_bytes
+            .fetch_add(bytes, Ordering::Relaxed)
+            + bytes;
+        self.peak_speculative_receipt_bytes
+            .fetch_max(live, Ordering::Relaxed);
     }
     fn opened(&self) {
         let live = self.live_fds.fetch_add(1, Ordering::Relaxed) + 1;
@@ -98,6 +111,7 @@ pub(super) struct TestHooks {
     pub(super) after_entry: Option<RouteHook>,
     pub(super) completed: Option<RouteHook>,
     pub(super) tape: Option<TapeHook>,
+    pub(super) spawn_failure: Option<Arc<dyn Fn(usize) -> bool + Send + Sync>>,
     pub(super) initial_links: Vec<(u64, u64)>,
 }
 
@@ -148,14 +162,16 @@ struct Receipt {
     observations: Vec<Observation>,
     outcome: Outcome,
     bytes: usize,
+    speculative: bool,
     stats: Arc<Stats>,
 }
 impl Receipt {
-    fn new(stats: &Arc<Stats>) -> Self {
+    fn new(stats: &Arc<Stats>, speculative: bool) -> Self {
         Self {
             observations: vec![],
             outcome: Outcome::End,
             bytes: 0,
+            speculative,
             stats: stats.clone(),
         }
     }
@@ -178,6 +194,22 @@ impl Receipt {
             owned + (self.observations.capacity() - previous) * std::mem::size_of::<Observation>();
         self.bytes += bytes;
         self.stats.add_bytes(bytes);
+        if self.speculative {
+            self.stats.add_speculative_bytes(bytes);
+        }
+    }
+    fn set_speculative(&mut self, speculative: bool) {
+        if self.speculative == speculative {
+            return;
+        }
+        if speculative {
+            self.stats.add_speculative_bytes(self.bytes);
+        } else {
+            self.stats
+                .speculative_receipt_bytes
+                .fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+        self.speculative = speculative;
     }
 }
 impl Drop for Receipt {
@@ -185,6 +217,11 @@ impl Drop for Receipt {
         self.stats
             .receipt_bytes
             .fetch_sub(self.bytes, Ordering::Relaxed);
+        if self.speculative {
+            self.stats
+                .speculative_receipt_bytes
+                .fetch_sub(self.bytes, Ordering::Relaxed);
+        }
     }
 }
 
@@ -289,6 +326,12 @@ impl Drop for ScanFd {
         self.stats.live_fds.fetch_sub(1, Ordering::Relaxed);
     }
 }
+struct RootFdCount<'a>(&'a Stats);
+impl Drop for RootFdCount<'_> {
+    fn drop(&mut self) {
+        self.0.live_fds.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 struct CachePermit {
     live: Arc<AtomicUsize>,
 }
@@ -356,7 +399,9 @@ impl Cache {
 
 struct State {
     ready: BTreeMap<Vec<usize>, Arc<Route>>,
+    deferred: BTreeMap<Vec<usize>, Arc<Route>>,
     finished: BTreeMap<Vec<usize>, Receipt>,
+    active: BTreeSet<Vec<usize>>,
     needed: Option<Vec<usize>>,
     reserved: usize,
     stopping: bool,
@@ -372,7 +417,12 @@ struct Queue {
 impl Queue {
     fn publish(&self, route: Arc<Route>) {
         let mut state = self.state.lock().unwrap();
-        if !state.stopping {
+        if !state.stopping
+            && !state.active.contains(&route.key)
+            && !state.ready.contains_key(&route.key)
+            && !state.deferred.contains_key(&route.key)
+            && !state.finished.contains_key(&route.key)
+        {
             state.ready.insert(route.key.clone(), route);
             self.wake.notify_all();
         }
@@ -388,26 +438,42 @@ impl Queue {
                 let required = state
                     .needed
                     .as_ref()
-                    .filter(|key| state.ready.contains_key(*key))
+                    .filter(|key| {
+                        state.ready.contains_key(*key) || state.deferred.contains_key(*key)
+                    })
                     .cloned();
                 let live = self.stats.receipt_bytes.load(Ordering::Relaxed);
                 let speculative = live
                     .saturating_add(state.reserved)
                     .saturating_add(self.reservation)
                     <= self.window.saturating_sub(self.reservation);
+                let required_over_window = required.is_some() && live > self.window;
                 let key = required.or_else(|| {
                     speculative
-                        .then(|| state.ready.first_key_value().map(|(key, _)| key.clone()))
+                        .then(|| {
+                            state
+                                .ready
+                                .keys()
+                                .find(|key| !state.deferred.contains_key(*key))
+                                .cloned()
+                        })
                         .flatten()
                 });
                 if let Some(key) = key {
-                    if live > self.window {
+                    if required_over_window {
                         self.stats
                             .required_over_window
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     state.reserved += self.reservation;
-                    return state.ready.remove(&key);
+                    let route = state
+                        .ready
+                        .remove(&key)
+                        .or_else(|| state.deferred.remove(&key));
+                    if let Some(route) = &route {
+                        state.active.insert(route.key.clone());
+                    }
+                    return route;
                 }
             }
             let start = Instant::now();
@@ -420,8 +486,37 @@ impl Queue {
     fn complete(&self, route: &Route, receipt: Receipt) {
         let mut state = self.state.lock().unwrap();
         state.reserved -= self.reservation;
+        state.active.remove(&route.key);
         if !state.stopping {
             state.finished.insert(route.key.clone(), receipt);
+        }
+        self.wake.notify_all();
+    }
+
+    fn is_speculative(&self, route: &Route) -> bool {
+        self.state.lock().unwrap().needed.as_deref() != Some(route.key.as_slice())
+    }
+
+    fn try_abandon(&self, route: &Arc<Route>, mut receipt: Receipt) -> Result<(), Receipt> {
+        let state = self.state.lock().unwrap();
+        if state.stopping {
+            return Err(receipt);
+        }
+        if state.needed.as_deref() == Some(route.key.as_slice()) {
+            receipt.set_speculative(false);
+            return Err(receipt);
+        }
+        drop(receipt);
+        self.stats.abandons.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn defer(&self, route: &Arc<Route>) {
+        let mut state = self.state.lock().unwrap();
+        state.reserved -= self.reservation;
+        state.active.remove(&route.key);
+        if !state.stopping {
+            state.deferred.insert(route.key.clone(), route.clone());
         }
         self.wake.notify_all();
     }
@@ -550,7 +645,7 @@ struct Reader<'a, 'b> {
     permit: &'b mut Option<std::sync::MutexGuard<'a, ()>>,
 }
 impl Reader<'_, '_> {
-    fn read(&mut self, directory: &OwnedFd, route: &Arc<Route>) -> Receipt {
+    fn read(&mut self, directory: &OwnedFd, route: &Arc<Route>) -> Option<Receipt> {
         let Self {
             root,
             home,
@@ -561,7 +656,8 @@ impl Reader<'_, '_> {
             permit,
         } = self;
         let (root, home, device, queue, options) = (*root, *home, *device, *queue, *options);
-        let mut receipt = Receipt::new(&options.stats);
+        let mut receipt = Some(Receipt::new(&options.stats, queue.is_speculative(route)));
+        let mut abandoned = false;
         let path = route.path(root);
         let mut ordinal = 0;
         let result = observe_entries(directory, route, options, |entry| {
@@ -570,7 +666,7 @@ impl Reader<'_, '_> {
                 hook(&route.key);
             }
             if !io_ready(queue, priority, permit) {
-                receipt.outcome = Outcome::Interrupted;
+                receipt.as_mut().unwrap().outcome = Outcome::Interrupted;
                 return false;
             }
             let position = ordinal;
@@ -581,17 +677,30 @@ impl Reader<'_, '_> {
                 && !entry.error
                 && entry.device == device
             {
-                if let Some(Observation::Plain(run)) = receipt.observations.last_mut() {
+                if let Some(Observation::Plain(run)) =
+                    receipt.as_mut().unwrap().observations.last_mut()
+                {
                     if run.allocated == entry.allocated && run.in_cloud == entry.in_cloud {
                         run.count += 1;
                         return true;
                     }
                 }
-                receipt.push(Observation::Plain(PlainRun {
+                receipt.as_mut().unwrap().push(Observation::Plain(PlainRun {
                     count: 1,
                     allocated: entry.allocated,
                     in_cloud: entry.in_cloud,
                 }));
+                if receipt.as_ref().unwrap().speculative
+                    && receipt.as_ref().unwrap().bytes > queue.reservation
+                {
+                    match queue.try_abandon(route, receipt.take().unwrap()) {
+                        Ok(()) => {
+                            abandoned = true;
+                            return false;
+                        }
+                        Err(returned) => receipt = Some(returned),
+                    }
+                }
                 return true;
             }
             let traversable =
@@ -643,23 +752,41 @@ impl Reader<'_, '_> {
             } else {
                 None
             };
-            receipt.push(Observation::Entry(Box::new(ObservedEntry {
-                entry,
-                child: child.clone(),
-                cleanable,
-            })));
+            receipt
+                .as_mut()
+                .unwrap()
+                .push(Observation::Entry(Box::new(ObservedEntry {
+                    entry,
+                    child: child.clone(),
+                    cleanable,
+                })));
             if let Some(child) = child {
                 queue.publish(child);
             }
+            if receipt.as_ref().unwrap().speculative
+                && receipt.as_ref().unwrap().bytes > queue.reservation
+            {
+                match queue.try_abandon(route, receipt.take().unwrap()) {
+                    Ok(()) => {
+                        abandoned = true;
+                        return false;
+                    }
+                    Err(returned) => receipt = Some(returned),
+                }
+            }
             true
         });
+        if abandoned {
+            return None;
+        }
+        let mut receipt = receipt.unwrap();
         if result.is_err() {
             receipt.outcome = Outcome::ReadError;
         }
         if receipt.bytes > queue.reservation {
             options.stats.oversized.fetch_add(1, Ordering::Relaxed);
         }
-        receipt
+        Some(receipt)
     }
 }
 
@@ -711,7 +838,8 @@ impl Coordinator<'_, '_> {
             }
             {
                 let mut state = self.queue.state.lock().unwrap();
-                if let Some(receipt) = state.finished.remove(&route.key) {
+                if let Some(mut receipt) = state.finished.remove(&route.key) {
+                    receipt.set_speculative(false);
                     state.needed = None;
                     return Some(receipt);
                 }
@@ -871,6 +999,23 @@ impl Drop for WorkerExit<'_> {
     }
 }
 
+// The scope joins after its closure returns, so every exit must wake workers first.
+struct StopWorkers<'a> {
+    control: &'a Control<'a>,
+    queue: &'a Queue,
+}
+impl Drop for StopWorkers<'_> {
+    fn drop(&mut self) {
+        self.control.stop.store(true, Ordering::Relaxed);
+        let mut state = self.queue.state.lock().unwrap();
+        state.stopping = true;
+        state.ready.clear();
+        state.deferred.clear();
+        state.finished.clear();
+        self.queue.wake.notify_all();
+    }
+}
+
 pub(super) struct Callbacks<'a> {
     pub(super) progress: &'a mut dyn FnMut(&Tree),
     pub(super) on_tick: &'a mut dyn FnMut() -> Urgency,
@@ -909,7 +1054,9 @@ pub(super) fn run(
     let queue = Queue {
         state: Mutex::new(State {
             ready: BTreeMap::from([(vec![], root.clone())]),
+            deferred: BTreeMap::new(),
             finished: BTreeMap::new(),
+            active: BTreeSet::new(),
             needed: Some(vec![]),
             reserved: 0,
             stopping: false,
@@ -926,12 +1073,26 @@ pub(super) fn run(
         capacity: cache_capacity,
     };
     options.stats.opened();
+    let _root_fd_count = RootFdCount(&options.stats);
     let device = tree.nodes[0].identity.device;
     std::thread::scope(|scope| {
+        let _stop_workers = StopWorkers {
+            control: &control,
+            queue: &queue,
+        };
+        let mut started = 0;
         for index in 0..workers {
             let (queue, cache, control, options, root_path) =
                 (&queue, &cache, &control, &options, &root_path);
-            scope.spawn(move || {
+            #[cfg(test)]
+            let fail_spawn = options
+                .hooks
+                .spawn_failure
+                .as_ref()
+                .is_some_and(|hook| hook(index));
+            #[cfg(not(test))]
+            let fail_spawn = false;
+            let worker = move || {
                 let _exit = WorkerExit { control, queue };
                 let mut priority = Priority {
                     applied: None,
@@ -955,7 +1116,7 @@ pub(super) fn run(
                         &mut permit,
                     ) {
                         Ok(directory) => {
-                            let receipt = Reader {
+                            let outcome = Reader {
                                 root: root_path,
                                 home,
                                 device,
@@ -965,6 +1126,12 @@ pub(super) fn run(
                                 permit: &mut permit,
                             }
                             .read(&directory.fd, &route);
+                            let Some(receipt) = outcome else {
+                                drop(directory);
+                                drop(permit);
+                                queue.defer(&route);
+                                continue;
+                            };
                             if !route.key.is_empty() && receipt.observations.iter().any(|observation| {
                                 matches!(observation, Observation::Entry(observed) if observed.child.is_some())
                             }) {
@@ -973,7 +1140,7 @@ pub(super) fn run(
                             receipt
                         }
                         Err(_) => {
-                            let mut receipt = Receipt::new(&options.stats);
+                            let mut receipt = Receipt::new(&options.stats, false);
                             receipt.outcome = Outcome::OpenError;
                             receipt
                         }
@@ -990,7 +1157,20 @@ pub(super) fn run(
                     }
                     queue.complete(&route, receipt);
                 }
-            });
+            };
+            let spawn = if fail_spawn {
+                Err(io::Error::other("Injected worker spawn failure"))
+            } else {
+                std::thread::Builder::new().spawn_scoped(scope, worker)
+            };
+            match spawn {
+                Ok(_) => started += 1,
+                Err(error) if started == 0 => {
+                    tree.state = ScanState::Failed(format!("Could not start scan worker: {error}"));
+                    return;
+                }
+                Err(_) => break,
+            }
         }
         let mut links = HashSet::new();
         #[cfg(test)]
@@ -1014,16 +1194,9 @@ pub(super) fn run(
         if coordinator.replay(&root, &mut reducer).is_err() {
             reducer.tree.nodes[0].unreadable += 1;
         }
-        control.stop.store(true, Ordering::Relaxed);
-        let mut state = queue.state.lock().unwrap();
-        state.stopping = true;
-        state.ready.clear();
-        state.finished.clear();
-        queue.wake.notify_all();
     });
     drop(cache);
     drop(queue);
-    options.stats.live_fds.fetch_sub(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]

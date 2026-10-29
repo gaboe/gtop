@@ -42,6 +42,7 @@ fn options(width: usize) -> Options {
 fn assert_released(stats: &Stats, width: usize) {
     assert_eq!(stats.live_fds.load(Ordering::Relaxed), 0);
     assert_eq!(stats.receipt_bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.speculative_receipt_bytes.load(Ordering::Relaxed), 0);
     assert!(stats.peak_fds.load(Ordering::Relaxed) <= 1 + 2 * width + CACHE_FDS);
 }
 
@@ -120,11 +121,50 @@ fn queue_finishes_nested_large_directory_schedule_without_output_backpressure() 
 #[test]
 fn queue_forced_later_completion_preserves_dfs_and_overlaps_real_enumeration() {
     let home = Scratch::new();
-    for index in 0..12 {
-        let directory = home.0.join(format!("child-{index}"));
-        fs::create_dir(&directory).unwrap();
-        fs::write(directory.join("file"), [1; 4096]).unwrap();
+    fs::write(home.0.join("source"), [1; 4096]).unwrap();
+    let scan = home.0.join("scan");
+    fs::create_dir(&scan).unwrap();
+    for index in 0..2 {
+        let directory = scan.join(format!("child-{index}"));
+        fs::create_dir_all(directory.join("node_modules/pkg")).unwrap();
+        fs::write(directory.join("node_modules/pkg/payload"), b"same size").unwrap();
     }
+    let (shared_name, native_order) = (0..128)
+        .find_map(|index| {
+            let name = format!("z-shared-{index:03}");
+            let shared_path = scan.join(&name);
+            fs::hard_link(home.0.join("source"), &shared_path).unwrap();
+            let scan_fd = open_root(&scan).unwrap();
+            let mut entries_in_order = vec![];
+            entries(&scan_fd, |entry| {
+                entries_in_order.push((entry.name, entry.directory));
+                true
+            })
+            .unwrap();
+            drop(scan_fd);
+            let shared_index = entries_in_order
+                .iter()
+                .position(|(entry_name, _)| entry_name == std::ffi::OsStr::new(&name))
+                .unwrap();
+            let first_child = entries_in_order[..shared_index]
+                .iter()
+                .find(|(_, directory)| *directory)
+                .map(|(entry_name, _)| scan.join(entry_name));
+            if let Some(first_child) = first_child {
+                let native_order = entries_in_order
+                    .iter()
+                    .filter(|(_, directory)| *directory)
+                    .map(|(entry_name, _)| entry_name.clone())
+                    .collect::<Vec<_>>();
+                fs::hard_link(home.0.join("source"), first_child.join("shared")).unwrap();
+                Some((name, native_order))
+            } else {
+                fs::remove_file(shared_path).unwrap();
+                None
+            }
+        })
+        .expect("find a root sibling after a scanned child");
+    assert_eq!(native_order.len(), 2);
     for width in [2, 4, 8, 14] {
         let later_done = Arc::new((Mutex::new(false), Condvar::new()));
         let order = Arc::new(Mutex::new(vec![]));
@@ -155,9 +195,28 @@ fn queue_forced_later_completion_preserves_dfs_and_overlaps_real_enumeration() {
                 }
             }
         }));
-        let actual = scan_options(&home.0, &AtomicBool::new(false), config);
+        let actual = scan_options(&scan, &AtomicBool::new(false), config);
         assert_ne!(order.lock().unwrap()[0], 0);
-        assert_same(actual, serial(&home.0, &AtomicBool::new(false)));
+        let later_sibling = actual
+            .nodes
+            .iter()
+            .find(|node| node.name == std::ffi::OsStr::new(&shared_name))
+            .expect("later root sibling should be visible in the tree");
+        assert!(later_sibling.shared);
+        let candidates = actual.candidates.iter().collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].allocated, candidates[1].allocated);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|row| row.path.parent().unwrap().file_name().unwrap())
+                .collect::<Vec<_>>(),
+            native_order
+                .iter()
+                .map(std::ffi::OsString::as_os_str)
+                .collect::<Vec<_>>()
+        );
+        assert_same(actual, serial(&scan, &AtomicBool::new(false)));
     }
     let barrier = Arc::new(Barrier::new(2));
     let admitted = Arc::new(AtomicUsize::new(0));
@@ -168,7 +227,7 @@ fn queue_forced_later_completion_preserves_dfs_and_overlaps_real_enumeration() {
             barrier.wait();
         }
     }));
-    let tree = scan_options(&home.0, &AtomicBool::new(false), config);
+    let tree = scan_options(&scan, &AtomicBool::new(false), config);
     assert_eq!(tree.state, ScanState::Complete);
     assert!(admitted.load(Ordering::SeqCst) >= 2);
 }
@@ -313,6 +372,56 @@ fn queue_single_flat_directory_can_exceed_admission_window() {
 }
 
 #[test]
+fn queue_defers_oversized_speculative_receipts_until_they_are_required() {
+    let home = Scratch::new();
+    let root = home.0.join("scan");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join("first")).unwrap();
+    fs::create_dir(root.join("later")).unwrap();
+    let root_fd = open_root(&root).unwrap();
+    let mut native_order = vec![];
+    entries(&root_fd, |entry| {
+        native_order.push(entry.name);
+        true
+    })
+    .unwrap();
+    drop(root_fd);
+    assert_eq!(native_order.len(), 2);
+    let later = root.join(&native_order[1]);
+    for index in 0..1600 {
+        fs::create_dir(later.join(format!("directory-{index:04}"))).unwrap();
+    }
+
+    let mut config = options(4);
+    config.window = 256 * 1024;
+    let window = config.window;
+    let stats = config.stats.clone();
+    let observed = stats.clone();
+    config.hooks.before_open = Some(Arc::new(move |key| {
+        if key == [0] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while observed.abandons.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(observed.abandons.load(Ordering::Relaxed) > 0);
+        }
+    }));
+
+    assert_same(
+        scan_options(&root, &AtomicBool::new(false), config),
+        serial(&root, &AtomicBool::new(false)),
+    );
+    assert!(stats.abandons.load(Ordering::Relaxed) > 0);
+    assert_eq!(stats.jobs.load(Ordering::Relaxed), 1603);
+    let workers = stats.effective_workers.load(Ordering::Relaxed);
+    let reservation = window / (workers + 2);
+    assert!(stats.peak_speculative_receipt_bytes.load(Ordering::Relaxed) > reservation);
+    let bound = window + workers * reservation;
+    assert!(stats.peak_speculative_receipt_bytes.load(Ordering::Relaxed) <= bound);
+    assert_released(&stats, 4);
+}
+
+#[test]
 fn queue_rejects_identity_replacements_and_stays_within_fd_budget() {
     let home = Scratch::new();
     fs::create_dir(home.0.join("child")).unwrap();
@@ -349,6 +458,74 @@ fn queue_rejects_identity_replacements_and_stays_within_fd_budget() {
     assert_eq!(tree.nodes[0].descendants, 1);
     assert_eq!(tree.nodes[0].unreadable, 1);
     assert_eq!(tree.nodes[1].descendants, 0);
+    assert_released(&stats, 4);
+}
+
+#[test]
+fn queue_partial_worker_spawn_failure_joins_started_workers_and_releases_descriptors() {
+    let home = Scratch::new();
+    fs::write(home.0.join("file"), b"contents").unwrap();
+    let baseline = descriptor_count();
+    let mut config = options(4);
+    config.hooks.spawn_failure = Some(Arc::new(|index| index == 1));
+    let stats = config.stats.clone();
+    let actual = scan_options(&home.0, &AtomicBool::new(false), config);
+    assert_same(actual, serial(&home.0, &AtomicBool::new(false)));
+    assert!(stats.effective_workers.load(Ordering::Relaxed) >= 2);
+    assert_released(&stats, 4);
+    if let (Some(before), Some(after)) = (baseline, descriptor_count()) {
+        assert_eq!(after, before);
+    }
+
+    let mut config = options(4);
+    config.hooks.spawn_failure = Some(Arc::new(|_| true));
+    let stats = config.stats.clone();
+    let failed = scan_options(&home.0, &AtomicBool::new(false), config);
+    assert!(matches!(failed.state, ScanState::Failed(_)));
+    assert_released(&stats, 4);
+}
+
+#[test]
+fn queue_coordinator_callback_panic_stops_and_joins_workers() {
+    let home = Scratch::new();
+    fs::write(home.0.join("file"), b"contents").unwrap();
+    let stats = Arc::<Stats>::default();
+    let worker_stats = stats.clone();
+    let root = home.0.clone();
+    let (sent, received) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
+        let before = descriptor_count();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            foreground_priority();
+            let _tree = scan_opened(
+                &root,
+                &root,
+                &AtomicBool::new(false),
+                Callbacks {
+                    progress: &mut |_| {},
+                    on_tick: &mut || panic!("injected coordinator callback panic"),
+                    last_tick: &mut (Instant::now() - Duration::from_secs(1)),
+                },
+                || open_root(&root),
+                Options {
+                    workers: 4,
+                    initial_urgency: Urgency::Foreground,
+                    stats: worker_stats.clone(),
+                    ..Options::default()
+                },
+            );
+        }));
+        let after = descriptor_count();
+        sent.send((result.is_err(), before, after)).unwrap();
+    });
+    let (panicked, before, after) = received
+        .recv_timeout(Duration::from_secs(10))
+        .expect("callback panic must not hang scoped worker joins");
+    runner.join().unwrap();
+    assert!(panicked);
+    if let (Some(before), Some(after)) = (before, after) {
+        assert_eq!(after, before);
+    }
     assert_released(&stats, 4);
 }
 
@@ -532,7 +709,9 @@ fn queue_first_progress_does_not_depend_on_a_recent_scope_tick() {
     let queue = Queue {
         state: Mutex::new(State {
             ready: BTreeMap::new(),
+            deferred: BTreeMap::new(),
             finished: BTreeMap::new(),
+            active: BTreeSet::new(),
             needed: None,
             reserved: 0,
             stopping: false,
