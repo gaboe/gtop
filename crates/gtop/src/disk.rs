@@ -389,6 +389,7 @@ fn publish_browse(
         return tree.state == ScanState::Complete && !token.load(Ordering::Relaxed);
     }
     let mut published_complete = false;
+    disk_scan::foreground_priority();
     let subtree = disk_scan::scan_beneath(&tree.root, path, home, token, |subtree| {
         published_complete |= subtree.state == ScanState::Complete;
         let mut folder = subtree.folder(path, page, false);
@@ -397,6 +398,7 @@ fn publish_browse(
         mailbox.folder = Some((generation, navigation, folder));
         mailbox.notify();
     });
+    disk_scan::background_priority();
     if !published_complete {
         let mut folder = subtree.folder(path, page, false);
         folder.root = tree.root.clone();
@@ -492,6 +494,7 @@ fn worker_with_trash(
                     let key = cache.keys().next().unwrap().clone();
                     cache.remove(&key);
                 }
+                disk_scan::foreground_priority();
                 let tree = disk_scan::scan(&root, &home, &token, |tree| {
                     while let Ok(command) = receiver.try_recv() {
                         queue.push_back(command);
@@ -500,6 +503,7 @@ fn worker_with_trash(
                         &output, tree, &browsing, page, false, generation, navigation,
                     );
                 });
+                disk_scan::background_priority();
                 publish(
                     &output, &tree, &browsing, page, false, generation, navigation,
                 );
@@ -539,6 +543,7 @@ fn worker_with_trash(
                         let browsing = path;
                         let page = p;
                         let navigation = n;
+                        disk_scan::foreground_priority();
                         let refreshed = disk_scan::scan(&root, &home, &token, |tree| {
                             while let Ok(command) = receiver.try_recv() {
                                 queue.push_back(command);
@@ -549,6 +554,7 @@ fn worker_with_trash(
                                 );
                             }
                         });
+                        disk_scan::background_priority();
                         completed = publish_browse(
                             &output,
                             &refreshed,

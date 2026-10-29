@@ -808,6 +808,13 @@ fn open_child(parent: &OwnedFd, name: &std::ffi::OsStr, expected: FileId) -> io:
     Ok(fd)
 }
 
+pub fn foreground_priority() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+    }
+}
+
 pub fn background_priority() {
     #[cfg(target_os = "macos")]
     unsafe {
