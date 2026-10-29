@@ -1901,7 +1901,7 @@ async fn detail_kill_completion_restores_focus_and_reaps_owned_child(cx: &mut Te
 #[cfg(target_os = "macos")]
 #[gpui::test]
 async fn detail_kill_completion_reports_exited_child_and_restores_focus(cx: &mut TestAppContext) {
-    use gpui::{px, size, Modifiers};
+    use gpui::{point, px, size, Modifiers, MouseButton};
 
     struct ChildGuard(std::process::Child);
     impl Drop for ChildGuard {
@@ -1920,14 +1920,15 @@ async fn detail_kill_completion_reports_exited_child_and_restores_focus(cx: &mut
             .unwrap(),
     );
     let core = Arc::new(gtop_core::AppState::new());
-    let snapshot = core.snapshot(false, false).unwrap();
-    let process = snapshot
-        .processes
-        .iter()
+    let mut snapshot = core.snapshot(false, false).unwrap();
+    let mut processes = snapshot.processes.as_ref().clone();
+    let process = processes
+        .iter_mut()
         .find(|process| process.pid == child.0.id())
-        .unwrap()
-        .clone();
-    let key = ProcessKey::from(&process);
+        .unwrap();
+    process.start_time += 1;
+    let key = ProcessKey::from(&*process);
+    snapshot.processes = Arc::new(processes);
 
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -1954,11 +1955,22 @@ async fn detail_kill_completion_reports_exited_child_and_restores_focus(cx: &mut
     let kill = visual.debug_bounds("kill").unwrap();
     visual.simulate_click(kill.center(), Modifiers::default());
     visual.update(|window, cx| window.draw(cx).clear(cx));
-
-    child.0.kill().unwrap();
-    assert!(!child.0.wait().unwrap().success());
-
     let confirm = visual.debug_bounds("confirm-kill").unwrap();
+
+    let bounds = visual.debug_bounds("executable-value").unwrap();
+    let start = bounds.origin + point(px(1.), px(5.));
+    let end = bounds.origin + point(px(46.), px(5.));
+    visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    let selection_focus = visual.update(|window, cx| {
+        assert!(!gpui_base::TextSelection::selected_text(window, cx).is_empty());
+        window.focused(cx).unwrap()
+    });
+    visual.update(|window, cx| {
+        assert_eq!(window.focused(cx), Some(selection_focus));
+        assert_ne!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+    });
     visual.simulate_click(confirm.center(), Modifiers::default());
     visual.run_until_parked();
 
@@ -1978,6 +1990,7 @@ async fn detail_kill_completion_reports_exited_child_and_restores_focus(cx: &mut
             )
         );
     });
+    assert!(child.0.try_wait().unwrap().is_none());
 }
 
 #[cfg(target_os = "macos")]
