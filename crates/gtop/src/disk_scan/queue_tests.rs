@@ -39,6 +39,32 @@ fn options(width: usize) -> Options {
     }
 }
 
+fn wait_for(signal: &std::sync::mpsc::Receiver<()>, message: &str) {
+    signal
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("timed out waiting for {message}"));
+}
+
+fn release(gate: &Arc<(Mutex<bool>, Condvar)>) {
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+}
+
+fn wait_for_release(gate: &Arc<(Mutex<bool>, Condvar)>, message: &str) {
+    let (released, timeout) = gate
+        .1
+        .wait_timeout_while(
+            gate.0.lock().unwrap(),
+            Duration::from_secs(60),
+            |released| !*released,
+        )
+        .unwrap();
+    assert!(
+        *released && !timeout.timed_out(),
+        "timed out waiting for {message}"
+    );
+}
+
 fn assert_released(stats: &Stats, width: usize) {
     assert_eq!(stats.live_fds.load(Ordering::Relaxed), 0);
     assert_eq!(stats.receipt_bytes.load(Ordering::Relaxed), 0);
@@ -422,6 +448,211 @@ fn queue_defers_oversized_speculative_receipts_until_they_are_required() {
 }
 
 #[test]
+fn queue_promotion_keeps_an_in_progress_read_and_publishes_its_children() {
+    let home = Scratch::new();
+    let root = home.0.join("scan");
+    fs::create_dir(&root).unwrap();
+    let first = root.join("first");
+    fs::create_dir(&first).unwrap();
+    for index in 0..2400 {
+        fs::create_dir(first.join(format!("child-{index:04}"))).unwrap();
+    }
+
+    let mut config = options(4);
+    config.window = 128 * 1024;
+    let stats = config.stats.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (needed_tx, needed_rx) = std::sync::mpsc::channel();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let waiting = gate.clone();
+    let entries_seen = Arc::new(AtomicUsize::new(0));
+    let count = entries_seen.clone();
+    config.hooks.after_entry = Some(Arc::new(move |key| {
+        if key == [0] && count.fetch_add(1, Ordering::Relaxed) == 7 {
+            let _ = started_tx.send(());
+            wait_for_release(&waiting, "promotion release");
+        }
+    }));
+    config.hooks.needed = Some(Arc::new(move |key| {
+        if key == [0] {
+            let _ = needed_tx.send(());
+        }
+    }));
+
+    let scan_root = root.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        done_tx
+            .send(scan_options(&scan_root, &AtomicBool::new(false), config))
+            .unwrap();
+    });
+    wait_for(
+        &started_rx,
+        "the speculative read to pause below its reservation",
+    );
+    wait_for(&needed_rx, "the reducer to require the paused route");
+    release(&gate);
+    let actual = done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("promoted read must finish without abandoning or reopening");
+    assert_same(actual, serial(&root, &AtomicBool::new(false)));
+    assert_eq!(stats.abandons.load(Ordering::Relaxed), 0);
+    assert!(stats.oversized.load(Ordering::Relaxed) > 0);
+    assert_eq!(stats.jobs.load(Ordering::Relaxed), 2402);
+    assert_released(&stats, 4);
+}
+
+#[test]
+fn queue_demand_between_abandon_and_defer_claims_the_deferred_route() {
+    let home = Scratch::new();
+    let root = home.0.join("scan");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join("first")).unwrap();
+    fs::create_dir(root.join("second")).unwrap();
+    let root_fd = open_root(&root).unwrap();
+    let mut root_order = vec![];
+    entries(&root_fd, |entry| {
+        root_order.push(entry.name);
+        true
+    })
+    .unwrap();
+    drop(root_fd);
+    let first = root.join(&root_order[0]);
+    for index in 0..400 {
+        fs::create_dir(first.join(format!("child-{index:04}"))).unwrap();
+    }
+
+    let mut config = options(4);
+    config.window = 8 * 1024;
+    let stats = config.stats.clone();
+    let (abandoned_tx, abandoned_rx) = std::sync::mpsc::channel();
+    let (needed_tx, needed_rx) = std::sync::mpsc::channel();
+    let (root_paused_tx, root_paused_rx) = std::sync::mpsc::channel();
+    let root_gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let wait_for_root = root_gate.clone();
+    let entries_seen = Arc::new(AtomicUsize::new(0));
+    let count = entries_seen.clone();
+    config.hooks.after_entry = Some(Arc::new(move |key| {
+        if key.is_empty() && count.fetch_add(1, Ordering::Relaxed) == 1 {
+            let _ = root_paused_tx.send(());
+            wait_for_release(&wait_for_root, "root release");
+        }
+    }));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let waiting = gate.clone();
+    config.hooks.abandoned = Some(Arc::new(move |key| {
+        if key == [0] {
+            let _ = abandoned_tx.send(());
+            wait_for_release(&waiting, "defer release");
+        }
+    }));
+    config.hooks.needed = Some(Arc::new(move |key| {
+        if key == [0] {
+            let _ = needed_tx.send(());
+        }
+    }));
+    let opens = Arc::new(AtomicUsize::new(0));
+    let open_count = opens.clone();
+    config.hooks.before_open = Some(Arc::new(move |key| {
+        if key == [0] {
+            open_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }));
+
+    let scan_root = root.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        done_tx
+            .send(scan_options(&scan_root, &AtomicBool::new(false), config))
+            .unwrap();
+    });
+    wait_for(&abandoned_rx, "the speculative read to abandon");
+    wait_for(
+        &root_paused_rx,
+        "the parent read to pause after publishing the route",
+    );
+    release(&root_gate);
+    wait_for(&needed_rx, "the reducer to request the route before defer");
+    release(&gate);
+    let actual = done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the deferred required route must become claimable");
+    assert_same(actual, serial(&root, &AtomicBool::new(false)));
+    assert_eq!(stats.abandons.load(Ordering::Relaxed), 1);
+    assert!(opens.load(Ordering::Relaxed) >= 2);
+    assert_released(&stats, 4);
+}
+
+#[test]
+fn queue_bounds_finished_speculation_with_many_empty_siblings() {
+    let home = Scratch::new();
+    let root = home.0.join("scan");
+    fs::create_dir(&root).unwrap();
+    for index in 0..14 {
+        let sibling = root.join(format!("sibling-{index:02}"));
+        fs::create_dir(&sibling).unwrap();
+        for child in 0..30 {
+            fs::create_dir(sibling.join(format!("empty-{child:03}"))).unwrap();
+        }
+    }
+    let root_fd = open_root(&root).unwrap();
+    let mut order = vec![];
+    entries(&root_fd, |entry| {
+        order.push(entry.name);
+        true
+    })
+    .unwrap();
+    drop(root_fd);
+    assert!(order.len() >= 8);
+
+    let mut config = options(4);
+    config.window = 64 * 1024;
+    let window = config.window;
+    let stats = config.stats.clone();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (release_first, first_rx) = std::sync::mpsc::channel();
+    let first_rx = Arc::new(Mutex::new(first_rx));
+    let wait_for_siblings = first_rx.clone();
+    let completed_siblings = Arc::new(AtomicUsize::new(0));
+    let completed = completed_siblings.clone();
+    config.hooks.before_open = Some(Arc::new(move |key| {
+        if key == [0] {
+            let _ = release_tx.send(());
+            wait_for(
+                &wait_for_siblings.lock().unwrap(),
+                "later sibling receipts to finish",
+            );
+        }
+    }));
+    config.hooks.completed = Some(Arc::new(move |key| {
+        if key.len() == 1 && key[0] != 0 && completed.fetch_add(1, Ordering::Relaxed) == 2 {
+            let _ = release_first.send(());
+        }
+    }));
+
+    let scan_root = root.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        done_tx
+            .send(scan_options(&scan_root, &AtomicBool::new(false), config))
+            .unwrap();
+    });
+    wait_for(&release_rx, "the first directory to block");
+    let actual = done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("bounded speculative output must let the scan finish");
+    assert_same(actual, serial(&root, &AtomicBool::new(false)));
+    let workers = stats.effective_workers.load(Ordering::Relaxed);
+    let reservation = window / (workers + 2);
+    assert!(stats.peak_speculative_receipt_bytes.load(Ordering::Relaxed) > reservation);
+    assert!(
+        stats.peak_speculative_receipt_bytes.load(Ordering::Relaxed)
+            <= window + workers * reservation
+    );
+    assert_released(&stats, 4);
+}
+
+#[test]
 fn queue_rejects_identity_replacements_and_stays_within_fd_budget() {
     let home = Scratch::new();
     fs::create_dir(home.0.join("child")).unwrap();
@@ -721,6 +952,8 @@ fn queue_first_progress_does_not_depend_on_a_recent_scope_tick() {
         window: 4096,
         stats: stats.clone(),
         background: Mutex::new(()),
+        abandoned_hook: None,
+        needed_hook: None,
     };
     let cancel = AtomicBool::new(false);
     let control = Control {

@@ -5,8 +5,9 @@ use std::{
 };
 
 const RECEIPT_WINDOW: usize = 64 * 1024 * 1024;
-// Pending speculative receipts stay within this window plus one reservation per worker.
-// The reducer's required directory may exceed the window to preserve progress.
+// Charged speculative receipts and pending route keys stay within this window plus one
+// reservation per worker. The reducer's required directory may exceed the window.
+const MAP_NODE_OVERHEAD: usize = 64;
 const CACHE_FDS: usize = 32;
 const REPORT_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const DEFAULT_WORKERS: usize = 4;
@@ -70,6 +71,13 @@ impl Stats {
         self.peak_speculative_receipt_bytes
             .fetch_max(live, Ordering::Relaxed);
     }
+    fn remove_bytes(&self, bytes: usize) {
+        self.receipt_bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+    fn remove_speculative_bytes(&self, bytes: usize) {
+        self.speculative_receipt_bytes
+            .fetch_sub(bytes, Ordering::Relaxed);
+    }
     fn opened(&self) {
         let live = self.live_fds.fetch_add(1, Ordering::Relaxed) + 1;
         self.peak_fds.fetch_max(live, Ordering::Relaxed);
@@ -110,6 +118,8 @@ pub(super) struct TestHooks {
     pub(super) cancel_after: Option<u64>,
     pub(super) after_entry: Option<RouteHook>,
     pub(super) completed: Option<RouteHook>,
+    pub(super) abandoned: Option<RouteHook>,
+    pub(super) needed: Option<RouteHook>,
     pub(super) tape: Option<TapeHook>,
     pub(super) spawn_failure: Option<Arc<dyn Fn(usize) -> bool + Send + Sync>>,
     pub(super) initial_links: Vec<(u64, u64)>,
@@ -120,6 +130,21 @@ struct Route {
     name: std::ffi::OsString,
     expected: FileId,
     key: Vec<usize>,
+}
+struct PendingRoute {
+    route: Arc<Route>,
+    charge: usize,
+    speculative: bool,
+}
+fn map_key_charge(key: &[usize]) -> usize {
+    std::mem::size_of::<Vec<usize>>() + std::mem::size_of_val(key) + MAP_NODE_OVERHEAD
+}
+fn pending_route_charge(route: &Route) -> usize {
+    std::mem::size_of::<Route>()
+        + route.name.capacity()
+        + route.key.capacity() * std::mem::size_of::<usize>()
+        + 2 * std::mem::size_of::<usize>()
+        + map_key_charge(&route.key)
 }
 impl Route {
     fn path(&self, root: &Path) -> PathBuf {
@@ -163,6 +188,8 @@ struct Receipt {
     outcome: Outcome,
     bytes: usize,
     speculative: bool,
+    has_children: bool,
+    children_published: bool,
     stats: Arc<Stats>,
 }
 impl Receipt {
@@ -172,10 +199,15 @@ impl Receipt {
             outcome: Outcome::End,
             bytes: 0,
             speculative,
+            has_children: false,
+            children_published: false,
             stats: stats.clone(),
         }
     }
     fn push(&mut self, observation: Observation) {
+        if matches!(&observation, Observation::Entry(observed) if observed.child.is_some()) {
+            self.has_children = true;
+        }
         let owned = match &observation {
             Observation::Plain(_) => 0,
             Observation::Entry(observed) => {
@@ -192,6 +224,14 @@ impl Receipt {
         self.observations.push(observation);
         let bytes =
             owned + (self.observations.capacity() - previous) * std::mem::size_of::<Observation>();
+        self.bytes += bytes;
+        self.stats.add_bytes(bytes);
+        if self.speculative {
+            self.stats.add_speculative_bytes(bytes);
+        }
+    }
+    fn charge_finished(&mut self, key: &[usize]) {
+        let bytes = std::mem::size_of::<Self>() + map_key_charge(key);
         self.bytes += bytes;
         self.stats.add_bytes(bytes);
         if self.speculative {
@@ -398,8 +438,8 @@ impl Cache {
 }
 
 struct State {
-    ready: BTreeMap<Vec<usize>, Arc<Route>>,
-    deferred: BTreeMap<Vec<usize>, Arc<Route>>,
+    ready: BTreeMap<Vec<usize>, PendingRoute>,
+    deferred: BTreeMap<Vec<usize>, PendingRoute>,
     finished: BTreeMap<Vec<usize>, Receipt>,
     active: BTreeSet<Vec<usize>>,
     needed: Option<Vec<usize>>,
@@ -413,18 +453,53 @@ struct Queue {
     window: usize,
     stats: Arc<Stats>,
     background: Mutex<()>,
+    #[cfg(test)]
+    abandoned_hook: Option<RouteHook>,
+    #[cfg(test)]
+    needed_hook: Option<RouteHook>,
 }
 impl Queue {
-    fn publish(&self, route: Arc<Route>) {
-        let mut state = self.state.lock().unwrap();
+    fn publish_locked(&self, state: &mut State, route: Arc<Route>, speculative: bool) {
         if !state.stopping
             && !state.active.contains(&route.key)
             && !state.ready.contains_key(&route.key)
             && !state.deferred.contains_key(&route.key)
             && !state.finished.contains_key(&route.key)
         {
-            state.ready.insert(route.key.clone(), route);
+            let charge = pending_route_charge(&route);
+            self.stats.add_bytes(charge);
+            if speculative {
+                self.stats.add_speculative_bytes(charge);
+            }
+            state.ready.insert(
+                route.key.clone(),
+                PendingRoute {
+                    route,
+                    charge,
+                    speculative,
+                },
+            );
             self.wake.notify_all();
+        }
+    }
+    fn publish_required(&self, route: &Route, receipt: &mut Receipt) {
+        let mut state = self.state.lock().unwrap();
+        if state.needed.as_deref() != Some(route.key.as_slice()) {
+            return;
+        }
+        receipt.set_speculative(false);
+        publish_receipt_children(self, &mut state, receipt, false);
+    }
+    fn publish_required_child(&self, route: &Route, receipt: &mut Receipt, child: Arc<Route>) {
+        let mut state = self.state.lock().unwrap();
+        if state.needed.as_deref() != Some(route.key.as_slice()) {
+            return;
+        }
+        receipt.set_speculative(false);
+        if receipt.children_published {
+            self.publish_locked(&mut state, child, false);
+        } else {
+            publish_receipt_children(self, &mut state, receipt, false);
         }
     }
     fn claim(&self, index: usize, priority: &mut Priority<'_>) -> Option<Arc<Route>> {
@@ -466,14 +541,18 @@ impl Queue {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     state.reserved += self.reservation;
-                    let route = state
+                    let item = state
                         .ready
                         .remove(&key)
                         .or_else(|| state.deferred.remove(&key));
-                    if let Some(route) = &route {
-                        state.active.insert(route.key.clone());
+                    if let Some(item) = &item {
+                        self.stats.remove_bytes(item.charge);
+                        if item.speculative {
+                            self.stats.remove_speculative_bytes(item.charge);
+                        }
+                        state.active.insert(item.route.key.clone());
                     }
-                    return route;
+                    return item.map(|item| item.route);
                 }
             }
             let start = Instant::now();
@@ -483,11 +562,17 @@ impl Queue {
                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
     }
-    fn complete(&self, route: &Route, receipt: Receipt) {
+    fn complete(&self, route: &Route, mut receipt: Receipt) {
         let mut state = self.state.lock().unwrap();
         state.reserved -= self.reservation;
         state.active.remove(&route.key);
         if !state.stopping {
+            if state.needed.as_deref() == Some(route.key.as_slice()) {
+                receipt.set_speculative(false);
+            }
+            let speculative = receipt.speculative;
+            publish_receipt_children(self, &mut state, &mut receipt, speculative);
+            receipt.charge_finished(&route.key);
             state.finished.insert(route.key.clone(), receipt);
         }
         self.wake.notify_all();
@@ -498,16 +583,22 @@ impl Queue {
     }
 
     fn try_abandon(&self, route: &Arc<Route>, mut receipt: Receipt) -> Result<(), Receipt> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if state.stopping {
             return Err(receipt);
         }
         if state.needed.as_deref() == Some(route.key.as_slice()) {
             receipt.set_speculative(false);
+            publish_receipt_children(self, &mut state, &mut receipt, false);
             return Err(receipt);
         }
+        drop(state);
         drop(receipt);
         self.stats.abandons.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(hook) = &self.abandoned_hook {
+            hook(&route.key);
+        }
         Ok(())
     }
 
@@ -516,10 +607,42 @@ impl Queue {
         state.reserved -= self.reservation;
         state.active.remove(&route.key);
         if !state.stopping {
-            state.deferred.insert(route.key.clone(), route.clone());
+            let speculative = state.needed.as_deref() != Some(route.key.as_slice());
+            let charge = pending_route_charge(route);
+            self.stats.add_bytes(charge);
+            if speculative {
+                self.stats.add_speculative_bytes(charge);
+            }
+            state.deferred.insert(
+                route.key.clone(),
+                PendingRoute {
+                    route: route.clone(),
+                    charge,
+                    speculative,
+                },
+            );
         }
         self.wake.notify_all();
     }
+}
+
+fn publish_receipt_children(
+    queue: &Queue,
+    state: &mut State,
+    receipt: &mut Receipt,
+    speculative: bool,
+) {
+    if receipt.children_published {
+        return;
+    }
+    for observation in &receipt.observations {
+        if let Observation::Entry(observed) = observation {
+            if let Some(child) = &observed.child {
+                queue.publish_locked(state, child.clone(), speculative);
+            }
+        }
+    }
+    receipt.children_published = true;
 }
 
 fn io_ready<'a>(
@@ -669,6 +792,12 @@ impl Reader<'_, '_> {
                 receipt.as_mut().unwrap().outcome = Outcome::Interrupted;
                 return false;
             }
+            if receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.speculative && receipt.has_children)
+            {
+                queue.publish_required(route, receipt.as_mut().unwrap());
+            }
             let position = ordinal;
             ordinal += 1;
             if !route.key.is_empty()
@@ -761,7 +890,7 @@ impl Reader<'_, '_> {
                     cleanable,
                 })));
             if let Some(child) = child {
-                queue.publish(child);
+                queue.publish_required_child(route, receipt.as_mut().unwrap(), child);
             }
             if receipt.as_ref().unwrap().speculative
                 && receipt.as_ref().unwrap().bytes > queue.reservation
@@ -845,6 +974,10 @@ impl Coordinator<'_, '_> {
                 }
                 state.needed = Some(route.key.clone());
                 self.queue.wake.notify_all();
+                #[cfg(test)]
+                if let Some(hook) = &self.queue.needed_hook {
+                    hook(&route.key);
+                }
                 let mut remaining = REPORT_INTERVAL.saturating_sub(self.last_report.elapsed());
                 if self.reported {
                     remaining =
@@ -1009,6 +1142,12 @@ impl Drop for StopWorkers<'_> {
         self.control.stop.store(true, Ordering::Relaxed);
         let mut state = self.queue.state.lock().unwrap();
         state.stopping = true;
+        for item in state.ready.values().chain(state.deferred.values()) {
+            self.queue.stats.remove_bytes(item.charge);
+            if item.speculative {
+                self.queue.stats.remove_speculative_bytes(item.charge);
+            }
+        }
         state.ready.clear();
         state.deferred.clear();
         state.finished.clear();
@@ -1053,7 +1192,14 @@ pub(super) fn run(
     };
     let queue = Queue {
         state: Mutex::new(State {
-            ready: BTreeMap::from([(vec![], root.clone())]),
+            ready: BTreeMap::from([(
+                vec![],
+                PendingRoute {
+                    route: root.clone(),
+                    charge: pending_route_charge(&root),
+                    speculative: false,
+                },
+            )]),
             deferred: BTreeMap::new(),
             finished: BTreeMap::new(),
             active: BTreeSet::new(),
@@ -1066,7 +1212,12 @@ pub(super) fn run(
         window: options.window,
         stats: options.stats.clone(),
         background: Mutex::new(()),
+        #[cfg(test)]
+        abandoned_hook: options.hooks.abandoned.clone(),
+        #[cfg(test)]
+        needed_hook: options.hooks.needed.clone(),
     };
+    options.stats.add_bytes(pending_route_charge(&root));
     let cache = Cache {
         entries: Mutex::default(),
         live: Arc::default(),
