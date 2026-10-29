@@ -7,7 +7,7 @@ use std::{
 const RECEIPT_WINDOW: usize = 64 * 1024 * 1024;
 const CACHE_FDS: usize = 32;
 const REPORT_INTERVAL: Duration = Duration::from_millis(100);
-pub(super) const DEFAULT_WORKERS: usize = 1;
+pub(super) const DEFAULT_WORKERS: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Urgency {
