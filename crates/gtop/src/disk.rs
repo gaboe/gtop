@@ -413,15 +413,21 @@ fn publish_browse(
     }
     let mut published_complete = false;
     priority.update();
-    let subtree = disk_scan::scan_beneath(&tree.root, path, home, token, |subtree| {
-        priority.update();
-        published_complete |= subtree.state == ScanState::Complete;
-        let mut folder = subtree.folder(path, page, false);
-        folder.root = tree.root.clone();
-        let mut mailbox = output.lock().unwrap();
-        mailbox.folder = Some((generation, navigation, folder));
-        mailbox.notify();
-    });
+    let subtree = disk_scan::scan_beneath(
+        &tree.root,
+        path,
+        home,
+        token,
+        |subtree| {
+            published_complete |= subtree.state == ScanState::Complete;
+            let mut folder = subtree.folder(path, page, false);
+            folder.root = tree.root.clone();
+            let mut mailbox = output.lock().unwrap();
+            mailbox.folder = Some((generation, navigation, folder));
+            mailbox.notify();
+        },
+        || priority.update(),
+    );
     priority.restore();
     if !published_complete {
         let mut folder = subtree.folder(path, page, false);
@@ -561,15 +567,20 @@ fn worker_with_trash(
                     cache.remove(&key);
                 }
                 priority.update();
-                let tree = disk_scan::scan(&root, &home, &token, |tree| {
-                    priority.update();
-                    while let Ok(command) = receiver.try_recv() {
-                        queue.push_back(command);
-                    }
-                    publish(
-                        &output, tree, &browsing, page, false, generation, navigation,
-                    );
-                });
+                let tree = disk_scan::scan_with_hook(
+                    &root,
+                    &home,
+                    &token,
+                    |tree| {
+                        while let Ok(command) = receiver.try_recv() {
+                            queue.push_back(command);
+                        }
+                        publish(
+                            &output, tree, &browsing, page, false, generation, navigation,
+                        );
+                    },
+                    || priority.update(),
+                );
                 priority.restore();
                 publish(
                     &output, &tree, &browsing, page, false, generation, navigation,
@@ -621,17 +632,23 @@ fn worker_with_trash(
                         let page = p;
                         let navigation = n;
                         priority.update();
-                        let refreshed = disk_scan::scan(&root, &home, &token, |tree| {
-                            priority.update();
-                            while let Ok(command) = receiver.try_recv() {
-                                queue.push_back(command);
-                            }
-                            if browsing == tree.root || tree.state != ScanState::Complete {
-                                publish(
-                                    &output, tree, &browsing, page, false, generation, navigation,
-                                );
-                            }
-                        });
+                        let refreshed = disk_scan::scan_with_hook(
+                            &root,
+                            &home,
+                            &token,
+                            |tree| {
+                                while let Ok(command) = receiver.try_recv() {
+                                    queue.push_back(command);
+                                }
+                                if browsing == tree.root || tree.state != ScanState::Complete {
+                                    publish(
+                                        &output, tree, &browsing, page, false, generation,
+                                        navigation,
+                                    );
+                                }
+                            },
+                            || priority.update(),
+                        );
                         priority.restore();
                         completed = publish_browse(
                             &output,

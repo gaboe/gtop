@@ -509,22 +509,38 @@ fn open_directory(root: &OwnedFd, tree: &Tree, id: usize) -> io::Result<OwnedFd>
     Ok(fd)
 }
 
-pub fn scan(
+pub fn scan(root: &Path, home: &Path, cancel: &AtomicBool, progress: impl FnMut(&Tree)) -> Tree {
+    scan_with_hook(root, home, cancel, progress, || {})
+}
+
+pub(super) fn scan_with_hook(
     root: &Path,
     home: &Path,
     cancel: &AtomicBool,
     mut progress: impl FnMut(&Tree),
+    mut on_tick: impl FnMut(),
 ) -> Tree {
-    scan_opened(root, home, cancel, &mut progress, || open_root(root))
+    let mut last_tick = Instant::now() - Duration::from_secs(1);
+    scan_opened(
+        root,
+        home,
+        cancel,
+        &mut progress,
+        &mut on_tick,
+        &mut last_tick,
+        || open_root(root),
+    )
 }
 
-pub fn scan_beneath(
+pub(super) fn scan_beneath(
     scope: &Path,
     root: &Path,
     home: &Path,
     cancel: &AtomicBool,
     mut progress: impl FnMut(&Tree),
+    mut on_tick: impl FnMut(),
 ) -> Tree {
+    let mut last_tick = Instant::now() - Duration::from_secs(1);
     let opened = (|| {
         let mut fd = open_root(scope)?;
         let device = identity(&fd)?.device;
@@ -538,6 +554,7 @@ pub fn scan_beneath(
             };
             let mut found = None;
             entries(&fd, |entry| {
+                tick(&mut last_tick, &mut on_tick);
                 if cancel.load(Ordering::Relaxed) {
                     return false;
                 }
@@ -564,7 +581,15 @@ pub fn scan_beneath(
         Ok(fd)
     })();
     match opened {
-        Ok(fd) => scan_opened(root, home, cancel, &mut progress, || Ok(fd)),
+        Ok(fd) => scan_opened(
+            root,
+            home,
+            cancel,
+            &mut progress,
+            &mut on_tick,
+            &mut last_tick,
+            || Ok(fd),
+        ),
         Err(error) => {
             let mut tree = Tree::new(root);
             tree.state = if cancel.load(Ordering::Relaxed) {
@@ -582,6 +607,8 @@ fn scan_opened(
     home: &Path,
     cancel: &AtomicBool,
     mut progress: impl FnMut(&Tree),
+    on_tick: &mut impl FnMut(),
+    last_tick: &mut Instant,
     open: impl FnOnce() -> io::Result<OwnedFd>,
 ) -> Tree {
     let scan_home = data_home(home).filter(|alias| {
@@ -638,6 +665,8 @@ fn scan_opened(
         cancel,
         progress: &mut progress,
         last: Instant::now() - Duration::from_secs(1),
+        on_tick,
+        last_tick,
         links: HashSet::new(),
     };
     walker.walk(&root_fd, root, 0);
@@ -652,6 +681,13 @@ fn scan_opened(
     tree
 }
 
+fn tick<F: FnMut() + ?Sized>(last_tick: &mut Instant, on_tick: &mut F) {
+    if last_tick.elapsed() >= Duration::from_millis(100) {
+        on_tick();
+        *last_tick = Instant::now();
+    }
+}
+
 struct Walker<'a, F> {
     tree: &'a mut Tree,
     home: &'a Path,
@@ -659,6 +695,8 @@ struct Walker<'a, F> {
     cancel: &'a AtomicBool,
     progress: &'a mut F,
     last: Instant,
+    on_tick: &'a mut dyn FnMut(),
+    last_tick: &'a mut Instant,
     links: HashSet<(u64, u64)>,
 }
 impl<F: FnMut(&Tree)> Walker<'_, F> {
@@ -718,6 +756,7 @@ impl<F: FnMut(&Tree)> Walker<'_, F> {
         self.tree.nodes[0].allocated = self.tree.nodes[0].allocated.saturating_add(allocated);
         self.tree.nodes[0].descendants += 1;
         self.tree.nodes[0].unreadable += row.unreadable;
+        tick(self.last_tick, self.on_tick);
         if self.last.elapsed() >= Duration::from_millis(100) {
             (self.progress)(self.tree);
             self.last = Instant::now();
@@ -1619,6 +1658,8 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let mut tree = Tree::new(&home.0);
         let mut progress = |_: &Tree| {};
+        let mut on_tick = || {};
+        let mut last_tick = Instant::now();
         let mut walker = Walker {
             tree: &mut tree,
             home: &home.0,
@@ -1626,6 +1667,8 @@ mod tests {
             cancel: &cancel,
             progress: &mut progress,
             last: Instant::now(),
+            on_tick: &mut on_tick,
+            last_tick: &mut last_tick,
             links: HashSet::new(),
         };
         let mut total = (0, 0, 0);
@@ -1696,6 +1739,8 @@ mod tests {
         let mut tree = Tree::new(&home.0);
         let cancel = AtomicBool::new(false);
         let mut progress = |_: &Tree| {};
+        let mut on_tick = || {};
+        let mut last_tick = Instant::now();
         let mut walker = Walker {
             tree: &mut tree,
             home: &home.0,
@@ -1703,6 +1748,8 @@ mod tests {
             cancel: &cancel,
             progress: &mut progress,
             last: Instant::now(),
+            on_tick: &mut on_tick,
+            last_tick: &mut last_tick,
             links: HashSet::new(),
         };
         let mut total = (0, 0, 0);
@@ -1723,9 +1770,26 @@ mod tests {
             &home.0,
             &AtomicBool::new(true),
             |_| {},
+            || {},
         );
         assert_eq!(tree.state, ScanState::Cancelled);
         assert_eq!(tree.nodes[0].descendants, 0);
+    }
+    #[test]
+    fn scope_discovery_ticks_while_resolving_path() {
+        let home = Scratch::new();
+        fs::create_dir(home.0.join("child")).unwrap();
+        let ticks = std::cell::Cell::new(0);
+        let tree = scan_beneath(
+            &home.0,
+            &home.0.join("child"),
+            &home.0,
+            &AtomicBool::new(false),
+            |_| {},
+            || ticks.set(ticks.get() + 1),
+        );
+        assert_eq!(tree.state, ScanState::Complete);
+        assert_eq!(ticks.get(), 1);
     }
     #[test]
     fn duplicate_hardlink_at_capacity_needs_no_new_tracking_slot() {
@@ -1733,6 +1797,8 @@ mod tests {
         let mut tree = Tree::new(&home.0);
         let cancel = AtomicBool::new(false);
         let mut progress = |_: &Tree| {};
+        let mut on_tick = || {};
+        let mut last_tick = Instant::now();
         let mut walker = Walker {
             tree: &mut tree,
             home: &home.0,
@@ -1740,6 +1806,8 @@ mod tests {
             cancel: &cancel,
             progress: &mut progress,
             last: Instant::now(),
+            on_tick: &mut on_tick,
+            last_tick: &mut last_tick,
             links: (0..MAX_LINKS as u64).map(|inode| (1, inode)).collect(),
         };
         let mut total = (0, 0, 0);
@@ -1770,7 +1838,14 @@ mod tests {
         fs::create_dir(outside.0.join("nested")).unwrap();
         symlink(&outside.0, home.0.join("escape")).unwrap();
         for path in [home.0.join("escape/nested"), home.0.join("../outside")] {
-            let tree = scan_beneath(&home.0, &path, &home.0, &AtomicBool::new(false), |_| {});
+            let tree = scan_beneath(
+                &home.0,
+                &path,
+                &home.0,
+                &AtomicBool::new(false),
+                |_| {},
+                || {},
+            );
             assert!(matches!(tree.state, ScanState::Failed(_)));
             assert_eq!(tree.nodes[0].descendants, 0);
         }
@@ -1827,6 +1902,8 @@ mod cleanup_regressions {
         let mut tree = Tree::new(&home.0);
         let cancel = AtomicBool::new(false);
         let mut progress = |_: &Tree| {};
+        let mut on_tick = || {};
+        let mut last_tick = Instant::now();
         let mut walker = Walker {
             tree: &mut tree,
             home: &home.0,
@@ -1834,6 +1911,8 @@ mod cleanup_regressions {
             cancel: &cancel,
             progress: &mut progress,
             last: Instant::now(),
+            on_tick: &mut on_tick,
+            last_tick: &mut last_tick,
             links: HashSet::new(),
         };
         let mut total = (0, 0, 0);
