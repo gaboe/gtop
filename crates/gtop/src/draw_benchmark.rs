@@ -1900,6 +1900,88 @@ async fn detail_kill_completion_restores_focus_and_reaps_owned_child(cx: &mut Te
 
 #[cfg(target_os = "macos")]
 #[gpui::test]
+async fn detail_kill_completion_reports_exited_child_and_restores_focus(cx: &mut TestAppContext) {
+    use gpui::{px, size, Modifiers};
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    let mut child = ChildGuard(
+        std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .spawn()
+            .unwrap(),
+    );
+    let core = Arc::new(gtop_core::AppState::new());
+    let snapshot = core.snapshot(false, false).unwrap();
+    let process = snapshot
+        .processes
+        .iter()
+        .find(|process| process.pid == child.0.id())
+        .unwrap()
+        .clone();
+    let key = ProcessKey::from(&process);
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let (root, visual) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| {
+            let mut monitor = fixture(window, cx);
+            monitor.core = Some(core.clone());
+            monitor.snapshot = Some(Rc::new(snapshot));
+            monitor.select(key, cx);
+            monitor
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let _root = root;
+    let monitor = monitor.unwrap();
+    visual.simulate_resize(size(px(1480.), px(960.)));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let kill = visual.debug_bounds("kill").unwrap();
+    visual.simulate_click(kill.center(), Modifiers::default());
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    child.0.kill().unwrap();
+    assert!(!child.0.wait().unwrap().success());
+
+    let confirm = visual.debug_bounds("confirm-kill").unwrap();
+    visual.simulate_click(confirm.center(), Modifiers::default());
+    visual.run_until_parked();
+
+    visual.update(|window, cx| {
+        let monitor = monitor.read(cx);
+        assert_eq!(window.focused(cx), Some(monitor.focus.clone()));
+        assert_eq!(monitor.pending_kill, None);
+        assert!(matches!(
+            monitor.details.as_ref().unwrap().kill,
+            details::KillState::Ready
+        ));
+        assert_eq!(
+            monitor.status,
+            format!(
+                "Could not kill PID {}. It exited, changed, or permission was denied.",
+                child.0.id()
+            )
+        );
+    });
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
 async fn detail_copy_state_releases_after_close(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
