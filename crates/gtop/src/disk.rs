@@ -49,6 +49,7 @@ pub(super) struct Disk {
     events: Option<futures::channel::mpsc::Receiver<()>>,
     cancel: Arc<AtomicBool>,
     release: Arc<AtomicBool>,
+    foreground: Arc<AtomicBool>,
     pub folder: Option<Folder>,
     pub selected: usize,
     pub confirmation: Option<Confirmation>,
@@ -64,11 +65,15 @@ impl Drop for Disk {
     }
 }
 impl Disk {
-    fn new() -> Self {
+    fn new(visible: bool) -> Self {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into()));
-        Self::with_home(home)
+        Self::with_home_and_visibility(home, visible)
     }
+    #[cfg(test)]
     fn with_home(home: PathBuf) -> Self {
+        Self::with_home_and_visibility(home, false)
+    }
+    fn with_home_and_visibility(home: PathBuf, visible: bool) -> Self {
         let (sender, receiver) = mpsc::sync_channel(32);
         let (wake, events) = futures::channel::mpsc::channel(1);
         let mailbox = Arc::new(Mutex::new(Mailbox {
@@ -79,9 +84,19 @@ impl Disk {
         let worker_home = home.clone();
         let release = Arc::new(AtomicBool::new(false));
         let worker_release = release.clone();
+        let foreground = Arc::new(AtomicBool::new(visible));
+        let worker_foreground = foreground.clone();
         std::thread::Builder::new()
             .name("disk-scan".into())
-            .spawn(move || worker(receiver, output, worker_home, worker_release))
+            .spawn(move || {
+                worker(
+                    receiver,
+                    output,
+                    worker_home,
+                    worker_release,
+                    worker_foreground,
+                )
+            })
             .expect("start disk worker");
         let mut disk = Self {
             open: true,
@@ -93,6 +108,7 @@ impl Disk {
             events: Some(events),
             cancel: Arc::new(AtomicBool::new(false)),
             release,
+            foreground,
             folder: None,
             selected: 0,
             confirmation: None,
@@ -104,6 +120,9 @@ impl Disk {
         };
         disk.start(home, false);
         disk
+    }
+    pub(super) fn set_visible(&self, visible: bool) {
+        self.foreground.store(visible, Ordering::Release);
     }
     pub fn close(&mut self) {
         self.open = false;
@@ -378,9 +397,13 @@ fn publish_browse(
     path: &Path,
     page: usize,
     home: &Path,
-    token: &AtomicBool,
-    identity: (u64, u64),
+    control: ScanControl<'_>,
 ) -> bool {
+    let ScanControl {
+        token,
+        priority,
+        identity,
+    } = control;
     let (generation, navigation) = identity;
     if path == tree.root || !path.starts_with(&tree.root) {
         publish(
@@ -389,8 +412,9 @@ fn publish_browse(
         return tree.state == ScanState::Complete && !token.load(Ordering::Relaxed);
     }
     let mut published_complete = false;
-    disk_scan::foreground_priority();
+    priority.update();
     let subtree = disk_scan::scan_beneath(&tree.root, path, home, token, |subtree| {
+        priority.update();
         published_complete |= subtree.state == ScanState::Complete;
         let mut folder = subtree.folder(path, page, false);
         folder.root = tree.root.clone();
@@ -398,7 +422,7 @@ fn publish_browse(
         mailbox.folder = Some((generation, navigation, folder));
         mailbox.notify();
     });
-    disk_scan::background_priority();
+    priority.restore();
     if !published_complete {
         let mut folder = subtree.folder(path, page, false);
         folder.root = tree.root.clone();
@@ -407,6 +431,41 @@ fn publish_browse(
         mailbox.notify();
     }
     subtree.state == ScanState::Complete && !token.load(Ordering::Relaxed)
+}
+struct ScanControl<'a> {
+    token: &'a AtomicBool,
+    priority: &'a mut ScanPriority,
+    identity: (u64, u64),
+}
+struct ScanPriority {
+    foreground: Arc<AtomicBool>,
+    applied_foreground: bool,
+}
+impl ScanPriority {
+    fn new(foreground: Arc<AtomicBool>) -> Self {
+        disk_scan::background_priority();
+        Self {
+            foreground,
+            applied_foreground: false,
+        }
+    }
+    fn update(&mut self) {
+        self.set(self.foreground.load(Ordering::Acquire));
+    }
+    fn restore(&mut self) {
+        self.set(false);
+    }
+    fn set(&mut self, foreground: bool) {
+        if self.applied_foreground == foreground {
+            return;
+        }
+        if foreground {
+            disk_scan::foreground_priority();
+        } else {
+            disk_scan::background_priority();
+        }
+        self.applied_foreground = foreground;
+    }
 }
 fn prepare_cleanup(
     completed: Option<(u64, u64)>,
@@ -426,19 +485,26 @@ fn worker(
     output: Arc<Mutex<Mailbox>>,
     home: PathBuf,
     release: Arc<AtomicBool>,
+    foreground: Arc<AtomicBool>,
 ) {
-    worker_with_trash(receiver, output, home, release, |confirmation, home| {
-        confirmation.trash(home)
-    });
+    worker_with_trash(
+        receiver,
+        output,
+        home,
+        release,
+        foreground,
+        |confirmation, home| confirmation.trash(home),
+    );
 }
 fn worker_with_trash(
     receiver: mpsc::Receiver<Command>,
     output: Arc<Mutex<Mailbox>>,
     home: PathBuf,
     release: Arc<AtomicBool>,
+    foreground: Arc<AtomicBool>,
     mut trash: impl FnMut(Confirmation, &Path) -> std::io::Result<PathBuf>,
 ) {
-    disk_scan::background_priority();
+    let mut priority = ScanPriority::new(foreground);
     let mut cache: HashMap<PathBuf, Tree> = HashMap::new();
     let mut active: Option<Tree> = None;
     let mut generation = 0;
@@ -494,8 +560,9 @@ fn worker_with_trash(
                     let key = cache.keys().next().unwrap().clone();
                     cache.remove(&key);
                 }
-                disk_scan::foreground_priority();
+                priority.update();
                 let tree = disk_scan::scan(&root, &home, &token, |tree| {
+                    priority.update();
                     while let Ok(command) = receiver.try_recv() {
                         queue.push_back(command);
                     }
@@ -503,7 +570,7 @@ fn worker_with_trash(
                         &output, tree, &browsing, page, false, generation, navigation,
                     );
                 });
-                disk_scan::background_priority();
+                priority.restore();
                 publish(
                     &output, &tree, &browsing, page, false, generation, navigation,
                 );
@@ -514,9 +581,19 @@ fn worker_with_trash(
             Command::Browse(path, p, g, n, token) => {
                 if g == generation && !token.load(Ordering::Relaxed) {
                     if let Some(tree) = &active {
-                        completed =
-                            publish_browse(&output, tree, &path, p, &home, &token, (generation, n))
-                                .then_some((generation, n));
+                        completed = publish_browse(
+                            &output,
+                            tree,
+                            &path,
+                            p,
+                            &home,
+                            ScanControl {
+                                token: &token,
+                                priority: &mut priority,
+                                identity: (generation, n),
+                            },
+                        )
+                        .then_some((generation, n));
                     }
                 }
             }
@@ -543,8 +620,9 @@ fn worker_with_trash(
                         let browsing = path;
                         let page = p;
                         let navigation = n;
-                        disk_scan::foreground_priority();
+                        priority.update();
                         let refreshed = disk_scan::scan(&root, &home, &token, |tree| {
+                            priority.update();
                             while let Ok(command) = receiver.try_recv() {
                                 queue.push_back(command);
                             }
@@ -554,15 +632,18 @@ fn worker_with_trash(
                                 );
                             }
                         });
-                        disk_scan::background_priority();
+                        priority.restore();
                         completed = publish_browse(
                             &output,
                             &refreshed,
                             &browsing,
                             page,
                             &home,
-                            &token,
-                            (generation, navigation),
+                            ScanControl {
+                                token: &token,
+                                priority: &mut priority,
+                                identity: (generation, navigation),
+                            },
                         )
                         .then_some((generation, navigation));
                         active = Some(refreshed);
@@ -583,11 +664,12 @@ impl Monitor {
         self.settings_open = false;
         if let Some(disk) = &mut self.disk {
             disk.open = true;
+            disk.set_visible(window.is_visible());
             if disk.folder.is_none() {
                 disk.start(disk.home.clone(), false);
             }
         } else {
-            self.disk = Some(Disk::new());
+            self.disk = Some(Disk::new(window.is_visible()));
             let mut events = self.disk.as_mut().unwrap().events.take().unwrap();
             cx.spawn(async move |entity, cx| {
                 use futures::StreamExt;
@@ -1027,7 +1109,7 @@ impl Monitor {
         self.disk.as_ref().unwrap().selected
     }
     pub(super) fn prepare_disk_draw_benchmark(&mut self) {
-        let disk = Disk::new();
+        let disk = Disk::new(false);
         std::thread::sleep(std::time::Duration::from_millis(250));
         let folder = disk
             .mailbox
@@ -1105,6 +1187,53 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path.canonicalize().unwrap()
+    }
+    #[test]
+    fn scan_priority_tracks_visibility_and_defaults_to_utility() {
+        fn current_qos_class() -> u32 {
+            let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+            let mut priority = 0;
+            let result = unsafe {
+                libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut priority)
+            };
+            assert_eq!(result, 0);
+            class as u32
+        }
+
+        let foreground = Arc::new(AtomicBool::new(false));
+        let mut priority = ScanPriority::new(foreground.clone());
+        assert!(!priority.applied_foreground);
+        assert_eq!(
+            current_qos_class(),
+            libc::qos_class_t::QOS_CLASS_UTILITY as u32
+        );
+
+        foreground.store(true, Ordering::Release);
+        priority.update();
+        assert_eq!(
+            current_qos_class(),
+            libc::qos_class_t::QOS_CLASS_USER_INITIATED as u32
+        );
+
+        foreground.store(false, Ordering::Release);
+        priority.update();
+        assert_eq!(
+            current_qos_class(),
+            libc::qos_class_t::QOS_CLASS_UTILITY as u32
+        );
+    }
+    #[test]
+    fn worker_without_visibility_scans_at_utility() {
+        let home = scratch();
+        fs::write(home.join("file"), [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        assert!(!disk.foreground.load(Ordering::Acquire));
+        assert_eq!(
+            receive(&mut disk, ScanState::Complete).state,
+            ScanState::Complete
+        );
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
     }
     fn receive(disk: &mut Disk, expected: ScanState) -> Folder {
         let start = Instant::now();
@@ -1234,14 +1363,20 @@ mod tests {
         });
         assert_eq!(root.state, ScanState::Cancelled);
         let output = Mutex::new(Mailbox::default());
+        let foreground = Arc::new(AtomicBool::new(false));
+        let mut priority = ScanPriority::new(foreground.clone());
+        let browse_token = AtomicBool::new(false);
         let completed = publish_browse(
             &output,
             &root,
             &child,
             0,
             &home,
-            &AtomicBool::new(false),
-            (7, 3),
+            ScanControl {
+                token: &browse_token,
+                priority: &mut priority,
+                identity: (7, 3),
+            },
         )
         .then_some((7, 3));
         let (_, _, folder) = output.lock().unwrap().folder.take().unwrap();
@@ -1277,8 +1412,11 @@ mod tests {
             &home,
             0,
             &home,
-            &AtomicBool::new(false),
-            (7, 4),
+            ScanControl {
+                token: &browse_token,
+                priority: &mut priority,
+                identity: (7, 4),
+            },
         );
         assert!(!completed_root);
         let mut disk = Disk::with_home(home.clone());
@@ -1487,6 +1625,7 @@ mod tests {
                     receiver,
                     output,
                     worker_home,
+                    Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     |confirmation, _| {
                         let destination = confirmation.path.with_file_name("moved");

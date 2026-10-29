@@ -246,6 +246,9 @@ impl Monitor {
                 if gtop_core::perf_enabled() {
                     eprintln!("perf visibility visible={}", visibility.is_visible());
                 }
+                if let Some(disk) = &this.disk {
+                    disk.set_visible(visibility.is_visible());
+                }
                 this.wake();
             }),
         ];
