@@ -18,8 +18,8 @@ system SSD I/O. This does not measure NAND write amplification or wear.
 
 Network totals use the same interface counters as the live network panel.
 History uses cumulative bytes rather than integrating the rounded live rates.
-A reset or decrease starts a new baseline. Removing an interface can also
-cause such a decrease. The next valid sample resumes collection. First samples,
+A reset or decrease starts a new baseline. An empty or changed interface set
+reports unknown. A returning interface set starts a new baseline. First samples,
 pauses, sleep, restarts, and long collection gaps do not charge unobserved I/O.
 
 Free space is a time-weighted mean of the system-volume free-space samples.
@@ -35,7 +35,10 @@ identity with PID and start time, subtracts cumulative counters with saturation,
 and drops exited records. History records only fresh process snapshots.
 It distributes each delta over its valid duration and splits it at minute
 boundaries. No bytes are charged before recording starts or across a pause.
-A failed rusage read can extend the next valid delta across earlier minutes.
+A failed rusage read primes the next valid baseline when its recovery span
+exceeds CPU sampling or crosses a recording session boundary. Such bytes are
+dropped, not spread into later minutes. An older first-seen process only primes
+its disk baseline. A process born inside the collection interval keeps its bytes.
 
 Process counters describe disk I/O attributed to a process, across all devices.
 They cannot identify the target SSD or assign kernel/cache writeback to an

@@ -560,7 +560,21 @@ impl Collector {
                                 now,
                             ),
                             cpu_sample: None,
-                            disk_sample: self.last_collection.map(|at| ((0, 0), at)),
+                            disk_sample: self
+                                .last_collection
+                                .filter(|at| {
+                                    let wall_now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs_f64();
+                                    born_in_interval(
+                                        bsd.pbi_start_tvsec as f64
+                                            + bsd.pbi_start_tvusec as f64 / 1_000_000.,
+                                        wall_now,
+                                        at.elapsed().as_secs_f64(),
+                                    )
+                                })
+                                .map(|at| ((0, 0), at)),
                         },
                     );
                 }
@@ -733,6 +747,13 @@ mod tests {
             .unwrap()
             .iter()
             .any(|p| p.pid == child.0.id()));
+        let discovered = unseen.collect(&users, false, &HashMap::new()).unwrap();
+        let discovered = discovered.iter().find(|p| p.pid == child.0.id()).unwrap();
+        assert_eq!(
+            discovered.disk_sample_seconds, None,
+            "older first discovery must only prime disk counters"
+        );
+        assert_eq!(discovered.disk_usage, (0, 0));
         let mut collector = Collector::default();
         let mut ports = HashMap::new();
         ports.insert(child.0.id(), vec![12345]);
@@ -941,5 +962,19 @@ mod tests {
         child.0.wait().unwrap();
         std::fs::remove_file(scratch).unwrap();
         std::fs::remove_file(ready).unwrap();
+    }
+}
+
+fn born_in_interval(birth: f64, now: f64, span: f64) -> bool {
+    birth >= now - span && birth <= now
+}
+
+#[cfg(test)]
+mod disk_baseline_tests {
+    use super::*;
+    #[test]
+    fn older_first_discovery_only_primes_disk_counter() {
+        assert!(!born_in_interval(1000., 6003., 3.));
+        assert!(born_in_interval(6001., 6003., 3.));
     }
 }

@@ -64,6 +64,8 @@ impl DiskSample {
 pub struct SystemMonitor {
     /// Tracks network usage between updates
     last_network_update: (Instant, u64, u64),
+    network_interfaces: std::collections::BTreeSet<String>,
+    network_totals: Option<(u64, u64)>,
     /// Reads the GPUs found at start-up
     gpu_monitor: GpuMonitor,
     /// Reads the temperature sensors
@@ -94,6 +96,8 @@ impl SystemMonitor {
 
         Self {
             last_network_update: (Instant::now(), initial_rx, initial_tx),
+            network_interfaces: networks.keys().cloned().collect(),
+            network_totals: None,
             gpu_monitor: GpuMonitor::new(),
             temperature_monitor: TemperatureMonitor::new(),
             disks_refreshed_at: None,
@@ -129,7 +133,7 @@ impl SystemMonitor {
                 - (sys.used_memory() + (sys.total_memory() - sys.used_memory())),
             uptime: System::uptime(),
             load_avg: [load_average.one, load_average.five, load_average.fifteen],
-            network_totals: Some((self.last_network_update.1, self.last_network_update.2)),
+            network_totals: self.network_totals,
             #[cfg(target_os = "macos")]
             disk_io_totals: self.storage_drivers.totals(),
             #[cfg(not(target_os = "macos"))]
@@ -210,6 +214,13 @@ impl SystemMonitor {
                     )
                 });
 
+        let interfaces = networks.keys().cloned().collect();
+        self.network_totals = stable_network_totals(
+            &self.network_interfaces,
+            &interfaces,
+            (current_rx, current_tx),
+        );
+        self.network_interfaces = interfaces;
         let elapsed = self.last_network_update.0.elapsed().as_secs_f64();
         let rx_rate =
             ((current_rx.saturating_sub(self.last_network_update.1)) as f64 / elapsed) as u64;
@@ -217,7 +228,11 @@ impl SystemMonitor {
             ((current_tx.saturating_sub(self.last_network_update.2)) as f64 / elapsed) as u64;
 
         self.last_network_update = (Instant::now(), current_rx, current_tx);
-        (rx_rate, tx_rate)
+        if self.network_totals.is_some() {
+            (rx_rate, tx_rate)
+        } else {
+            (0, 0)
+        }
     }
 
     /// Calculates disk usage statistics for the displayed volumes.
@@ -577,5 +592,36 @@ mod tests {
         let stats = monitor.collect_stats(&sys, &networks, &disks);
         assert!(!stats.cpu_usage.is_empty());
         assert!(stats.memory_total > 0);
+    }
+}
+
+fn stable_network_totals(
+    previous: &std::collections::BTreeSet<String>,
+    current: &std::collections::BTreeSet<String>,
+    totals: (u64, u64),
+) -> Option<(u64, u64)> {
+    (!current.is_empty() && previous == current).then_some(totals)
+}
+
+#[cfg(test)]
+mod network_validity_tests {
+    use super::*;
+    #[test]
+    fn unavailable_and_returning_interfaces_are_unknown() {
+        let networks = Networks::new();
+        let mut monitor = SystemMonitor::new(&networks);
+        let stats = monitor.collect_stats(&System::new(), &networks, &Disks::new());
+        assert_eq!(stats.network_totals, None);
+        let known = ["en0".to_string()].into_iter().collect();
+        let empty = Default::default();
+        assert_eq!(stable_network_totals(&known, &empty, (0, 0)), None);
+        assert_eq!(
+            stable_network_totals(&empty, &known, (1_000_000_300, 0)),
+            None
+        );
+        assert_eq!(
+            stable_network_totals(&known, &known, (1_000_000_600, 0)),
+            Some((1_000_000_600, 0))
+        );
     }
 }

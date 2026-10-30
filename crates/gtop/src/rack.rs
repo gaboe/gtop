@@ -1384,14 +1384,7 @@ impl Monitor {
                 Metric::DiskWrite,
                 Metric::DiskFree,
             ] {
-                let view = &self.history[self.view.unwrap_or(0)];
-                let columns = view.columns.iter().flatten().filter(|b| {
-                    b.minute >= selection.start_minute
-                        && b.minute < selection.start_minute + selection.step as u64
-                });
-                let average = crate::history::weighted_average(
-                    columns.filter_map(|b| b.value(metric).map(|v| (v, b.weight(metric)))),
-                );
+                let average = detail.io.value(metric);
                 metrics = metrics.child(
                     div().p(px(8.)).child(label(metric.label(), t)).child(lit(
                         average

@@ -250,6 +250,7 @@ pub struct MomentSelection {
 
 #[derive(Clone, Debug, Default)]
 pub struct MomentDetail {
+    pub io: IoHistory,
     pub selection: MomentSelection,
     pub recorded_minutes: usize,
     pub cpu_average: Option<f64>,
@@ -684,10 +685,7 @@ impl History {
             let process_span = snapshot
                 .processes
                 .iter()
-                .filter_map(|p| match (p.cpu_sample_seconds, p.disk_sample_seconds) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (a, b) => a.or(b),
-                })
+                .filter_map(|p| p.cpu_sample_seconds)
                 .fold(0., f64::max);
             let mut cursor = (now - process_span).max(cpu_start).min(gpu_start);
             self.touched.start = self.touched.start.min(cursor as u64 / 60);
@@ -732,10 +730,7 @@ impl History {
             let span = snapshot
                 .processes
                 .iter()
-                .filter_map(|p| match (p.cpu_sample_seconds, p.disk_sample_seconds) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (a, b) => a.or(b),
-                })
+                .filter_map(|p| p.cpu_sample_seconds)
                 .fold(0., f64::max);
             let oldest = minute.saturating_sub(MINUTES - 1) as f64 * 60.;
             let cpu_start = self.process_recording_since.unwrap_or(now).max(oldest);
@@ -875,11 +870,18 @@ impl History {
             let gpu_seconds = (part.end - part.start.max(gpu_start).max(process_start)).max(0.);
             let disk_fraction = process
                 .disk_sample_seconds
-                .filter(|span| *span > 0.)
+                .filter(|span| {
+                    *span > 0.
+                        && now - span >= cpu_start
+                        && *span
+                            <= process
+                                .cpu_sample_seconds
+                                .unwrap_or(now - gpu_start)
+                                .max(now - gpu_start)
+                })
                 .map_or(0., |span| {
                     let start = (now - span).max(process_start);
-                    (part.end - part.start.max(start).max(cpu_start)).max(0.)
-                        / (now - start).max(0.000001)
+                    (part.end - part.start.max(start)).max(0.) / (now - start).max(0.000001)
                 });
             if part.end > part.start
                 && cpu_seconds == 0.
@@ -987,6 +989,23 @@ impl History {
                 rows.entry(name.clone()).or_default().merge(total);
             }
         }
+        for i in 0..4 {
+            detail.io.bytes[i] = buckets
+                .iter()
+                .filter_map(|b| b.io.bytes[i])
+                .reduce(|a, b| a + b);
+            detail.io.seconds[i] = buckets.iter().map(|b| b.io.seconds[i]).sum();
+            detail.io.peaks[i] = buckets
+                .iter()
+                .filter_map(|b| b.io.peaks[i])
+                .reduce(f64::max);
+        }
+        detail.io.free = weighted_average(
+            buckets
+                .iter()
+                .filter_map(|b| b.io.free.map(|v| (v, b.io.free_seconds))),
+        );
+        detail.io.free_seconds = buckets.iter().map(|b| b.io.free_seconds).sum();
         detail.rows = rows.into_iter().collect();
         Ok(detail)
     }
@@ -1001,6 +1020,94 @@ pub fn support_path(file: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resumed_disk_recovery_drops_bytes_from_before_session() {
+        let mut h = History::default();
+        let mut snapshot = crate::test_data::snapshot();
+        h.record(&snapshot, 6000., 3.).unwrap();
+        h.suspend();
+        let process = &mut std::sync::Arc::make_mut(&mut snapshot.processes)[0];
+        process.disk_sample_seconds = None;
+        h.record(&snapshot, 6600., 3.).unwrap();
+        let process = &mut std::sync::Arc::make_mut(&mut snapshot.processes)[0];
+        process.disk_sample_seconds = Some(603.);
+        process.disk_usage = (100_000_000, 100_000_000);
+        h.record(&snapshot, 6603., 3.).unwrap();
+        assert_eq!(
+            h.buckets.back().unwrap().processes["rustc"].disk_write_bytes,
+            0.
+        );
+        let process = &mut std::sync::Arc::make_mut(&mut snapshot.processes)[0];
+        process.disk_sample_seconds = Some(3.);
+        process.disk_usage = (30, 60);
+        h.record(&snapshot, 6606., 3.).unwrap();
+        assert_eq!(
+            h.buckets.back().unwrap().processes["rustc"].disk_write_bytes,
+            60.
+        );
+    }
+
+    #[test]
+    fn disk_recovery_keeps_loaded_range_bounded_by_cpu() {
+        let directory = std::env::temp_dir().join(format!("gtop-disk-span-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut h = History::open(
+            &directory.join("history.sqlite"),
+            &directory.join("absent.json"),
+            6000,
+        )
+        .unwrap();
+        let mut snapshot = crate::test_data::snapshot();
+        h.record(&snapshot, 6000., 3.).unwrap();
+        h.persist(6000).unwrap();
+        h.buckets.clear();
+        h.last_sample = Some(89997.);
+        h.last_process_sample = Some(89997.);
+        let process = &mut std::sync::Arc::make_mut(&mut snapshot.processes)[0];
+        process.cpu_sample_seconds = Some(3.);
+        process.disk_sample_seconds = Some(83997.);
+        process.disk_usage = (100_000_000, 100_000_000);
+        h.prepare_sample(&snapshot, 90000., 3.).unwrap();
+        assert!(
+            h.buckets.iter().all(|b| b.minute >= 1499),
+            "disk recovery loaded unrelated old history"
+        );
+        h.record(&snapshot, 90000., 3.).unwrap();
+        assert_eq!(h.touched, 1499..1501);
+        assert_eq!(
+            h.buckets.back().unwrap().processes["rustc"].disk_write_bytes,
+            0.
+        );
+        drop(h);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn moment_io_uses_selected_buckets_and_refreshes_within_minute() {
+        let mut h = History::default();
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.stats.network_totals = Some((100, 200));
+        h.record(&snapshot, 6000., 3.).unwrap();
+        snapshot.stats.network_totals = Some((400, 800));
+        h.record(&snapshot, 6003., 3.).unwrap();
+        let selection = MomentSelection {
+            start_minute: 100,
+            step: 1,
+        };
+        assert_eq!(
+            h.moment(selection).unwrap().io.value(Metric::NetworkRx),
+            Some(100.)
+        );
+        snapshot.stats.network_totals = Some((1300, 2600));
+        h.record(&snapshot, 6006., 3.).unwrap();
+        let detail = h.moment(selection).unwrap();
+        assert_eq!(detail.io.value(Metric::NetworkRx), Some(200.));
+        assert_eq!(detail.io.bytes[0], Some(1200.));
+        let other_view = h.view(1, 30000).unwrap();
+        assert!(other_view.columns.iter().flatten().all(|b| b.minute != 100));
+        assert_eq!(detail.io.value(Metric::NetworkRx), Some(200.));
+    }
 
     #[test]
     fn io_splits_minutes_and_rebaselines_after_pause_reset_and_failure() {
@@ -1055,8 +1162,8 @@ mod tests {
         h.record(&snapshot, 6070., 5.).unwrap();
         assert_eq!(h.buckets[0].processes["rustc"].peak_cpu, cpu);
         assert_eq!(h.buckets[0].processes["rustc"].peak_memory, memory);
-        assert_eq!(h.buckets[0].processes["rustc"].disk_write_bytes, 400.);
-        assert_eq!(h.buckets[1].processes["rustc"].disk_write_bytes, 2000.);
+        assert_eq!(h.buckets[0].processes["rustc"].disk_write_bytes, 0.);
+        assert_eq!(h.buckets[1].processes["rustc"].disk_write_bytes, 0.);
     }
 
     #[test]

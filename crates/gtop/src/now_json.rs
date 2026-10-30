@@ -490,10 +490,7 @@ mod tests {
             rate.update(start + Duration::from_secs(2), Some((150, 260)), 2),
             Some((50.0, 60.0))
         );
-        assert_eq!(
-            rate.update(start + Duration::from_secs(3), None, 2),
-            None
-        );
+        assert_eq!(rate.update(start + Duration::from_secs(3), None, 2), None);
         assert_eq!(
             rate.update(start + Duration::from_secs(4), Some((900, 900)), 2),
             None
