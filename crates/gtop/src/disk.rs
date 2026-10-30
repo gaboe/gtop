@@ -41,7 +41,7 @@ fn cancel_expired_scan(retention: &Mutex<Retention>, token: &AtomicBool) {
 }
 
 enum Command {
-    Scan(PathBuf, bool, Arc<AtomicBool>, u64),
+    Scan(PathBuf, bool, bool, Arc<AtomicBool>, u64),
     DropCache,
     RetentionChanged,
     Browse(PathBuf, usize, u64, u64, Arc<AtomicBool>),
@@ -54,6 +54,7 @@ struct Mailbox {
     expired: Option<u64>,
     #[cfg(test)]
     scan_gate: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+    running: Option<u64>,
     folder: Option<(u64, u64, Folder)>,
     status: Option<String>,
     wake: Option<futures::channel::mpsc::Sender<()>>,
@@ -68,6 +69,7 @@ impl Mailbox {
 pub(super) struct Disk {
     pub open: bool,
     generation: u64,
+    scan_running: bool,
     navigation: u64,
     home: PathBuf,
     sender: mpsc::SyncSender<Command>,
@@ -131,6 +133,7 @@ impl Disk {
         let mut disk = Self {
             open: true,
             generation: 0,
+            scan_running: false,
             navigation: 0,
             home: home.clone(),
             sender,
@@ -168,22 +171,20 @@ impl Disk {
     }
     fn reopen(&mut self, now: Instant, visible: bool) {
         let expired = {
-            let mut retention = self.retention.lock().unwrap();
-            let expired = retention.expire(now);
-            *retention = Retention::default();
-            expired
+            let retention = self.retention.lock().unwrap();
+            retention.expired || retention.deadline.is_some_and(|deadline| now >= deadline)
         };
-        if expired {
-            self.release_cache();
-        }
         self.open = true;
         self.set_visible(visible);
-        if expired {
-            self.start(self.home.clone(), false);
+        if expired || (self.folder.is_none() && !self.scan_running) {
+            self.start(self.home.clone(), true);
+        } else {
+            *self.retention.lock().unwrap() = Retention::default();
         }
     }
     fn release_cache(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.scan_running = false;
         self.release.store(true, Ordering::Release);
         self.generation += 1;
         self.navigation += 1;
@@ -236,16 +237,39 @@ impl Disk {
     fn start(&mut self, root: PathBuf, force: bool) {
         let cancel = Arc::new(AtomicBool::new(false));
         let generation = self.generation + 1;
-        if !self.accepted(Command::Scan(root, force, cancel.clone(), generation)) {
+        let release_cache = {
+            let retention = self.retention.lock().unwrap();
+            retention.expired
+                || retention
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+        };
+        if !self.accepted(Command::Scan(
+            root,
+            force,
+            release_cache,
+            cancel.clone(),
+            generation,
+        )) {
             return;
         }
+        *self.retention.lock().unwrap() = Retention::default();
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = cancel;
+        self.scan_running = false;
         self.invalidate_proposal();
         self.generation = generation;
         self.navigation = 0;
         self.selected = 0;
         self.folder = None;
+    }
+    fn start_over(&mut self) {
+        let root = self
+            .folder
+            .as_ref()
+            .map(|folder| folder.root.clone())
+            .unwrap_or_else(|| self.home.clone());
+        self.start(root, true);
     }
     fn browse(&mut self, path: PathBuf, page: usize) {
         let navigation = self.navigation + 1;
@@ -414,9 +438,7 @@ impl Disk {
             }
             "c" => self.cancel.store(true, Ordering::Relaxed),
             "r" => {
-                if let Some(f) = &self.folder {
-                    self.start(f.root.clone(), true);
-                }
+                self.start_over();
             }
             "pagedown" | "pageup" => self.change_page(key == "pagedown"),
             _ => return false,
@@ -641,7 +663,12 @@ fn worker_with_trash(
                 mailbox.folder = None;
                 mailbox.proposal = None;
             }
-            Command::Scan(root, force, token, scan_generation) => {
+            Command::Scan(root, force, release_cache, token, scan_generation) => {
+                if release_cache {
+                    active = None;
+                    cache.clear();
+                    completed = None;
+                }
                 if token.load(Ordering::Relaxed) {
                     continue;
                 }
@@ -677,6 +704,11 @@ fn worker_with_trash(
                     cache.remove(&key);
                 }
                 priority.update();
+                {
+                    let mut mailbox = output.lock().unwrap();
+                    mailbox.running = Some(scan_generation);
+                    mailbox.notify();
+                }
                 let tree = disk_scan::scan_with_hook(
                     &root,
                     &home,
@@ -702,6 +734,11 @@ fn worker_with_trash(
                 completed = (tree.state == ScanState::Complete && !token.load(Ordering::Relaxed))
                     .then_some((generation, navigation));
                 active = Some(tree);
+                let mut mailbox = output.lock().unwrap();
+                if mailbox.running == Some(scan_generation) {
+                    mailbox.running = None;
+                    mailbox.notify();
+                }
             }
             Command::Browse(path, p, g, n, token) => {
                 if g == generation && !token.load(Ordering::Relaxed) {
@@ -815,6 +852,7 @@ impl Monitor {
                                 let folder = mailbox.folder.take();
                                 let status = mailbox.status.take();
                                 let proposal = mailbox.proposal.take();
+                                disk.scan_running = mailbox.running == Some(disk.generation);
                                 drop(mailbox);
                                 if expired == Some(disk.generation) {
                                     disk.release_cache();
@@ -1157,9 +1195,7 @@ impl Monitor {
                                     .small()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let d = this.disk.as_mut().unwrap();
-                                        if let Some(f) = &d.folder {
-                                            d.start(f.root.clone(), true);
-                                        }
+                                        d.start_over();
                                         cx.notify();
                                     })),
                             ),
@@ -1595,19 +1631,65 @@ mod tests {
         let home = scratch();
         let mut disk = Disk::with_home(home.clone());
         disk.folder = Some(receive(&mut disk, ScanState::Complete));
-        let (sender, _receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel(1);
         disk.sender = sender;
         disk.browse(home.clone(), 0);
         let identity = (disk.generation, disk.navigation);
-        let token = disk.cancel.clone();
+        let folder = disk.folder.clone();
         disk.close();
-        disk.reopen(Instant::now() + SESSION_RETENTION, false);
-        assert!(disk.release.load(Ordering::Acquire));
-        assert!(token.load(Ordering::Relaxed));
-        assert_ne!(identity, (disk.generation, disk.navigation));
-        assert!(disk.folder.is_none());
-        disk.open = true;
-        assert_ne!(identity, (disk.generation, disk.navigation));
+        disk.retention.lock().unwrap().deadline = Some(Instant::now());
+        disk.reopen(Instant::now(), false);
+        assert_eq!(identity, (disk.generation, disk.navigation));
+        assert_eq!(disk.folder.as_ref().unwrap().items, folder.unwrap().items);
+        assert!(disk.status.contains("busy"));
+        assert!(matches!(receiver.try_recv(), Ok(Command::Browse(..))));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        disk.sender = sender;
+        disk.key("r");
+        assert_ne!(identity.0, disk.generation);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Command::Scan(_, true, true, _, _))
+        ));
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn reopening_retries_a_cancelled_queued_scan() {
+        let home = scratch();
+        fs::write(home.join("one"), [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        let _ = receive(&mut disk, ScanState::Complete);
+        let (started, ready) = mpsc::sync_channel(1);
+        let (resume, suspended) = mpsc::sync_channel(1);
+        disk.mailbox.lock().unwrap().scan_gate = Some((started, suspended));
+        disk.start(home.clone(), true);
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        disk.scan_running = disk.mailbox.lock().unwrap().running == Some(disk.generation);
+        assert!(disk.scan_running);
+        disk.start(home.clone(), true);
+        let queued_token = disk.cancel.clone();
+        queued_token.store(true, Ordering::Relaxed);
+        disk.close();
+        disk.reopen(Instant::now(), false);
+        assert!(!Arc::ptr_eq(&queued_token, &disk.cancel));
+        assert!(!disk.cancel.load(Ordering::Relaxed));
+        resume.send(()).unwrap();
+        assert_eq!(receive(&mut disk, ScanState::Complete).items, 1);
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn start_over_scans_home_when_no_folder_is_available() {
+        let home = scratch();
+        fs::write(home.join("one"), [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        let _ = receive(&mut disk, ScanState::Complete);
+        disk.folder = None;
+        assert!(disk.key("r"));
+        assert_eq!(receive(&mut disk, ScanState::Complete).items, 1);
         drop(disk);
         fs::remove_dir_all(home).unwrap();
     }
@@ -1856,6 +1938,8 @@ mod tests {
         disk.mailbox.lock().unwrap().scan_gate = Some((started, suspended));
         disk.start(home.clone(), true);
         ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        disk.scan_running = disk.mailbox.lock().unwrap().running == Some(disk.generation);
+        assert!(disk.scan_running);
         let generation = disk.generation;
         disk.close();
         assert!(!disk.cancel.load(Ordering::Relaxed));
