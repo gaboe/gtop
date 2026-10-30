@@ -905,8 +905,10 @@ impl History {
             total.disk_write_bytes += process.disk_usage.1 as f64 * disk_fraction;
             total.cpu_seconds += process.cpu_usage as f64 / 100. * cpu_seconds;
             total.gpu_seconds += process.gpu_usage.unwrap_or(0.) as f64 / 100. * gpu_seconds;
-            total.peak_memory += process.memory_usage;
-            total.peak_cpu += process.cpu_usage;
+            if cpu_seconds > 0. || gpu_seconds > 0. || part.is_empty() {
+                total.peak_memory += process.memory_usage;
+                total.peak_cpu += process.cpu_usage;
+            }
         }
         for (name, total) in sampled_processes {
             b.processes.entry(name).or_default().merge(&total);
@@ -1034,6 +1036,27 @@ mod tests {
         snapshot.stats.disk_io_totals = Some((19000, 19000));
         h.record(&snapshot, 6073., 3.).unwrap();
         assert_eq!(h.buckets[1].io.bytes[3], Some(400.));
+    }
+
+    #[test]
+    fn disk_recovery_does_not_backfill_unobserved_cpu_and_memory_peaks() {
+        let mut h = History::default();
+        let mut snapshot = crate::test_data::snapshot();
+        h.record(&snapshot, 6058., 5.).unwrap();
+        h.record(&snapshot, 6061., 5.).unwrap();
+        let cpu = h.buckets[0].processes["rustc"].peak_cpu;
+        let memory = h.buckets[0].processes["rustc"].peak_memory;
+        let process = &mut std::sync::Arc::make_mut(&mut snapshot.processes)[0];
+        process.cpu_usage = 900.;
+        process.cpu_sample_seconds = Some(3.);
+        process.memory_usage = 1_000_000_000;
+        process.disk_usage = (1200, 2400);
+        process.disk_sample_seconds = Some(12.);
+        h.record(&snapshot, 6070., 5.).unwrap();
+        assert_eq!(h.buckets[0].processes["rustc"].peak_cpu, cpu);
+        assert_eq!(h.buckets[0].processes["rustc"].peak_memory, memory);
+        assert_eq!(h.buckets[0].processes["rustc"].disk_write_bytes, 400.);
+        assert_eq!(h.buckets[1].processes["rustc"].disk_write_bytes, 2000.);
     }
 
     #[test]
