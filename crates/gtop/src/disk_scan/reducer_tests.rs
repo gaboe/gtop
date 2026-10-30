@@ -200,14 +200,22 @@ fn reducer_matches_serial_oracle_when_hook_cancels_an_entered_directory() {
     fs::create_dir_all(home.0.join("node_modules/pkg")).unwrap();
     fs::write(home.0.join("node_modules/pkg/file"), b"data").unwrap();
     let actual_cancel = AtomicBool::new(false);
-    let actual = scan_with_hook(
+    let actual = scan_opened(
         &home.0,
         &home.0,
         &actual_cancel,
-        |_| {},
-        || {
-            actual_cancel.store(true, Ordering::Relaxed);
-            ScanUrgency::Background
+        queue::Callbacks {
+            progress: &mut |_| {},
+            on_tick: &mut || ScanUrgency::Background,
+            last_tick: &mut Instant::now(),
+        },
+        || open_root(&home.0),
+        queue::Options {
+            hooks: queue::TestHooks {
+                cancel_after: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
         },
     );
     let expected_cancel = AtomicBool::new(false);
