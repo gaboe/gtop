@@ -19,11 +19,13 @@ const TARGET: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 1, 
 pub(crate) struct SampledMetrics {
     pub(crate) time: u64,
     pub(crate) interval_s: u64,
+    pub(crate) sampled_at: Instant,
     pub(crate) cpu_percent: f64,
     pub(crate) memory_used_bytes: u64,
     pub(crate) memory_total_bytes: u64,
     pub(crate) disk_free_bytes: Option<u64>,
     pub(crate) disk_total_bytes: Option<u64>,
+    pub(crate) disk_io_totals: Option<(u64, u64)>,
     pub(crate) rx_bytes_per_s: u64,
     pub(crate) tx_bytes_per_s: u64,
     pub(crate) temperature_c: Option<f64>,
@@ -128,7 +130,17 @@ struct Net {
     probe: &'static str,
 }
 
+#[cfg(test)]
 fn snapshot_at(metrics: SampledMetrics, reading: &ProbeReading, now: u64) -> NowSnapshot {
+    snapshot_at_with_disk_io_rates(metrics, reading, now, None)
+}
+
+fn snapshot_at_with_disk_io_rates(
+    metrics: SampledMetrics,
+    reading: &ProbeReading,
+    now: u64,
+    disk_io_rates: Option<(f64, f64)>,
+) -> NowSnapshot {
     let mut reading = reading.clone();
     reading.expire(now);
     NowSnapshot {
@@ -149,8 +161,8 @@ fn snapshot_at(metrics: SampledMetrics, reading: &ProbeReading, now: u64) -> Now
         ssd: Ssd {
             free_bytes: metrics.disk_free_bytes,
             total_bytes: metrics.disk_total_bytes,
-            read_bytes_per_s: None,
-            write_bytes_per_s: None,
+            read_bytes_per_s: disk_io_rates.map(|(read, _)| read),
+            write_bytes_per_s: disk_io_rates.map(|(_, write)| write),
             temperature_c: metrics.temperature_c,
         },
         net: Net {
@@ -163,8 +175,40 @@ fn snapshot_at(metrics: SampledMetrics, reading: &ProbeReading, now: u64) -> Now
     }
 }
 
+#[cfg(test)]
 fn snapshot(metrics: SampledMetrics, reading: &ProbeReading) -> NowSnapshot {
     snapshot_at(metrics, reading, unix_seconds())
+}
+
+#[derive(Default)]
+struct DiskIoRate {
+    previous: Option<(Instant, Option<(u64, u64)>)>,
+}
+
+impl DiskIoRate {
+    fn update(
+        &mut self,
+        sampled_at: Instant,
+        totals: Option<(u64, u64)>,
+        interval_s: u64,
+    ) -> Option<(f64, f64)> {
+        let (previous_at, previous_totals) = self.previous.replace((sampled_at, totals))?;
+        let (previous_read, previous_write) = previous_totals?;
+        let (current_read, current_write) = totals?;
+        let elapsed = sampled_at.duration_since(previous_at);
+        if elapsed.is_zero()
+            || elapsed > Duration::from_secs(interval_s.saturating_mul(3))
+            || current_read < previous_read
+            || current_write < previous_write
+        {
+            return None;
+        }
+        let seconds = elapsed.as_secs_f64();
+        Some((
+            (current_read - previous_read) as f64 / seconds,
+            (current_write - previous_write) as f64 / seconds,
+        ))
+    }
 }
 
 fn write_atomic(directory: &Path, value: &NowSnapshot) -> io::Result<()> {
@@ -265,7 +309,7 @@ pub(crate) struct Writer {
 
 impl Writer {
     pub(crate) fn start(directory: PathBuf) -> io::Result<Self> {
-        let (updates, receiver) = mpsc::channel();
+        let (updates, receiver) = mpsc::channel::<SampledMetrics>();
         let reading = Arc::new(Mutex::new(ProbeReading::default()));
         let stop = Arc::new(StopSignal::new());
 
@@ -280,6 +324,7 @@ impl Writer {
         let writer = match thread::Builder::new()
             .name("gtop-now-json".into())
             .spawn(move || {
+                let mut disk_io_rate = DiskIoRate::default();
                 while writer_stop.wait(Duration::ZERO) {
                     let metrics = match receiver.recv() {
                         Ok(metrics) => metrics,
@@ -288,7 +333,18 @@ impl Writer {
                     let reading = writer_reading
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    if let Err(error) = write_atomic(&directory, &snapshot(metrics, &reading)) {
+                    let disk_io_rates = disk_io_rate.update(
+                        metrics.sampled_at,
+                        metrics.disk_io_totals,
+                        metrics.interval_s,
+                    );
+                    let snapshot = snapshot_at_with_disk_io_rates(
+                        metrics,
+                        &reading,
+                        unix_seconds(),
+                        disk_io_rates,
+                    );
+                    if let Err(error) = write_atomic(&directory, &snapshot) {
                         eprintln!("Current metrics could not be saved: {error}");
                     }
                 }
@@ -328,11 +384,13 @@ mod tests {
         SampledMetrics {
             time: 1_800_000_000,
             interval_s: 2,
+            sampled_at: Instant::now(),
             cpu_percent: 12.5,
             memory_used_bytes: 500,
             memory_total_bytes: 1000,
             disk_free_bytes: Some(2000),
             disk_total_bytes: Some(4000),
+            disk_io_totals: Some((0, 0)),
             rx_bytes_per_s: 10,
             tx_bytes_per_s: 20,
             temperature_c: None,
@@ -343,15 +401,103 @@ mod tests {
     fn serialization_matches_the_version_one_format() {
         let mut reading = ProbeReading::default();
         reading.record(1_800_000_000, Outcome::Reply(Duration::from_millis(25)));
-        let value = snapshot_at(metrics(), &reading, 1_800_000_000);
+        let value = snapshot_at_with_disk_io_rates(
+            metrics(),
+            &reading,
+            1_800_000_000,
+            Some((123.0, 456.0)),
+        );
         let json = serde_json::to_string(&value).unwrap();
         let expected = format!(
-            r#"{{"version":1,"time":1800000000,"interval_s":2,"pid":{},"commit":"{}","cpu":{{"percent":12.5}},"memory":{{"used_bytes":500,"total_bytes":1000,"percent":50.0}},"ssd":{{"free_bytes":2000,"total_bytes":4000,"read_bytes_per_s":null,"write_bytes_per_s":null,"temperature_c":null}},"net":{{"rx_bytes_per_s":10,"tx_bytes_per_s":20,"latency_ms":25.0,"loss_percent":0.0,"probe":"tcp 1.1.1.1:443"}}}}"#,
+            r#"{{"version":1,"time":1800000000,"interval_s":2,"pid":{},"commit":"{}","cpu":{{"percent":12.5}},"memory":{{"used_bytes":500,"total_bytes":1000,"percent":50.0}},"ssd":{{"free_bytes":2000,"total_bytes":4000,"read_bytes_per_s":123.0,"write_bytes_per_s":456.0,"temperature_c":null}},"net":{{"rx_bytes_per_s":10,"tx_bytes_per_s":20,"latency_ms":25.0,"loss_percent":0.0,"probe":"tcp 1.1.1.1:443"}}}}"#,
             std::process::id(),
             option_env!("GTOP_GIT_COMMIT").unwrap_or("unknown")
         );
         assert_eq!(json, expected);
         println!("SAMPLE_NOW_JSON={json}");
+    }
+
+    #[test]
+    fn disk_io_rates_are_null_for_the_first_sample() {
+        let mut rate = DiskIoRate::default();
+        let start = Instant::now();
+        assert_eq!(rate.update(start, Some((100, 200)), 2), None);
+    }
+
+    #[test]
+    fn disk_io_rates_use_cumulative_counter_deltas() {
+        let mut rate = DiskIoRate::default();
+        let start = Instant::now();
+        assert_eq!(rate.update(start, Some((100, 200)), 2), None);
+        assert_eq!(
+            rate.update(start + Duration::from_secs(2), Some((500, 800)), 2),
+            Some((200.0, 300.0))
+        );
+    }
+
+    #[test]
+    fn disk_io_counter_decrease_resets_both_rates() {
+        let mut rate = DiskIoRate::default();
+        let start = Instant::now();
+        assert_eq!(rate.update(start, Some((100, 200)), 2), None);
+        assert_eq!(
+            rate.update(start + Duration::from_secs(1), Some((150, 199)), 2),
+            None
+        );
+        assert_eq!(
+            rate.update(start + Duration::from_secs(2), Some((170, 239)), 2),
+            Some((20.0, 40.0))
+        );
+    }
+
+    #[test]
+    fn disk_io_rates_are_null_after_a_long_gap() {
+        let mut rate = DiskIoRate::default();
+        let start = Instant::now();
+        assert_eq!(rate.update(start, Some((100, 200)), 2), None);
+        assert_eq!(
+            rate.update(start + Duration::from_secs(7), Some((800, 900)), 2),
+            None
+        );
+        assert_eq!(
+            rate.update(start + Duration::from_secs(8), Some((900, 1000)), 2),
+            Some((100.0, 100.0))
+        );
+    }
+
+    #[test]
+    fn disk_io_rates_are_null_for_zero_elapsed_time() {
+        let mut rate = DiskIoRate::default();
+        let sample = Instant::now();
+        assert_eq!(rate.update(sample, Some((100, 200)), 2), None);
+        assert_eq!(rate.update(sample, Some((200, 300)), 2), None);
+        assert_eq!(
+            rate.update(sample + Duration::from_secs(1), Some((250, 350)), 2),
+            Some((50.0, 50.0))
+        );
+    }
+
+    #[test]
+    fn missing_disk_io_totals_reset_the_rate_baseline() {
+        let mut rate = DiskIoRate::default();
+        let start = Instant::now();
+        assert_eq!(rate.update(start, None, 2), None);
+        assert_eq!(
+            rate.update(start + Duration::from_secs(1), Some((100, 200)), 2),
+            None
+        );
+        assert_eq!(
+            rate.update(start + Duration::from_secs(2), Some((150, 260)), 2),
+            Some((50.0, 60.0))
+        );
+        assert_eq!(
+            rate.update(start + Duration::from_secs(3), None, 2),
+            None
+        );
+        assert_eq!(
+            rate.update(start + Duration::from_secs(4), Some((900, 900)), 2),
+            None
+        );
     }
 
     #[test]

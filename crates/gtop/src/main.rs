@@ -28,7 +28,11 @@ use gtop::perf;
 use gtop_core::{AppState, Snapshot};
 use model::{ProcessKey, Search};
 use process_table::Processes;
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::{
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 const SESSION_RETENTION: Duration = Duration::from_secs(10 * 60);
 
@@ -550,6 +554,7 @@ impl Monitor {
                                     writer.update(now_json::SampledMetrics {
                                         time: rack::now() as u64,
                                         interval_s: seconds,
+                                        sampled_at: Instant::now(),
                                         cpu_percent: (stats.cpu_usage.iter().sum::<f32>()
                                             / stats.cpu_usage.len().max(1) as f32)
                                             as f64,
@@ -559,6 +564,7 @@ impl Monitor {
                                             .then_some(stats.disk_free_bytes),
                                         disk_total_bytes: (stats.disk_total_bytes > 0)
                                             .then_some(stats.disk_total_bytes),
+                                        disk_io_totals: stats.disk_io_totals,
                                         rx_bytes_per_s: stats.network_rx_bytes,
                                         tx_bytes_per_s: stats.network_tx_bytes,
                                         temperature_c: stats.temperatures.iter()
