@@ -2,7 +2,7 @@ use crate::{
     disk_scan::{self, Confirmation, Folder, ScanState, Tree},
     model::bytes,
     rack::RackButton,
-    Monitor,
+    Monitor, SESSION_RETENTION,
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -16,11 +16,34 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
     },
+    time::Instant,
 };
+
+#[derive(Default)]
+struct Retention {
+    deadline: Option<Instant>,
+    expired: bool,
+}
+impl Retention {
+    fn expire(&mut self, now: Instant) -> bool {
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
+            self.deadline = None;
+            self.expired = true;
+        }
+        self.expired
+    }
+}
+
+fn cancel_expired_scan(retention: &Mutex<Retention>, token: &AtomicBool) {
+    if retention.lock().unwrap().expire(Instant::now()) {
+        token.store(true, Ordering::Relaxed);
+    }
+}
 
 enum Command {
     Scan(PathBuf, bool, Arc<AtomicBool>, u64),
     DropCache,
+    RetentionChanged,
     Browse(PathBuf, usize, u64, u64, Arc<AtomicBool>),
     Trash(Confirmation, Arc<AtomicBool>, u64, u64, PathBuf, usize),
     Prepare(PathBuf, u64, disk_scan::FileId, u64, u64, u64),
@@ -28,6 +51,9 @@ enum Command {
 #[derive(Default)]
 struct Mailbox {
     proposal: Option<(u64, u64, Result<Confirmation, String>)>,
+    expired: Option<u64>,
+    #[cfg(test)]
+    scan_gate: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     folder: Option<(u64, u64, Folder)>,
     status: Option<String>,
     wake: Option<futures::channel::mpsc::Sender<()>>,
@@ -50,6 +76,7 @@ pub(super) struct Disk {
     cancel: Arc<AtomicBool>,
     release: Arc<AtomicBool>,
     foreground: Arc<AtomicBool>,
+    retention: Arc<Mutex<Retention>>,
     pub folder: Option<Folder>,
     pub selected: usize,
     pub confirmation: Option<Confirmation>,
@@ -86,6 +113,8 @@ impl Disk {
         let worker_release = release.clone();
         let foreground = Arc::new(AtomicBool::new(visible));
         let worker_foreground = foreground.clone();
+        let retention = Arc::new(Mutex::new(Retention::default()));
+        let worker_retention = retention.clone();
         std::thread::Builder::new()
             .name("disk-scan".into())
             .spawn(move || {
@@ -95,6 +124,7 @@ impl Disk {
                     worker_home,
                     worker_release,
                     worker_foreground,
+                    worker_retention,
                 )
             })
             .expect("start disk worker");
@@ -109,6 +139,7 @@ impl Disk {
             cancel: Arc::new(AtomicBool::new(false)),
             release,
             foreground,
+            retention,
             folder: None,
             selected: 0,
             confirmation: None,
@@ -122,10 +153,36 @@ impl Disk {
         disk
     }
     pub(super) fn set_visible(&self, visible: bool) {
-        self.foreground.store(visible, Ordering::Release);
+        self.foreground
+            .store(visible && self.open, Ordering::Release);
     }
     pub fn close(&mut self) {
+        if !self.open {
+            return;
+        }
         self.open = false;
+        self.set_visible(false);
+        self.retention.lock().unwrap().deadline = Some(Instant::now() + SESSION_RETENTION);
+        let _ = self.sender.try_send(Command::RetentionChanged);
+        self.invalidate_proposal();
+    }
+    fn reopen(&mut self, now: Instant, visible: bool) {
+        let expired = {
+            let mut retention = self.retention.lock().unwrap();
+            let expired = retention.expire(now);
+            *retention = Retention::default();
+            expired
+        };
+        if expired {
+            self.release_cache();
+        }
+        self.open = true;
+        self.set_visible(visible);
+        if expired {
+            self.start(self.home.clone(), false);
+        }
+    }
+    fn release_cache(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
         self.release.store(true, Ordering::Release);
         self.generation += 1;
@@ -386,6 +443,14 @@ fn publish(
     generation: u64,
     navigation: u64,
 ) {
+    #[cfg(test)]
+    if tree.state == ScanState::Scanning {
+        let gate = output.lock().unwrap().scan_gate.take();
+        if let Some((started, resume)) = gate {
+            started.send(()).unwrap();
+            resume.recv().unwrap();
+        }
+    }
     let folder = tree.folder(path, page, cached);
     let mut mailbox = output.lock().unwrap();
     mailbox.folder = Some((generation, navigation, folder));
@@ -403,6 +468,7 @@ fn publish_browse(
         token,
         priority,
         identity,
+        retention,
     } = control;
     let (generation, navigation) = identity;
     if path == tree.root || !path.starts_with(&tree.root) {
@@ -419,6 +485,7 @@ fn publish_browse(
         home,
         token,
         |subtree| {
+            cancel_expired_scan(retention, token);
             published_complete |= subtree.state == ScanState::Complete;
             let mut folder = subtree.folder(path, page, false);
             folder.root = tree.root.clone();
@@ -426,7 +493,10 @@ fn publish_browse(
             mailbox.folder = Some((generation, navigation, folder));
             mailbox.notify();
         },
-        || priority.update(),
+        || {
+            cancel_expired_scan(retention, token);
+            priority.update()
+        },
     );
     priority.restore();
     if !published_complete {
@@ -442,6 +512,7 @@ struct ScanControl<'a> {
     token: &'a AtomicBool,
     priority: &'a mut ScanPriority,
     identity: (u64, u64),
+    retention: &'a Mutex<Retention>,
 }
 struct ScanPriority {
     foreground: Arc<AtomicBool>,
@@ -498,6 +569,7 @@ fn worker(
     home: PathBuf,
     release: Arc<AtomicBool>,
     foreground: Arc<AtomicBool>,
+    retention: Arc<Mutex<Retention>>,
 ) {
     worker_with_trash(
         receiver,
@@ -505,6 +577,7 @@ fn worker(
         home,
         release,
         foreground,
+        retention,
         |confirmation, home| confirmation.trash(home),
     );
 }
@@ -514,6 +587,7 @@ fn worker_with_trash(
     home: PathBuf,
     release: Arc<AtomicBool>,
     foreground: Arc<AtomicBool>,
+    retention: Arc<Mutex<Retention>>,
     mut trash: impl FnMut(Confirmation, &Path) -> std::io::Result<PathBuf>,
 ) {
     let mut priority = ScanPriority::new(foreground);
@@ -522,13 +596,43 @@ fn worker_with_trash(
     let mut generation = 0;
     let mut completed = None;
     let mut queue = VecDeque::new();
-    while let Some(command) = queue.pop_front().or_else(|| receiver.recv().ok()) {
+    loop {
+        let expired = retention.lock().unwrap().expire(Instant::now());
+        if expired {
+            active = None;
+            cache.clear();
+            completed = None;
+            let mut mailbox = output.lock().unwrap();
+            mailbox.folder = None;
+            mailbox.proposal = None;
+            mailbox.expired = Some(generation);
+            mailbox.notify();
+        }
+        let command = if let Some(command) = queue.pop_front() {
+            command
+        } else {
+            let deadline = retention.lock().unwrap().deadline;
+            let result = match deadline {
+                Some(deadline) => {
+                    receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                }
+                None => receiver
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            };
+            match result {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        };
         if release.swap(false, Ordering::AcqRel) {
             active = None;
             cache.clear();
             completed = None;
         }
         match command {
+            Command::RetentionChanged => {}
             Command::DropCache => {
                 completed = None;
                 active = None;
@@ -578,6 +682,7 @@ fn worker_with_trash(
                     &home,
                     &token,
                     |tree| {
+                        cancel_expired_scan(&retention, &token);
                         while let Ok(command) = receiver.try_recv() {
                             queue.push_back(command);
                         }
@@ -585,7 +690,10 @@ fn worker_with_trash(
                             &output, tree, &browsing, page, false, generation, navigation,
                         );
                     },
-                    || priority.update(),
+                    || {
+                        cancel_expired_scan(&retention, &token);
+                        priority.update()
+                    },
                 );
                 priority.restore();
                 publish(
@@ -608,6 +716,7 @@ fn worker_with_trash(
                                 token: &token,
                                 priority: &mut priority,
                                 identity: (generation, n),
+                                retention: &retention,
                             },
                         )
                         .then_some((generation, n));
@@ -643,6 +752,7 @@ fn worker_with_trash(
                             &home,
                             &token,
                             |tree| {
+                                cancel_expired_scan(&retention, &token);
                                 while let Ok(command) = receiver.try_recv() {
                                     queue.push_back(command);
                                 }
@@ -653,7 +763,10 @@ fn worker_with_trash(
                                     );
                                 }
                             },
-                            || priority.update(),
+                            || {
+                                cancel_expired_scan(&retention, &token);
+                                priority.update()
+                            },
                         );
                         priority.restore();
                         completed = publish_browse(
@@ -666,6 +779,7 @@ fn worker_with_trash(
                                 token: &token,
                                 priority: &mut priority,
                                 identity: (generation, navigation),
+                                retention: &retention,
                             },
                         )
                         .then_some((generation, navigation));
@@ -686,11 +800,7 @@ impl Monitor {
         self.moment = None;
         self.settings_open = false;
         if let Some(disk) = &mut self.disk {
-            disk.open = true;
-            disk.set_visible(window.is_visible());
-            if disk.folder.is_none() {
-                disk.start(disk.home.clone(), false);
-            }
+            disk.reopen(Instant::now(), window.is_visible());
         } else {
             self.disk = Some(Disk::new(window.is_visible()));
             let mut events = self.disk.as_mut().unwrap().events.take().unwrap();
@@ -701,10 +811,14 @@ impl Monitor {
                         .update(cx, |this, cx| {
                             if let Some(disk) = &mut this.disk {
                                 let mut mailbox = disk.mailbox.lock().unwrap();
+                                let expired = mailbox.expired.take();
                                 let folder = mailbox.folder.take();
                                 let status = mailbox.status.take();
                                 let proposal = mailbox.proposal.take();
                                 drop(mailbox);
+                                if expired == Some(disk.generation) {
+                                    disk.release_cache();
+                                }
                                 if let Some((g, id, result)) = proposal {
                                     if disk.apply_proposal(g, id, result) {
                                         cx.notify();
@@ -716,7 +830,7 @@ impl Monitor {
                                     cx.notify();
                                 }
                                 if let Some((_, _, folder)) = folder.filter(|(g, n, _)| {
-                                    disk.open && *g == disk.generation && *n == disk.navigation
+                                    *g == disk.generation && *n == disk.navigation
                                 }) {
                                     disk.selected =
                                         disk.selected.min(folder.rows.len().saturating_sub(1));
@@ -970,11 +1084,10 @@ impl Monitor {
         } else {
             body = body.child("Starting disk scan…");
         }
-        body = body.child(
-            div()
-                .text_size(px(10.))
-                .child("↑ ↓ select · Enter open · Backspace up · X trash · C cancel · R rescan"),
-        );
+        body =
+            body.child(div().text_size(px(10.)).child(
+                "↑ ↓ select · Enter open · Backspace up · X trash · C cancel · R start over",
+            ));
         let mut panel = div()
             .relative()
             .child(crate::rack::screws(&t, "disk"))
@@ -1039,7 +1152,7 @@ impl Monitor {
                             )
                             .child(
                                 Button::new("disk-rescan")
-                                    .label("Rescan")
+                                    .label("Start over")
                                     .rack(&t)
                                     .small()
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1168,10 +1281,7 @@ impl Monitor {
 mod tests {
     use super::*;
     use std::prelude::v1::test;
-    use std::{
-        fs,
-        time::{Duration, Instant},
-    };
+    use std::{fs, time::Duration};
 
     struct CurrentPathLayout;
 
@@ -1399,6 +1509,7 @@ mod tests {
                 token: &browse_token,
                 priority: &mut priority,
                 identity: (7, 3),
+                retention: &Mutex::new(Retention::default()),
             },
         )
         .then_some((7, 3));
@@ -1439,6 +1550,7 @@ mod tests {
                 token: &browse_token,
                 priority: &mut priority,
                 identity: (7, 4),
+                retention: &Mutex::new(Retention::default()),
             },
         );
         assert!(!completed_root);
@@ -1479,7 +1591,7 @@ mod tests {
         fs::remove_dir_all(home).unwrap();
     }
     #[test]
-    fn close_full_queue_invalidates_replies_and_requests_release() {
+    fn expiry_with_full_queue_invalidates_replies_and_requests_release() {
         let home = scratch();
         let mut disk = Disk::with_home(home.clone());
         disk.folder = Some(receive(&mut disk, ScanState::Complete));
@@ -1489,6 +1601,7 @@ mod tests {
         let identity = (disk.generation, disk.navigation);
         let token = disk.cancel.clone();
         disk.close();
+        disk.reopen(Instant::now() + SESSION_RETENTION, false);
         assert!(disk.release.load(Ordering::Acquire));
         assert!(token.load(Ordering::Relaxed));
         assert_ne!(identity, (disk.generation, disk.navigation));
@@ -1650,6 +1763,7 @@ mod tests {
                     worker_home,
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
+                    Arc::new(Mutex::new(Retention::default())),
                     |confirmation, _| {
                         let destination = confirmation.path.with_file_name("moved");
                         if outcome != "failure" {
@@ -1709,6 +1823,134 @@ mod tests {
         mailbox.notify();
         assert_eq!(events.next().now_or_never(), Some(Some(())));
     }
+    #[test]
+    fn close_and_reopen_keep_completed_tree_and_start_over_refreshes() {
+        let home = scratch();
+        fs::write(home.join("one"), [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        disk.folder = Some(receive(&mut disk, ScanState::Complete));
+        let generation = disk.generation;
+        disk.close();
+        fs::write(home.join("two"), [2; 4096]).unwrap();
+        disk.reopen(Instant::now(), false);
+        assert_eq!(disk.generation, generation);
+        assert_eq!(disk.folder.as_ref().unwrap().items, 1);
+        assert_eq!(disk.folder.as_ref().unwrap().state, ScanState::Complete);
+        assert!(!disk.cancel.load(Ordering::Relaxed));
+        assert!(disk.key("r"));
+        let refreshed = receive(&mut disk, ScanState::Complete);
+        assert_eq!(refreshed.items, 2);
+        assert!(!refreshed.cached);
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn running_scan_survives_close_and_reopen_without_restarting() {
+        let home = scratch();
+        fs::write(home.join("one"), [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        let _ = receive(&mut disk, ScanState::Complete);
+        let (started, ready) = mpsc::sync_channel(1);
+        let (resume, suspended) = mpsc::sync_channel(1);
+        disk.mailbox.lock().unwrap().scan_gate = Some((started, suspended));
+        disk.start(home.clone(), true);
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        let generation = disk.generation;
+        disk.close();
+        assert!(!disk.cancel.load(Ordering::Relaxed));
+        assert!(!disk.foreground.load(Ordering::Acquire));
+        disk.reopen(Instant::now(), false);
+        assert_eq!(disk.generation, generation);
+        resume.send(()).unwrap();
+        assert_eq!(receive(&mut disk, ScanState::Complete).items, 1);
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn closed_scan_completes_in_background_and_expiry_releases_cache() {
+        let home = scratch();
+        fs::write(home.join("one"), [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        let _ = receive(&mut disk, ScanState::Complete);
+        let (started, ready) = mpsc::sync_channel(1);
+        let (resume, suspended) = mpsc::sync_channel(1);
+        disk.mailbox.lock().unwrap().scan_gate = Some((started, suspended));
+        disk.start(home.clone(), true);
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        disk.close();
+        resume.send(()).unwrap();
+        disk.folder = Some(receive(&mut disk, ScanState::Complete));
+        fs::write(home.join("two"), [2; 4096]).unwrap();
+        disk.reopen(Instant::now() + SESSION_RETENTION, false);
+        let fresh = receive(&mut disk, ScanState::Complete);
+        assert_eq!(fresh.items, 2);
+        assert!(!fresh.cached);
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn expired_running_scan_is_cancelled_and_cache_is_released() {
+        let home = scratch();
+        for n in 0..256 {
+            fs::create_dir(home.join(format!("dir-{n}"))).unwrap();
+        }
+        let mut disk = Disk::with_home(home.clone());
+        let _ = receive(&mut disk, ScanState::Complete);
+        let (started, ready) = mpsc::sync_channel(1);
+        let (resume, suspended) = mpsc::sync_channel(1);
+        disk.mailbox.lock().unwrap().scan_gate = Some((started, suspended));
+        disk.start(home.clone(), true);
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        let token = disk.cancel.clone();
+        disk.close();
+        disk.retention.lock().unwrap().deadline = Some(Instant::now());
+        resume.send(()).unwrap();
+        let start = Instant::now();
+        while disk.mailbox.lock().unwrap().expired != Some(disk.generation) {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(token.load(Ordering::Relaxed));
+        disk.reopen(Instant::now(), false);
+        assert!(disk.folder.is_none());
+        let fresh = receive(&mut disk, ScanState::Complete);
+        assert!(!fresh.cached);
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn worker_expires_closed_cache_without_reopening() {
+        let home = scratch();
+        fs::write(home.join("one"), [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        disk.folder = Some(receive(&mut disk, ScanState::Complete));
+        disk.close();
+        disk.retention.lock().unwrap().deadline = Some(Instant::now());
+        disk.sender.send(Command::RetentionChanged).unwrap();
+        let start = Instant::now();
+        loop {
+            let mailbox = disk.mailbox.lock().unwrap();
+            if mailbox.expired == Some(disk.generation) {
+                assert!(mailbox.folder.is_none());
+                break;
+            }
+            drop(mailbox);
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fs::write(home.join("two"), [2; 4096]).unwrap();
+        disk.reopen(Instant::now(), false);
+        let fresh = receive(&mut disk, ScanState::Complete);
+        assert_eq!(fresh.items, 2);
+        assert!(!fresh.cached);
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn completed_scan_is_cached_until_explicit_rescan() {
         let home = scratch();

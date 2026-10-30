@@ -29,6 +29,16 @@ use model::{ProcessKey, Search};
 use process_table::Processes;
 use std::{rc::Rc, sync::Arc, time::Duration};
 
+const SESSION_RETENTION: Duration = Duration::from_secs(10 * 60);
+
+fn after_retention(cx: &App, expire: impl FnOnce(&mut App) + 'static) -> Task<()> {
+    let timer = cx.background_executor().timer(SESSION_RETENTION);
+    cx.spawn(async move |cx| {
+        timer.await;
+        cx.update(expire);
+    })
+}
+
 fn refresh_stopped(events: &mut mpsc::Receiver<()>) -> bool {
     loop {
         match events.try_recv() {
@@ -809,9 +819,19 @@ fn main() {
     if disk_scan::headless() {
         return;
     }
-    gpui_platform::application()
+    let pending_quit: Rc<std::cell::RefCell<Option<Task<()>>>> = Rc::default();
+    let reopen_quit = pending_quit.clone();
+    let application = gpui_platform::application();
+    application.on_reopen(move |cx| {
+        reopen_quit.borrow_mut().take();
+        cx.activate(true);
+        for window in cx.windows() {
+            let _ = window.update(cx, |_, window, _| window.activate_window());
+        }
+    });
+    application
         .with_assets(gpui_kit_assets::Assets)
-        .run(|cx| {
+        .run(move |cx| {
             let quit_monitor: Rc<std::cell::RefCell<Option<Entity<Monitor>>>> =
                 Rc::new(std::cell::RefCell::new(None));
             let quit_monitor_for_shutdown = quit_monitor.clone();
@@ -876,12 +896,6 @@ fn main() {
                 KeyBinding::new("tab", ToggleView, Some("Gtop")),
                 KeyBinding::new("shift-tab", PreviousView, Some("Gtop")),
             ]);
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
             cx.set_menus([Menu::new("gtop").items([MenuItem::action("Quit gtop", Quit)])]);
             let bounds = Bounds::centered(None, size(px(1480.), px(930.)), cx);
             cx.open_window(
@@ -894,7 +908,21 @@ fn main() {
                     }),
                     ..Default::default()
                 },
-                |window, cx| {
+                move |window, cx| {
+                    let visible_quit = pending_quit.clone();
+                    window
+                        .observe_window_visibility(move |visibility, _, _| {
+                            if visibility.is_visible() {
+                                visible_quit.borrow_mut().take();
+                            }
+                        })
+                        .detach();
+                    let close_quit = pending_quit.clone();
+                    window.on_window_should_close(cx, move |_, cx| {
+                        cx.hide();
+                        *close_quit.borrow_mut() = Some(after_retention(cx, |cx| cx.quit()));
+                        false
+                    });
                     let monitor = cx.new(|cx| {
                         let mut monitor = Monitor::new(window, cx);
                         if std::env::args().any(|arg| arg == "--disk") {
@@ -914,6 +942,29 @@ fn main() {
 #[cfg(test)]
 mod wake_tests {
     use super::DrawMetrics;
+
+    #[test]
+    fn retained_window_timeout_can_be_cancelled_on_reopen() {
+        use gpui::TestAppContext;
+        use std::{cell::Cell, rc::Rc};
+
+        let cx = TestAppContext::single();
+        let expired = Rc::new(Cell::new(false));
+        let flag = expired.clone();
+        let pending = cx.update(|cx| super::after_retention(cx, move |_| flag.set(true)));
+        drop(pending);
+        cx.background_executor
+            .advance_clock(super::SESSION_RETENTION);
+        cx.run_until_parked();
+        assert!(!expired.get());
+
+        let flag = expired.clone();
+        let _pending = cx.update(|cx| super::after_retention(cx, move |_| flag.set(true)));
+        cx.background_executor
+            .advance_clock(super::SESSION_RETENTION);
+        cx.run_until_parked();
+        assert!(expired.get());
+    }
 
     #[test]
     fn quit_drains_partial_history_with_queued_wakes() {
