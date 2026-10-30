@@ -70,6 +70,8 @@ pub struct SystemMonitor {
     temperature_monitor: TemperatureMonitor,
     disks_refreshed_at: Option<Instant>,
     #[cfg(target_os = "macos")]
+    storage_drivers: super::iokit::StorageDrivers,
+    #[cfg(target_os = "macos")]
     disk_samples: HashMap<PathBuf, DiskSample>,
 }
 
@@ -95,6 +97,8 @@ impl SystemMonitor {
             gpu_monitor: GpuMonitor::new(),
             temperature_monitor: TemperatureMonitor::new(),
             disks_refreshed_at: None,
+            #[cfg(target_os = "macos")]
+            storage_drivers: super::iokit::StorageDrivers::new(),
             #[cfg(target_os = "macos")]
             disk_samples: HashMap::new(),
         }
@@ -125,6 +129,11 @@ impl SystemMonitor {
                 - (sys.used_memory() + (sys.total_memory() - sys.used_memory())),
             uptime: System::uptime(),
             load_avg: [load_average.one, load_average.five, load_average.fifteen],
+            network_totals: Some((self.last_network_update.1, self.last_network_update.2)),
+            #[cfg(target_os = "macos")]
+            disk_io_totals: self.storage_drivers.totals(),
+            #[cfg(not(target_os = "macos"))]
+            disk_io_totals: None,
             network_rx_bytes: network_rx,
             network_tx_bytes: network_tx,
             disk_total_bytes: disk_stats.total_bytes,
@@ -202,8 +211,10 @@ impl SystemMonitor {
                 });
 
         let elapsed = self.last_network_update.0.elapsed().as_secs_f64();
-        let rx_rate = ((current_rx - self.last_network_update.1) as f64 / elapsed) as u64;
-        let tx_rate = ((current_tx - self.last_network_update.2) as f64 / elapsed) as u64;
+        let rx_rate =
+            ((current_rx.saturating_sub(self.last_network_update.1)) as f64 / elapsed) as u64;
+        let tx_rate =
+            ((current_tx.saturating_sub(self.last_network_update.2)) as f64 / elapsed) as u64;
 
         self.last_network_update = (Instant::now(), current_rx, current_tx);
         (rx_rate, tx_rate)

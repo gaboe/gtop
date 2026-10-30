@@ -105,6 +105,10 @@ pub struct SystemStats {
     pub network_rx_bytes: u64,
     /// Total bytes transmitted over network
     pub network_tx_bytes: u64,
+    /// Cumulative interface bytes, received and sent.
+    pub network_totals: Option<(u64, u64)>,
+    /// Cumulative physical internal SSD bytes, read and written.
+    pub disk_io_totals: Option<(u64, u64)>,
     /// Total disk space in bytes
     pub disk_total_bytes: u64,
     /// Used disk space in bytes

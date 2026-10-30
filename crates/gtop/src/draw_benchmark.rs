@@ -133,6 +133,8 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
                 (
                     p.name.clone(),
                     history::ProcessTotal {
+                        disk_read_bytes: 0.,
+                        disk_write_bytes: 0.,
                         cpu_seconds: p.cpu_usage as f64 / 100. * count as f64 * 60.,
                         gpu_seconds: 0.,
                         peak_memory: p.memory_usage,
@@ -157,6 +159,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
             columns: (0..count)
                 .map(|i| {
                     Some(history::Column {
+                        io: Default::default(),
                         minute: start_minute + i as u64,
                         seconds: 60.,
                         cpu: snapshot
@@ -813,6 +816,9 @@ fn full_monitor_draw_benchmark() {
                         let mut analysis =
                             analysis::analyze("process-0001", "/bin/process-0001", 30_000_000, []);
                         analysis.history = Some(analysis::ProcessHistory {
+                            disk_columns: Default::default(),
+                            disk_read_bytes: 0.,
+                            disk_write_bytes: 0.,
                             columns: (0..144).map(|i| Some((i % 60) as f32)).collect(),
                             pattern: "Recurring work".into(),
                             core_minutes: 120.,
@@ -1584,6 +1590,62 @@ fn deleting_a_saved_palette_while_amber_is_active_queues_settings() {
     let queued = futures::executor::block_on(palette::next_settings(&mut receiver)).unwrap();
     assert_eq!(queued.active, 0);
     assert!(queued.saved.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn io_history_metrics_draw_in_each_range_and_disk_headers_sort(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let (monitor, visual) = cx.add_window_view(fixture);
+    visual.simulate_resize(gpui::size(px(1800.), px(1100.)));
+    monitor.update(visual, |monitor, _| {
+        for view in &mut monitor.history {
+            for column in view.columns.iter_mut().flatten() {
+                column.io = history::IoHistory {
+                    bytes: [Some(4096.); 4],
+                    peaks: [Some(2048.); 4],
+                    seconds: [3.; 4],
+                    free: Some(40e9),
+                    free_seconds: 3.,
+                };
+            }
+            view.rows[0].1.disk_read_bytes = 4096.;
+            view.rows[0].1.disk_write_bytes = 8192.;
+            view.cached_leaders = history::Metric::ALL.map(|metric| view.leaders(metric));
+        }
+    });
+    for range in 0..3 {
+        for metric in [
+            history::Metric::NetworkRx,
+            history::Metric::NetworkTx,
+            history::Metric::DiskRead,
+            history::Metric::DiskWrite,
+            history::Metric::DiskFree,
+        ] {
+            monitor.update(visual, |monitor, cx| {
+                monitor.view = Some(range);
+                monitor.metric = metric;
+                cx.notify();
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(visual.debug_bounds("history-header-7").is_some());
+            assert!(visual.debug_bounds("history-header-8").is_some());
+        }
+    }
+    for (selector, column) in [
+        ("history-header-7", history::HistorySortColumn::DiskRead),
+        ("history-header-8", history::HistorySortColumn::DiskWrite),
+    ] {
+        let header = visual.debug_bounds(selector).unwrap();
+        visual.simulate_click(header.center(), gpui::Modifiers::default());
+        assert_eq!(
+            monitor.read_with(visual, |monitor, _| monitor.history_sort.column),
+            column
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]

@@ -1132,6 +1132,12 @@ fn tape(
     } else {
         1
     };
+    let maximum = view
+        .columns
+        .iter()
+        .flatten()
+        .filter_map(|b| b.value(metric))
+        .fold(1., f64::max);
     div().flex().items_end().gap(px(1.)).h(px(height)).children(
         view.columns.chunks(step).enumerate().map(|(index, group)| {
             let selection = crate::history::MomentSelection {
@@ -1158,6 +1164,7 @@ fn tape(
                     Metric::Cpu | Metric::Gpu => value,
                     Metric::Memory => value / mem_total.max(1) as f64 * 100.,
                     Metric::Temperature => (value - 30.) / 80. * 100.,
+                    _ => value / maximum * 100.,
                 };
                 div()
                     .flex_1()
@@ -1167,7 +1174,8 @@ fn tape(
                             > match metric {
                                 Metric::Memory => mem_total as f64 * 0.92,
                                 Metric::Temperature => 90.,
-                                _ => 70.,
+                                Metric::Cpu | Metric::Gpu => 70.,
+                                _ => f64::INFINITY,
                             }
                         {
                             t.base.hot
@@ -1194,6 +1202,69 @@ fn tape(
 }
 
 impl Monitor {
+    fn history_metric_tabs(&self, t: &Tokens, cx: &mut Context<Self>) -> Div {
+        let mut tabs = div().flex().flex_wrap().gap(px(2.));
+        for (i, m) in Metric::ALL.into_iter().enumerate() {
+            tabs = tabs.child(
+                Button::new(("metric", i))
+                    .label(format!(
+                        "{} {}",
+                        if self.metric == m { "■" } else { "□" },
+                        m.label().to_uppercase()
+                    ))
+                    .rack(t)
+                    .small()
+                    .font_family("Archivo Labels")
+                    .text_size(px(9.))
+                    .when(self.metric == m, |b| b.primary())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.metric = m;
+                        if this.moment.is_some() {
+                            this.wake();
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        tabs
+    }
+
+    fn io_readout(&self, view: &HistoryView, t: &Tokens) -> Div {
+        if (self.metric as usize) < Metric::NetworkRx as usize {
+            return div();
+        }
+        let value = crate::history::weighted_average(
+            view.columns
+                .iter()
+                .flatten()
+                .filter_map(|b| b.value(self.metric).map(|v| (v, b.weight(self.metric)))),
+        );
+        let text = if self.metric == Metric::DiskFree {
+            value.map(|v| format!("MEAN {}", bytes(v as u64)))
+        } else {
+            let i = self.metric as usize - Metric::NetworkRx as usize;
+            let totals: Vec<_> = view
+                .columns
+                .iter()
+                .flatten()
+                .filter(|b| b.io.bytes[i].is_some())
+                .collect();
+            (!totals.is_empty()).then(|| {
+                format!(
+                    "TOTAL {} · PEAK {}/s",
+                    bytes(totals.iter().filter_map(|b| b.io.bytes[i]).sum::<f64>() as u64),
+                    bytes(
+                        totals
+                            .iter()
+                            .filter_map(|b| b.io.peaks[i])
+                            .fold(0., f64::max) as u64
+                    )
+                )
+            })
+        };
+        div().child(label(text.unwrap_or_else(|| "NO I/O SAMPLE".into()), t))
+    }
+
     fn moment_panel(&self, t: &Tokens, cx: &mut Context<Self>) -> Stateful<Div> {
         let Some(selection) = self.moment else {
             return div().id("moment-panel");
@@ -1306,6 +1377,38 @@ impl Monitor {
                         .child(readout),
                 );
             }
+            for metric in [
+                Metric::NetworkRx,
+                Metric::NetworkTx,
+                Metric::DiskRead,
+                Metric::DiskWrite,
+                Metric::DiskFree,
+            ] {
+                let view = &self.history[self.view.unwrap_or(0)];
+                let columns = view.columns.iter().flatten().filter(|b| {
+                    b.minute >= selection.start_minute
+                        && b.minute < selection.start_minute + selection.step as u64
+                });
+                let average = crate::history::weighted_average(
+                    columns.filter_map(|b| b.value(metric).map(|v| (v, b.weight(metric)))),
+                );
+                metrics = metrics.child(
+                    div().p(px(8.)).child(label(metric.label(), t)).child(lit(
+                        average
+                            .map(|v| {
+                                format!(
+                                    "{}{}",
+                                    bytes(v as u64),
+                                    if metric == Metric::DiskFree { "" } else { "/s" }
+                                )
+                            })
+                            .unwrap_or_else(|| "·".into()),
+                        18.,
+                        false,
+                        t,
+                    )),
+                );
+            }
             let rows = self.moment_rows.clone();
             let max = rows.first().map(|r| r.2).unwrap_or(1.).max(0.001);
             let mut list = div().flex().flex_col().gap(px(1.));
@@ -1317,6 +1420,8 @@ impl Monitor {
                 let value_label = match self.metric {
                     Metric::Memory => bytes(total.peak_memory),
                     Metric::Gpu => format!("{:.1} min", total.gpu_seconds / 60.),
+                    Metric::DiskRead => bytes(total.disk_read_bytes as u64),
+                    Metric::DiskWrite => bytes(total.disk_write_bytes as u64),
                     _ => format!("{:.1} min", total.cpu_seconds / 60.),
                 };
                 let row_text = |text: String| {
@@ -1392,6 +1497,9 @@ impl Monitor {
                 Metric::Memory => "PEAK MEMORY",
                 Metric::Gpu => "GPU TIME",
                 Metric::Temperature => "CORE TIME",
+                Metric::DiskRead => "SSD READ",
+                Metric::DiskWrite => "SSD WRITE",
+                _ => "NO PROCESS ATTRIBUTION",
             };
             panel = panel
                 .child(div().p(px(10.)).child(win(t).child(metrics)))
@@ -1778,7 +1886,8 @@ impl Monitor {
                 .justify_between()
                 .child(label(
                     format!(
-                        "TOTAL CPU · LAST {} H · ONE COLUMN PER {step} MIN",
+                        "{} · LAST {} H · ONE COLUMN PER {step} MIN",
+                        self.metric.label().to_uppercase(),
                         [1, 8, 24][index]
                     ),
                     &t,
@@ -1832,6 +1941,8 @@ impl Monitor {
                         (HistorySortColumn::GpuTime, Column::GpuTime, true),
                         (HistorySortColumn::PeakMemory, Column::PeakMemory, true),
                         (HistorySortColumn::PeakCpu, Column::PeakCpu, true),
+                        (HistorySortColumn::DiskRead, Column::DiskRead, true),
+                        (HistorySortColumn::DiskWrite, Column::DiskWrite, true),
                     ]
                     .into_iter()
                     .enumerate()
@@ -1905,7 +2016,9 @@ impl Monitor {
                 .child(
                     win(&t)
                         .child(heading)
-                        .child(tape(h, Metric::Cpu, 150., mem, &t, self.moment, cx))
+                        .child(self.history_metric_tabs(&t, cx))
+                        .child(self.io_readout(h, &t))
+                        .child(tape(h, self.metric, 150., mem, &t, self.moment, cx))
                         .child(axis),
                 )
                 .child(
@@ -2096,7 +2209,9 @@ impl Monitor {
                                                                                 cpu_scale,
                                                                             )
                                                                         )),
-                                                                ),
+                                                                )
+                                                                .child(history_cell(widths[8], true).child(row_text(bytes(p.disk_read_bytes as u64))))
+                                                                .child(history_cell(widths[9], true).child(row_text(bytes(p.disk_write_bytes as u64)))),
                                                         )
                                                     })
                                                     .collect::<Vec<_>>()
@@ -2116,29 +2231,7 @@ impl Monitor {
                 .items_center()
                 .gap(px(14.))
                 .child(label("LAST HOUR", &t));
-            let mut tabs = div().flex().gap(px(2.));
-            for (i, m) in Metric::ALL.into_iter().enumerate() {
-                tabs = tabs.child(
-                    Button::new(("metric", i))
-                        .label(format!(
-                            "{} {}",
-                            if self.metric == m { "■" } else { "□" },
-                            m.label().to_uppercase()
-                        ))
-                        .rack(&t)
-                        .small()
-                        .font_family("Archivo Labels")
-                        .text_size(px(9.))
-                        .when(self.metric == m, |b| b.primary())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.metric = m;
-                            if this.moment.is_some() {
-                                this.wake();
-                            }
-                            cx.notify();
-                        })),
-                );
-            }
+            let tabs = self.history_metric_tabs(&t, cx);
             head = head
                 .child(tabs)
                 .child(div().flex_1())
@@ -2165,8 +2258,10 @@ impl Monitor {
                                                         Metric::Cpu | Metric::Gpu => {
                                                             format!("{:.1}m", v / 60.)
                                                         }
-                                                        Metric::Memory => bytes(*v as u64),
-                                                        Metric::Temperature => unreachable!(),
+                                                        Metric::Memory
+                                                        | Metric::DiskRead
+                                                        | Metric::DiskWrite => bytes(*v as u64),
+                                                        _ => unreachable!(),
                                                     },
                                                     15.,
                                                     false,
@@ -2176,6 +2271,7 @@ impl Monitor {
                                     }),
                             ),
                         )
+                        .child(self.io_readout(h, &t))
                         .child(tape(h, self.metric, 54., mem, &t, self.moment, cx)),
                 )
                 .child(div().flex_1().min_h_0().child(

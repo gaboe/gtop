@@ -36,6 +36,8 @@ pub fn snapshot() -> Snapshot {
             process(4, "quiet", 50.),
         ]),
         stats: SystemStats {
+            network_totals: None,
+            disk_io_totals: None,
             cpu_usage: vec![50.; 4],
             memory_total: 1000,
             memory_used: 500,

@@ -21,6 +21,8 @@ pub enum Column {
     GpuTime,
     PeakMemory,
     PeakCpu,
+    DiskRead,
+    DiskWrite,
 }
 impl Column {
     pub fn default_width(self) -> f32 {
@@ -41,6 +43,7 @@ impl Column {
             Self::GpuTime => 100.,
             Self::PeakMemory => 125.,
             Self::PeakCpu => 115.,
+            Self::DiskRead | Self::DiskWrite => 100.,
         }
     }
     pub fn minimum(self) -> f32 {
@@ -61,6 +64,7 @@ impl Column {
             Self::GpuTime => 95.,
             Self::PeakMemory => 120.,
             Self::PeakCpu => 110.,
+            Self::DiskRead | Self::DiskWrite => 90.,
         }
     }
     fn clamp_width(self, width: f32) -> f32 {
@@ -75,7 +79,7 @@ impl Column {
     }
 }
 
-pub const HISTORY: [Column; 8] = [
+pub const HISTORY: [Column; 10] = [
     Column::Lamp,
     Column::Name,
     Column::CoreTime,
@@ -84,6 +88,8 @@ pub const HISTORY: [Column; 8] = [
     Column::GpuTime,
     Column::PeakMemory,
     Column::PeakCpu,
+    Column::DiskRead,
+    Column::DiskWrite,
 ];
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

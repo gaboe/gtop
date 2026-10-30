@@ -28,7 +28,7 @@ fn unsigned(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
     Ok(row.get::<_, SqlU64>(index)?.0)
 }
 
-const NAMED_BUCKETS_SQL: &str = "SELECT p.minute,?3,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM system s CROSS JOIN process p WHERE s.resolution=1 AND s.minute>=?1 AND s.minute<?2 AND p.resolution=1 AND p.minute=s.minute AND p.name_id=(SELECT id FROM names WHERE name=?3)";
+const NAMED_BUCKETS_SQL: &str = "SELECT p.minute,?3,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu,p.disk_read_bytes,p.disk_write_bytes FROM system s CROSS JOIN process p WHERE s.resolution=1 AND s.minute>=?1 AND s.minute<?2 AND p.resolution=1 AND p.minute=s.minute AND p.name_id=(SELECT id FROM names WHERE name=?3)";
 
 type Totals = BTreeMap<String, ProcessTotal>;
 
@@ -60,7 +60,7 @@ impl Store {
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !(0..=3).contains(&version) {
+        if !(0..=4).contains(&version) {
             return Err(format!("Unsupported history database version {version}").into());
         }
         if version == 0 {
@@ -76,10 +76,16 @@ impl Store {
         tx.execute_batch(include_str!("schema.sql"))?;
         if version == 1 || version == 2 {
             tx.execute_batch(
-                "INSERT INTO process SELECT * FROM old_process; DROP TABLE old_process;",
+                "INSERT INTO process(resolution,minute,name_id,cpu_seconds,gpu_seconds,peak_memory,peak_cpu) SELECT * FROM old_process; DROP TABLE old_process;",
             )?;
             for resolution in [1, 10, 60] {
                 pack_zero_rows(&tx, resolution, 0..i64::MAX as u64)?;
+            }
+        }
+        if (1..=3).contains(&version) {
+            tx.execute_batch(include_str!("migration-4.sql"))?;
+            if version == 3 {
+                tx.execute_batch("ALTER TABLE process ADD COLUMN disk_read_bytes NUMERIC NOT NULL DEFAULT 0; ALTER TABLE process ADD COLUMN disk_write_bytes NUMERIC NOT NULL DEFAULT 0;")?;
             }
         }
         tx.commit()?;
@@ -164,7 +170,7 @@ impl Store {
         if !ready {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute("DELETE FROM process WHERE resolution=60", [])?;
-            tx.execute("INSERT INTO process SELECT 60,minute/60*60,name_id,TOTAL(cpu_seconds),TOTAL(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 GROUP BY minute/60,name_id",[])?;
+            tx.execute("INSERT INTO process SELECT 60,minute/60*60,name_id,TOTAL(cpu_seconds),TOTAL(gpu_seconds),MAX(peak_memory),MAX(peak_cpu),TOTAL(disk_read_bytes),TOTAL(disk_write_bytes) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 GROUP BY minute/60,name_id",[])?;
             rebuild_presence(&tx, 60, 0..i64::MAX as u64, 60)?;
             tx.execute("INSERT INTO rollup_meta VALUES(1)", [])?;
             tx.commit()?;
@@ -241,7 +247,7 @@ impl Store {
     }
 
     fn system(&self, range: Range<u64>) -> Result<VecDeque<Bucket>> {
-        let mut statement = self.connection.prepare_cached("SELECT minute,seconds,cpu,memory,gpu,gpu_seconds,temperature,temp_seconds,peak_cpu,peak_memory,peak_gpu,peak_temp FROM system WHERE resolution=1 AND minute>=?1 AND minute<?2 ORDER BY minute")?;
+        let mut statement = self.connection.prepare_cached("SELECT minute,seconds,cpu,memory,gpu,gpu_seconds,temperature,temp_seconds,peak_cpu,peak_memory,peak_gpu,peak_temp,network_rx_bytes, network_rx_peak, network_rx_seconds, network_tx_bytes, network_tx_peak, network_tx_seconds, disk_read_bytes, disk_read_peak, disk_read_seconds, disk_write_bytes, disk_write_peak, disk_write_seconds, disk_free, disk_free_seconds FROM system WHERE resolution=1 AND minute>=?1 AND minute<?2 ORDER BY minute")?;
         let buckets = statement
             .query_map(
                 params![SqlU64(range.start), SqlU64(range.end)],
@@ -261,7 +267,7 @@ impl Store {
         let sql = if name.is_some() {
             NAMED_BUCKETS_SQL
         } else {
-            "SELECT p.minute,n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM process p INDEXED BY sqlite_autoindex_process_1 JOIN names n ON n.id=p.name_id WHERE p.resolution=1 AND p.minute>=?1 AND p.minute<?2 AND ?3 IS NULL"
+            "SELECT p.minute,n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu,p.disk_read_bytes,p.disk_write_bytes FROM process p INDEXED BY sqlite_autoindex_process_1 JOIN names n ON n.id=p.name_id WHERE p.resolution=1 AND p.minute>=?1 AND p.minute<?2 AND ?3 IS NULL"
         };
         let mut statement = self.connection.prepare_cached(sql)?;
         let mut rows = statement.query(params![SqlU64(range.start), SqlU64(range.end), name])?;
@@ -346,7 +352,7 @@ impl Store {
             totals.entry(name).or_default();
         }
         let excluded = serde_json::to_string(excluded)?;
-        let mut statement=self.connection.prepare_cached("SELECT n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu FROM (SELECT name_id,TOTAL(cpu_seconds) AS cpu_seconds,TOTAL(gpu_seconds) AS gpu_seconds,MAX(peak_memory) AS peak_memory,MAX(peak_cpu) AS peak_cpu FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND minute NOT IN (SELECT value FROM json_each(?4)) GROUP BY name_id) p JOIN names n ON n.id=p.name_id")?;
+        let mut statement=self.connection.prepare_cached("SELECT n.name,p.cpu_seconds,p.gpu_seconds,p.peak_memory,p.peak_cpu,p.disk_read_bytes,p.disk_write_bytes FROM (SELECT name_id,TOTAL(cpu_seconds) AS cpu_seconds,TOTAL(gpu_seconds) AS gpu_seconds,MAX(peak_memory) AS peak_memory,MAX(peak_cpu) AS peak_cpu,TOTAL(disk_read_bytes) AS disk_read_bytes,TOTAL(disk_write_bytes) AS disk_write_bytes FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND minute NOT IN (SELECT value FROM json_each(?4)) GROUP BY name_id) p JOIN names n ON n.id=p.name_id")?;
         #[cfg(feature = "history-profile")]
         let profile_start = std::time::Instant::now();
         let mut rows = statement.query(params![
@@ -472,7 +478,7 @@ fn presence_names(connection: &Connection, ids: &BTreeSet<i64>) -> Result<BTreeM
 }
 
 fn pack_zero_rows(tx: &Transaction<'_>, resolution: i64, range: Range<u64>) -> Result<()> {
-    let mut statement = tx.prepare_cached("SELECT minute,name_id FROM process WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0 ORDER BY minute,name_id")?;
+    let mut statement = tx.prepare_cached("SELECT minute,name_id FROM process WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0 AND disk_read_bytes=0 AND disk_write_bytes=0 ORDER BY minute,name_id")?;
     let mut rows = statement.query(params![resolution, SqlU64(range.start), SqlU64(range.end)])?;
     let mut groups: BTreeMap<u64, BTreeSet<i64>> = BTreeMap::new();
     while let Some(row) = rows.next()? {
@@ -495,7 +501,7 @@ fn pack_zero_rows(tx: &Transaction<'_>, resolution: i64, range: Range<u64>) -> R
         }
         write_presence(tx, resolution, minute, &ids)?;
     }
-    tx.execute("DELETE FROM process WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0",params![resolution,SqlU64(range.start),SqlU64(range.end)])?;
+    tx.execute("DELETE FROM process WHERE resolution=?1 AND minute>=?2 AND minute<?3 AND cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0 AND disk_read_bytes=0 AND disk_write_bytes=0",params![resolution,SqlU64(range.start),SqlU64(range.end)])?;
     Ok(())
 }
 
@@ -562,6 +568,18 @@ fn system_bucket(row: &Row<'_>) -> rusqlite::Result<Bucket> {
         peak_memory: row.get(9)?,
         peak_gpu: row.get(10)?,
         peak_temperature: row.get(11)?,
+        io: super::IoHistory {
+            bytes: [row.get(12)?, row.get(15)?, row.get(18)?, row.get(21)?],
+            peaks: [row.get(13)?, row.get(16)?, row.get(19)?, row.get(22)?],
+            seconds: [
+                row.get::<_, Option<f64>>(14)?.unwrap_or(0.),
+                row.get::<_, Option<f64>>(17)?.unwrap_or(0.),
+                row.get::<_, Option<f64>>(20)?.unwrap_or(0.),
+                row.get::<_, Option<f64>>(23)?.unwrap_or(0.),
+            ],
+            free: row.get(24)?,
+            free_seconds: row.get::<_, Option<f64>>(25)?.unwrap_or(0.),
+        },
         ..Default::default()
     })
 }
@@ -571,6 +589,8 @@ fn process_total(row: &Row<'_>, offset: usize) -> rusqlite::Result<ProcessTotal>
         gpu_seconds: row.get(offset + 1)?,
         peak_memory: unsigned(row, offset + 2)?,
         peak_cpu: row.get(offset + 3)?,
+        disk_read_bytes: row.get(offset + 4)?,
+        disk_write_bytes: row.get(offset + 5)?,
     })
 }
 
@@ -584,7 +604,7 @@ fn write_bucket(tx: &Transaction<'_>, b: &Bucket) -> Result<()> {
         [SqlU64(b.minute)],
     )?;
     tx.execute(
-        "INSERT OR REPLACE INTO system VALUES(1,?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        "INSERT OR REPLACE INTO system VALUES(1,?1,1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
         params![
             SqlU64(b.minute),
             b.seconds,
@@ -597,18 +617,38 @@ fn write_bucket(tx: &Transaction<'_>, b: &Bucket) -> Result<()> {
             b.peak_cpu,
             b.peak_memory,
             b.peak_gpu,
-            b.peak_temperature
+            b.peak_temperature,
+            b.io.bytes[0],
+            b.io.peaks[0],
+            b.io.seconds[0],
+            b.io.bytes[1],
+            b.io.peaks[1],
+            b.io.seconds[1],
+            b.io.bytes[2],
+            b.io.peaks[2],
+            b.io.seconds[2],
+            b.io.bytes[3],
+            b.io.peaks[3],
+            b.io.seconds[3],
+            b.io.free,
+            b.io.free_seconds
         ],
     )?;
     let mut intern = tx.prepare_cached("INSERT OR IGNORE INTO names(name) VALUES(?1)")?;
     let mut insert = tx.prepare_cached(
-        "INSERT INTO process SELECT 1,?1,id,?3,?4,?5,?6 FROM names WHERE name=?2",
+        "INSERT INTO process SELECT 1,?1,id,?3,?4,?5,?6,?7,?8 FROM names WHERE name=?2",
     )?;
     let mut zero_ids = BTreeSet::new();
     let mut name_id = tx.prepare_cached("SELECT id FROM names WHERE name=?1")?;
     for (name, p) in &b.processes {
         intern.execute([name])?;
-        if p.cpu_seconds == 0. && p.gpu_seconds == 0. && p.peak_memory == 0 && p.peak_cpu == 0. {
+        if p.cpu_seconds == 0.
+            && p.gpu_seconds == 0.
+            && p.peak_memory == 0
+            && p.peak_cpu == 0.
+            && p.disk_read_bytes == 0.
+            && p.disk_write_bytes == 0.
+        {
             zero_ids.insert(name_id.query_row([name], |r| r.get(0))?);
             continue;
         }
@@ -618,7 +658,9 @@ fn write_bucket(tx: &Transaction<'_>, b: &Bucket) -> Result<()> {
             p.cpu_seconds,
             p.gpu_seconds,
             SqlU64(p.peak_memory),
-            p.peak_cpu
+            p.peak_cpu,
+            p.disk_read_bytes,
+            p.disk_write_bytes
         ])?;
     }
     write_presence(tx, 1, b.minute, &zero_ids)?;
@@ -630,7 +672,7 @@ fn rebuild_hour(tx: &Transaction<'_>, hour: u64) -> Result<()> {
         "DELETE FROM process WHERE resolution=60 AND minute=?1",
         [SqlU64(hour)],
     )?;
-    tx.execute("INSERT INTO process SELECT 60,?1,name_id,TOTAL(cpu_seconds),TOTAL(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 AND minute>=?1 AND minute<?2 GROUP BY name_id",params![SqlU64(hour),SqlU64(hour+60)])?;
+    tx.execute("INSERT INTO process SELECT 60,?1,name_id,TOTAL(cpu_seconds),TOTAL(gpu_seconds),MAX(peak_memory),MAX(peak_cpu),TOTAL(disk_read_bytes),TOTAL(disk_write_bytes) FROM process INDEXED BY sqlite_autoindex_process_1 WHERE resolution=1 AND minute>=?1 AND minute<?2 GROUP BY name_id",params![SqlU64(hour),SqlU64(hour+60)])?;
     rebuild_presence(tx, 60, hour..hour + 60, 60)?;
     Ok(())
 }
@@ -643,8 +685,8 @@ fn compact(tx: &Transaction<'_>, now: u64) -> Result<bool> {
     if cutoff <= watermark {
         return Ok(false);
     }
-    tx.execute("INSERT OR REPLACE INTO system SELECT 10,minute/10*10,SUM(recorded),SUM(seconds),COALESCE(SUM(cpu*seconds)/NULLIF(SUM(seconds),0),MAX(cpu)),COALESCE(SUM(memory*seconds)/NULLIF(SUM(seconds),0),MAX(memory)),COALESCE(SUM(gpu*(CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END))/NULLIF(SUM((CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END)),0),MAX(gpu)),SUM((CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END)),COALESCE(SUM(temperature*(CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END))/NULLIF(SUM((CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END)),0),MAX(temperature)),SUM((CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END)),MAX(peak_cpu),MAX(peak_memory),MAX(peak_gpu),MAX(peak_temp) FROM system WHERE resolution=1 AND minute<?1 GROUP BY minute/10",[SqlU64(cutoff)])?;
-    tx.execute("INSERT OR REPLACE INTO process SELECT 10,minute/10*10,name_id,TOTAL(cpu_seconds),TOTAL(gpu_seconds),MAX(peak_memory),MAX(peak_cpu) FROM process WHERE resolution=1 AND minute<?1 GROUP BY minute/10,name_id",[SqlU64(cutoff)])?;
+    tx.execute("INSERT OR REPLACE INTO system SELECT 10,minute/10*10,SUM(recorded),SUM(seconds),COALESCE(SUM(cpu*seconds)/NULLIF(SUM(seconds),0),MAX(cpu)),COALESCE(SUM(memory*seconds)/NULLIF(SUM(seconds),0),MAX(memory)),COALESCE(SUM(gpu*(CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END))/NULLIF(SUM((CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END)),0),MAX(gpu)),SUM((CASE WHEN gpu IS NULL THEN 0 WHEN gpu_seconds<0 THEN seconds ELSE gpu_seconds END)),COALESCE(SUM(temperature*(CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END))/NULLIF(SUM((CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END)),0),MAX(temperature)),SUM((CASE WHEN temperature IS NULL THEN 0 WHEN temp_seconds<0 THEN seconds ELSE temp_seconds END)),MAX(peak_cpu),MAX(peak_memory),MAX(peak_gpu),MAX(peak_temp), CASE WHEN COUNT(network_rx_bytes)>0 THEN TOTAL(network_rx_bytes) END, MAX(network_rx_peak), SUM(network_rx_seconds), CASE WHEN COUNT(network_tx_bytes)>0 THEN TOTAL(network_tx_bytes) END, MAX(network_tx_peak), SUM(network_tx_seconds), CASE WHEN COUNT(disk_read_bytes)>0 THEN TOTAL(disk_read_bytes) END, MAX(disk_read_peak), SUM(disk_read_seconds), CASE WHEN COUNT(disk_write_bytes)>0 THEN TOTAL(disk_write_bytes) END, MAX(disk_write_peak), SUM(disk_write_seconds), SUM(disk_free*disk_free_seconds)/NULLIF(SUM(disk_free_seconds),0), SUM(disk_free_seconds) FROM system WHERE resolution=1 AND minute<?1 GROUP BY minute/10",[SqlU64(cutoff)])?;
+    tx.execute("INSERT OR REPLACE INTO process SELECT 10,minute/10*10,name_id,TOTAL(cpu_seconds),TOTAL(gpu_seconds),MAX(peak_memory),MAX(peak_cpu),TOTAL(disk_read_bytes),TOTAL(disk_write_bytes) FROM process WHERE resolution=1 AND minute<?1 GROUP BY minute/10,name_id",[SqlU64(cutoff)])?;
     rebuild_presence(tx, 10, watermark..cutoff, 10)?;
     for table in ["process", "system", "presence"] {
         tx.execute(&format!("DELETE FROM {table} WHERE (resolution=1 AND minute<?1) OR (resolution=10 AND minute<?2)"),params![SqlU64(cutoff),SqlU64(expired)])?;
@@ -668,6 +710,125 @@ fn compact(tx: &Transaction<'_>, now: u64) -> Result<bool> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn io_survives_named_reads_hourly_totals_and_compaction() {
+        let f = Fixture::new();
+        let mut a = bucket(100, 30., 1.);
+        a.io = super::super::IoHistory {
+            bytes: [Some(100.); 4],
+            peaks: [Some(10.); 4],
+            seconds: [30.; 4],
+            free: Some(1000.),
+            free_seconds: 30.,
+        };
+        let mut b = a.clone();
+        b.minute = 101;
+        b.io.bytes = [Some(200.); 4];
+        b.io.peaks = [Some(20.); 4];
+        b.io.free = Some(2000.);
+        b.io.free_seconds = 60.;
+        for bucket in [&mut a, &mut b] {
+            bucket.processes.insert(
+                "io-only".into(),
+                ProcessTotal {
+                    disk_read_bytes: 12.5,
+                    disk_write_bytes: 42.,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut s = f.open(101);
+        s.append([&a, &b], 101).unwrap();
+        let loaded = s.buckets(100..102, Some("io-only")).unwrap();
+        assert_eq!(loaded[0].io.bytes, [Some(100.); 4]);
+        assert_eq!(loaded[0].processes["io-only"].disk_read_bytes, 12.5);
+        for range in [100..102, 60..120] {
+            let total = s.view_data(range, &VecDeque::new()).unwrap().1;
+            assert_eq!(total["io-only"].disk_read_bytes, 25.);
+            assert_eq!(total["io-only"].disk_write_bytes, 84.);
+        }
+        s.append([], 8 * 1440).unwrap();
+        let (bytes, peak, free): (f64, f64, f64) = s.connection.query_row("SELECT disk_write_bytes,disk_write_peak,disk_free FROM system WHERE resolution=10 AND minute=100", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(bytes, 300.);
+        assert_eq!(peak, 20.);
+        assert!((free - 5000. / 3.).abs() < 1e-9);
+        let total: f64 = s.connection.query_row("SELECT disk_write_bytes FROM process WHERE resolution=10 AND name_id=(SELECT id FROM names WHERE name='io-only')", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 84.);
+    }
+
+    #[test]
+    fn version_three_migration_marks_old_system_io_unknown_and_keeps_work() {
+        let f = Fixture::new();
+        {
+            let mut s = f.open(100);
+            s.append([&bucket(100, 30., 17.)], 100).unwrap();
+            downgrade_io(&s.connection);
+            s.connection.execute_batch("PRAGMA user_version=3").unwrap();
+        }
+        let s = f.open(100);
+        let loaded = s.buckets(100..101, None).unwrap();
+        assert_eq!(loaded[0].io.bytes, [None; 4]);
+        assert_eq!(loaded[0].io.free, None);
+        assert_eq!(loaded[0].processes["worker"].cpu_seconds, 17.);
+        assert_eq!(loaded[0].processes["worker"].disk_write_bytes, 0.);
+        drop(s);
+        let s = f.open(100);
+        assert_eq!(s.buckets(100..101, None).unwrap()[0].io.bytes, [None; 4]);
+    }
+
+    #[test]
+    #[ignore = "requires GTOP_HISTORY_MIGRATION_COPY pointing to a scratch database"]
+    fn migrate_real_database_copy() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("GTOP_HISTORY_MIGRATION_COPY").expect("scratch copy path"),
+        );
+        assert!(path
+            .canonicalize()
+            .unwrap()
+            .starts_with(std::path::Path::new("/private/tmp")));
+        let c = Connection::open(&path).unwrap();
+        let version: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        let counts = |c: &Connection| -> Vec<i64> {
+            ["system", "process", "presence", "names"]
+                .map(|table| {
+                    c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                        .unwrap()
+                })
+                .to_vec()
+        };
+        let before = counts(&c);
+        let minute = c
+            .query_row(
+                "SELECT MAX(minute) FROM system WHERE resolution=1",
+                [],
+                |r| unsigned(r, 0),
+            )
+            .unwrap();
+        drop(c);
+        let started = std::time::Instant::now();
+        let s = Store::open(&path, &path.with_extension("absent-json"), minute).unwrap();
+        let elapsed = started.elapsed();
+        let after = counts(&s.connection);
+        assert_eq!(before, after);
+        let version: i64 = s
+            .connection
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        assert_eq!(
+            s.connection
+                .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        let unknown: i64 = s.connection.query_row("SELECT COUNT(*) FROM system WHERE disk_read_bytes IS NULL AND network_rx_bytes IS NULL AND disk_free IS NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(unknown, before[0]);
+        println!("migration counts {before:?} -> {after:?}, user_version 3 -> {version}, elapsed {elapsed:?}, integrity ok");
+    }
 
     struct Fixture(std::path::PathBuf);
     impl Fixture {
@@ -715,6 +876,8 @@ mod tests {
                 (
                     "worker".into(),
                     ProcessTotal {
+                        disk_read_bytes: 0.,
+                        disk_write_bytes: 0.,
                         cpu_seconds: cpu,
                         gpu_seconds: 2.,
                         peak_memory: 100,
@@ -773,6 +936,10 @@ mod tests {
         assert_eq!(h.buckets[0].seconds, 63.);
     }
 
+    fn downgrade_io(connection: &Connection) {
+        connection.execute_batch("ALTER TABLE system DROP COLUMN network_rx_bytes;ALTER TABLE system DROP COLUMN network_rx_peak;ALTER TABLE system DROP COLUMN network_rx_seconds;ALTER TABLE system DROP COLUMN network_tx_bytes;ALTER TABLE system DROP COLUMN network_tx_peak;ALTER TABLE system DROP COLUMN network_tx_seconds;ALTER TABLE system DROP COLUMN disk_read_bytes;ALTER TABLE system DROP COLUMN disk_read_peak;ALTER TABLE system DROP COLUMN disk_read_seconds;ALTER TABLE system DROP COLUMN disk_write_bytes;ALTER TABLE system DROP COLUMN disk_write_peak;ALTER TABLE system DROP COLUMN disk_write_seconds;ALTER TABLE system DROP COLUMN disk_free;ALTER TABLE system DROP COLUMN disk_free_seconds;ALTER TABLE process DROP COLUMN disk_read_bytes; ALTER TABLE process DROP COLUMN disk_write_bytes;").unwrap();
+    }
+
     #[test]
     fn version_one_migration_keeps_explicit_sensor_durations() {
         let f = Fixture::new();
@@ -784,6 +951,7 @@ mod tests {
             b.temperature = Some(70.);
             b.temperature_seconds = Some(7.);
             s.append([&b], 100).unwrap();
+            downgrade_io(&s.connection);
             s.connection.execute_batch("PRAGMA user_version=1").unwrap();
         }
         let s = f.open(100);
@@ -794,7 +962,7 @@ mod tests {
             s.connection
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
     }
 
@@ -910,6 +1078,8 @@ mod tests {
             bucket.processes.insert(
                 "fraction".into(),
                 ProcessTotal {
+                    disk_read_bytes: 0.,
+                    disk_write_bytes: 0.,
                     cpu_seconds: 0.1,
                     gpu_seconds: f64::from_bits(1),
                     peak_cpu: 0.1f32,
@@ -920,6 +1090,7 @@ mod tests {
         {
             let mut s = f.open(101);
             s.append([&a, &b], 101).unwrap();
+            downgrade_io(&s.connection);
             s.connection.execute_batch("ALTER TABLE process RENAME TO v3_process; CREATE TABLE process(resolution INTEGER NOT NULL, minute INTEGER NOT NULL, name_id INTEGER NOT NULL,cpu_seconds REAL NOT NULL,gpu_seconds REAL NOT NULL,peak_memory INTEGER NOT NULL,peak_cpu REAL NOT NULL,PRIMARY KEY(resolution,minute,name_id)) WITHOUT ROWID; INSERT INTO process SELECT * FROM v3_process; DROP TABLE v3_process; CREATE INDEX process_name_minute ON process(name_id,resolution,minute); PRAGMA user_version=2;").unwrap();
         }
         let mut s = f.open(101);
@@ -1004,6 +1175,7 @@ mod tests {
         let f = Fixture::new();
         {
             let s = f.open(100);
+            downgrade_io(&s.connection);
             s.connection.execute_batch("INSERT INTO names VALUES(-1,'invalid-name-id'); INSERT INTO process VALUES(1,100,-1,0,0,0,0); CREATE INDEX process_name_minute ON process(name_id,resolution,minute); PRAGMA user_version=2;").unwrap();
         }
         assert!(Store::open(&f.0.join("history.sqlite"), &f.0.join("history.json"), 100).is_err());
@@ -1104,10 +1276,11 @@ mod tests {
         {
             let mut s = f.open(101);
             s.append([&bucket(100, 20., 30.)], 101).unwrap();
+            downgrade_io(&s.connection);
             s.connection.execute_batch("INSERT INTO process SELECT 10,90,id,0,0,0,0 FROM names WHERE name='zero'; INSERT OR REPLACE INTO process SELECT 60,60,id,0,0,0,0 FROM names WHERE name='zero'; PRAGMA user_version=2;").unwrap();
         }
         let mut s = f.open(101);
-        let count: i64 = s.connection.query_row("SELECT COUNT(*) FROM process WHERE cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0", [], |r| r.get(0)).unwrap();
+        let count: i64 = s.connection.query_row("SELECT COUNT(*) FROM process WHERE cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0 AND disk_read_bytes=0 AND disk_write_bytes=0", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 0);
         let count: i64 = s
             .connection
@@ -1195,7 +1368,7 @@ mod tests {
         let named = s.buckets(100..102, Some("only-zero")).unwrap();
         assert!(named.iter().all(|b| b.processes.len() == 1));
         s.append(std::iter::empty(), 7 * 1440 + 110).unwrap();
-        let zero_rows: i64 = s.connection.query_row("SELECT COUNT(*) FROM process WHERE cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0", [], |r| r.get(0)).unwrap();
+        let zero_rows: i64 = s.connection.query_row("SELECT COUNT(*) FROM process WHERE cpu_seconds=0 AND gpu_seconds=0 AND peak_memory=0 AND peak_cpu=0 AND disk_read_bytes=0 AND disk_write_bytes=0", [], |r| r.get(0)).unwrap();
         assert_eq!(zero_rows, 0);
         assert_eq!(
             s.connection

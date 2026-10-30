@@ -76,13 +76,14 @@ fn main() {
         assert!(snapshot.stats.memory_total > 0 && !snapshot.stats.cpu_usage.is_empty());
         if tick >= 2 {
             println!(
-                "{{\"tick\":{},\"elapsed_us\":{},\"cpu_us\":{},\"started_unix_us\":{},\"gap_us\":{},\"processes\":{},\"errors\":0}}",
+                "{{\"tick\":{},\"elapsed_us\":{},\"cpu_us\":{},\"started_unix_us\":{},\"gap_us\":{},\"processes\":{},\"errors\":0,\"ssd_available\":{}}}",
                 tick - 2,
                 elapsed.as_micros(),
                 cpu_elapsed,
                 sample_start.duration_since(UNIX_EPOCH).unwrap().as_micros(),
                 gap.as_micros(),
-                snapshot.processes.len()
+                snapshot.processes.len(),
+                snapshot.stats.disk_io_totals.is_some()
             );
         }
     }

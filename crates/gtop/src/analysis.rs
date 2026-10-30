@@ -15,6 +15,9 @@ pub struct ProcessIdentity {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcessHistory {
     pub columns: Vec<Option<f32>>,
+    pub disk_columns: [Vec<Option<f64>>; 2],
+    pub disk_read_bytes: f64,
+    pub disk_write_bytes: f64,
     pub pattern: String,
     pub core_minutes: f64,
     pub busy_average: f64,
@@ -142,7 +145,35 @@ fn process_history<'a>(
         })
         .collect();
 
+    let disk_columns: [Vec<Option<f64>>; 2] = std::array::from_fn(|index| {
+        (start_minute..=now_minute)
+            .collect::<Vec<_>>()
+            .chunks(10)
+            .map(|minutes| {
+                let values: Vec<_> = minutes
+                    .iter()
+                    .filter_map(|minute| buckets.get(minute))
+                    .collect();
+                (!values.is_empty()).then(|| {
+                    values
+                        .iter()
+                        .filter_map(|bucket| bucket.processes.get(name))
+                        .map(|p| {
+                            if index == 0 {
+                                p.disk_read_bytes
+                            } else {
+                                p.disk_write_bytes
+                            }
+                        })
+                        .sum()
+                })
+            })
+            .collect()
+    });
     Some(ProcessHistory {
+        disk_read_bytes: disk_columns[0].iter().flatten().sum(),
+        disk_write_bytes: disk_columns[1].iter().flatten().sum(),
+        disk_columns,
         columns,
         pattern,
         core_minutes: core_seconds / 60.,

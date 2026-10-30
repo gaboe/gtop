@@ -19,19 +19,39 @@ pub enum Metric {
     Memory,
     Gpu,
     Temperature,
+    NetworkRx,
+    NetworkTx,
+    DiskRead,
+    DiskWrite,
+    DiskFree,
 }
 impl Metric {
-    pub const ALL: [Self; 4] = [Self::Cpu, Self::Memory, Self::Gpu, Self::Temperature];
+    pub const ALL: [Self; 9] = [
+        Self::Cpu,
+        Self::Memory,
+        Self::Gpu,
+        Self::Temperature,
+        Self::NetworkRx,
+        Self::NetworkTx,
+        Self::DiskRead,
+        Self::DiskWrite,
+        Self::DiskFree,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             Self::Cpu => "CPU",
             Self::Memory => "Memory",
             Self::Gpu => "GPU",
             Self::Temperature => "CPU temperature",
+            Self::NetworkRx => "NET ↓",
+            Self::NetworkTx => "NET ↑",
+            Self::DiskRead => "SSD read",
+            Self::DiskWrite => "SSD write",
+            Self::DiskFree => "SSD free",
         }
     }
     pub fn next(self) -> Self {
-        Self::ALL[(Self::ALL.iter().position(|v| *v == self).unwrap() + 1) % 4]
+        Self::ALL[(Self::ALL.iter().position(|v| *v == self).unwrap() + 1) % Self::ALL.len()]
     }
 }
 
@@ -41,9 +61,15 @@ pub struct ProcessTotal {
     pub gpu_seconds: f64,
     pub peak_memory: u64,
     pub peak_cpu: f32,
+    #[serde(default)]
+    pub disk_read_bytes: f64,
+    #[serde(default)]
+    pub disk_write_bytes: f64,
 }
 impl ProcessTotal {
     fn merge(&mut self, other: &Self) {
+        self.disk_read_bytes += other.disk_read_bytes;
+        self.disk_write_bytes += other.disk_write_bytes;
         self.cpu_seconds += other.cpu_seconds;
         self.gpu_seconds += other.gpu_seconds;
         self.peak_memory = self.peak_memory.max(other.peak_memory);
@@ -60,6 +86,8 @@ pub enum HistorySortColumn {
     GpuTime,
     PeakMemory,
     PeakCpu,
+    DiskRead,
+    DiskWrite,
 }
 
 impl HistorySortColumn {
@@ -72,6 +100,8 @@ impl HistorySortColumn {
             Self::GpuTime => "GPU TIME",
             Self::PeakMemory => "PEAK MEMORY",
             Self::PeakCpu => "PEAK CPU %",
+            Self::DiskRead => "SSD READ",
+            Self::DiskWrite => "SSD WRITE",
         }
     }
 
@@ -136,6 +166,12 @@ impl HistorySort {
                     total_a.peak_cpu.total_cmp(&total_b.peak_cpu)
                 }
                 HistorySortColumn::GpuTime => total_a.gpu_seconds.total_cmp(&total_b.gpu_seconds),
+                HistorySortColumn::DiskRead => {
+                    total_a.disk_read_bytes.total_cmp(&total_b.disk_read_bytes)
+                }
+                HistorySortColumn::DiskWrite => total_a
+                    .disk_write_bytes
+                    .total_cmp(&total_b.disk_write_bytes),
                 HistorySortColumn::PeakMemory => total_a.peak_memory.cmp(&total_b.peak_memory),
             };
             let value_order = if self.direction == SortDirection::Descending {
@@ -160,9 +196,37 @@ impl HistorySort {
     }
 }
 
+/// Byte totals and observed sample peaks. Order matches the four I/O metrics.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IoHistory {
+    pub bytes: [Option<f64>; 4],
+    pub peaks: [Option<f64>; 4],
+    pub seconds: [f64; 4],
+    pub free: Option<f64>,
+    pub free_seconds: f64,
+}
+impl IoHistory {
+    pub fn value(&self, metric: Metric) -> Option<f64> {
+        if metric == Metric::DiskFree {
+            return self.free;
+        }
+        let index = metric as usize - Metric::NetworkRx as usize;
+        self.bytes[index].map(|bytes| bytes / self.seconds[index].max(0.001))
+    }
+    pub fn weight(&self, metric: Metric) -> f64 {
+        if metric == Metric::DiskFree {
+            self.free_seconds
+        } else {
+            self.seconds[metric as usize - Metric::NetworkRx as usize]
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Bucket {
+    pub io: IoHistory,
     pub minute: u64,
     pub seconds: f64,
     pub cpu: f64,
@@ -210,6 +274,12 @@ impl Default for MomentSelection {
 
 impl MomentDetail {
     pub fn ranked(&self, metric: Metric) -> Vec<(String, ProcessTotal, f64)> {
+        if matches!(
+            metric,
+            Metric::NetworkRx | Metric::NetworkTx | Metric::DiskFree
+        ) {
+            return vec![];
+        }
         let mut rows: Vec<_> = self
             .rows
             .iter()
@@ -218,6 +288,9 @@ impl MomentDetail {
                     Metric::Cpu | Metric::Temperature => total.cpu_seconds,
                     Metric::Memory => total.peak_memory as f64,
                     Metric::Gpu => total.gpu_seconds,
+                    Metric::DiskRead => total.disk_read_bytes,
+                    Metric::DiskWrite => total.disk_write_bytes,
+                    Metric::NetworkRx | Metric::NetworkTx | Metric::DiskFree => 0.,
                 };
                 (name.clone(), total.clone(), value)
             })
@@ -268,6 +341,7 @@ pub fn selection_in_window(selection: MomentSelection, start: u64, end: u64) -> 
 }
 #[derive(Clone, Debug)]
 pub struct Column {
+    pub io: IoHistory,
     pub minute: u64,
     pub seconds: f64,
     pub cpu: f64,
@@ -281,6 +355,7 @@ pub struct Column {
 impl From<&Bucket> for Column {
     fn from(b: &Bucket) -> Self {
         Self {
+            io: b.io.clone(),
             minute: b.minute,
             seconds: b.seconds,
             cpu: b.cpu,
@@ -307,6 +382,11 @@ impl Column {
         match metric {
             Metric::Gpu => self.gpu_seconds,
             Metric::Temperature => self.temperature_seconds,
+            Metric::NetworkRx
+            | Metric::NetworkTx
+            | Metric::DiskRead
+            | Metric::DiskWrite
+            | Metric::DiskFree => self.io.weight(metric),
             _ => self.seconds,
         }
     }
@@ -316,6 +396,7 @@ impl Column {
             Metric::Memory => Some(self.memory),
             Metric::Gpu => self.gpu,
             Metric::Temperature => self.temperature,
+            _ => self.io.value(metric),
         }
     }
 }
@@ -327,10 +408,16 @@ pub struct HistoryView {
     pub rows: Vec<(String, ProcessTotal)>,
     pub total_cpu: f64,
     pub covered: usize,
-    pub cached_leaders: [Vec<(String, f64)>; 4],
+    pub cached_leaders: [Vec<(String, f64)>; 9],
 }
 impl HistoryView {
     pub fn leaders(&self, metric: Metric) -> Vec<(String, f64)> {
+        if matches!(
+            metric,
+            Metric::NetworkRx | Metric::NetworkTx | Metric::DiskFree
+        ) {
+            return vec![];
+        }
         if metric == Metric::Temperature {
             let live: Vec<_> = self
                 .columns
@@ -368,7 +455,9 @@ impl HistoryView {
                         Metric::Cpu => p.cpu_seconds,
                         Metric::Gpu => p.gpu_seconds,
                         Metric::Memory => p.peak_memory as f64,
-                        Metric::Temperature => unreachable!(),
+                        Metric::DiskRead => p.disk_read_bytes,
+                        Metric::DiskWrite => p.disk_write_bytes,
+                        _ => unreachable!(),
                     },
                 )
             })
@@ -388,6 +477,10 @@ pub struct History {
     dirty: std::collections::BTreeSet<u64>,
     #[serde(skip)]
     last_sample: Option<f64>,
+    #[serde(skip)]
+    io_previous: [Option<u64>; 4],
+    #[serde(skip)]
+    io_rates: [Option<f64>; 4],
     #[serde(skip)]
     last_process_sample: Option<f64>,
     #[serde(skip)]
@@ -517,6 +610,7 @@ impl History {
     }
     pub fn suspend(&mut self) {
         self.last_sample = None;
+        self.io_previous = [None; 4];
         self.last_process_sample = None;
         self.process_recording_since = None;
     }
@@ -545,6 +639,24 @@ impl History {
             self.last_process_sample = None;
             self.process_recording_since = None;
         }
+        let network = snapshot.stats.network_totals;
+        let disk = snapshot.stats.disk_io_totals;
+        let counters = [
+            network.map(|v| v.0),
+            network.map(|v| v.1),
+            disk.map(|v| v.0),
+            disk.map(|v| v.1),
+        ];
+        self.io_rates = std::array::from_fn(|i| {
+            if seconds <= 0. {
+                return None;
+            }
+            counters[i]
+                .zip(self.io_previous[i])
+                .and_then(|(now, previous)| now.checked_sub(previous))
+                .map(|bytes| bytes as f64 / seconds)
+        });
+        self.io_previous = counters;
         self.touched = ((now - seconds) as u64 / 60)..minute + 1;
         if seconds == 0. {
             self.record_part(snapshot, minute, 0.);
@@ -569,12 +681,15 @@ impl History {
             let oldest = minute.saturating_sub(MINUTES - 1) as f64 * 60.;
             let cpu_start = recording_since.max(oldest);
             let gpu_start = (now - process_seconds).max(oldest);
-            let cpu_seconds = snapshot
+            let process_span = snapshot
                 .processes
                 .iter()
-                .filter_map(|p| p.cpu_sample_seconds)
+                .filter_map(|p| match (p.cpu_sample_seconds, p.disk_sample_seconds) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                })
                 .fold(0., f64::max);
-            let mut cursor = (now - cpu_seconds).max(cpu_start).min(gpu_start);
+            let mut cursor = (now - process_span).max(cpu_start).min(gpu_start);
             self.touched.start = self.touched.start.min(cursor as u64 / 60);
             while cursor < now {
                 let part_minute = cursor as u64 / 60;
@@ -617,7 +732,10 @@ impl History {
             let span = snapshot
                 .processes
                 .iter()
-                .filter_map(|p| p.cpu_sample_seconds)
+                .filter_map(|p| match (p.cpu_sample_seconds, p.disk_sample_seconds) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                })
                 .fold(0., f64::max);
             let oldest = minute.saturating_sub(MINUTES - 1) as f64 * 60.;
             let cpu_start = self.process_recording_since.unwrap_or(now).max(oldest);
@@ -649,6 +767,25 @@ impl History {
             });
         }
         let b = self.buckets.back_mut().unwrap();
+        for (i, rate) in self.io_rates.iter().enumerate() {
+            if let Some(rate) = rate.filter(|_| seconds > 0.) {
+                b.io.bytes[i] = Some(b.io.bytes[i].unwrap_or(0.) + rate * seconds);
+                b.io.seconds[i] += seconds;
+                b.io.peaks[i] = Some(b.io.peaks[i].unwrap_or(0.).max(rate));
+            }
+        }
+        if snapshot.stats.disk_total_bytes > 0 {
+            let weight = seconds.max(if b.io.free.is_none() { 0.001 } else { 0. });
+            let total = b.io.free_seconds + weight;
+            if total > 0. {
+                b.io.free = Some(
+                    (b.io.free.unwrap_or(0.) * b.io.free_seconds
+                        + snapshot.stats.disk_free_bytes as f64 * weight)
+                        / total,
+                );
+                b.io.free_seconds = total;
+            }
+        }
         let old = b.seconds;
         let weight = if seconds > 0. {
             seconds
@@ -736,7 +873,19 @@ impl History {
                 (part.end - part.start.max(now - span).max(cpu_start).max(process_start)).max(0.)
             });
             let gpu_seconds = (part.end - part.start.max(gpu_start).max(process_start)).max(0.);
-            if part.end > part.start && cpu_seconds == 0. && gpu_seconds == 0. {
+            let disk_fraction = process
+                .disk_sample_seconds
+                .filter(|span| *span > 0.)
+                .map_or(0., |span| {
+                    let start = (now - span).max(process_start);
+                    (part.end - part.start.max(start).max(cpu_start)).max(0.)
+                        / (now - start).max(0.000001)
+                });
+            if part.end > part.start
+                && cpu_seconds == 0.
+                && gpu_seconds == 0.
+                && disk_fraction == 0.
+            {
                 continue;
             }
 
@@ -752,6 +901,8 @@ impl History {
                 distinct_names += 1;
             }
             let total = sampled_processes.entry(process.name.clone()).or_default();
+            total.disk_read_bytes += process.disk_usage.0 as f64 * disk_fraction;
+            total.disk_write_bytes += process.disk_usage.1 as f64 * disk_fraction;
             total.cpu_seconds += process.cpu_usage as f64 / 100. * cpu_seconds;
             total.gpu_seconds += process.gpu_usage.unwrap_or(0.) as f64 / 100. * gpu_seconds;
             total.peak_memory += process.memory_usage;
@@ -849,11 +1000,87 @@ pub fn support_path(file: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn io_splits_minutes_and_rebaselines_after_pause_reset_and_failure() {
+        let mut h = History::default();
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.stats.network_totals = Some((100, 200));
+        snapshot.stats.disk_io_totals = Some((300, 400));
+        snapshot.stats.disk_total_bytes = 10000;
+        snapshot.stats.disk_free_bytes = 1000;
+        h.record(&snapshot, 6058., 3.).unwrap();
+        snapshot.stats.network_totals = Some((400, 800));
+        snapshot.stats.disk_io_totals = Some((1200, 1600));
+        h.record(&snapshot, 6061., 3.).unwrap();
+        assert_eq!(
+            h.buckets[0].io.bytes,
+            [Some(200.), Some(400.), Some(600.), Some(800.)]
+        );
+        assert_eq!(
+            h.buckets[1].io.bytes,
+            [Some(100.), Some(200.), Some(300.), Some(400.)]
+        );
+        assert_eq!(h.buckets[1].io.peaks[3], Some(400.));
+        assert_eq!(h.buckets[1].io.free, Some(1000.));
+        snapshot.stats.disk_io_totals = Some((1, 1));
+        h.record(&snapshot, 6064., 3.).unwrap();
+        assert_eq!(h.buckets[1].io.bytes[3], Some(400.));
+        snapshot.stats.disk_io_totals = None;
+        h.record(&snapshot, 6067., 3.).unwrap();
+        snapshot.stats.disk_io_totals = Some((9000, 9000));
+        h.record(&snapshot, 6070., 3.).unwrap();
+        assert_eq!(h.buckets[1].io.bytes[3], Some(400.));
+        h.suspend();
+        snapshot.stats.disk_io_totals = Some((19000, 19000));
+        h.record(&snapshot, 6073., 3.).unwrap();
+        assert_eq!(h.buckets[1].io.bytes[3], Some(400.));
+    }
+
+    #[test]
+    fn new_process_keeps_all_bytes_since_birth_between_ticks() {
+        let mut h = History::default();
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.processes = std::sync::Arc::new(vec![]);
+        h.record(&snapshot, 6058., 3.).unwrap();
+        let mut process = crate::test_data::process(9, "new-writer", 0.);
+        process.start_time = 6060;
+        process.disk_usage = (300, 600);
+        process.disk_sample_seconds = Some(3.);
+        snapshot.processes = std::sync::Arc::new(vec![process]);
+        h.record(&snapshot, 6061., 3.).unwrap();
+        assert!(!h.buckets[0].processes.contains_key("new-writer"));
+        assert_eq!(h.buckets[1].processes["new-writer"].disk_read_bytes, 300.);
+        assert_eq!(h.buckets[1].processes["new-writer"].disk_write_bytes, 600.);
+    }
+
+    #[test]
+    fn process_io_uses_sample_span_once_and_ignores_retained_snapshots() {
+        let mut h = History::default();
+        let mut snapshot = crate::test_data::snapshot();
+        let p = &mut std::sync::Arc::make_mut(&mut snapshot.processes)[0];
+        p.start_time = 0;
+        p.disk_usage = (300, 600);
+        p.disk_sample_seconds = Some(3.);
+        let name = p.name.clone();
+        h.record(&snapshot, 6058., 3.).unwrap();
+        h.record(&snapshot, 6061., 3.).unwrap();
+        assert_eq!(h.buckets[0].processes[&name].disk_write_bytes, 400.);
+        assert_eq!(h.buckets[1].processes[&name].disk_write_bytes, 200.);
+        snapshot.process_data = gtop_core::ProcessData::Stale {
+            since: std::time::Instant::now(),
+            reason: "test".into(),
+        };
+        h.record(&snapshot, 6064., 3.).unwrap();
+        assert_eq!(h.buckets[1].processes[&name].disk_write_bytes, 200.);
+    }
+
     fn sort_rows() -> Vec<(String, ProcessTotal)> {
         vec![
             (
                 "beta".into(),
                 ProcessTotal {
+                    disk_read_bytes: 0.,
+                    disk_write_bytes: 0.,
                     cpu_seconds: 2.,
                     gpu_seconds: 3.,
                     peak_memory: 20,
@@ -863,6 +1090,8 @@ mod tests {
             (
                 "alpha".into(),
                 ProcessTotal {
+                    disk_read_bytes: 0.,
+                    disk_write_bytes: 0.,
                     cpu_seconds: 1.,
                     gpu_seconds: 1.,
                     peak_memory: 10,
@@ -872,6 +1101,8 @@ mod tests {
             (
                 "gamma".into(),
                 ProcessTotal {
+                    disk_read_bytes: 0.,
+                    disk_write_bytes: 0.,
                     cpu_seconds: 3.,
                     gpu_seconds: 2.,
                     peak_memory: 30,
@@ -918,7 +1149,9 @@ mod tests {
                 HistorySortColumn::Share
                 | HistorySortColumn::GpuTime
                 | HistorySortColumn::PeakCpu => vec!["alpha", "gamma", "beta"],
-                HistorySortColumn::PeakMemory => vec!["alpha", "beta", "gamma"],
+                HistorySortColumn::PeakMemory
+                | HistorySortColumn::DiskRead
+                | HistorySortColumn::DiskWrite => vec!["alpha", "beta", "gamma"],
             };
             assert_eq!(sorted_names(sort, &rows), reversed);
         }
@@ -1402,6 +1635,7 @@ mod tests {
     fn metric_leaders_use_their_own_units() {
         let view = HistoryView {
             columns: vec![Some(Column {
+                io: Default::default(),
                 minute: 0,
                 seconds: 1.,
                 cpu: 0.,
@@ -1417,6 +1651,8 @@ mod tests {
                     (
                         i.to_string(),
                         ProcessTotal {
+                            disk_read_bytes: 0.,
+                            disk_write_bytes: 0.,
                             cpu_seconds: i as f64,
                             gpu_seconds: (4 - i) as f64,
                             peak_memory: (i * 10) as u64,
@@ -1483,6 +1719,8 @@ mod tests {
             processes.insert(
                 "cpu-heavy".into(),
                 ProcessTotal {
+                    disk_read_bytes: 0.,
+                    disk_write_bytes: 0.,
                     cpu_seconds: 9.,
                     gpu_seconds: 1.,
                     peak_memory: first_mem,
@@ -1492,6 +1730,8 @@ mod tests {
             processes.insert(
                 "gpu-heavy".into(),
                 ProcessTotal {
+                    disk_read_bytes: 0.,
+                    disk_write_bytes: 0.,
                     cpu_seconds: 3.,
                     gpu_seconds: 10.,
                     peak_memory: 50,
@@ -1501,6 +1741,8 @@ mod tests {
             processes.insert(
                 "memory-heavy".into(),
                 ProcessTotal {
+                    disk_read_bytes: 0.,
+                    disk_write_bytes: 0.,
                     cpu_seconds: 1.,
                     gpu_seconds: 2.,
                     peak_memory: 900,

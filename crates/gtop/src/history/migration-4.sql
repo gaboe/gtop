@@ -1,0 +1,14 @@
+ALTER TABLE system ADD COLUMN network_rx_bytes NUMERIC;
+ALTER TABLE system ADD COLUMN network_rx_peak REAL;
+ALTER TABLE system ADD COLUMN network_rx_seconds REAL;
+ALTER TABLE system ADD COLUMN network_tx_bytes NUMERIC;
+ALTER TABLE system ADD COLUMN network_tx_peak REAL;
+ALTER TABLE system ADD COLUMN network_tx_seconds REAL;
+ALTER TABLE system ADD COLUMN disk_read_bytes NUMERIC;
+ALTER TABLE system ADD COLUMN disk_read_peak REAL;
+ALTER TABLE system ADD COLUMN disk_read_seconds REAL;
+ALTER TABLE system ADD COLUMN disk_write_bytes NUMERIC;
+ALTER TABLE system ADD COLUMN disk_write_peak REAL;
+ALTER TABLE system ADD COLUMN disk_write_seconds REAL;
+ALTER TABLE system ADD COLUMN disk_free REAL;
+ALTER TABLE system ADD COLUMN disk_free_seconds REAL;

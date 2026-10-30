@@ -1002,6 +1002,35 @@ fn analysis_panel(
                     }
                 }),
             ));
+        for (index, name) in ["SSD read", "SSD write"].into_iter().enumerate() {
+            let columns = &history.disk_columns[index];
+            let max = columns.iter().flatten().copied().fold(1., f64::max);
+            history_panel = history_panel
+                .child(detail_line(
+                    name,
+                    bytes(if index == 0 {
+                        history.disk_read_bytes
+                    } else {
+                        history.disk_write_bytes
+                    } as u64),
+                ))
+                .child(div().flex().items_end().gap(px(1.)).h(px(24.)).children(
+                    columns.iter().map(|value| {
+                        match value {
+                            None => crate::rack::hatch(crate::palette::mix(
+                                t.base.led,
+                                t.base.ground,
+                                0.14,
+                            )),
+                            Some(value) => div()
+                                .flex_1()
+                                .min_w_0()
+                                .h(px((value / max * 24.).clamp(1., 24.) as f32))
+                                .bg(rgb(t.base.led)),
+                        }
+                    }),
+                ));
+        }
         history_panel = history_panel.child(
             div()
                 .flex()
