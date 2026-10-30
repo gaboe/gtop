@@ -3,12 +3,11 @@ use std::{
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{mpsc, Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const INTERVAL: Duration = Duration::from_secs(2);
 const PROBE_INTERVAL: Duration = Duration::from_secs(15);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const PROBE_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -19,6 +18,7 @@ const TARGET: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 1, 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SampledMetrics {
     pub(crate) time: u64,
+    pub(crate) interval_s: u64,
     pub(crate) cpu_percent: f64,
     pub(crate) memory_used_bytes: u64,
     pub(crate) memory_total_bytes: u64,
@@ -35,47 +35,51 @@ enum Outcome {
     Lost,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ProbeReading {
-    recent: Vec<(u64, Outcome)>,
+    loss: Vec<(u64, Outcome)>,
+    latency: Vec<(u64, Duration)>,
 }
 
 impl ProbeReading {
     fn record(&mut self, at: u64, outcome: Outcome) {
-        self.recent.push((at, outcome));
+        self.loss.push((at, outcome));
+        if let Outcome::Reply(duration) = outcome {
+            self.latency.push((at, duration));
+        }
         self.expire(at);
     }
 
     fn expire(&mut self, now: u64) {
-        self.recent
+        self.loss
             .retain(|(at, _)| *at <= now && now - *at <= PROBE_WINDOW.as_secs());
-        if self.recent.len() > PROBE_LIMIT {
-            self.recent.drain(..self.recent.len() - PROBE_LIMIT);
+        if self.loss.len() > PROBE_LIMIT {
+            self.loss.drain(..self.loss.len() - PROBE_LIMIT);
+        }
+        self.latency
+            .retain(|(at, _)| *at <= now && now - *at <= PROBE_WINDOW.as_secs());
+        if self.latency.len() > LATENCY_PROBES {
+            self.latency.drain(..self.latency.len() - LATENCY_PROBES);
         }
     }
 
     fn latency_ms(&self) -> Option<f64> {
         let mut successful: Vec<_> = self
-            .recent
+            .latency
             .iter()
-            .rev()
-            .filter_map(|(_, outcome)| match outcome {
-                Outcome::Reply(duration) => Some(duration.as_secs_f64() * 1000.),
-                Outcome::Lost => None,
-            })
-            .take(LATENCY_PROBES)
+            .map(|(_, duration)| duration.as_secs_f64() * 1000.)
             .collect();
         successful.sort_by(f64::total_cmp);
         successful.get(successful.len() / 2).copied()
     }
 
     fn loss_percent(&self) -> Option<f64> {
-        (!self.recent.is_empty()).then(|| {
-            self.recent
+        (!self.loss.is_empty()).then(|| {
+            self.loss
                 .iter()
                 .filter(|(_, outcome)| *outcome == Outcome::Lost)
                 .count() as f64
-                / self.recent.len() as f64
+                / self.loss.len() as f64
                 * 100.
         })
     }
@@ -124,11 +128,13 @@ struct Net {
     probe: &'static str,
 }
 
-fn snapshot(metrics: SampledMetrics, reading: &ProbeReading) -> NowSnapshot {
+fn snapshot_at(metrics: SampledMetrics, reading: &ProbeReading, now: u64) -> NowSnapshot {
+    let mut reading = reading.clone();
+    reading.expire(now);
     NowSnapshot {
         version: 1,
         time: metrics.time,
-        interval_s: 2,
+        interval_s: metrics.interval_s.min(u8::MAX as u64) as u8,
         pid: std::process::id(),
         commit: option_env!("GTOP_GIT_COMMIT").unwrap_or("unknown"),
         cpu: Cpu {
@@ -157,13 +163,20 @@ fn snapshot(metrics: SampledMetrics, reading: &ProbeReading) -> NowSnapshot {
     }
 }
 
+fn snapshot(metrics: SampledMetrics, reading: &ProbeReading) -> NowSnapshot {
+    snapshot_at(metrics, reading, unix_seconds())
+}
+
 fn write_atomic(directory: &Path, value: &NowSnapshot) -> io::Result<()> {
     std::fs::create_dir_all(directory)?;
     let file = directory.join("now.json");
     let temporary = directory.join(format!(".now.{}.tmp", std::process::id()));
     let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
-    std::fs::write(&temporary, bytes)?;
-    std::fs::rename(temporary, file)
+    let result = std::fs::write(&temporary, bytes).and_then(|()| std::fs::rename(&temporary, file));
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
 }
 
 fn probe_once(connector: impl FnOnce(SocketAddr, Duration) -> io::Result<Duration>) -> Outcome {
@@ -177,6 +190,27 @@ fn connect(target: SocketAddr, timeout: Duration) -> io::Result<Duration> {
     let started = Instant::now();
     TcpStream::connect_timeout(&target, timeout)?;
     Ok(started.elapsed())
+}
+
+fn probe_loop(
+    stop: Arc<StopSignal>,
+    reading: Arc<Mutex<ProbeReading>>,
+    connector: impl Fn(SocketAddr, Duration) -> io::Result<Duration>,
+) {
+    loop {
+        if !stop.wait(Duration::ZERO) {
+            break;
+        }
+        let due = Instant::now() + PROBE_INTERVAL;
+        let outcome = probe_once(&connector);
+        reading
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .record(unix_seconds(), outcome);
+        if !stop.wait(due.saturating_duration_since(Instant::now())) {
+            break;
+        }
+    }
 }
 
 fn unix_seconds() -> u64 {
@@ -224,14 +258,14 @@ impl StopSignal {
 }
 
 pub(crate) struct Writer {
-    metrics: Arc<Mutex<Option<SampledMetrics>>>,
+    updates: mpsc::Sender<SampledMetrics>,
     stop: Arc<StopSignal>,
     _workers: Vec<JoinHandle<()>>,
 }
 
 impl Writer {
     pub(crate) fn start(directory: PathBuf) -> io::Result<Self> {
-        let metrics = Arc::new(Mutex::new(None));
+        let (updates, receiver) = mpsc::channel();
         let reading = Arc::new(Mutex::new(ProbeReading::default()));
         let stop = Arc::new(StopSignal::new());
 
@@ -239,30 +273,18 @@ impl Writer {
         let probe_reading = reading.clone();
         let probe = thread::Builder::new()
             .name("gtop-network-probe".into())
-            .spawn(move || loop {
-                let due = Instant::now() + PROBE_INTERVAL;
-                let outcome = probe_once(connect);
-                let mut reading = probe_reading
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                reading.record(unix_seconds(), outcome);
-                drop(reading);
-                if !probe_stop.wait(due.saturating_duration_since(Instant::now())) {
-                    break;
-                }
-            })?;
+            .spawn(move || probe_loop(probe_stop, probe_reading, connect))?;
 
         let writer_stop = stop.clone();
-        let writer_metrics = metrics.clone();
         let writer_reading = reading;
         let writer = match thread::Builder::new()
             .name("gtop-now-json".into())
             .spawn(move || {
-                while writer_stop.wait(INTERVAL) {
-                    let metrics = *writer_metrics
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    let Some(metrics) = metrics else { continue };
+                while writer_stop.wait(Duration::ZERO) {
+                    let metrics = match receiver.recv() {
+                        Ok(metrics) => metrics,
+                        Err(_) => break,
+                    };
                     let reading = writer_reading
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
@@ -280,17 +302,14 @@ impl Writer {
         };
 
         Ok(Self {
-            metrics,
+            updates,
             stop,
             _workers: vec![probe, writer],
         })
     }
 
     pub(crate) fn update(&self, metrics: SampledMetrics) {
-        *self
-            .metrics
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(metrics);
+        let _ = self.updates.send(metrics);
     }
 }
 
@@ -308,6 +327,7 @@ mod tests {
     fn metrics() -> SampledMetrics {
         SampledMetrics {
             time: 1_800_000_000,
+            interval_s: 2,
             cpu_percent: 12.5,
             memory_used_bytes: 500,
             memory_total_bytes: 1000,
@@ -323,7 +343,7 @@ mod tests {
     fn serialization_matches_the_version_one_format() {
         let mut reading = ProbeReading::default();
         reading.record(1_800_000_000, Outcome::Reply(Duration::from_millis(25)));
-        let value = snapshot(metrics(), &reading);
+        let value = snapshot_at(metrics(), &reading, 1_800_000_000);
         let json = serde_json::to_string(&value).unwrap();
         let expected = format!(
             r#"{{"version":1,"time":1800000000,"interval_s":2,"pid":{},"commit":"{}","cpu":{{"percent":12.5}},"memory":{{"used_bytes":500,"total_bytes":1000,"percent":50.0}},"ssd":{{"free_bytes":2000,"total_bytes":4000,"read_bytes_per_s":null,"write_bytes_per_s":null,"temperature_c":null}},"net":{{"rx_bytes_per_s":10,"tx_bytes_per_s":20,"latency_ms":25.0,"loss_percent":0.0,"probe":"tcp 1.1.1.1:443"}}}}"#,
@@ -378,8 +398,10 @@ mod tests {
         assert_eq!(reading.latency_ms(), Some(40.));
         reading.record(1_005, Outcome::Lost);
         assert_eq!(reading.loss_percent(), Some(1. / 6. * 100.));
-        reading.expire(1_306);
-        assert_eq!(reading.loss_percent(), None);
+        let expired = snapshot_at(metrics(), &reading, 1_306);
+        let json = serde_json::to_value(expired).unwrap();
+        assert_eq!(json["net"]["latency_ms"], serde_json::Value::Null);
+        assert_eq!(json["net"]["loss_percent"], serde_json::Value::Null);
     }
 
     #[test]
@@ -406,7 +428,76 @@ mod tests {
         for at in 0..25 {
             reading.record(at, Outcome::Reply(Duration::from_millis(at)));
         }
-        assert_eq!(reading.recent.len(), PROBE_LIMIT);
+        assert_eq!(reading.loss.len(), PROBE_LIMIT);
         assert_eq!(reading.latency_ms(), Some(23.));
+    }
+
+    #[test]
+    fn latency_survives_a_full_window_of_failures() {
+        let mut reading = ProbeReading::default();
+        for (at, millis) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+            reading.record(at, Outcome::Reply(Duration::from_millis(millis)));
+        }
+        for at in 5..25 {
+            reading.record(at, Outcome::Lost);
+        }
+        assert_eq!(reading.loss.len(), PROBE_LIMIT);
+        assert_eq!(reading.latency_ms(), Some(30.));
+    }
+
+    #[test]
+    fn snapshot_reports_the_active_sampling_interval() {
+        let mut sample = metrics();
+        sample.interval_s = 10;
+        let value = snapshot_at(sample, &ProbeReading::default(), sample.time);
+        let directory = tempfile::tempdir().unwrap();
+        write_atomic(directory.path(), &value).unwrap();
+        let contents: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.path().join("now.json")).unwrap())
+                .unwrap();
+        assert_eq!(contents["interval_s"], 10);
+    }
+
+    #[test]
+    fn publication_expires_old_probe_results() {
+        let mut reading = ProbeReading::default();
+        reading.record(1_000, Outcome::Reply(Duration::from_millis(25)));
+        reading.record(1_000, Outcome::Lost);
+        let value = snapshot_at(metrics(), &reading, 1_301);
+        let json = serde_json::to_value(value).unwrap();
+        assert_eq!(json["net"]["latency_ms"], serde_json::Value::Null);
+        assert_eq!(json["net"]["loss_percent"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn stopped_probe_does_not_connect() {
+        let stop = Arc::new(StopSignal::new());
+        stop.stop();
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connector_called = called.clone();
+        probe_loop(
+            stop,
+            Arc::new(Mutex::new(ProbeReading::default())),
+            move |_, _| {
+                connector_called.store(true, Ordering::Relaxed);
+                Ok(Duration::ZERO)
+            },
+        );
+        assert!(!called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn failed_rename_removes_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("now.json")).unwrap();
+        assert!(write_atomic(
+            directory.path(),
+            &snapshot(metrics(), &ProbeReading::default())
+        )
+        .is_err());
+        assert!(!directory
+            .path()
+            .join(format!(".now.{}.tmp", std::process::id()))
+            .exists());
     }
 }

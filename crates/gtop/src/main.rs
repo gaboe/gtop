@@ -549,6 +549,7 @@ impl Monitor {
                                     let stats = &snapshot.stats;
                                     writer.update(now_json::SampledMetrics {
                                         time: rack::now() as u64,
+                                        interval_s: seconds,
                                         cpu_percent: (stats.cpu_usage.iter().sum::<f32>()
                                             / stats.cpu_usage.len().max(1) as f32)
                                             as f64,
