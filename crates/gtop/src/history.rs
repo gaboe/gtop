@@ -856,6 +856,12 @@ impl History {
                 },
             );
         }
+        let process_span = snapshot
+            .processes
+            .iter()
+            .filter_map(|process| process.cpu_sample_seconds)
+            .fold(0., f64::max);
+        let loaded_start = (now - process_span).max(cpu_start).min(gpu_start);
         let b = &mut self.buckets[index];
         let mut sampled_processes = BTreeMap::<String, ProcessTotal>::new();
         let mut distinct_names = b.processes.len();
@@ -870,17 +876,10 @@ impl History {
             let gpu_seconds = (part.end - part.start.max(gpu_start).max(process_start)).max(0.);
             let disk_fraction = process
                 .disk_sample_seconds
-                .filter(|span| {
-                    *span > 0.
-                        && now - span >= cpu_start
-                        && *span
-                            <= process
-                                .cpu_sample_seconds
-                                .unwrap_or(now - gpu_start)
-                                .max(now - gpu_start)
-                })
-                .map_or(0., |span| {
-                    let start = (now - span).max(process_start);
+                .filter(|span| *span > 0.)
+                .map(|span| (now - span).max(process_start))
+                .filter(|start| *start >= cpu_start && *start >= loaded_start)
+                .map_or(0., |start| {
                     (part.end - part.start.max(start)).max(0.) / (now - start).max(0.000001)
                 });
             if part.end > part.start
@@ -1181,6 +1180,25 @@ mod tests {
         assert!(!h.buckets[0].processes.contains_key("new-writer"));
         assert_eq!(h.buckets[1].processes["new-writer"].disk_read_bytes, 300.);
         assert_eq!(h.buckets[1].processes["new-writer"].disk_write_bytes, 600.);
+    }
+
+    #[test]
+    fn newborn_disk_bytes_survive_unequal_collection_and_history_intervals() {
+        let mut h = History::default();
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.processes = std::sync::Arc::new(vec![]);
+        h.record(&snapshot, 5900., 3.).unwrap();
+        h.record(&snapshot, 6000.100, 3.).unwrap();
+        let mut process = crate::test_data::process(9, "new-writer", 0.);
+        process.start_time = 6001;
+        process.cpu_sample_seconds = None;
+        process.disk_sample_seconds = Some(3.100);
+        process.disk_usage = (300, 100 * 1024 * 1024);
+        snapshot.processes = std::sync::Arc::new(vec![process]);
+        h.record(&snapshot, 6003.150, 3.).unwrap();
+        let total = &h.buckets.back().unwrap().processes["new-writer"];
+        assert_eq!(total.disk_read_bytes, 300.);
+        assert_eq!(total.disk_write_bytes, (100 * 1024 * 1024) as f64);
     }
 
     #[test]

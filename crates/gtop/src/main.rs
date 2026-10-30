@@ -450,7 +450,8 @@ impl Monitor {
                     } else {
                         state.snapshot(false, true)
                     };
-                    let sample_duration = start.elapsed();
+                    let sampled_at = Instant::now();
+                    let sample_duration = sampled_at.duration_since(start);
                     sample_perf.add_sampler(sample_duration);
                     let tick_ms = sample_duration.as_secs_f64() * 1000.;
                     let mut views = None;
@@ -508,9 +509,9 @@ impl Monitor {
                         Some((key, _, _, _)) if !matches!(history_save, Some(Err(_))) && (snapshot.is_ok() || previous_analysis_key == Some(key)) => Some(key),
                         _ => None,
                     };
-                    (snapshot, tick_ms, views, moment_detail, process_analysis, history, cached_minute, history_save, moment, metric, selected_key)
+                    (snapshot, sampled_at, tick_ms, views, moment_detail, process_analysis, history, cached_minute, history_save, moment, metric, selected_key)
                 }).await;
-                let (result, tick_ms, views, moment_detail, process_analysis, returned_history, returned_minute, history_save, selection, metric, selected_key) = result;
+                let (result, sampled_at, tick_ms, views, moment_detail, process_analysis, returned_history, returned_minute, history_save, selection, metric, selected_key) = result;
                 cached_minute=returned_minute;
                 cached_analysis_key = selected_key;
                 history = returned_history;
@@ -554,7 +555,7 @@ impl Monitor {
                                     writer.update(now_json::SampledMetrics {
                                         time: rack::now() as u64,
                                         interval_s: seconds,
-                                        sampled_at: Instant::now(),
+                                        sampled_at,
                                         cpu_percent: (stats.cpu_usage.iter().sum::<f32>()
                                             / stats.cpu_usage.len().max(1) as f32)
                                             as f64,
