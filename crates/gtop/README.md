@@ -24,6 +24,14 @@ Choose a refresh interval from 1, 2, 3, 5, or 10 seconds. The default is 3 secon
 
 The SSD panel shows system-volume storage in decimal GB. On macOS, the app reads free space on every sample and refreshes total capacity and the paired purgeable-space estimate every 60 seconds while sampling runs. Purgeable space is the difference between `NSURLVolumeAvailableCapacityForImportantUsageKey` and free space from the same refresh. APFS volumes share the container capacity. On other platforms, gtop uses sysinfo's available-space value, which updates during the 60-second disk refresh. It reports no purgeable space.
 
+## Current metrics file
+
+While gtop runs, it writes `~/Library/Application Support/gtop/now.json` every two seconds. The file contains the latest system sample. Its `time` is the sample time in Unix seconds. Readers can use it to detect stale data. The file remains after gtop exits.
+
+Version 1 has `cpu.percent`; `memory.used_bytes`, `memory.total_bytes`, and `memory.percent`; `ssd.free_bytes`, `ssd.total_bytes`, `ssd.read_bytes_per_s`, `ssd.write_bytes_per_s`, and `ssd.temperature_c`; and `net.rx_bytes_per_s`, `net.tx_bytes_per_s`, `net.latency_ms`, `net.loss_percent`, and `net.probe`. Percentages use the same values as the CPU and memory panels. The SSD byte counts use the same system-volume values as the SSD panel. Read and write rates are `null` until gtop can sample system-wide disk rates. The temperature is `null` when no SSD sensor is available.
+
+The network probe opens a TCP connection to `1.1.1.1:443` every 15 seconds and closes it after the handshake. `latency_ms` is the median of the last four successful probes. `loss_percent` covers up to 20 probes from the last five minutes. Both values are `null` before gtop has probe results.
+
 To log sampling and visible UI ticks, run:
 
 ```sh

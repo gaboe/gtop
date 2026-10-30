@@ -8,6 +8,7 @@ mod draw_benchmark;
 mod glow;
 mod history;
 mod model;
+mod now_json;
 mod palette;
 mod process_table;
 mod rack;
@@ -151,6 +152,7 @@ struct Monitor {
     shutdown: Option<ShutdownDrains>,
     _ports: Task<()>,
     _perf_writer: Task<()>,
+    _now_json: Option<now_json::Writer>,
     _frames: Task<()>,
 }
 
@@ -543,6 +545,26 @@ impl Monitor {
                         Ok(snapshot) => {
                             if !this.paused {
                                 this.observe_sample(&snapshot);
+                                if let Some(writer) = &this._now_json {
+                                    let stats = &snapshot.stats;
+                                    writer.update(now_json::SampledMetrics {
+                                        time: rack::now() as u64,
+                                        cpu_percent: (stats.cpu_usage.iter().sum::<f32>()
+                                            / stats.cpu_usage.len().max(1) as f32)
+                                            as f64,
+                                        memory_used_bytes: stats.memory_used,
+                                        memory_total_bytes: stats.memory_total,
+                                        disk_free_bytes: (stats.disk_total_bytes > 0)
+                                            .then_some(stats.disk_free_bytes),
+                                        disk_total_bytes: (stats.disk_total_bytes > 0)
+                                            .then_some(stats.disk_total_bytes),
+                                        rx_bytes_per_s: stats.network_rx_bytes,
+                                        tx_bytes_per_s: stats.network_tx_bytes,
+                                        temperature_c: stats.temperatures.iter()
+                                            .find(|temperature| temperature.name == "SSD")
+                                            .map(|temperature| temperature.celsius as f64),
+                                    });
+                                }
                                 if window.is_visible() {
                                     this.tick_ms = tick_ms;
                                     this.accept(snapshot, window, cx);
@@ -646,6 +668,18 @@ impl Monitor {
                 }
             }
         });
+        let now_json = match now_json::Writer::start(
+            history::support_path("now.json")
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf(),
+        ) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                eprintln!("Current metrics writer could not start: {error}");
+                None
+            }
+        };
         Self {
             core: None,
             snapshot: None,
@@ -696,6 +730,7 @@ impl Monitor {
             _frames: frames,
             _ports: ports_task,
             _perf_writer: perf_writer,
+            _now_json: now_json,
         }
     }
 
@@ -851,15 +886,17 @@ fn main() {
                                 monitor.shutdown.take(),
                                 monitor.settings_writes.take(),
                                 monitor.settings_writer.take(),
+                                monitor._now_json.take(),
                                 monitor.settings.clone(),
                             )
                         })
                     });
                 async move {
-                    if let Some((refresh, drains, sender, writer, settings)) = state {
+                    if let Some((refresh, drains, sender, writer, now_json, settings)) = state {
                         // Shutdown blocks foreground tasks. Poll their shared futures here.
                         drop(refresh);
                         drop(writer);
+                        drop(now_json);
                         if let Some(ShutdownDrains {
                             history,
                             settings: settings_drain,

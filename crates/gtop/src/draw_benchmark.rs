@@ -258,6 +258,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
         _ports: Task::ready(()),
         _frames: Task::ready(()),
         _perf_writer: Task::ready(()),
+        _now_json: None,
     }
 }
 
