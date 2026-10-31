@@ -16,7 +16,7 @@ sh crates/gtop/package-macos.sh
 
 The bundle is `target/gtop-native/gtop.app`. Packaging does not install it in `/Applications`.
 
-Click a table header to sort. Click it again to reverse the order. Search accepts names, commands, PID substrings, and comma-separated alternatives. Use `:3000` or `port:3000` to find a local bound port. Port collection runs only while the search contains a valid port term.
+Click a table header to sort. Click it again to reverse the order. Search accepts names, commands, PID substrings, and comma-separated alternatives. Use `:3000` or `port:3000` to find a local bound port. While the window is visible and not paused, gtop refreshes its port cache every 10 seconds. A valid port search also collects ports on each sample.
 
 Select a process to show its command, root directory, resources, parent, and children. Load environment variables on demand. The kill action requires a second confirmation. It checks the process start time before sending the signal.
 
@@ -38,7 +38,7 @@ To log sampling and visible UI ticks, run:
 GTOP_PERF=1 cargo run --release -p gtop
 ```
 
-The app pins `gpui-pre` and its platform crate to `0.3.9`. It pins `gpui-component` to `0.8.0`, which requires that exact GPUI version. The component table virtualizes rows and columns. Search and sorting run when input or a snapshot changes. They do not run during row rendering.
+The app pins `gpui-pre` and its platform crate to `0.3.9`. It pins `gpui-component` to `0.8.0`, which requires that exact GPUI version. The process table uses custom GPUI elements. It renders the first ten rows directly and virtualizes the remaining rows with `uniform_list`. Columns are not virtualized. Search and sorting run when input or a snapshot changes. They do not run during row rendering.
 
 On macOS, `font-kit` enables native text. The app compiles Metal shaders at startup through GPUI's `runtime_shaders` feature. This avoids a build dependency on Apple's optional Metal Toolchain. The first window can take longer to appear.
 
