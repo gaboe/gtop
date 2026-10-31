@@ -3,13 +3,20 @@ name = "gtop"
 version = "1.2.0"
 edition = "2021"
 license = "MIT"
+description = "Native GPUI system monitor for macOS"
+repository = "https://github.com/gaboe/gtop"
+homepage = "https://github.com/gaboe/gtop"
+readme = "README.md"
+keywords = ["macos", "monitor", "process", "system"]
+categories = ["os::macos-apis", "visualization"]
+rust-version = "1.99.1"
 
 [features]
 history-benchmark = []
 history-profile = []
 
 [dependencies]
-gtop-core = { path = "../gtop-core" }
+gtop-core = { path = "../gtop-core", version = "1.2.0" }
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["profiler"] }
 gpui-base = "=0.8.0"
 gpui-component = "=0.8.0"
@@ -28,6 +35,7 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 rusqlite = { version = "=0.41.0", features = ["bundled"] }
 
 [dev-dependencies]
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["test-support"] }
 tempfile = "3"
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
 

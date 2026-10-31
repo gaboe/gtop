@@ -57,7 +57,7 @@ It does not measure visible UI cost.
 ## Measure the visible window later
 
 Do this only after the operator permits the visible measurement.
-Start the release app with `NEOHTOP_PERF=1` and redirect stderr to a new log file.
+Start the release app with `GTOP_PERF=1` and redirect stderr to a new log file.
 Keep its window frontmost and exposed for the full measurement.
 Do not interact with it during the 60 seconds.
 

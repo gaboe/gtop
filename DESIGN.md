@@ -52,7 +52,7 @@ components:
 The visual world is a VFD rack instrument. The app runs in Operate mode.
 Recessed readouts sit inside flat metal plates. Dense rows keep process names and resource values visible beside the system readings.
 
-This document describes the native GPUI app in `crates/gtop`, not the older Svelte interface or HTML prototypes.
+This document describes the native GPUI app in `crates/gtop`.
 The default palette is Amber. Palette changes preserve the same geometry and semantic color roles.
 
 ## Colors

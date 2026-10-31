@@ -35,7 +35,7 @@ The network probe opens a TCP connection to `1.1.1.1:443` every 15 seconds and c
 To log sampling and visible UI ticks, run:
 
 ```sh
-NEOHTOP_PERF=1 cargo run --release -p gtop
+GTOP_PERF=1 cargo run --release -p gtop
 ```
 
 The app pins `gpui-pre` and its platform crate to `0.3.9`. It pins `gpui-component` to `0.8.0`, which requires that exact GPUI version. The component table virtualizes rows and columns. Search and sorting run when input or a snapshot changes. They do not run during row rendering.
@@ -49,3 +49,13 @@ cargo test --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace -- -D warnings
 ```
+
+## README screenshots
+
+From the repository root on macOS, run:
+
+```sh
+cargo test -p gtop --bin gtop readme_screenshots -- --ignored --nocapture
+```
+
+This writes `docs/screenshots/live.png`, `detail.png`, and `history24h.png` using a fixed clock and 40 fake processes. It uses GPUI TestPlatform with Apple text and the headless Metal renderer. It opens no native window and reads no live monitoring data or saved settings. The disk screenshot is omitted because the existing disk fixture starts a real filesystem scan.

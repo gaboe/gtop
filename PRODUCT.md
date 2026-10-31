@@ -10,7 +10,7 @@ Native macOS desktop app drawn with GPUI (Metal). Not a web view. Linux and Wind
 
 ## Users
 
-Developers on Apple Silicon Macs. The primary user keeps gtop open all day and looks at it when a build or test runs, or when the Mac gets loud and hot, to find which process causes it. A second use is a quick glance at CPU, memory and GPU before closing it. The fork is public, so other Mac developers are an intended audience too.
+Developers on Apple Silicon Macs. The primary user keeps gtop open all day and looks at it when a build or test runs, or when the Mac gets loud and hot, to find which process causes it. A second use is a quick glance at CPU, memory and GPU before closing it. The project is public, so other Mac developers are an intended audience too.
 
 ## Product Purpose
 
@@ -20,7 +20,7 @@ Show what the Mac is doing right now, and which process is responsible, at a cos
 
 Speed is the product. gtop aims to be the fastest process monitor there is: the lowest CPU and memory cost per refresh, the shortest time from launch to the first full table, and no dropped frames while scrolling and sorting hundreds of processes. GPUI draws the window on the GPU (Metal), and the data layer refreshes only what changed. Confirmed by the user on 2026-10-23 as the most important product feature.
 
-"Fastest in the world" is a goal, not yet a claim. Publish it only next to a reproducible benchmark against named monitors (Activity Monitor, btop, htop, NeoHtop). Until then, show the monitor's own measured cost instead of the slogan.
+"Fastest in the world" is a goal, not yet a claim. Publish it only next to a reproducible benchmark against named monitors (Activity Monitor, btop, htop). Until then, show the monitor's own measured cost instead of the slogan.
 
 Second: per-process GPU time, GPU memory and temperatures read from IOKit without sudo, and listening ports mapped to processes. Activity Monitor has no per-process GPU percentage or temperature panel; terminal tops have no native window.
 
@@ -47,13 +47,13 @@ Second: per-process GPU time, GPU memory and temperatures read from IOKit withou
 
 ## Brand Commitments
 
-- Name: gtop. Fork of NeoHtop by Abdenasser, MIT license. Credit the upstream project in About.
+- Name: gtop. Native GPUI system monitor, MIT license.
 - The user asked for a modern brutalist, cypherpunk or cyberpunk direction for the redesign (2026-10-23).
 
 ## Evidence on Hand
 
-- Real measurements from this fork: per-tick refresh cost dropped from 68–74 ms to 7–16 ms, payload from 3.37 MB to 0.34 MB. These are developer-machine numbers, not published benchmarks.
-- No screenshots, testimonials, users or download counts exist yet. Do not invent them.
+- Real measurements from gtop: per-tick refresh cost dropped from 68–74 ms to 7–16 ms, payload from 3.37 MB to 0.34 MB. These are developer-machine numbers, not published benchmarks.
+- README screenshots use fake data. No testimonials, users or download counts are recorded. Do not invent them.
 
 ## Product Principles
 

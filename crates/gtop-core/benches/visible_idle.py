@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run later with permission. Sample an existing frontmost gtop, without focusing it.
 
-Launch gtop with NEOHTOP_PERF=1 and redirect stderr to a new log file first.
+Launch gtop with GTOP_PERF=1 and redirect stderr to a new log file first.
 Pass its PID, that log, and an output JSON path. Exit nonzero on invalid samples.
 CPU is ps averaged CPU. RSS is resident memory in KiB. Frame logs report CPU
 Window::draw work, not GPU completion. FPS counts draws in each sampled second.

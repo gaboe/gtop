@@ -111,10 +111,19 @@ fn fixed_snapshot() -> Snapshot {
 
 #[cfg(target_os = "macos")]
 fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
+    fixture_from_snapshot(fixed_snapshot(), window, cx)
+}
+
+#[cfg(target_os = "macos")]
+fn fixture_from_snapshot(
+    snapshot: Snapshot,
+    window: &mut Window,
+    cx: &mut Context<Monitor>,
+) -> Monitor {
     let settings = palette::Settings::default();
     let base = settings.base();
     let focus = cx.focus_handle();
-    let snapshot = Rc::new(fixed_snapshot());
+    let snapshot = Rc::new(snapshot);
     let table = cx.new(|_| {
         let mut table = Processes::default();
         table.snapshot = Some(snapshot.clone());
@@ -2234,3 +2243,7 @@ fn detail_focus_transition(cx: &mut TestAppContext, key: &str) {
         _ => unreachable!(),
     }
 }
+
+#[cfg(target_os = "macos")]
+#[path = "screenshots.rs"]
+mod screenshots;

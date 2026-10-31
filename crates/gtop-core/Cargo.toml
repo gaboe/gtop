@@ -3,6 +3,13 @@ name = "gtop-core"
 version = "1.2.0"
 edition = "2021"
 license = "MIT"
+description = "System monitoring collectors for gtop"
+repository = "https://github.com/gaboe/gtop"
+homepage = "https://github.com/gaboe/gtop"
+readme = "../../README.md"
+keywords = ["macos", "monitor", "process", "system"]
+categories = ["os::macos-apis", "visualization"]
+rust-version = "1.99.1"
 
 [dependencies]
 listeners = "0.6"
