@@ -24,7 +24,7 @@ pub struct AppState {
     process_monitor: Mutex<ProcessMonitor>,
     /// System statistics monitoring component
     system_monitor: Mutex<SystemMonitor>,
-    /// Apple Silicon performance and efficiency core counts, read at startup.
+    /// Apple Silicon fast and slow core banks, read at startup.
     cpu_topology: CpuTopology,
     #[cfg(target_os = "macos")]
     process_rows: Mutex<(Arc<Vec<crate::ProcessInfo>>, ProcessData, u64)>,

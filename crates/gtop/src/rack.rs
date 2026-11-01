@@ -974,23 +974,22 @@ fn core_bank_share(values: &[(usize, f32)], logical_cpus: usize, scale: palette:
     values.iter().map(|(_, value)| value).sum::<f32>() / divisor as f32
 }
 
-fn hybrid_bank_widths(performance_count: usize, efficiency_count: usize) -> (f32, f32) {
-    let total_count = (performance_count + efficiency_count).max(1) as f32;
+fn hybrid_bank_widths(fast_count: usize, slow_count: usize) -> (f32, f32) {
+    let total_count = (fast_count + slow_count).max(1) as f32;
     let available_width = CORE_BANK_ROW_WIDTH - CORE_BANK_GAP;
     let free_space = available_width - 2. * CORE_BANK_FLEX_BASIS;
-    let mut performance_width =
-        CORE_BANK_FLEX_BASIS + free_space * performance_count as f32 / total_count;
-    let mut efficiency_width = available_width - performance_width;
+    let mut fast_width = CORE_BANK_FLEX_BASIS + free_space * fast_count as f32 / total_count;
+    let mut slow_width = available_width - fast_width;
 
-    if performance_width < CORE_BANK_MIN_WIDTH {
-        performance_width = CORE_BANK_MIN_WIDTH;
-        efficiency_width = available_width - performance_width;
-    } else if efficiency_width < CORE_BANK_MIN_WIDTH {
-        efficiency_width = CORE_BANK_MIN_WIDTH;
-        performance_width = available_width - efficiency_width;
+    if fast_width < CORE_BANK_MIN_WIDTH {
+        fast_width = CORE_BANK_MIN_WIDTH;
+        slow_width = available_width - fast_width;
+    } else if slow_width < CORE_BANK_MIN_WIDTH {
+        slow_width = CORE_BANK_MIN_WIDTH;
+        fast_width = available_width - slow_width;
     }
 
-    (performance_width, efficiency_width)
+    (fast_width, slow_width)
 }
 
 fn core_bank(
@@ -1064,28 +1063,28 @@ fn core_banks(usage: &[f32], topology: &CpuTopology, scale: palette::CpuScale, t
     let logical_cpus = usage.len();
     match topology.banks(usage) {
         CpuBanks::Hybrid {
-            performance,
-            efficiency,
+            fast,
+            slow,
+            letters: [fast_letter, slow_letter],
         } => {
-            let (performance_width, efficiency_width) =
-                hybrid_bank_widths(performance.len(), efficiency.len());
+            let (fast_width, slow_width) = hybrid_bank_widths(fast.len(), slow.len());
             banks = banks
                 .child(core_bank(
-                    "P CORES",
-                    "P",
-                    &performance,
+                    &format!("{fast_letter} CORES"),
+                    &fast_letter.to_string(),
+                    &fast,
                     logical_cpus,
                     scale,
-                    performance_width,
+                    fast_width,
                     t,
                 ))
                 .child(core_bank(
-                    "E CORES",
-                    "E",
-                    &efficiency,
+                    &format!("{slow_letter} CORES"),
+                    &slow_letter.to_string(),
+                    &slow,
                     logical_cpus,
                     scale,
-                    efficiency_width,
+                    slow_width,
                     t,
                 ));
         }
