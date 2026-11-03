@@ -25,7 +25,8 @@ examine_globs = [
 
 exclude_re = [
   # FFI shells: they call IOKit, SMC, or libproc and need real hardware.
-  "<impl Drop for ",
+  # Only their Drop impls release kernel handles; other Drop impls stay in scope.
+  '(iokit|smc)\.rs.*<impl Drop for ',
   "iokit.rs.*(Object::|Accelerator::(all|name|stats|gpu_time_per_process|number)|StorageDrivers::)",
   "smc.rs.*GpuTemperature::",
   "temperature_monitor.rs.*TemperatureMonitor::collect",
