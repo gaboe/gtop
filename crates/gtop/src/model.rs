@@ -659,4 +659,40 @@ mod tests {
             vec![1, 3, 2, 0]
         );
     }
+
+    #[test]
+    fn column_headers_name_each_live_column() {
+        assert_eq!(
+            ProcessColumn::ALL.map(ProcessColumn::label),
+            ["", "Process", "PID", "User", "CPU %", "Memory", "Age", "GPU %", "Ports", "Command"]
+        );
+    }
+
+    #[test]
+    fn gpu_text_shows_measured_use_and_a_dot_for_idle_or_unknown() {
+        let mut gpu = process(1, "gpu", 0., vec![]);
+        let text = |process: &ProcessInfo| {
+            ProcessColumn::Gpu.text(process, 1, crate::palette::CpuScale::Mac)
+        };
+        assert_eq!(text(&gpu), "·");
+        gpu.gpu_usage = Some(0.);
+        assert_eq!(text(&gpu), "·");
+        gpu.gpu_usage = Some(2.5);
+        assert_eq!(text(&gpu), "2.5");
+    }
+
+    #[test]
+    fn byte_labels_stop_at_terabytes() {
+        assert_eq!(bytes(999), "999.0 B");
+        assert_eq!(bytes(5_000_000_000_000_000), "5000.0 TB");
+    }
+
+    #[test]
+    fn running_time_lists_hours_below_a_day_and_days_from_one_day() {
+        assert_eq!(duration(0), "0h 0m 0s");
+        assert_eq!(duration(3661), "1h 1m 1s");
+        assert_eq!(duration(86399), "23h 59m 59s");
+        assert_eq!(duration(86400), "1d 0h 0m");
+        assert_eq!(duration(90061), "1d 1h 1m");
+    }
 }

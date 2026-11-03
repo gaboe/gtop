@@ -570,4 +570,85 @@ mod tests {
         assert_eq!(history.peak_cpu, 60.);
         assert_eq!(history.peak_minute, 0);
     }
+
+    #[test]
+    fn history_covers_exactly_the_last_day_up_to_now() {
+        let now = 2_000;
+        assert!(process_history("builder", now, &[bucket(now - 1_440, 20.)]).is_none());
+        assert!(process_history("builder", now, &[bucket(now + 1, 20.)]).is_none());
+        let history = process_history(
+            "builder",
+            now,
+            &[bucket(now - 1_440, 20.), bucket(now - 1_439, 40.)],
+        )
+        .unwrap();
+        assert_eq!(history.recorded_minutes, 1);
+        assert_eq!(history.columns[0], Some(40.));
+    }
+
+    #[test]
+    fn a_minute_without_sampled_time_counts_as_idle() {
+        let mut unsampled = bucket(0, 50.);
+        unsampled.seconds = 0.;
+        let history = process_history("builder", 1439, &[unsampled]).unwrap();
+        assert_eq!(history.columns[0], Some(0.));
+        assert_eq!(history.busy_average, 0.);
+    }
+
+    #[test]
+    fn busy_runs_need_more_than_half_a_core() {
+        let half = (0..3).map(|minute| bucket(minute, 50.)).collect::<Vec<_>>();
+        assert_eq!(
+            process_history("builder", 1439, &half)
+                .unwrap()
+                .longest_busy_minutes,
+            0
+        );
+        let broken = [60., 60., 10., 60.]
+            .into_iter()
+            .enumerate()
+            .map(|(minute, cpu)| bucket(minute as u64, cpu))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            process_history("builder", 1439, &broken)
+                .unwrap()
+                .longest_busy_minutes,
+            2
+        );
+    }
+
+    #[test]
+    fn cpu_tape_averages_the_recorded_minutes_of_each_column() {
+        let history = process_history("builder", 1439, &[bucket(0, 25.), bucket(1, 75.)]).unwrap();
+        assert_eq!(history.columns[0], Some(50.));
+    }
+
+    #[test]
+    fn disk_tape_keeps_reads_and_writes_apart_and_marks_unrecorded_columns() {
+        let buckets = [0, 25].map(|minute| {
+            let mut bucket = bucket(minute, 10.);
+            let total = bucket.processes.get_mut("builder").unwrap();
+            total.disk_read_bytes = 100.;
+            total.disk_write_bytes = 7.;
+            bucket
+        });
+        let history = process_history("builder", 1439, &buckets).unwrap();
+        assert_eq!(history.disk_columns[0][..3], [Some(100.), None, Some(100.)]);
+        assert_eq!(history.disk_columns[1][..3], [Some(7.), None, Some(7.)]);
+        assert_eq!(history.disk_read_bytes, 200.);
+        assert_eq!(history.disk_write_bytes, 14.);
+    }
+
+    #[test]
+    fn sample_sentence_without_a_busy_history_reads_as_usual() {
+        for (current, expected) in [
+            (0., "Now 0.00 %, about its usual busy load."),
+            (30., "Now 30.0 %, about its usual busy load."),
+        ] {
+            assert_eq!(
+                super::now_sentence(current, 0., 1, crate::palette::CpuScale::Core),
+                expected
+            );
+        }
+    }
 }

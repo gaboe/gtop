@@ -55,14 +55,12 @@ impl ProbeReading {
     fn expire(&mut self, now: u64) {
         self.loss
             .retain(|(at, _)| *at <= now && now - *at <= PROBE_WINDOW.as_secs());
-        if self.loss.len() > PROBE_LIMIT {
-            self.loss.drain(..self.loss.len() - PROBE_LIMIT);
-        }
+        self.loss
+            .drain(..self.loss.len().saturating_sub(PROBE_LIMIT));
         self.latency
             .retain(|(at, _)| *at <= now && now - *at <= PROBE_WINDOW.as_secs());
-        if self.latency.len() > LATENCY_PROBES {
-            self.latency.drain(..self.latency.len() - LATENCY_PROBES);
-        }
+        self.latency
+            .drain(..self.latency.len().saturating_sub(LATENCY_PROBES));
     }
 
     fn latency_ms(&self) -> Option<f64> {
@@ -239,22 +237,27 @@ fn connect(target: SocketAddr, timeout: Duration) -> io::Result<Duration> {
 fn probe_loop(
     stop: Arc<StopSignal>,
     reading: Arc<Mutex<ProbeReading>>,
+    interval: Duration,
     connector: impl Fn(SocketAddr, Duration) -> io::Result<Duration>,
 ) {
     loop {
         if !stop.wait(Duration::ZERO) {
             break;
         }
-        let due = Instant::now() + PROBE_INTERVAL;
+        let started = Instant::now();
         let outcome = probe_once(&connector);
         reading
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .record(unix_seconds(), outcome);
-        if !stop.wait(due.saturating_duration_since(Instant::now())) {
+        if !stop.wait(time_until_next_probe(started, interval, Instant::now())) {
             break;
         }
     }
+}
+
+fn time_until_next_probe(started: Instant, interval: Duration, now: Instant) -> Duration {
+    (started + interval).saturating_duration_since(now)
 }
 
 fn unix_seconds() -> u64 {
@@ -309,6 +312,14 @@ pub(crate) struct Writer {
 
 impl Writer {
     pub(crate) fn start(directory: PathBuf) -> io::Result<Self> {
+        Self::start_with(directory, connect, PROBE_INTERVAL)
+    }
+
+    fn start_with(
+        directory: PathBuf,
+        connector: impl Fn(SocketAddr, Duration) -> io::Result<Duration> + Send + 'static,
+        probe_interval: Duration,
+    ) -> io::Result<Self> {
         let (updates, receiver) = mpsc::channel::<SampledMetrics>();
         let reading = Arc::new(Mutex::new(ProbeReading::default()));
         let stop = Arc::new(StopSignal::new());
@@ -317,7 +328,7 @@ impl Writer {
         let probe_reading = reading.clone();
         let probe = thread::Builder::new()
             .name("gtop-network-probe".into())
-            .spawn(move || probe_loop(probe_stop, probe_reading, connect))?;
+            .spawn(move || probe_loop(probe_stop, probe_reading, probe_interval, connector))?;
 
         let writer_stop = stop.clone();
         let writer_reading = reading;
@@ -378,7 +389,7 @@ impl Drop for Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn metrics() -> SampledMetrics {
         SampledMetrics {
@@ -474,6 +485,28 @@ mod tests {
         assert_eq!(
             rate.update(sample + Duration::from_secs(1), Some((250, 350)), 2),
             Some((50.0, 50.0))
+        );
+    }
+
+    #[test]
+    fn disk_io_rates_accept_a_gap_of_exactly_three_intervals() {
+        let mut rate = DiskIoRate::default();
+        let start = Instant::now();
+        assert_eq!(rate.update(start, Some((100, 200)), 2), None);
+        assert_eq!(
+            rate.update(start + Duration::from_secs(6), Some((700, 800)), 2),
+            Some((100.0, 100.0))
+        );
+    }
+
+    #[test]
+    fn unchanged_disk_io_counters_give_zero_rates() {
+        let mut rate = DiskIoRate::default();
+        let start = Instant::now();
+        assert_eq!(rate.update(start, Some((100, 200)), 2), None);
+        assert_eq!(
+            rate.update(start + Duration::from_secs(2), Some((100, 200)), 2),
+            Some((0.0, 0.0))
         );
     }
 
@@ -602,6 +635,15 @@ mod tests {
     }
 
     #[test]
+    fn publication_keeps_probe_results_for_five_minutes() {
+        let mut reading = ProbeReading::default();
+        reading.record(1_000, Outcome::Reply(Duration::from_millis(25)));
+        let json = serde_json::to_value(snapshot_at(metrics(), &reading, 1_300)).unwrap();
+        assert_eq!(json["net"]["latency_ms"], 25.0);
+        assert_eq!(json["net"]["loss_percent"], 0.0);
+    }
+
+    #[test]
     fn publication_expires_old_probe_results() {
         let mut reading = ProbeReading::default();
         reading.record(1_000, Outcome::Reply(Duration::from_millis(25)));
@@ -612,21 +654,146 @@ mod tests {
         assert_eq!(json["net"]["loss_percent"], serde_json::Value::Null);
     }
 
+    const BOUND: Duration = Duration::from_secs(10);
+
+    fn within_bound<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        finished
+            .recv_timeout(BOUND)
+            .expect("work finished within the bound")
+    }
+
     #[test]
     fn stopped_probe_does_not_connect() {
         let stop = Arc::new(StopSignal::new());
         stop.stop();
-        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = Arc::new(AtomicBool::new(false));
         let connector_called = called.clone();
-        probe_loop(
-            stop,
-            Arc::new(Mutex::new(ProbeReading::default())),
-            move |_, _| {
-                connector_called.store(true, Ordering::Relaxed);
-                Ok(Duration::ZERO)
-            },
-        );
+        within_bound(move || {
+            probe_loop(
+                stop,
+                Arc::new(Mutex::new(ProbeReading::default())),
+                Duration::ZERO,
+                move |_, _| {
+                    connector_called.store(true, Ordering::Relaxed);
+                    Ok(Duration::ZERO)
+                },
+            )
+        });
         assert!(!called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn probe_loop_records_every_probe_until_stopped() {
+        let stop = Arc::new(StopSignal::new());
+        let reading = Arc::new(Mutex::new(ProbeReading::default()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (loop_stop, loop_reading, loop_calls) = (stop.clone(), reading.clone(), calls.clone());
+        within_bound(move || {
+            probe_loop(loop_stop, loop_reading, Duration::ZERO, move |_, _| {
+                if loop_calls.fetch_add(1, Ordering::Relaxed) == 2 {
+                    stop.stop();
+                }
+                Ok(Duration::from_millis(5))
+            })
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let reading = reading.lock().unwrap();
+        assert_eq!(reading.loss.len(), 3);
+        assert_eq!(reading.loss_percent(), Some(0.));
+        assert_eq!(reading.latency_ms(), Some(5.));
+    }
+
+    #[test]
+    fn next_probe_waits_out_the_rest_of_the_interval() {
+        let started = Instant::now();
+        assert_eq!(
+            time_until_next_probe(started, PROBE_INTERVAL, started + Duration::from_secs(4)),
+            Duration::from_secs(11)
+        );
+        assert_eq!(
+            time_until_next_probe(started, PROBE_INTERVAL, started + PROBE_TIMEOUT * 5),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn stop_signal_times_out_while_running_and_returns_at_once_when_stopped() {
+        let signal = Arc::new(StopSignal::new());
+        assert!(signal.wait(Duration::from_millis(10)));
+        let waiter = signal.clone();
+        let (started, waiting) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            started.send(()).unwrap();
+            let _ = done.send(waiter.wait(Duration::from_secs(600)));
+        });
+        waiting.recv_timeout(BOUND).unwrap();
+        signal.stop();
+        assert_eq!(finished.recv_timeout(BOUND), Ok(false));
+        assert!(!signal.wait(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn unix_seconds_reads_the_system_clock() {
+        let seconds = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let before = seconds();
+        let now = unix_seconds();
+        assert!(before <= now && now <= seconds());
+    }
+
+    #[test]
+    fn connect_succeeds_on_an_open_port_and_fails_on_a_closed_one() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let open = listener.local_addr().unwrap();
+        assert!(connect(open, BOUND).is_ok());
+        drop(listener);
+        assert!(connect(open, BOUND).is_err());
+    }
+
+    #[test]
+    fn writer_publishes_updates_and_stops_probing_when_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let (probed, probes) = mpsc::channel();
+        let writer = Writer::start_with(
+            directory.path().to_path_buf(),
+            move |_, _| {
+                let _ = probed.send(());
+                Ok(Duration::from_millis(5))
+            },
+            Duration::from_secs(3_600),
+        )
+        .unwrap();
+        probes.recv_timeout(BOUND).unwrap();
+        let mut sample = metrics();
+        sample.time = 1_900_000_000;
+        writer.update(sample);
+        let path = directory.path().join("now.json");
+        let deadline = Instant::now() + BOUND;
+        let published = loop {
+            let json = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            if let Some(json) = json {
+                break json;
+            }
+            assert!(Instant::now() < deadline, "now.json was not written");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(published["time"], 1_900_000_000);
+        drop(writer);
+        assert_eq!(
+            probes.recv_timeout(BOUND),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
     }
 
     #[test]
