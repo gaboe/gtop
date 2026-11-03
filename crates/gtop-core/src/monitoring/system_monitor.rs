@@ -519,8 +519,11 @@ mod tests {
         let before = df_free_bytes();
         let free_bytes = macos_free_bytes(Path::new("/")).unwrap();
         let after = df_free_bytes();
-        let lower = before.min(after).saturating_sub(1024);
-        let upper = before.max(after).saturating_add(1024);
+        // Other writers move free space in both directions between the readings.
+        // 64 MiB still catches a unit or field error, which is off by orders of magnitude.
+        const SLACK: u64 = 64 << 20;
+        let lower = before.min(after).saturating_sub(SLACK);
+        let upper = before.max(after).saturating_add(SLACK);
 
         assert!(
             (lower..=upper).contains(&free_bytes),

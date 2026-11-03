@@ -1,0 +1,37 @@
+# cargo-mutants scope for gtop. Run `sh scripts/mutants-diff.sh` for changed code.
+# Only domain logic is mutated: collectors' pure parsing, state, history, disk scan,
+# search, sorting, and number formatting. GPUI views, FFI shells, and test code are out.
+
+examine_globs = [
+  "crates/gtop-core/src/lib.rs",
+  "crates/gtop-core/src/state.rs",
+  "crates/gtop-core/src/monitoring/native_processes.rs",
+  "crates/gtop-core/src/monitoring/process_monitor.rs",
+  "crates/gtop-core/src/monitoring/port_monitor.rs",
+  "crates/gtop-core/src/monitoring/system_monitor.rs",
+  "crates/gtop-core/src/monitoring/smc.rs",
+  "crates/gtop-core/src/monitoring/iokit.rs",
+  "crates/gtop-core/src/monitoring/temperature_monitor.rs",
+  "crates/gtop/src/analysis.rs",
+  "crates/gtop/src/column_widths.rs",
+  "crates/gtop/src/model.rs",
+  "crates/gtop/src/now_json.rs",
+  "crates/gtop/src/history.rs",
+  "crates/gtop/src/history/store.rs",
+  "crates/gtop/src/disk_scan.rs",
+  "crates/gtop/src/disk_scan/queue.rs",
+  "crates/gtop/src/perf.rs",
+]
+
+exclude_re = [
+  # FFI shells: they call IOKit, SMC, or libproc and need real hardware.
+  "<impl Drop for ",
+  "iokit.rs.*(Object::|Accelerator::(all|name|stats|gpu_time_per_process|number)|StorageDrivers::)",
+  "smc.rs.*GpuTemperature::",
+  "temperature_monitor.rs.*TemperatureMonitor::collect",
+]
+
+# The gtop test binary links GPUI. A cold build in a fresh copy takes minutes.
+build_timeout_multiplier = 4.0
+timeout_multiplier = 3.0
+minimum_test_timeout = 60
