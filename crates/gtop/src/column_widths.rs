@@ -555,13 +555,17 @@ mod tests {
             visual.update(|window, cx| window.draw(cx).clear(cx));
             let inside = point(px(150.), px(50.));
             visual.simulate_mouse_move(inside, None, Modifiers::default());
-            visual.simulate_mouse_move(inside, Some(MouseButton::Left), Modifiers::default());
-            visual.simulate_mouse_up(inside, MouseButton::Left, Modifiers::default());
             view.read_with(visual, |drag, _| {
                 assert_eq!(drag.measured, 300.);
-                assert_eq!(drag.moves, 1, "only a move with the left button drags");
-                assert_eq!(drag.releases, 1);
+                assert_eq!(
+                    drag.moves, 0,
+                    "a move without a pressed button does not drag"
+                );
             });
+            visual.simulate_mouse_move(inside, Some(MouseButton::Left), Modifiers::default());
+            view.read_with(visual, |drag, _| assert_eq!(drag.moves, 1));
+            visual.simulate_mouse_up(inside, MouseButton::Left, Modifiers::default());
+            view.read_with(visual, |drag, _| assert_eq!(drag.releases, 1));
         }
     }
 }
