@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::fmt::Debug;
 
 /// Formatted process data for the monitor UI.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone, Default)]
 pub struct ProcessInfo {
     /// Process ID
     pub pid: u32,

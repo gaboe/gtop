@@ -29,6 +29,21 @@ exclude_re = [
   "iokit.rs.*(Object::|Accelerator::(all|name|stats|gpu_time_per_process|number)|StorageDrivers::)",
   "smc.rs.*GpuTemperature::",
   "temperature_monitor.rs.*TemperatureMonitor::collect",
+  # Reads the host's sysctl and ioreg output; the parsers it feeds are tested. The
+  # non-macOS variant is not compiled on macOS.
+  "lib\\.rs.*replace CpuTopology::detect -> Self with Default::default\\(\\)",
+  # Equivalent: the banks are checked to be disjoint first, so | and ^ agree.
+  "lib\\.rs.*replace \\| with \\^ in CpuTopology::complete",
+  # Caches the process environment in a OnceLock; perf_requested holds the parse.
+  "lib\\.rs.*replace perf_enabled -> bool with ",
+  # Default calls new, which calls this again. Every frame reads the user list, so
+  # the recursion only ever times out; no caller can observe another result.
+  "state\\.rs.*replace AppState::with_process_monitor -> Self with Default::default\\(\\)",
+  # Test-only hooks that force the permission-denied path; release builds drop them.
+  "process_monitor\\.rs.*replace ProcessMonitor::deny_identity with \\(\\)",
+  "native_processes\\.rs.*replace == with != in Collector::read_bsd_info",
+  # Equivalent: a larger first buffer lists the same PIDs, only with more slack.
+  "native_processes\\.rs.*replace \\+ with \\* in list_pids",
 ]
 
 # The gtop test binary links GPUI. A cold build in a fresh copy takes minutes.

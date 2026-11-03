@@ -228,8 +228,7 @@ impl ProcessMonitor {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            sys.process(Pid::from_u32(pid))
-                .is_some_and(|process| process.start_time() == start_time)
+            sysinfo_identity_matches(sys, pid, start_time)
         }
     }
 
@@ -295,6 +294,21 @@ impl ProcessMonitor {
     }
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
+fn sysinfo_identity_matches(sys: &System, pid: u32, start_time: u64) -> bool {
+    sys.process(Pid::from_u32(pid))
+        .is_some_and(|process| process.start_time() == start_time)
+}
+
+/// Seconds since `start_time`, or 0 when the start time is unknown.
+pub(super) fn run_time(start_time: u64, now: u64) -> u64 {
+    if start_time > 0 {
+        now.saturating_sub(start_time)
+    } else {
+        0
+    }
+}
+
 pub(super) fn process_row(
     pid: u32,
     process: &sysinfo::Process,
@@ -342,11 +356,7 @@ pub(super) fn process_row(
             .unwrap_or_default(),
         virtual_memory: process.virtual_memory(),
         start_time,
-        run_time: if start_time > 0 {
-            current_time.saturating_sub(start_time)
-        } else {
-            0
-        },
+        run_time: run_time(start_time, current_time),
         disk_usage: (disk_usage.read_bytes, disk_usage.written_bytes),
         disk_sample_seconds: None,
         session_id: process.session_id().map(|id| id.as_u32()),
@@ -424,8 +434,47 @@ mod tests {
         assert_eq!(own.argv.join(" "), own.command);
 
         assert!(
-            !ProcessMonitor::process_environ(&mut sys, own_pid).is_empty(),
+            ProcessMonitor::process_environ(&mut sys, own_pid)
+                .iter()
+                .any(|value| value.starts_with("PATH=")),
             "environ is read on demand"
         );
+    }
+
+    #[test]
+    fn sysinfo_identity_needs_the_same_pid_and_start_time() {
+        let own_pid = std::process::id();
+        let mut sys = System::new();
+        ProcessMonitor::refresh(&mut sys, false);
+        let start_time = sys.process(Pid::from_u32(own_pid)).unwrap().start_time();
+        assert!(sysinfo_identity_matches(&sys, own_pid, start_time));
+        assert!(!sysinfo_identity_matches(&sys, own_pid, start_time + 1));
+        assert!(!sysinfo_identity_matches(&sys, i32::MAX as u32, start_time));
+    }
+
+    #[test]
+    fn run_time_counts_from_a_known_start() {
+        assert_eq!(run_time(40, 100), 60);
+        assert_eq!(run_time(0, 100), 0);
+        assert_eq!(run_time(200, 100), 0);
+    }
+
+    #[test]
+    fn current_time_is_unix_seconds() {
+        // 2023-11-14, before this code existed.
+        assert!(ProcessMonitor::get_current_time().unwrap() > 1_700_000_000);
+    }
+
+    #[test]
+    fn formats_each_process_status() {
+        for (status, label) in [
+            (ProcessStatus::Run, "Running"),
+            (ProcessStatus::Sleep, "Sleeping"),
+            (ProcessStatus::Idle, "Idle"),
+            (ProcessStatus::Zombie, "Zombie"),
+            (ProcessStatus::Stop, "Unknown"),
+        ] {
+            assert_eq!(ProcessMonitor::format_status(status), label);
+        }
     }
 }

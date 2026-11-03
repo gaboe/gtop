@@ -84,16 +84,7 @@ impl SystemMonitor {
     ///
     /// * `sys` - System information provider for initial readings
     pub fn new(networks: &Networks) -> Self {
-        let (initial_rx, initial_tx) =
-            networks
-                .iter()
-                .fold((0, 0), |(initial_rx, initial_tx), (_, data)| {
-                    (
-                        initial_rx + data.total_received(),
-                        initial_tx + data.total_transmitted(),
-                    )
-                });
-
+        let (initial_rx, initial_tx) = network_totals(networks);
         Self {
             last_network_update: (Instant::now(), initial_rx, initial_tx),
             network_interfaces: networks.keys().cloned().collect(),
@@ -119,8 +110,12 @@ impl SystemMonitor {
         networks: &Networks,
         disks: &Disks,
     ) -> SystemStats {
-        let (network_rx, network_tx) = self.calculate_network_stats(networks);
-        let disk_stats = self.calculate_disk_stats(disks);
+        let (network_rx, network_tx) = self.network_rates(
+            networks.keys().cloned().collect(),
+            network_totals(networks),
+            Instant::now(),
+        );
+        let disk_stats = self.calculate_disk_stats_with(disks, real_free_bytes);
         let load_average = System::load_average();
 
         SystemStats {
@@ -129,8 +124,7 @@ impl SystemMonitor {
             memory_used: sys.used_memory(),
             swap_used: sys.used_swap(),
             memory_free: sys.total_memory() - sys.used_memory(),
-            memory_cached: sys.total_memory()
-                - (sys.used_memory() + (sys.total_memory() - sys.used_memory())),
+            memory_cached: 0,
             uptime: System::uptime(),
             load_avg: [load_average.one, load_average.five, load_average.fifteen],
             network_totals: self.network_totals,
@@ -153,6 +147,7 @@ impl SystemMonitor {
     pub fn refresh_disks(&mut self, disks: &mut Disks) {
         self.refresh_disks_with(
             disks,
+            Instant::now(),
             || Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage()),
             real_free_bytes,
         );
@@ -161,12 +156,13 @@ impl SystemMonitor {
     fn refresh_disks_with(
         &mut self,
         disks: &mut Disks,
+        now: Instant,
         refresh: impl FnOnce() -> Disks,
         read_free: impl FnMut(&Path) -> Option<u64>,
     ) {
         if self
             .disks_refreshed_at
-            .is_some_and(|refreshed_at| refreshed_at.elapsed() < Duration::from_secs(60))
+            .is_some_and(|refreshed_at| now.duration_since(refreshed_at) < Duration::from_secs(60))
         {
             return;
         }
@@ -187,57 +183,37 @@ impl SystemMonitor {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = read_free;
-        self.disks_refreshed_at = Some(Instant::now());
+        self.disks_refreshed_at = Some(now);
     }
 
-    /// Whether a disk counts toward the storage panel
-    #[cfg(not(target_os = "windows"))]
+    /// Whether a disk counts toward the storage panel. Windows shows every disk.
     fn is_shown(disk: &Disk) -> bool {
-        disk.mount_point() == Path::new("/")
+        cfg!(target_os = "windows") || disk.mount_point() == Path::new("/")
     }
 
-    /// Windows-specific disk filtering
-    #[cfg(target_os = "windows")]
-    fn is_shown(_disk: &Disk) -> bool {
-        true
-    }
-
-    /// Calculates network usage rates
-    fn calculate_network_stats(&mut self, networks: &Networks) -> (u64, u64) {
-        let (current_rx, current_tx) =
-            networks
-                .iter()
-                .fold((0, 0), |(current_rx, current_tx), (_, data)| {
-                    (
-                        current_rx + data.total_received(),
-                        current_tx + data.total_transmitted(),
-                    )
-                });
-
-        let interfaces = networks.keys().cloned().collect();
+    /// Byte rates since the previous reading, or zeros while the interface set changes.
+    fn network_rates(
+        &mut self,
+        interfaces: std::collections::BTreeSet<String>,
+        (current_rx, current_tx): (u64, u64),
+        now: Instant,
+    ) -> (u64, u64) {
         self.network_totals = stable_network_totals(
             &self.network_interfaces,
             &interfaces,
             (current_rx, current_tx),
         );
         self.network_interfaces = interfaces;
-        let elapsed = self.last_network_update.0.elapsed().as_secs_f64();
-        let rx_rate =
-            ((current_rx.saturating_sub(self.last_network_update.1)) as f64 / elapsed) as u64;
-        let tx_rate =
-            ((current_tx.saturating_sub(self.last_network_update.2)) as f64 / elapsed) as u64;
+        let elapsed = now.duration_since(self.last_network_update.0).as_secs_f64();
+        let rx_rate = rate(current_rx, self.last_network_update.1, elapsed);
+        let tx_rate = rate(current_tx, self.last_network_update.2, elapsed);
 
-        self.last_network_update = (Instant::now(), current_rx, current_tx);
+        self.last_network_update = (now, current_rx, current_tx);
         if self.network_totals.is_some() {
             (rx_rate, tx_rate)
         } else {
             (0, 0)
         }
-    }
-
-    /// Calculates disk usage statistics for the displayed volumes.
-    fn calculate_disk_stats(&mut self, disks: &Disks) -> DiskStats {
-        self.calculate_disk_stats_with(disks, real_free_bytes)
     }
 
     fn calculate_disk_stats_with(
@@ -275,6 +251,25 @@ impl SystemMonitor {
         }
         aggregate_disk_capacities(capacities)
     }
+}
+
+/// Received and transmitted bytes summed over every interface.
+fn network_totals(networks: &Networks) -> (u64, u64) {
+    sum_pairs(
+        networks
+            .values()
+            .map(|data| (data.total_received(), data.total_transmitted())),
+    )
+}
+
+fn sum_pairs(pairs: impl Iterator<Item = (u64, u64)>) -> (u64, u64) {
+    pairs.fold((0, 0), |(rx, tx), (data_rx, data_tx)| {
+        (rx + data_rx, tx + data_tx)
+    })
+}
+
+fn rate(current: u64, previous: u64, elapsed_seconds: f64) -> u64 {
+    (current.saturating_sub(previous) as f64 / elapsed_seconds) as u64
 }
 
 #[cfg(target_os = "macos")]
@@ -366,6 +361,7 @@ mod tests {
         let mut reads = 0;
         monitor.refresh_disks_with(
             &mut disks,
+            Instant::now(),
             || {
                 reads += 1;
                 Disks::new()
@@ -376,6 +372,7 @@ mod tests {
         let first_refresh = monitor.disks_refreshed_at;
         monitor.refresh_disks_with(
             &mut disks,
+            Instant::now(),
             || {
                 reads += 1;
                 Disks::new()
@@ -388,6 +385,7 @@ mod tests {
         monitor.disks_refreshed_at = Some(Instant::now() - Duration::from_secs(60));
         monitor.refresh_disks_with(
             &mut disks,
+            Instant::now(),
             || {
                 reads += 1;
                 Disks::new()
@@ -407,6 +405,7 @@ mod tests {
 
         monitor.refresh_disks_with(
             &mut disks,
+            Instant::now(),
             || {
                 let refreshed = Disks::new_with_refreshed_list_specifics(
                     DiskRefreshKind::nothing().with_storage(),
@@ -517,7 +516,7 @@ mod tests {
                 * 1024
         };
         let before = df_free_bytes();
-        let free_bytes = macos_free_bytes(Path::new("/")).unwrap();
+        let free_bytes = real_free_bytes(Path::new("/")).unwrap();
         let after = df_free_bytes();
         // Other writers move free space in both directions between the readings.
         // 64 MiB still catches a unit or field error, which is off by orders of magnitude.
@@ -595,6 +594,86 @@ mod tests {
         let stats = monitor.collect_stats(&sys, &networks, &disks);
         assert!(!stats.cpu_usage.is_empty());
         assert!(stats.memory_total > 0);
+        assert_eq!(stats.memory_free + stats.memory_used, stats.memory_total);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missing_mount_point_has_no_free_space() {
+        assert_eq!(
+            real_free_bytes(Path::new("/gtop-missing-mount-point")),
+            None
+        );
+    }
+
+    #[test]
+    fn storage_refresh_fills_an_empty_disk_list_with_the_system_volume() {
+        let mut monitor = SystemMonitor::new(&Networks::new());
+        let mut disks = Disks::new();
+        monitor.refresh_disks(&mut disks);
+        assert!(disks
+            .iter()
+            .any(|disk| disk.mount_point() == Path::new("/")));
+    }
+
+    #[test]
+    fn storage_refresh_is_due_exactly_sixty_seconds_after_the_last_one() {
+        let mut monitor = SystemMonitor::new(&Networks::new());
+        let mut disks = Disks::new();
+        let refreshed_at = Instant::now();
+        let mut reads = 0;
+        for (after, expected_reads) in [(59_999, 0), (60_000, 1)] {
+            monitor.disks_refreshed_at = Some(refreshed_at);
+            monitor.refresh_disks_with(
+                &mut disks,
+                refreshed_at + Duration::from_millis(after),
+                || {
+                    reads += 1;
+                    Disks::new()
+                },
+                |_| Some(100),
+            );
+            assert_eq!(reads, expected_reads, "{after} ms after the last refresh");
+        }
+        assert_eq!(
+            monitor.disks_refreshed_at,
+            Some(refreshed_at + Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn network_rates_divide_new_bytes_by_elapsed_time() {
+        let mut monitor = SystemMonitor::new(&Networks::new());
+        let start = Instant::now();
+        let interfaces: std::collections::BTreeSet<String> =
+            ["en0".to_string()].into_iter().collect();
+        monitor.network_interfaces = interfaces.clone();
+        monitor.last_network_update = (start, 1000, 2000);
+        let now = start + Duration::from_secs(2);
+        assert_eq!(
+            monitor.network_rates(interfaces.clone(), (3000, 6000), now),
+            (1000, 2000)
+        );
+        assert_eq!(monitor.network_totals, Some((3000, 6000)));
+        assert_eq!(monitor.last_network_update, (now, 3000, 6000));
+
+        let changed = ["en1".to_string()].into_iter().collect();
+        let later = now + Duration::from_secs(1);
+        assert_eq!(monitor.network_rates(changed, (9000, 9000), later), (0, 0));
+        assert_eq!(monitor.network_totals, None);
+    }
+
+    #[test]
+    fn network_totals_sum_every_interface() {
+        assert_eq!(sum_pairs([(1, 2), (3, 4)].into_iter()), (4, 6));
+        let networks = Networks::new_with_refreshed_list();
+        let received = networks.values().map(|data| data.total_received()).sum();
+        let transmitted = networks.values().map(|data| data.total_transmitted()).sum();
+        assert!(
+            received > 1 && transmitted > 1,
+            "interfaces carried traffic since boot"
+        );
+        assert_eq!(network_totals(&networks), (received, transmitted));
     }
 }
 

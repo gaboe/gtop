@@ -478,6 +478,28 @@ mod tests {
     }
 
     #[test]
+    fn reads_environment_of_an_owned_child_by_pid() {
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .args(["-c", "import time; time.sleep(30)"])
+            .env("GTOP_ENV_MARKER", "by-pid")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let result = AppState::new().process_environ(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(result
+            .unwrap()
+            .iter()
+            .any(|value| value == "GTOP_ENV_MARKER=by-pid"));
+    }
+
+    #[test]
+    fn legacy_kill_reports_failure_for_a_missing_process() {
+        assert!(!AppState::new().kill_process(i32::MAX as u32).unwrap());
+    }
+
+    #[test]
     #[ignore]
     fn tick_cost() {
         let state = AppState::new();

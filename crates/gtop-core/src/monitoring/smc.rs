@@ -28,6 +28,25 @@ struct Message {
     bytes: [u8; 32],
 }
 
+impl Message {
+    fn info_request(key: u32) -> Self {
+        Self {
+            key,
+            command: 9,
+            ..Default::default()
+        }
+    }
+
+    fn read_request(key: u32, info: KeyInfo) -> Self {
+        Self {
+            key,
+            info,
+            command: 5,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct GpuTemperature {
     connection: u32,
@@ -108,23 +127,11 @@ impl GpuTemperature {
     }
 
     fn info(&self, key: u32) -> Option<KeyInfo> {
-        Some(
-            self.call(Message {
-                key,
-                command: 9,
-                ..Default::default()
-            })?
-            .info,
-        )
+        Some(self.call(Message::info_request(key))?.info)
     }
 
     fn read(&self, key: u32, info: KeyInfo) -> Option<Message> {
-        self.call(Message {
-            key,
-            info,
-            command: 5,
-            ..Default::default()
-        })
+        self.call(Message::read_request(key, info))
     }
 
     fn call(&self, input: Message) -> Option<Message> {
@@ -196,8 +203,32 @@ mod tests {
             ),
             Some(52.5)
         );
+        bytes[..4].copy_from_slice(&52.5f32.to_le_bytes());
+        let wrong_float = KeyInfo {
+            kind: u32::from_be_bytes(*b"sp78"),
+            ..float
+        };
+        assert_eq!(decode(wrong_float, &bytes), None);
+        let wrong_fixed = KeyInfo { size: 2, ..float };
+        bytes[..2].copy_from_slice(&13440i16.to_be_bytes());
+        assert_eq!(decode(wrong_fixed, &bytes), None);
         assert!(gpu_key(u32::from_be_bytes(*b"Tg0f")));
         assert!(gpu_key(u32::from_be_bytes(*b"TG0D")));
         assert!(!gpu_key(u32::from_be_bytes(*b"Tp01")));
+    }
+
+    #[test]
+    fn requests_name_the_key_and_the_smc_command() {
+        let key = u32::from_be_bytes(*b"Tg0f");
+        let info = Message::info_request(key);
+        assert_eq!((info.key, info.command), (key, 9));
+        let sensor = KeyInfo {
+            size: 4,
+            kind: u32::from_be_bytes(*b"flt "),
+            attributes: 0,
+        };
+        let read = Message::read_request(key, sensor);
+        assert_eq!((read.key, read.command), (key, 5));
+        assert_eq!((read.info.size, read.info.kind), (sensor.size, sensor.kind));
     }
 }

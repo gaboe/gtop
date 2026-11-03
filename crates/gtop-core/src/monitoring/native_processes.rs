@@ -1,4 +1,7 @@
-use super::{process_monitor::process_row, ProcessInfo, ProcessMonitor};
+use super::{
+    process_monitor::{process_row, run_time},
+    ProcessInfo, ProcessMonitor,
+};
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
@@ -11,6 +14,8 @@ const PROC_PIDTASKINFO: i32 = 4;
 const PROC_PIDTHREADINFO: i32 = 5;
 const PROC_PIDVNODEPATHINFO: i32 = 9;
 const RUSAGE_INFO_V2: i32 = 2;
+const ESRCH: i32 = 3;
+const ENOMEM: i32 = 12;
 
 #[repr(C)]
 #[derive(Default, Debug)]
@@ -201,12 +206,64 @@ unsafe extern "C" {
 
 fn kernel_processes() -> Option<HashMap<u32, proc_bsdinfo>> {
     let mut mib = [1, 14, 0]; // CTL_KERN, KERN_PROC, KERN_PROC_ALL.
+    kernel_processes_with(|buffer, bytes| {
+        let buffer = buffer.map_or(std::ptr::null_mut(), |buffer| buffer.as_mut_ptr().cast());
+        if unsafe { sysctl(mib.as_mut_ptr(), 3, buffer, bytes, std::ptr::null_mut(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error())
+        }
+    })
+}
+
+/// Reads the process table with `read`, which fills a buffer (or only sizes the
+/// table when it gets none) like `sysctl`. A table that outgrows the buffer is
+/// read again with a larger one, at most three times.
+fn kernel_processes_with(
+    mut read: impl FnMut(Option<&mut [KernelProcess]>, &mut usize) -> Result<(), Option<i32>>,
+) -> Option<HashMap<u32, proc_bsdinfo>> {
     let mut bytes = 0;
+    read(None, &mut bytes).ok()?;
+    for _ in 0..3 {
+        let mut buffer = vec![KernelProcess([0; 648]); bytes / 648 + 128];
+        bytes = std::mem::size_of_val(buffer.as_slice());
+        match read(Some(&mut buffer), &mut bytes) {
+            Ok(()) => return kernel_table(&buffer, bytes),
+            Err(Some(ENOMEM)) => {
+                bytes = bytes.max(std::mem::size_of_val(buffer.as_slice())) * 2;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// The first `bytes` of `buffer` as records keyed by PID, if they are whole records.
+fn kernel_table(buffer: &[KernelProcess], bytes: usize) -> Option<HashMap<u32, proc_bsdinfo>> {
+    if bytes > std::mem::size_of_val(buffer) || !bytes.is_multiple_of(648) {
+        return None;
+    }
+    Some(
+        buffer[..bytes / 648]
+            .iter()
+            .map(|p| {
+                let bsd = p.bsd();
+                (bsd.pbi_pid, bsd)
+            })
+            .collect(),
+    )
+}
+
+fn kernel_process(pid: u32) -> Option<proc_bsdinfo> {
+    let pid = i32::try_from(pid).ok()?;
+    let mut mib = [1, 14, 1, pid]; // CTL_KERN, KERN_PROC, KERN_PROC_PID.
+    let mut buffer = vec![KernelProcess([0; 648]); 8];
+    let mut bytes = std::mem::size_of_val(buffer.as_slice());
     if unsafe {
         sysctl(
             mib.as_mut_ptr(),
-            3,
-            std::ptr::null_mut(),
+            4,
+            buffer.as_mut_ptr().cast(),
             &mut bytes,
             std::ptr::null_mut(),
             0,
@@ -215,71 +272,11 @@ fn kernel_processes() -> Option<HashMap<u32, proc_bsdinfo>> {
     {
         return None;
     }
-    for _ in 0..3 {
-        let mut buffer = vec![KernelProcess([0; 648]); bytes / 648 + 128];
-        bytes = std::mem::size_of_val(buffer.as_slice());
-        if unsafe {
-            sysctl(
-                mib.as_mut_ptr(),
-                3,
-                buffer.as_mut_ptr().cast(),
-                &mut bytes,
-                std::ptr::null_mut(),
-                0,
-            )
-        } == 0
-        {
-            if bytes > std::mem::size_of_val(buffer.as_slice()) || bytes % 648 != 0 {
-                return None;
-            }
-            return Some(
-                buffer[..bytes / 648]
-                    .iter()
-                    .map(|p| {
-                        let bsd = p.bsd();
-                        (bsd.pbi_pid, bsd)
-                    })
-                    .collect(),
-            );
-        }
-        if std::io::Error::last_os_error().raw_os_error() != Some(12) {
-            return None;
-        }
-        bytes = bytes.max(std::mem::size_of_val(buffer.as_slice())) * 2;
+    if bytes != 648 {
+        return None;
     }
-    None
-}
-
-fn kernel_process(pid: u32) -> Option<proc_bsdinfo> {
-    let pid = i32::try_from(pid).ok()?;
-    let mut mib = [1, 14, 1, pid]; // CTL_KERN, KERN_PROC, KERN_PROC_PID.
-    let mut buffer = vec![KernelProcess([0; 648]); 8];
-    for _ in 0..3 {
-        let capacity = std::mem::size_of_val(buffer.as_slice());
-        let mut bytes = capacity;
-        if unsafe {
-            sysctl(
-                mib.as_mut_ptr(),
-                4,
-                buffer.as_mut_ptr().cast(),
-                &mut bytes,
-                std::ptr::null_mut(),
-                0,
-            )
-        } == 0
-        {
-            if bytes != 648 {
-                return None;
-            }
-            let bsd = buffer[0].bsd();
-            return (bsd.pbi_pid == pid as u32).then_some(bsd);
-        }
-        if std::io::Error::last_os_error().raw_os_error() != Some(12) {
-            return None;
-        }
-        buffer.resize(buffer.len() * 2, KernelProcess([0; 648]));
-    }
-    None
+    let bsd = buffer[0].bsd();
+    (bsd.pbi_pid == pid as u32).then_some(bsd)
 }
 
 fn bsd_info(pid: u32) -> Result<proc_bsdinfo, std::io::Error> {
@@ -306,6 +303,139 @@ enum IdentityRead {
     Available(proc_bsdinfo),
     Unavailable,
     ConfirmedAbsent,
+}
+
+fn permission_denied(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(1 | 13))
+}
+
+/// The identity a guarded action may trust. A denied read falls back to the
+/// kernel table; any other failure, a zombie's ESRCH included, gives none.
+fn trusted_identity(
+    read: Result<proc_bsdinfo, std::io::Error>,
+    kernel: impl FnOnce() -> Option<proc_bsdinfo>,
+) -> Option<proc_bsdinfo> {
+    match read {
+        Ok(bsd) => Some(bsd),
+        Err(error) if permission_denied(&error) => kernel(),
+        Err(_) => None,
+    }
+}
+
+/// Classifies one listed PID. `kernel` caches the process table, read by `load`
+/// at most once per collection, for PIDs whose own read fails.
+fn listed_identity(
+    pid: u32,
+    read: Result<proc_bsdinfo, std::io::Error>,
+    kernel: &mut Option<Option<HashMap<u32, proc_bsdinfo>>>,
+    load: impl FnOnce() -> Option<HashMap<u32, proc_bsdinfo>>,
+) -> IdentityRead {
+    match read {
+        Ok(bsd) => IdentityRead::Available(bsd),
+        Err(error) if error.raw_os_error() == Some(ESRCH) => {
+            match kernel.get_or_insert_with(load) {
+                Some(processes) => processes
+                    .remove(&pid)
+                    .map_or(IdentityRead::ConfirmedAbsent, IdentityRead::Available),
+                None => IdentityRead::Unavailable,
+            }
+        }
+        Err(error) if permission_denied(&error) => kernel
+            .get_or_insert_with(load)
+            .as_mut()
+            .and_then(|processes| processes.remove(&pid))
+            .map_or(IdentityRead::Unavailable, IdentityRead::Available),
+        Err(_) => IdentityRead::Unavailable,
+    }
+}
+
+fn nanos_per_unit(status: i32, timebase: &Timebase) -> Option<f64> {
+    (status == 0 && timebase.denom != 0).then(|| timebase.numer as f64 / timebase.denom as f64)
+}
+
+/// Lists all PIDs into `pids` with `list`, which works like `proc_listallpids`:
+/// without a buffer it counts the PIDs. The buffer grows until the list fits.
+fn list_pids(
+    pids: &mut Vec<i32>,
+    mut list: impl FnMut(Option<&mut [i32]>) -> i32,
+) -> Option<usize> {
+    loop {
+        if pids.is_empty() {
+            let count = list(None);
+            if count <= 0 {
+                return None;
+            }
+            pids.resize(count as usize + 128, 0);
+        }
+        let count = list(Some(pids));
+        if count <= 0 {
+            return None;
+        }
+        if count as usize >= pids.len() {
+            pids.resize(pids.len() * 2, 0);
+            continue;
+        }
+        return Some(count as usize);
+    }
+}
+
+fn needs_metadata(row: &ProcessInfo) -> bool {
+    row.command.is_empty() || row.name.is_empty() || row.executable.is_empty()
+}
+
+/// The cached row repeated for a PID whose identity cannot be read this tick.
+fn unavailable_row(cached: &ProcessInfo, include_environ: bool) -> ProcessInfo {
+    let mut row = cached.clone();
+    row.cpu_usage = 0.;
+    row.cpu_sample_seconds = None;
+    row.disk_usage = (0, 0);
+    row.disk_sample_seconds = None;
+    if !include_environ {
+        row.environ.clear();
+    }
+    row
+}
+
+/// The root directory of a process that has one set, such as a chroot.
+fn root_path(vnodes: &proc_vnodepathinfo) -> Option<String> {
+    if vnodes.pvi_rdir.vip_vi.vi_stat.vst_dev == 0 {
+        return None;
+    }
+    let bytes = vnodes.pvi_rdir.vip_path.as_flattened();
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+}
+
+fn bsd_name(bsd: &proc_bsdinfo) -> String {
+    let bytes: Vec<u8> = bsd
+        .pbi_name
+        .iter()
+        .map(|b| *b as u8)
+        .take_while(|b| *b != 0)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Names an unknown owner from `users`, or by its numeric UID.
+fn fill_user<'a>(user: &mut String, uid: u32, mut users: impl Iterator<Item = (u32, &'a str)>) {
+    if user.is_empty() || user == "-" {
+        *user = users
+            .find(|(id, _)| *id == uid)
+            .map_or_else(|| uid.to_string(), |(_, name)| name.to_owned());
+    }
+}
+
+/// A runnable process is sleeping when its thread waits.
+fn run_status(bsd_status: u32, run_state: impl FnOnce() -> Option<i32>) -> sysinfo::ProcessStatus {
+    if bsd_status == 2 {
+        match run_state() {
+            Some(3) => sysinfo::ProcessStatus::Sleep,
+            Some(1) | None => sysinfo::ProcessStatus::Run,
+            _ => sysinfo::ProcessStatus::Unknown(0),
+        }
+    } else {
+        sysinfo::ProcessStatus::from(bsd_status)
+    }
 }
 
 impl Record {
@@ -379,15 +509,11 @@ impl Collector {
     }
 
     pub(super) fn identity_matches(&self, pid: u32, start_time: u64) -> bool {
-        if pid == 0 || pid > i32::MAX as u32 || start_time == 0 {
+        if pid == 0 || i32::try_from(pid).is_err() {
             return false;
         }
-        let bsd = match self.read_bsd_info(pid) {
-            Ok(bsd) => Some(bsd),
-            Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => kernel_process(pid),
-            Err(_) => None,
-        };
-        bsd.is_some_and(|bsd| bsd.pbi_pid == pid && bsd.pbi_start_tvsec == start_time)
+        trusted_identity(self.read_bsd_info(pid), || kernel_process(pid))
+            .is_some_and(|bsd| bsd.pbi_pid == pid && bsd.pbi_start_tvsec == start_time)
     }
 
     #[cfg(test)]
@@ -402,281 +528,214 @@ impl Collector {
         ports: &HashMap<u32, Vec<u16>>,
     ) -> Result<Vec<ProcessInfo>, String> {
         let mut timebase = Timebase::default();
-        if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
-            return Err("macOS could not read the CPU timebase".into());
-        }
-        let nanos_per_unit = timebase.numer as f64 / timebase.denom as f64;
+        let status = unsafe { mach_timebase_info(&mut timebase) };
+        let nanos_per_unit =
+            nanos_per_unit(status, &timebase).ok_or("macOS could not read the CPU timebase")?;
         let now = ProcessMonitor::get_current_time()?;
-        loop {
-            if self.pids.is_empty() {
-                let count = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
-                if count <= 0 {
-                    return Err("macOS could not enumerate processes".into());
-                }
-                self.pids.resize(count as usize + 128, 0);
-            }
-            let count = unsafe {
+        let count = list_pids(&mut self.pids, |buffer| match buffer {
+            None => unsafe { proc_listallpids(std::ptr::null_mut(), 0) },
+            Some(buffer) => unsafe {
                 proc_listallpids(
-                    self.pids.as_mut_ptr().cast(),
-                    std::mem::size_of_val(self.pids.as_slice()) as i32,
+                    buffer.as_mut_ptr().cast(),
+                    std::mem::size_of_val(buffer) as i32,
                 )
-            };
-            if count <= 0 {
-                return Err("macOS could not enumerate processes".into());
-            }
-            if count as usize >= self.pids.len() {
-                self.pids.resize(self.pids.len() * 2, 0);
+            },
+        })
+        .ok_or("macOS could not enumerate processes")?;
+        let mut kernel = None;
+        let mut live = HashSet::new();
+        let mut metadata = Vec::new();
+        let mut samples = Vec::new();
+        for &pid in &self.pids[..count] {
+            if pid <= 0 {
                 continue;
             }
-            let mut kernel = None;
-            let mut live = HashSet::new();
-            let mut metadata = Vec::new();
-            let mut samples = Vec::new();
-            for &pid in &self.pids[..count as usize] {
-                if pid <= 0 {
-                    continue;
-                }
-                let pid = pid as u32;
-                let identity = match self.read_bsd_info(pid) {
-                    Ok(bsd) => IdentityRead::Available(bsd),
-                    Err(error) if error.raw_os_error() == Some(3) => {
-                        match kernel.get_or_insert_with(kernel_processes) {
-                            Some(processes) => processes
-                                .remove(&pid)
-                                .map_or(IdentityRead::ConfirmedAbsent, IdentityRead::Available),
-                            None => IdentityRead::Unavailable,
-                        }
-                    }
-                    Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => kernel
-                        .get_or_insert_with(kernel_processes)
-                        .as_mut()
-                        .and_then(|processes| processes.remove(&pid))
-                        .map_or(IdentityRead::Unavailable, IdentityRead::Available),
-                    Err(_) => IdentityRead::Unavailable,
-                };
-                #[cfg(test)]
-                let identity = if self.confirmed_absent_identity == Some(pid) {
-                    self.confirmed_absent_identity = None;
-                    IdentityRead::ConfirmedAbsent
-                } else if self.unavailable_identity == Some(pid) {
-                    self.unavailable_identity = None;
-                    IdentityRead::Unavailable
-                } else {
-                    identity
-                };
-                let bsd = match identity {
-                    IdentityRead::Available(bsd) => Some(bsd),
-                    IdentityRead::Unavailable => None,
-                    IdentityRead::ConfirmedAbsent => continue,
-                };
-                live.insert(pid);
-                let identity = bsd
-                    .as_ref()
-                    .map(|b| (b.pbi_start_tvsec, b.pbi_start_tvusec));
-                if identity.is_none() {
-                    samples.push((pid, bsd));
-                    continue;
-                }
-                if self.records.get(&pid).map(|r| r.identity) != identity {
-                    self.records.remove(&pid);
-                    metadata.push(Pid::from_u32(pid));
-                }
-                if self.records.get(&pid).is_some_and(|r| {
-                    r.row.command.is_empty() || r.row.name.is_empty() || r.row.executable.is_empty()
-                }) {
-                    metadata.push(Pid::from_u32(pid));
-                }
+            let pid = pid as u32;
+            let identity =
+                listed_identity(pid, self.read_bsd_info(pid), &mut kernel, kernel_processes);
+            #[cfg(test)]
+            let identity = if self.confirmed_absent_identity == Some(pid) {
+                self.confirmed_absent_identity = None;
+                IdentityRead::ConfirmedAbsent
+            } else if self.unavailable_identity == Some(pid) {
+                self.unavailable_identity = None;
+                IdentityRead::Unavailable
+            } else {
+                identity
+            };
+            let bsd = match identity {
+                IdentityRead::Available(bsd) => Some(bsd),
+                IdentityRead::Unavailable => None,
+                IdentityRead::ConfirmedAbsent => continue,
+            };
+            live.insert(pid);
+            let identity = bsd
+                .as_ref()
+                .map(|b| (b.pbi_start_tvsec, b.pbi_start_tvusec));
+            if identity.is_none() {
                 samples.push((pid, bsd));
+                continue;
             }
-            self.records.retain(|pid, _| live.contains(pid));
-            let mut sys = System::new();
-            if !metadata.is_empty() {
-                let mut kind = ProcessRefreshKind::nothing()
-                    .with_user(UpdateKind::OnlyIfNotSet)
-                    .with_cmd(UpdateKind::OnlyIfNotSet)
-                    .with_exe(UpdateKind::OnlyIfNotSet)
-                    .with_root(UpdateKind::OnlyIfNotSet);
-                if include_environ {
-                    kind = kind.with_environ(UpdateKind::OnlyIfNotSet);
+            if self.records.get(&pid).map(|r| r.identity) != identity {
+                self.records.remove(&pid);
+                metadata.push(Pid::from_u32(pid));
+            }
+            if self
+                .records
+                .get(&pid)
+                .is_some_and(|r| needs_metadata(&r.row))
+            {
+                metadata.push(Pid::from_u32(pid));
+            }
+            samples.push((pid, bsd));
+        }
+        self.records.retain(|pid, _| live.contains(pid));
+        let mut sys = System::new();
+        if !metadata.is_empty() {
+            let mut kind = ProcessRefreshKind::nothing()
+                .with_user(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet)
+                .with_exe(UpdateKind::OnlyIfNotSet)
+                .with_root(UpdateKind::OnlyIfNotSet);
+            if include_environ {
+                kind = kind.with_environ(UpdateKind::OnlyIfNotSet);
+            }
+            sys.refresh_processes_specifics(ProcessesToUpdate::Some(&metadata), true, kind);
+        }
+        let mut rows = Vec::with_capacity(samples.len());
+        for (pid, bsd) in samples {
+            let Some(bsd) = bsd else {
+                if let Some(record) = self.records.get(&pid) {
+                    rows.push(unavailable_row(&record.row, include_environ));
                 }
-                sys.refresh_processes_specifics(ProcessesToUpdate::Some(&metadata), true, kind);
-            }
-            let mut rows = Vec::with_capacity(samples.len());
-            for (pid, bsd) in samples {
-                let Some(bsd) = bsd else {
-                    if let Some(record) = self.records.get(&pid) {
-                        let mut row = record.row.clone();
-                        row.cpu_usage = 0.;
-                        row.cpu_sample_seconds = None;
-                        row.disk_usage = (0, 0);
-                        row.disk_sample_seconds = None;
-                        if !include_environ {
-                            row.environ.clear();
-                        }
-                        rows.push(row);
-                    }
+                continue;
+            };
+            let sampled = Instant::now();
+            let task = info::<proc_taskinfo>(pid, PROC_PIDTASKINFO);
+            #[cfg(test)]
+            let task = task.filter(|_| self.unavailable_counters != Some(pid));
+            let cpu = task.as_ref().map(|task| {
+                (task.pti_total_user.saturating_add(task.pti_total_system) as f64 * nanos_per_unit)
+                    as u64
+            });
+            let mut usage = rusage_info_v2::default();
+            let disk = (unsafe {
+                proc_pid_rusage(
+                    pid as i32,
+                    RUSAGE_INFO_V2,
+                    (&mut usage as *mut rusage_info_v2).cast(),
+                )
+            } == 0)
+                .then_some((usage.ri_diskio_bytesread, usage.ri_diskio_byteswritten));
+            #[cfg(test)]
+            let disk = if self.unavailable_counters == Some(pid) {
+                self.unavailable_counters = None;
+                None
+            } else {
+                disk
+            };
+            let existing = self.records.contains_key(&pid);
+            if !existing {
+                let Some(process) = sys.process(Pid::from_u32(pid)) else {
                     continue;
                 };
-                let sampled = Instant::now();
-                let task = info::<proc_taskinfo>(pid, PROC_PIDTASKINFO);
-                #[cfg(test)]
-                let task = task.filter(|_| self.unavailable_counters != Some(pid));
-                let cpu = task.as_ref().map(|task| {
-                    (task.pti_total_user.saturating_add(task.pti_total_system) as f64
-                        * nanos_per_unit) as u64
-                });
-                let mut usage = rusage_info_v2::default();
-                let disk = (unsafe {
-                    proc_pid_rusage(
-                        pid as i32,
-                        RUSAGE_INFO_V2,
-                        (&mut usage as *mut rusage_info_v2).cast(),
-                    )
-                } == 0)
-                    .then_some((usage.ri_diskio_bytesread, usage.ri_diskio_byteswritten));
-                #[cfg(test)]
-                let disk = if self.unavailable_counters == Some(pid) {
-                    self.unavailable_counters = None;
-                    None
-                } else {
-                    disk
-                };
-                let existing = self.records.contains_key(&pid);
-                if !existing {
-                    let Some(process) = sys.process(Pid::from_u32(pid)) else {
-                        continue;
-                    };
-                    self.records.insert(
-                        pid,
-                        Record {
-                            identity: (bsd.pbi_start_tvsec, bsd.pbi_start_tvusec),
-                            row: process_row(
-                                pid,
-                                process,
-                                users,
-                                include_environ,
-                                ports,
-                                None,
-                                now,
-                            ),
-                            cpu_sample: None,
-                            disk_sample: self
-                                .last_collection
-                                .filter(|at| {
-                                    let wall_now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs_f64();
-                                    born_in_interval(
-                                        bsd.pbi_start_tvsec as f64
-                                            + bsd.pbi_start_tvusec as f64 / 1_000_000.,
-                                        wall_now,
-                                        at.elapsed().as_secs_f64(),
-                                    )
-                                })
-                                .map(|at| ((0, 0), at)),
-                        },
-                    );
-                }
-                let record = self.records.get_mut(&pid).unwrap();
-                if record.row.command.is_empty()
-                    || record.row.name.is_empty()
-                    || record.row.executable.is_empty()
-                {
-                    if let Some(process) = sys.process(Pid::from_u32(pid)) {
-                        if record.row.name.is_empty() {
-                            record.row.name = process.name().to_string_lossy().into_owned();
-                        }
-                        record.row.argv = process
-                            .cmd()
-                            .iter()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .collect();
-                        record.row.command = record.row.argv.join(" ");
-                        record.row.executable = process
-                            .exe()
-                            .map(|path| path.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                    }
-                }
-                if record.row.root.is_empty() {
-                    if let Some(vnodes) = info::<proc_vnodepathinfo>(pid, PROC_PIDVNODEPATHINFO) {
-                        if vnodes.pvi_rdir.vip_vi.vi_stat.vst_dev != 0 {
-                            let bytes = vnodes.pvi_rdir.vip_path.as_flattened();
-                            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-                            record.row.root = String::from_utf8_lossy(&bytes[..end]).into_owned();
-                        }
-                    }
-                }
-                if record.row.name.is_empty() {
-                    let bytes: Vec<u8> = bsd
-                        .pbi_name
-                        .iter()
-                        .map(|b| *b as u8)
-                        .take_while(|b| *b != 0)
-                        .collect();
-                    record.row.name = String::from_utf8_lossy(&bytes).into_owned();
-                }
-                if record.row.user.is_empty() || record.row.user == "-" {
-                    record.row.user = users
-                        .iter()
-                        .find(|user| **user.id() == bsd.pbi_uid)
-                        .map(|user| user.name().to_owned())
-                        .unwrap_or_else(|| bsd.pbi_uid.to_string());
-                }
-                record.row.start_time = bsd.pbi_start_tvsec;
-                record.row.ppid = bsd.pbi_ppid;
-                let mut row = record.row.clone();
-                {
-                    row.ppid = bsd.pbi_ppid;
-                    row.start_time = bsd.pbi_start_tvsec;
-                    let status = if bsd.pbi_status == 2 {
-                        match info::<proc_threadinfo>(pid, PROC_PIDTHREADINFO)
-                            .map(|t| t.pth_run_state)
-                        {
-                            Some(3) => sysinfo::ProcessStatus::Sleep,
-                            Some(1) | None => sysinfo::ProcessStatus::Run,
-                            _ => sysinfo::ProcessStatus::Unknown(0),
-                        }
-                    } else {
-                        sysinfo::ProcessStatus::from(bsd.pbi_status)
-                    };
-                    row.status = ProcessMonitor::format_status(status);
-                }
-                row.memory_usage = task.as_ref().map_or(0, |task| task.pti_resident_size);
-                row.virtual_memory = task.as_ref().map_or(0, |task| task.pti_virtual_size);
-                row.run_time = if row.start_time > 0 {
-                    now.saturating_sub(row.start_time)
-                } else {
-                    0
-                };
-                row.session_id = u32::try_from(unsafe { getsid(pid as i32) }).ok();
-                row.ports = ports.get(&pid).cloned().unwrap_or_default();
-                if !include_environ {
-                    row.environ.clear();
-                } else if row.environ.is_empty() {
-                    row.environ =
-                        super::process_monitor::macos_environment(pid).unwrap_or_default();
-                }
-                record.emit(
-                    &mut row,
-                    Sample {
-                        cpu_nanos: cpu,
-                        disk,
-                        sampled,
+                self.records.insert(
+                    pid,
+                    Record {
+                        identity: (bsd.pbi_start_tvsec, bsd.pbi_start_tvusec),
+                        row: process_row(pid, process, users, include_environ, ports, None, now),
+                        cpu_sample: None,
+                        disk_sample: self
+                            .last_collection
+                            .filter(|at| {
+                                let wall_now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs_f64();
+                                born_in_interval(
+                                    bsd.pbi_start_tvsec as f64
+                                        + bsd.pbi_start_tvusec as f64 / 1_000_000.,
+                                    wall_now,
+                                    at.elapsed().as_secs_f64(),
+                                )
+                            })
+                            .map(|at| ((0, 0), at)),
                     },
                 );
-                if !self.primed {
-                    row.cpu_usage = 0.;
-                    row.cpu_sample_seconds = None;
-                    row.disk_usage = (0, 0);
-                }
-                rows.push(row);
             }
-            self.primed = true;
-            self.last_collection = Some(Instant::now());
-            return Ok(rows);
+            let record = self.records.get_mut(&pid).unwrap();
+            if needs_metadata(&record.row) {
+                if let Some(process) = sys.process(Pid::from_u32(pid)) {
+                    if record.row.name.is_empty() {
+                        record.row.name = process.name().to_string_lossy().into_owned();
+                    }
+                    record.row.argv = process
+                        .cmd()
+                        .iter()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .collect();
+                    record.row.command = record.row.argv.join(" ");
+                    record.row.executable = process
+                        .exe()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                }
+            }
+            if record.row.root.is_empty() {
+                if let Some(root) = info::<proc_vnodepathinfo>(pid, PROC_PIDVNODEPATHINFO)
+                    .as_ref()
+                    .and_then(root_path)
+                {
+                    record.row.root = root;
+                }
+            }
+            if record.row.name.is_empty() {
+                record.row.name = bsd_name(&bsd);
+            }
+            fill_user(
+                &mut record.row.user,
+                bsd.pbi_uid,
+                users.iter().map(|user| (**user.id(), user.name())),
+            );
+            record.row.start_time = bsd.pbi_start_tvsec;
+            record.row.ppid = bsd.pbi_ppid;
+            let mut row = record.row.clone();
+            {
+                row.ppid = bsd.pbi_ppid;
+                row.start_time = bsd.pbi_start_tvsec;
+                let status = run_status(bsd.pbi_status, || {
+                    info::<proc_threadinfo>(pid, PROC_PIDTHREADINFO).map(|t| t.pth_run_state)
+                });
+                row.status = ProcessMonitor::format_status(status);
+            }
+            row.memory_usage = task.as_ref().map_or(0, |task| task.pti_resident_size);
+            row.virtual_memory = task.as_ref().map_or(0, |task| task.pti_virtual_size);
+            row.run_time = run_time(row.start_time, now);
+            row.session_id = u32::try_from(unsafe { getsid(pid as i32) }).ok();
+            row.ports = ports.get(&pid).cloned().unwrap_or_default();
+            if !include_environ {
+                row.environ.clear();
+            } else if row.environ.is_empty() {
+                row.environ = super::process_monitor::macos_environment(pid).unwrap_or_default();
+            }
+            record.emit(
+                &mut row,
+                Sample {
+                    cpu_nanos: cpu,
+                    disk,
+                    sampled,
+                },
+            );
+            if !self.primed {
+                row.cpu_usage = 0.;
+                row.cpu_sample_seconds = None;
+                row.disk_usage = (0, 0);
+            }
+            rows.push(row);
         }
+        self.primed = true;
+        self.last_collection = Some(Instant::now());
+        Ok(rows)
     }
 }
 
@@ -962,6 +1021,284 @@ mod tests {
         child.0.wait().unwrap();
         std::fs::remove_file(scratch).unwrap();
         std::fs::remove_file(ready).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+
+    fn record(pid: u32) -> KernelProcess {
+        let mut record = KernelProcess([0; 648]);
+        record.0[40..44].copy_from_slice(&pid.to_ne_bytes());
+        record
+    }
+
+    fn bsd(pid: u32) -> proc_bsdinfo {
+        proc_bsdinfo {
+            pbi_pid: pid,
+            ..Default::default()
+        }
+    }
+
+    fn error(code: i32) -> Result<proc_bsdinfo, std::io::Error> {
+        Err(std::io::Error::from_raw_os_error(code))
+    }
+
+    fn pids(table: Option<HashMap<u32, proc_bsdinfo>>) -> Option<Vec<u32>> {
+        table.map(|table| {
+            let mut pids: Vec<_> = table.into_keys().collect();
+            pids.sort_unstable();
+            pids
+        })
+    }
+
+    #[test]
+    fn kernel_table_keeps_only_whole_records_within_the_buffer() {
+        let buffer = [record(1), record(2), record(3)];
+        assert_eq!(pids(kernel_table(&buffer, 2 * 648)), Some(vec![1, 2]));
+        assert_eq!(pids(kernel_table(&buffer, 3 * 648)), Some(vec![1, 2, 3]));
+        assert_eq!(pids(kernel_table(&buffer, 0)), Some(vec![]));
+        assert_eq!(pids(kernel_table(&buffer, 4 * 648)), None);
+        assert_eq!(pids(kernel_table(&buffer, 648 + 1)), None);
+    }
+
+    /// A process table of `count` records that the probe reports as `probed` records.
+    fn table_reader(
+        probed: usize,
+        count: usize,
+        calls: &mut usize,
+    ) -> impl FnMut(Option<&mut [KernelProcess]>, &mut usize) -> Result<(), Option<i32>> + '_ {
+        move |buffer, bytes| {
+            *calls += 1;
+            let Some(buffer) = buffer else {
+                *bytes = probed * 648;
+                return Ok(());
+            };
+            assert_eq!(*bytes, std::mem::size_of_val(buffer));
+            if buffer.len() < count {
+                return Err(Some(ENOMEM));
+            }
+            for (pid, slot) in buffer[..count].iter_mut().enumerate() {
+                *slot = record(pid as u32 + 1);
+            }
+            *bytes = count * 648;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn kernel_table_read_doubles_the_buffer_while_the_table_grows() {
+        let mut calls = 0;
+        let table = kernel_processes_with(table_reader(0, 700, &mut calls));
+        assert_eq!(pids(table), Some((1..=700).collect()));
+        assert_eq!(calls, 4);
+
+        let mut calls = 0;
+        assert!(kernel_processes_with(table_reader(0, 1000, &mut calls)).is_none());
+        assert_eq!(calls, 4, "gives up after three reads");
+
+        let mut calls = 0;
+        let table = kernel_processes_with(table_reader(10, 10, &mut calls));
+        assert_eq!(pids(table), Some((1..=10).collect()));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn kernel_table_read_stops_on_other_errors() {
+        let mut calls = 0;
+        let table = kernel_processes_with(|buffer, _| {
+            calls += 1;
+            if buffer.is_some() {
+                Err(Some(1))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(table.is_none());
+        assert_eq!(calls, 2);
+        assert!(kernel_processes_with(|_, _| Err(None)).is_none());
+    }
+
+    #[test]
+    fn guarded_actions_trust_the_kernel_table_only_after_a_permission_denial() {
+        let kernel = || Some(bsd(7));
+        assert_eq!(
+            trusted_identity(Ok(bsd(5)), || unreachable!())
+                .unwrap()
+                .pbi_pid,
+            5
+        );
+        assert_eq!(trusted_identity(error(1), kernel).unwrap().pbi_pid, 7);
+        assert_eq!(trusted_identity(error(13), kernel).unwrap().pbi_pid, 7);
+        assert!(trusted_identity(error(ESRCH), kernel).is_none());
+        assert!(trusted_identity(error(5), kernel).is_none());
+    }
+
+    #[test]
+    fn listed_pids_fall_back_to_the_kernel_table_by_failure_kind() {
+        let classify = |code: i32, table: Option<&[u32]>| {
+            let mut kernel =
+                Some(table.map(|pids| pids.iter().map(|&pid| (pid, bsd(pid))).collect()));
+            listed_identity(7, error(code), &mut kernel, || unreachable!())
+        };
+        let available =
+            |identity| matches!(identity, IdentityRead::Available(bsd) if bsd.pbi_pid == 7);
+        assert!(available(classify(ESRCH, Some(&[7]))));
+        assert!(matches!(
+            classify(ESRCH, Some(&[8])),
+            IdentityRead::ConfirmedAbsent
+        ));
+        assert!(matches!(classify(ESRCH, None), IdentityRead::Unavailable));
+        assert!(available(classify(1, Some(&[7]))));
+        assert!(available(classify(13, Some(&[7]))));
+        assert!(matches!(classify(1, Some(&[8])), IdentityRead::Unavailable));
+        assert!(matches!(classify(13, None), IdentityRead::Unavailable));
+        assert!(matches!(classify(5, Some(&[7])), IdentityRead::Unavailable));
+
+        let mut kernel = None;
+        let mut loads = 0;
+        for pid in [7, 8] {
+            listed_identity(pid, error(ESRCH), &mut kernel, || {
+                loads += 1;
+                Some([(7, bsd(7)), (8, bsd(8))].into())
+            });
+        }
+        assert_eq!(loads, 1, "one table read per collection");
+        assert!(matches!(
+            listed_identity(9, Ok(bsd(9)), &mut kernel, || unreachable!()),
+            IdentityRead::Available(bsd) if bsd.pbi_pid == 9
+        ));
+    }
+
+    #[test]
+    fn timebase_converts_ticks_only_after_a_valid_read() {
+        let timebase = |numer, denom| Timebase { numer, denom };
+        assert_eq!(nanos_per_unit(0, &timebase(125, 3)), Some(125. / 3.));
+        assert_eq!(nanos_per_unit(1, &timebase(125, 3)), None);
+        assert_eq!(nanos_per_unit(0, &timebase(1, 0)), None);
+    }
+
+    #[test]
+    fn pid_list_grows_until_every_pid_fits() {
+        const LIVE: usize = 300;
+        let mut calls = 0;
+        let mut buffer = Vec::new();
+        let count = list_pids(&mut buffer, |pids| {
+            calls += 1;
+            assert!(calls <= 6, "the buffer never fit the list");
+            let Some(pids) = pids else {
+                return 10;
+            };
+            let filled = pids.len().min(LIVE);
+            for (slot, pid) in pids.iter_mut().zip(1..) {
+                *slot = pid;
+            }
+            filled as i32
+        });
+        assert_eq!(count, Some(LIVE));
+        assert_eq!(buffer[..LIVE], (1..=LIVE as i32).collect::<Vec<_>>());
+        assert_eq!(calls, 4);
+        assert_eq!(list_pids(&mut Vec::new(), |_| 0), None);
+        assert_eq!(list_pids(&mut vec![0; 4], |_| -1), None);
+    }
+
+    #[test]
+    fn rows_missing_a_command_name_or_executable_need_metadata() {
+        let complete = ProcessInfo {
+            command: "sleep 30".into(),
+            name: "sleep".into(),
+            executable: "/bin/sleep".into(),
+            ..Default::default()
+        };
+        assert!(!needs_metadata(&complete));
+        for clear in [
+            |row: &mut ProcessInfo| row.command.clear(),
+            |row: &mut ProcessInfo| row.name.clear(),
+            |row: &mut ProcessInfo| row.executable.clear(),
+        ] {
+            let mut row = complete.clone();
+            clear(&mut row);
+            assert!(needs_metadata(&row));
+        }
+    }
+
+    #[test]
+    fn unavailable_row_drops_counters_and_unrequested_environment() {
+        let cached = ProcessInfo {
+            pid: 7,
+            command: "sleep 30".into(),
+            cpu_usage: 12.,
+            cpu_sample_seconds: Some(1.),
+            disk_usage: (3, 4),
+            disk_sample_seconds: Some(1.),
+            environ: vec!["PATH=/bin".into()],
+            ..Default::default()
+        };
+        let row = unavailable_row(&cached, false);
+        assert_eq!((row.pid, row.command.as_str()), (7, "sleep 30"));
+        assert_eq!(row.cpu_usage, 0.);
+        assert_eq!(row.cpu_sample_seconds, None);
+        assert_eq!(row.disk_usage, (0, 0));
+        assert_eq!(row.disk_sample_seconds, None);
+        assert!(row.environ.is_empty());
+        assert_eq!(unavailable_row(&cached, true).environ, ["PATH=/bin"]);
+    }
+
+    #[test]
+    fn root_path_reads_a_set_root_directory() {
+        // SAFETY: the vnode path record holds only integers and byte arrays.
+        let mut vnodes: proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        vnodes.pvi_rdir.vip_path[0][..6].copy_from_slice(b"/jail\0");
+        assert_eq!(
+            root_path(&vnodes),
+            None,
+            "a zero device means no root is set"
+        );
+        vnodes.pvi_rdir.vip_vi.vi_stat.vst_dev = 1;
+        assert_eq!(root_path(&vnodes).as_deref(), Some("/jail"));
+    }
+
+    #[test]
+    fn bsd_name_stops_at_the_first_nul() {
+        let mut info = bsd(7);
+        for (slot, byte) in info.pbi_name.iter_mut().zip(b"sleep\0junk") {
+            *slot = *byte as i8;
+        }
+        assert_eq!(bsd_name(&info), "sleep");
+    }
+
+    #[test]
+    fn unknown_owner_is_named_from_the_users_or_by_uid() {
+        let users = [(501, "gabriel"), (0, "root")];
+        for unknown in ["", "-"] {
+            let mut user = unknown.to_string();
+            fill_user(&mut user, 0, users.into_iter());
+            assert_eq!(user, "root");
+        }
+        let mut user = "-".to_string();
+        fill_user(&mut user, 7, users.into_iter());
+        assert_eq!(user, "7");
+        let mut user = "alice".to_string();
+        fill_user(&mut user, 0, users.into_iter());
+        assert_eq!(user, "alice");
+    }
+
+    #[test]
+    fn runnable_status_follows_the_thread_run_state() {
+        use sysinfo::ProcessStatus;
+        assert_eq!(run_status(2, || Some(3)), ProcessStatus::Sleep);
+        assert_eq!(run_status(2, || Some(1)), ProcessStatus::Run);
+        assert_eq!(run_status(2, || None), ProcessStatus::Run);
+        assert_eq!(run_status(2, || Some(5)), ProcessStatus::Unknown(0));
+        assert_eq!(run_status(5, || unreachable!()), ProcessStatus::Zombie);
+    }
+
+    #[test]
+    fn identity_never_matches_the_kernel_task() {
+        let kernel_task = kernel_process(0).expect("pid 0 is in the kernel table");
+        assert_eq!(kernel_task.pbi_pid, 0);
+        assert!(!Collector::default().identity_matches(0, kernel_task.pbi_start_tvsec));
     }
 }
 

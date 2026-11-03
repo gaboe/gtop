@@ -212,6 +212,26 @@ mod tests {
     }
 
     #[test]
+    fn reads_only_numbers_from_a_dictionary() {
+        let keys = [
+            CFString::from_static_str("accumulatedGPUTime"),
+            CFString::from_static_str("name"),
+        ];
+        let number = CFNumber::new_f64(1234.5);
+        let text = CFString::from_static_str("GPU");
+        let values: [&CFType; 2] = [&number, &text];
+        let dictionary =
+            CFDictionary::<CFString, CFType>::from_slices(&[&*keys[0], &*keys[1]], &values);
+        let dictionary = dictionary.as_opaque();
+        assert_eq!(
+            dictionary_number(dictionary, "accumulatedGPUTime"),
+            Some(1234.5)
+        );
+        assert_eq!(dictionary_number(dictionary, "name"), None);
+        assert_eq!(dictionary_number(dictionary, "missing"), None);
+    }
+
+    #[test]
     fn parses_creator_pid() {
         assert_eq!(parse_creator_pid("pid 620, WindowServer"), Some(620));
         assert_eq!(parse_creator_pid("WindowServer"), None);

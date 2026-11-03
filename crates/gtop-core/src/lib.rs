@@ -127,8 +127,7 @@ impl CpuTopology {
     }
 
     fn complete(&self, count: usize) -> bool {
-        count > 0
-            && count < 128
+        count < 128
             && self.fast != 0
             && self.slow != 0
             && self.fast & self.slow == 0
@@ -171,7 +170,22 @@ impl CpuTopology {
 
 pub fn perf_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("GTOP_PERF").is_some())
+    *ENABLED.get_or_init(|| perf_requested(std::env::var_os("GTOP_PERF")))
+}
+
+/// Any `GTOP_PERF` value turns perf logging on, an empty one included.
+fn perf_requested(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some()
+}
+
+#[cfg(test)]
+mod perf_tests {
+    #[test]
+    fn any_gtop_perf_value_enables_perf_logging() {
+        assert!(!super::perf_requested(None));
+        assert!(super::perf_requested(Some("".into())));
+        assert!(super::perf_requested(Some("1".into())));
+    }
 }
 
 #[cfg(test)]
@@ -285,5 +299,28 @@ mod topology_tests {
             }
             assert_eq!(topology.label(usage.len()), "CPU · 3 cores");
         }
+    }
+
+    #[test]
+    fn shows_one_cores_bank_beyond_the_128_core_mask() {
+        let topology = CpuTopology {
+            fast: u128::MAX >> 64,
+            slow: u128::MAX << 64,
+            letters: ['P', 'E'],
+        };
+        let usage = [1.; 128];
+        assert!(matches!(topology.banks(&usage), CpuBanks::Cores(cores) if cores.len() == 128));
+        assert_eq!(topology.label(usage.len()), "CPU · 128 cores");
+    }
+
+    #[test]
+    fn empty_usage_is_one_cores_bank() {
+        let topology = CpuTopology {
+            fast: 1,
+            slow: 2,
+            letters: ['P', 'E'],
+        };
+        assert!(matches!(topology.banks(&[]), CpuBanks::Cores([])));
+        assert_eq!(topology.label(0), "CPU · 0 cores");
     }
 }

@@ -78,4 +78,19 @@ mod tests {
     fn indexes_udp_with_real_port() {
         assert!(should_index_socket(Protocol::UDP, SocketState::Unknown, 53));
     }
+
+    #[test]
+    fn lists_own_listening_ports_once_in_ascending_order() {
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let connected = std::net::TcpStream::connect(first.local_addr().unwrap()).unwrap();
+        let own = collect_ports_by_pid()
+            .remove(&std::process::id())
+            .expect("own listeners are indexed");
+        for listener in [&first, &second] {
+            assert!(own.contains(&listener.local_addr().unwrap().port()));
+        }
+        assert!(!own.contains(&connected.local_addr().unwrap().port()));
+        assert!(own.windows(2).all(|pair| pair[0] < pair[1]), "{own:?}");
+    }
 }
