@@ -84,7 +84,11 @@ impl SystemMonitor {
     ///
     /// * `sys` - System information provider for initial readings
     pub fn new(networks: &Networks) -> Self {
-        let (initial_rx, initial_tx) = network_totals(networks);
+        let (initial_rx, initial_tx) = network_totals(
+            networks
+                .values()
+                .map(|data| (data.total_received(), data.total_transmitted())),
+        );
         Self {
             last_network_update: (Instant::now(), initial_rx, initial_tx),
             network_interfaces: networks.keys().cloned().collect(),
@@ -112,7 +116,11 @@ impl SystemMonitor {
     ) -> SystemStats {
         let (network_rx, network_tx) = self.network_rates(
             networks.keys().cloned().collect(),
-            network_totals(networks),
+            network_totals(
+                networks
+                    .values()
+                    .map(|data| (data.total_received(), data.total_transmitted())),
+            ),
             Instant::now(),
         );
         let disk_stats = self.calculate_disk_stats_with(disks, real_free_bytes);
@@ -147,7 +155,7 @@ impl SystemMonitor {
     pub fn refresh_disks(&mut self, disks: &mut Disks) {
         self.refresh_disks_with(
             disks,
-            Instant::now(),
+            Instant::now,
             || Disks::new_with_refreshed_list_specifics(DiskRefreshKind::nothing().with_storage()),
             real_free_bytes,
         );
@@ -156,10 +164,11 @@ impl SystemMonitor {
     fn refresh_disks_with(
         &mut self,
         disks: &mut Disks,
-        now: Instant,
+        clock: impl Fn() -> Instant,
         refresh: impl FnOnce() -> Disks,
         read_free: impl FnMut(&Path) -> Option<u64>,
     ) {
+        let now = clock();
         if self
             .disks_refreshed_at
             .is_some_and(|refreshed_at| now.duration_since(refreshed_at) < Duration::from_secs(60))
@@ -183,7 +192,8 @@ impl SystemMonitor {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = read_free;
-        self.disks_refreshed_at = Some(now);
+        // The cooldown starts when the slow refresh finishes, not when it starts.
+        self.disks_refreshed_at = Some(clock());
     }
 
     /// Whether a disk counts toward the storage panel. Windows shows every disk.
@@ -253,17 +263,9 @@ impl SystemMonitor {
     }
 }
 
-/// Received and transmitted bytes summed over every interface.
-fn network_totals(networks: &Networks) -> (u64, u64) {
-    sum_pairs(
-        networks
-            .values()
-            .map(|data| (data.total_received(), data.total_transmitted())),
-    )
-}
-
-fn sum_pairs(pairs: impl Iterator<Item = (u64, u64)>) -> (u64, u64) {
-    pairs.fold((0, 0), |(rx, tx), (data_rx, data_tx)| {
+/// Received and transmitted bytes summed over every interface's counters.
+fn network_totals(counters: impl Iterator<Item = (u64, u64)>) -> (u64, u64) {
+    counters.fold((0, 0), |(rx, tx), (data_rx, data_tx)| {
         (rx + data_rx, tx + data_tx)
     })
 }
@@ -361,7 +363,7 @@ mod tests {
         let mut reads = 0;
         monitor.refresh_disks_with(
             &mut disks,
-            Instant::now(),
+            Instant::now,
             || {
                 reads += 1;
                 Disks::new()
@@ -372,7 +374,7 @@ mod tests {
         let first_refresh = monitor.disks_refreshed_at;
         monitor.refresh_disks_with(
             &mut disks,
-            Instant::now(),
+            Instant::now,
             || {
                 reads += 1;
                 Disks::new()
@@ -385,7 +387,7 @@ mod tests {
         monitor.disks_refreshed_at = Some(Instant::now() - Duration::from_secs(60));
         monitor.refresh_disks_with(
             &mut disks,
-            Instant::now(),
+            Instant::now,
             || {
                 reads += 1;
                 Disks::new()
@@ -405,7 +407,7 @@ mod tests {
 
         monitor.refresh_disks_with(
             &mut disks,
-            Instant::now(),
+            Instant::now,
             || {
                 let refreshed = Disks::new_with_refreshed_list_specifics(
                     DiskRefreshKind::nothing().with_storage(),
@@ -617,27 +619,35 @@ mod tests {
     }
 
     #[test]
-    fn storage_refresh_is_due_exactly_sixty_seconds_after_the_last_one() {
+    fn storage_refresh_is_due_sixty_seconds_after_the_last_one_finished() {
         let mut monitor = SystemMonitor::new(&Networks::new());
         let mut disks = Disks::new();
-        let refreshed_at = Instant::now();
-        let mut reads = 0;
-        for (after, expected_reads) in [(59_999, 0), (60_000, 1)] {
-            monitor.disks_refreshed_at = Some(refreshed_at);
-            monitor.refresh_disks_with(
-                &mut disks,
-                refreshed_at + Duration::from_millis(after),
-                || {
-                    reads += 1;
-                    Disks::new()
-                },
-                |_| Some(100),
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let reads = std::cell::Cell::new(0);
+        let slow_refresh = || {
+            reads.set(reads.get() + 1);
+            clock.set(clock.get() + Duration::from_secs(2));
+            Disks::new()
+        };
+        let finished = start + Duration::from_secs(2);
+
+        monitor.refresh_disks_with(&mut disks, || clock.get(), slow_refresh, |_| Some(100));
+        assert_eq!(reads.get(), 1);
+        assert_eq!(monitor.disks_refreshed_at, Some(finished));
+
+        for (after_finish, expected_reads) in [(58_000, 1), (59_999, 1), (60_000, 2)] {
+            clock.set(finished + Duration::from_millis(after_finish));
+            monitor.refresh_disks_with(&mut disks, || clock.get(), slow_refresh, |_| Some(100));
+            assert_eq!(
+                reads.get(),
+                expected_reads,
+                "{after_finish} ms after the last refresh finished"
             );
-            assert_eq!(reads, expected_reads, "{after} ms after the last refresh");
         }
         assert_eq!(
             monitor.disks_refreshed_at,
-            Some(refreshed_at + Duration::from_secs(60))
+            Some(finished + Duration::from_secs(62))
         );
     }
 
@@ -665,15 +675,10 @@ mod tests {
 
     #[test]
     fn network_totals_sum_every_interface() {
-        assert_eq!(sum_pairs([(1, 2), (3, 4)].into_iter()), (4, 6));
-        let networks = Networks::new_with_refreshed_list();
-        let received = networks.values().map(|data| data.total_received()).sum();
-        let transmitted = networks.values().map(|data| data.total_transmitted()).sum();
-        assert!(
-            received > 1 && transmitted > 1,
-            "interfaces carried traffic since boot"
-        );
-        assert_eq!(network_totals(&networks), (received, transmitted));
+        assert_eq!(network_totals([(1, 2), (3, 4)].into_iter()), (4, 6));
+        assert_eq!(network_totals([(7, 0), (0, 0)].into_iter()), (7, 0));
+        assert_eq!(network_totals([(0, 0), (0, 0)].into_iter()), (0, 0));
+        assert_eq!(network_totals(std::iter::empty()), (0, 0));
     }
 }
 
