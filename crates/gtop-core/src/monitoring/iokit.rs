@@ -199,6 +199,9 @@ pub(super) fn read_battery() -> Option<RawBattery> {
     };
     Some(RawBattery {
         capacity_percent: number("CurrentCapacity"),
+        current_capacity: number("CurrentCapacity"),
+        max_capacity: number("MaxCapacity"),
+        battery_installed: boolean("BatteryInstalled"),
         is_charging: boolean("IsCharging"),
         external_connected: boolean("ExternalConnected"),
         fully_charged: boolean("FullyCharged"),

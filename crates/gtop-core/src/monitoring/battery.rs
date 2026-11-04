@@ -3,6 +3,9 @@ use super::{BatteryState, Power};
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct RawBattery {
     pub capacity_percent: Option<i64>,
+    pub current_capacity: Option<i64>,
+    pub max_capacity: Option<i64>,
+    pub battery_installed: Option<bool>,
     pub is_charging: Option<bool>,
     pub external_connected: Option<bool>,
     pub fully_charged: Option<bool>,
@@ -72,6 +75,9 @@ mod tests {
     fn raw() -> RawBattery {
         RawBattery {
             capacity_percent: Some(80),
+            current_capacity: Some(80),
+            max_capacity: Some(100),
+            battery_installed: Some(true),
             is_charging: Some(true),
             external_connected: Some(true),
             fully_charged: Some(false),
@@ -169,6 +175,85 @@ mod tests {
             ..raw()
         };
         assert_eq!(power(&raw).unwrap().system_watts, Some(70.411));
+    }
+
+    #[test]
+    fn normalizes_capacity_units_and_rejects_missing_or_zero_maximum() {
+        for (current_capacity, max_capacity, expected_percent) in
+            [(80, 100, 80), (4_000, 5_000, 80), (50, 5_000, 1)]
+        {
+            let raw = RawBattery {
+                capacity_percent: None,
+                current_capacity: Some(current_capacity),
+                max_capacity: Some(max_capacity),
+                ..raw()
+            };
+            assert_eq!(power(&raw).map(|value| value.percent), Some(expected_percent));
+        }
+        for max_capacity in [None, Some(0)] {
+            let raw = RawBattery {
+                capacity_percent: None,
+                current_capacity: Some(80),
+                max_capacity,
+                ..raw()
+            };
+            assert_eq!(power(&raw), None);
+        }
+    }
+
+    #[test]
+    fn installed_flag_hides_absent_battery_but_zero_percent_stays_visible() {
+        let absent = RawBattery {
+            battery_installed: Some(false),
+            current_capacity: Some(0),
+            max_capacity: Some(5_000),
+            capacity_percent: None,
+            ..raw()
+        };
+        assert_eq!(power(&absent), None);
+
+        let empty = RawBattery {
+            current_capacity: Some(0),
+            max_capacity: Some(5_000),
+            capacity_percent: None,
+            ..raw()
+        };
+        assert_eq!(power(&empty).map(|value| value.percent), Some(0));
+    }
+
+    #[test]
+    fn ac_attached_battery_with_negative_current_is_discharging() {
+        let raw = RawBattery {
+            is_charging: Some(false),
+            external_connected: Some(true),
+            fully_charged: Some(false),
+            amperage_ma: Some(-800),
+            voltage_mv: Some(12_000),
+            avg_time_to_empty: Some(240),
+            system_load_mw: Some(70_411),
+            ..raw()
+        };
+        assert_eq!(
+            power(&raw),
+            Some(Power {
+                percent: 80,
+                state: BatteryState::Discharging {
+                    minutes_to_empty: Some(240),
+                },
+                system_watts: Some(70.411),
+                battery_watts: Some(-9.6),
+                adapter_watts: Some(90),
+            })
+        );
+    }
+
+    #[test]
+    fn zero_adapter_watts_are_not_a_valid_reading() {
+        let raw = RawBattery {
+            adapter_watts: Some(0),
+            ..raw()
+        };
+        assert_eq!(power(&raw).unwrap().adapter_watts, None);
     }
 
     #[test]

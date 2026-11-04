@@ -3271,13 +3271,13 @@ mod tests {
             battery_readouts(&Power {
                 percent: 80,
                 state: BatteryState::Discharging {
-                    minutes_to_empty: None,
+                    minutes_to_empty: Some(240),
                 },
-                system_watts: None,
-                battery_watts: Some(-8.1),
+                system_watts: Some(70.411),
+                battery_watts: Some(-9.6),
                 adapter_watts: None,
             }),
-            ["EMPTY IN N/A", "N/A", "-8.1"]
+            ["EMPTY IN 4:00", "70.4", "-9.6"]
         );
     }
 
