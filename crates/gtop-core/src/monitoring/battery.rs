@@ -57,7 +57,9 @@ pub(super) fn power(raw: &RawBattery) -> Option<Power> {
         .filter(|watts| *watts > 0)
         .map(|watts| watts as f32 / 1_000.)
         .or_else(|| {
-            if !matches!(&state, BatteryState::Discharging { .. }) {
+            if raw.external_connected != Some(false)
+                || !matches!(&state, BatteryState::Discharging { .. })
+            {
                 return None;
             }
             raw.voltage_mv
@@ -185,6 +187,32 @@ mod tests {
             ..raw()
         };
         assert_eq!(power(&raw).unwrap().system_watts, Some(70.411));
+    }
+
+    #[test]
+    fn ac_attached_discharge_without_system_load_keeps_notebook_watts_unknown() {
+        for system_load_mw in [None, Some(0)] {
+            let raw = RawBattery {
+                is_charging: Some(false),
+                external_connected: Some(true),
+                fully_charged: Some(false),
+                avg_time_to_empty: Some(240),
+                voltage_mv: Some(12_000),
+                amperage_ma: Some(-800),
+                system_load_mw,
+                ..raw()
+            };
+
+            let power = power(&raw).unwrap();
+            assert_eq!(
+                power.state,
+                BatteryState::Discharging {
+                    minutes_to_empty: Some(240),
+                }
+            );
+            assert_eq!(power.system_watts, None);
+            assert_eq!(power.battery_watts, Some(-9.6));
+        }
     }
 
     #[test]
