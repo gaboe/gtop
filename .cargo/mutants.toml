@@ -24,6 +24,10 @@ examine_globs = [
 ]
 
 exclude_re = [
+  # Sends real signals; a mutant could reach pid <= 1. Never mutate the kill path.
+  'signal_target_is_safe',
+  'ProcessMonitor::kill_process',
+  'AppState::kill_process',
   # FFI shells: they call IOKit, SMC, or libproc and need real hardware.
   # Only their Drop impls release kernel handles; other Drop impls stay in scope.
   '(iokit|smc)\.rs.*<impl Drop for ',
