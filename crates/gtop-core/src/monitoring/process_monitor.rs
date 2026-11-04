@@ -106,6 +106,14 @@ impl Default for ProcessMonitor {
     }
 }
 
+/// A signal goes to one process only. `kill(2)` reads 0 as this process group,
+/// a negative value as a group, and -1 as every process the user owns. sysinfo
+/// casts the PID to `i32`, so a PID above `i32::MAX` becomes negative. PID 1 is
+/// launchd. gtop never signals itself.
+fn signal_target_is_safe(pid: u32, own_pid: u32) -> bool {
+    pid > 1 && pid <= i32::MAX as u32 && pid != own_pid
+}
+
 impl ProcessMonitor {
     /// Creates a new process monitor instance
     pub fn new() -> Self {
@@ -268,6 +276,9 @@ impl ProcessMonitor {
     ///
     /// Boolean indicating whether the process was successfully killed
     pub fn kill_process(sys: &System, pid: u32) -> bool {
+        if !signal_target_is_safe(pid, std::process::id()) {
+            return false;
+        }
         sys.process(Pid::from(pid as usize))
             .map(|process| process.kill())
             .unwrap_or(false)
@@ -367,6 +378,21 @@ pub(super) fn process_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signals_never_reach_a_group_launchd_or_gtop() {
+        let own = 5000;
+        for pid in [0, 1, own, i32::MAX as u32 + 1, u32::MAX] {
+            assert!(!signal_target_is_safe(pid, own), "{pid}");
+        }
+        for pid in [2, own - 1, own + 1, i32::MAX as u32] {
+            assert!(signal_target_is_safe(pid, own), "{pid}");
+        }
+        // kill_process returns before any lookup for an unsafe target.
+        let sys = System::new();
+        assert!(!ProcessMonitor::kill_process(&sys, std::process::id()));
+        assert!(!ProcessMonitor::kill_process(&sys, u32::MAX));
+    }
 
     #[test]
     fn environment_parser_keeps_empty_first_argument_and_rejects_truncation() {
