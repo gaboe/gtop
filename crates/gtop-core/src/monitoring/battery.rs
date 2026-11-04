@@ -217,6 +217,17 @@ mod tests {
     }
 
     #[test]
+    fn rounds_half_capacity_percent_up() {
+        let raw = RawBattery {
+            current_capacity: Some(2_525),
+            max_capacity: Some(5_000),
+            ..raw()
+        };
+
+        assert_eq!(power(&raw).map(|value| value.percent), Some(51));
+    }
+
+    #[test]
     fn installed_flag_hides_absent_battery_but_zero_percent_stays_visible() {
         let absent = RawBattery {
             battery_installed: Some(false),
@@ -257,6 +268,41 @@ mod tests {
                 battery_watts: Some(-9.6),
                 adapter_watts: Some(90),
             })
+        );
+    }
+
+    #[test]
+    fn ac_disconnected_not_charging_battery_is_discharging_without_current() {
+        for amperage_ma in [None, Some(0)] {
+            let raw = RawBattery {
+                is_charging: Some(false),
+                external_connected: Some(false),
+                amperage_ma,
+                ..raw()
+            };
+
+            assert_eq!(
+                power(&raw).map(|value| value.state),
+                Some(BatteryState::Discharging {
+                    minutes_to_empty: Some(240),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn ac_connected_not_charging_battery_with_zero_current_is_not_charging() {
+        let raw = RawBattery {
+            is_charging: Some(false),
+            external_connected: Some(true),
+            fully_charged: Some(false),
+            amperage_ma: Some(0),
+            ..raw()
+        };
+
+        assert_eq!(
+            power(&raw).map(|value| value.state),
+            Some(BatteryState::NotCharging)
         );
     }
 
