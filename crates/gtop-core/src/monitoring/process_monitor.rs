@@ -388,10 +388,17 @@ mod tests {
         for pid in [2, own - 1, own + 1, i32::MAX as u32] {
             assert!(signal_target_is_safe(pid, own), "{pid}");
         }
-        // kill_process returns before any lookup for an unsafe target.
-        let sys = System::new();
-        assert!(!ProcessMonitor::kill_process(&sys, std::process::id()));
-        assert!(!ProcessMonitor::kill_process(&sys, u32::MAX));
+        // The System knows this test process, so without the guard the call
+        // would SIGKILL the test binary and the test would fail.
+        let own_pid = std::process::id();
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(own_pid)]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
+        assert!(sys.process(Pid::from_u32(own_pid)).is_some());
+        assert!(!ProcessMonitor::kill_process(&sys, own_pid));
     }
 
     #[test]
