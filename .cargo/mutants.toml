@@ -28,6 +28,12 @@ exclude_re = [
   'signal_target_is_safe',
   'ProcessMonitor::kill_process',
   'AppState::kill_process',
+  # Test code: a mutated test helper can turn a child pid into -1 (gsource sent
+  # kill(-1, SIGKILL) that way). Never mutate test modules or test files.
+  'replace tests::',
+  ' in tests::',
+  '_tests\.rs:',
+  '/tests/',
   # FFI shells: they call IOKit, SMC, or libproc and need real hardware.
   # Only their Drop impls release kernel handles; other Drop impls stay in scope.
   '(iokit|smc)\.rs.*<impl Drop for ',
