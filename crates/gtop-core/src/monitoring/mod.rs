@@ -4,6 +4,7 @@
 //! and processes. It includes process monitoring, system statistics collection,
 //! and data structures for representing system state.
 
+mod battery;
 #[cfg(not(target_os = "macos"))]
 mod drm;
 mod gpu_monitor;

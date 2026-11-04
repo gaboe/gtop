@@ -1,17 +1,21 @@
-//! Apple GPU and internal SSD readings from the IOKit registry
+//! Apple GPU, battery, and internal SSD readings from the IOKit registry
 //!
 //! Every GPU registers an `IOAccelerator` service. Its `PerformanceStatistics`
 //! dictionary holds the utilization and memory figures Activity Monitor shows,
 //! and each child user client records the GPU time its owning process used.
 //! None of this needs elevated privileges.
 
-use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
+use objc2_core_foundation::{
+    CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType,
+};
 use objc2_io_kit::{
     io_iterator_t, io_object_t, kIOReturnSuccess, kIOServicePlane, IOIteratorNext, IOObjectRelease,
     IORegistryEntryCreateCFProperty, IORegistryEntryGetChildIterator,
     IORegistryEntryGetParentEntry, IOServiceGetMatchingServices, IOServiceMatching,
 };
 use std::collections::HashMap;
+
+use super::battery::RawBattery;
 
 /// An IOKit object handle, released on drop
 #[derive(Debug)]
@@ -160,6 +164,53 @@ fn dictionary_number(dictionary: &CFDictionary, key: &'static str) -> Option<f64
         .and_then(|number| number.as_f64())
 }
 
+pub(super) fn read_battery() -> Option<RawBattery> {
+    let matching = unsafe { IOServiceMatching(c"AppleSmartBattery".as_ptr()) }?;
+    let matching = CFRetained::<CFDictionary>::from(&matching);
+    let mut iterator = 0;
+    if unsafe { IOServiceGetMatchingServices(0, Some(matching), &mut iterator) } != kIOReturnSuccess
+    {
+        return None;
+    }
+    let iterator = Object(iterator);
+    let service = Object::next(&iterator)?;
+    let number = |key| {
+        service
+            .property(key)
+            .and_then(|value| value.downcast::<CFNumber>().ok())
+            .and_then(|value| value.as_i64())
+    };
+    let boolean = |key| {
+        service
+            .property(key)
+            .and_then(|value| value.downcast::<CFBoolean>().ok())
+            .map(|value| value.as_bool())
+    };
+    let dictionary = |key| {
+        service
+            .property(key)
+            .and_then(|value| value.downcast::<CFDictionary>().ok())
+    };
+    let nested_number = |dictionary: Option<CFRetained<CFDictionary>>, key| {
+        dictionary
+            .as_deref()
+            .and_then(|dictionary| dictionary_number(dictionary, key))
+            .map(|value| value as i64)
+    };
+    Some(RawBattery {
+        capacity_percent: number("CurrentCapacity"),
+        is_charging: boolean("IsCharging"),
+        external_connected: boolean("ExternalConnected"),
+        fully_charged: boolean("FullyCharged"),
+        avg_time_to_full: number("AvgTimeToFull"),
+        avg_time_to_empty: number("AvgTimeToEmpty"),
+        voltage_mv: number("Voltage"),
+        amperage_ma: number("Amperage"),
+        adapter_watts: nested_number(dictionary("AdapterDetails"), "Watts"),
+        system_load_mw: nested_number(dictionary("PowerTelemetryData"), "SystemLoad"),
+    })
+}
+
 /// Reads the pid out of a creator string such as "pid 620, WindowServer"
 fn parse_creator_pid(creator: &str) -> Option<u32> {
     creator
@@ -173,6 +224,18 @@ fn parse_creator_pid(creator: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "measures one AppleSmartBattery registry read"]
+    fn battery_read_cost() {
+        let start = std::time::Instant::now();
+        let reading = std::hint::black_box(read_battery());
+        println!(
+            "one AppleSmartBattery read: elapsed_us={}, found={}",
+            start.elapsed().as_micros(),
+            reading.is_some()
+        );
+    }
 
     #[test]
     #[ignore = "headless SSD counter CPU-cost probe"]

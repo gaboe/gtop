@@ -81,6 +81,30 @@ pub struct Temperature {
     pub celsius: f32,
 }
 
+/// Battery charge and power readings exposed by the platform.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Power {
+    /// Battery charge from 0 to 100 percent.
+    pub percent: u8,
+    /// Whether the battery is charging, discharging, or externally powered.
+    pub state: BatteryState,
+    /// Current power drawn by the notebook, when available.
+    pub system_watts: Option<f32>,
+    /// Signed battery power. Positive values charge the battery.
+    pub battery_watts: Option<f32>,
+    /// Rated adapter power, when available.
+    pub adapter_watts: Option<u32>,
+}
+
+/// Battery power state from the system's perspective.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatteryState {
+    Charging { minutes_to_full: Option<u32> },
+    Discharging { minutes_to_empty: Option<u32> },
+    Full,
+    NotCharging,
+}
+
 /// System-wide statistics exposed to the frontend
 /// Provides overall system resource usage and performance metrics
 #[derive(Serialize, Debug)]
@@ -121,4 +145,6 @@ pub struct SystemStats {
     pub gpus: Vec<GpuInfo>,
     /// Hottest reading per component group; empty when no sensor is readable
     pub temperatures: Vec<Temperature>,
+    /// Battery and power readings, or `None` when no battery is available.
+    pub power: Option<Power>,
 }

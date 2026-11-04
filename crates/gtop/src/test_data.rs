@@ -57,6 +57,15 @@ pub fn snapshot() -> Snapshot {
                 name: "CPU".into(),
                 celsius: 80.,
             }],
+            power: Some(gtop_core::monitoring::Power {
+                percent: 80,
+                state: gtop_core::monitoring::BatteryState::Charging {
+                    minutes_to_full: Some(85),
+                },
+                system_watts: Some(70.4),
+                battery_watts: Some(12.3),
+                adapter_watts: Some(90),
+            }),
         },
         cpu_topology: gtop_core::CpuTopology::default(),
     }

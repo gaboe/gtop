@@ -11,7 +11,10 @@ use gpui_component::{
     input::Input,
     Disableable, Sizable,
 };
-use gtop_core::{CpuBanks, CpuTopology};
+use gtop_core::{
+    monitoring::{BatteryState, Power},
+    CpuBanks, CpuTopology,
+};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -25,6 +28,36 @@ fn settings_escape_closes(key: &str, settings_open: bool, editing: bool) -> bool
 fn gtop_self_cpu(cpu: Option<f32>, logical_cpus: usize, scale: palette::CpuScale) -> String {
     cpu.map(|value| crate::model::format_cpu_share(value as f64, logical_cpus, scale))
         .unwrap_or_else(|| "N/A".into())
+}
+
+fn battery_readouts(power: &Power) -> [String; 3] {
+    let state = match power.state {
+        BatteryState::Charging { minutes_to_full } => format!(
+            "FULL IN {}",
+            minutes_to_full
+                .map(|minutes| format!("{}:{:02}", minutes / 60, minutes % 60))
+                .unwrap_or_else(|| "N/A".into())
+        ),
+        BatteryState::Discharging { minutes_to_empty } => format!(
+            "EMPTY IN {}",
+            minutes_to_empty
+                .map(|minutes| format!("{}:{:02}", minutes / 60, minutes % 60))
+                .unwrap_or_else(|| "N/A".into())
+        ),
+        BatteryState::Full => "FULL".into(),
+        BatteryState::NotCharging => "NOT CHARGING".into(),
+    };
+    [
+        state,
+        power
+            .system_watts
+            .map(|watts| format!("{watts:.1}"))
+            .unwrap_or_else(|| "N/A".into()),
+        power
+            .battery_watts
+            .map(|watts| format!("{watts:+.1}"))
+            .unwrap_or_else(|| "N/A".into()),
+    ]
 }
 
 pub trait RackButton {
@@ -1680,6 +1713,32 @@ impl Monitor {
                 ),
             ),
         ));
+        if let Some(power) = stats.power.as_ref() {
+            let [state, system_watts, battery_watts] = battery_readouts(power);
+            tower = tower.child(
+                win(t)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(div().flex().items_center().gap(px(8.)).child(readout(
+                                "BATTERY",
+                                format!("{}%", power.percent),
+                                t,
+                            )))
+                            .child(segments(power.percent as f32, 40, t)),
+                    )
+                    .child(readout("STATE", state, t))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(readout("NTB W", system_watts, t))
+                            .child(readout("BAT W", battery_watts, t)),
+                    ),
+            );
+        }
         let own = s.processes.iter().find(|p| p.pid == std::process::id());
         let cost = |name: &str, value: String, unit: &str| {
             div()
@@ -3186,12 +3245,41 @@ fn purgeable_label(bytes: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cpu_segments, div, draw_readout_text, gtop_self_cpu, history_cell, lit_unit,
-        purgeable_label, vfd_digit_width, Bounds, DrawMetrics, Path, Pixels, Tokens,
+        battery_readouts, cpu_segments, div, draw_readout_text, gtop_self_cpu, history_cell,
+        lit_unit, purgeable_label, vfd_digit_width, Bounds, DrawMetrics, Path, Pixels, Tokens,
         DIGIT_GHOST_TEST_TEXTS, UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES,
         WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
     };
     use gpui::{prelude::*, px, TestAppContext, Window};
+    use gtop_core::monitoring::{BatteryState, Power};
+
+    #[test]
+    fn battery_window_readouts_show_charge_time_and_signed_watts() {
+        assert_eq!(
+            battery_readouts(&Power {
+                percent: 80,
+                state: BatteryState::Charging {
+                    minutes_to_full: Some(85),
+                },
+                system_watts: Some(70.411),
+                battery_watts: Some(12.3),
+                adapter_watts: Some(90),
+            }),
+            ["FULL IN 1:25", "70.4", "+12.3"]
+        );
+        assert_eq!(
+            battery_readouts(&Power {
+                percent: 80,
+                state: BatteryState::Discharging {
+                    minutes_to_empty: None,
+                },
+                system_watts: None,
+                battery_watts: Some(-8.1),
+                adapter_watts: None,
+            }),
+            ["EMPTY IN N/A", "N/A", "-8.1"]
+        );
+    }
 
     #[test]
     fn gtop_self_cpu_shows_whole_mac_share() {

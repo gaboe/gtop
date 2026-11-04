@@ -9,6 +9,7 @@ examine_globs = [
   "crates/gtop-core/src/monitoring/process_monitor.rs",
   "crates/gtop-core/src/monitoring/port_monitor.rs",
   "crates/gtop-core/src/monitoring/system_monitor.rs",
+  "crates/gtop-core/src/monitoring/battery.rs",
   "crates/gtop-core/src/monitoring/smc.rs",
   "crates/gtop-core/src/monitoring/iokit.rs",
   "crates/gtop-core/src/monitoring/temperature_monitor.rs",
@@ -36,6 +37,7 @@ exclude_re = [
   '/tests/',
   # FFI shells: they call IOKit, SMC, or libproc and need real hardware.
   # Only their Drop impls release kernel handles; other Drop impls stay in scope.
+  "iokit.rs.*read_battery",
   '(iokit|smc)\.rs.*<impl Drop for ',
   "iokit.rs.*(Object::|Accelerator::(all|name|stats|gpu_time_per_process|number)|StorageDrivers::)",
   "smc.rs.*GpuTemperature::",

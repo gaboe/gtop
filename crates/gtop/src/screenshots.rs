@@ -2,6 +2,15 @@ use super::*;
 
 fn snapshot() -> Snapshot {
     let mut snapshot = test_data::snapshot();
+    snapshot.stats.power = Some(gtop_core::monitoring::Power {
+        percent: 80,
+        state: gtop_core::monitoring::BatteryState::Charging {
+            minutes_to_full: Some(85),
+        },
+        system_watts: Some(70.4),
+        battery_watts: Some(12.3),
+        adapter_watts: Some(90),
+    });
     let names = [
         "Xcode",
         "Safari",
