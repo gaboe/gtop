@@ -15,12 +15,13 @@ cargo test --workspace
 ## Mutation tests
 
 - `.cargo/mutants.toml` lists the domain files that cargo-mutants mutates. GPUI views, FFI shells, and test code stay out.
-- Before a push that changes domain Rust code, run `sh scripts/mutants-diff.sh`. It mutates only the changed lines. It runs with `--jobs 2` and stops after 15 minutes. Report the untested mutants when it stops at the cap.
+- Never run plain `cargo mutants`. Every run goes through `mutants-run` (`~/.local/bin`). It sizes the shards to free RAM, pauses them under memory pressure, and removes its shard worktrees. Do not pass `--jobs`, `-j`, `--in-place`, `--shard`, or a `CARGO_TARGET_DIR`.
+- Before a push that changes domain Rust code, commit, then run `sh scripts/mutants-diff.sh`. It mutates only the lines changed between the merge base with `origin/main` and `HEAD`. Uncommitted changes make it refuse to start.
 - A missed mutant needs a behavior test, or a refactor that makes the code testable. An equivalent mutant goes into `exclude_re` with a reason comment.
-- For one file, run `cargo mutants --no-config -p <crate> -f <file> -j 2 --exclude-re 'signal_target_is_safe|kill_process|tests::|_tests\.rs:|/tests/' --timeout-multiplier 3 --minimum-test-timeout 60 -- -- <module>::`. Use `--no-config`, because `-f` adds to `examine_globs` instead of narrowing it. `--no-config` also drops the config's `exclude_re`, so keep the `--exclude-re` for the kill path and test code. Stop the run after 30 minutes.
+- For one file, run `mutants-run sweep -- --no-config -p <crate> -f <file> --exclude-re 'signal_target_is_safe|kill_process|tests::|_tests\.rs:|/tests/' --build-timeout-multiplier 4 --timeout-multiplier 3 --minimum-test-timeout 60 --output ~/.cache/gtop-mutants/<name> -- -- <module>::`. Use `--no-config`, because `-f` adds to `examine_globs` instead of narrowing it. `--no-config` also drops the config's `exclude_re`, so keep the `--exclude-re` for the kill path and test code. Resume an interrupted run with `--iterate` on the same output.
 - Never mutate the kill path (`signal_target_is_safe`, `ProcessMonitor::kill_process`, `AppState::kill_process*`). It sends real signals, and a mutant could reach pid <= 1. In another repo such a mutant sent `kill(-1, SIGKILL)` and killed every user process.
 - Never mutate test code (`tests::` modules, `*_tests.rs`, `tests/*.rs`). cargo-mutants mutates test helpers too, and a mutated helper can feed pid -1 to a kill. Test kills use a std `Child` handle only; a kill with a numeric pid in a test needs a `pid > 1` check.
-- The machine is shared: run one mutation process at a time, with `--jobs` at most 2. Run a full sweep only at night or when the owner asks.
+- The machine is shared. A full sweep waits for its turn in the sweep queue (coordinator gsource t12) and runs in its own worker and worktree. The diff gate needs no turn.
 
 ## Workers and reviewers
 
