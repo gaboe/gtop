@@ -323,28 +323,32 @@ fn trusted_identity(
 }
 
 /// Classifies one listed PID. `kernel` caches the process table, read by `load`
-/// at most once per collection, for PIDs whose own read fails.
+/// at most once per collection, for PIDs whose own read fails. If the table is
+/// denied, `lookup` can still read that PID with KERN_PROC_PID.
 fn listed_identity(
     pid: u32,
     read: Result<proc_bsdinfo, std::io::Error>,
     kernel: &mut Option<Option<HashMap<u32, proc_bsdinfo>>>,
     load: impl FnOnce() -> Option<HashMap<u32, proc_bsdinfo>>,
+    lookup: impl FnOnce() -> Option<proc_bsdinfo>,
 ) -> IdentityRead {
     match read {
         Ok(bsd) => IdentityRead::Available(bsd),
-        Err(error) if error.raw_os_error() == Some(ESRCH) => {
+        Err(error) if error.raw_os_error() == Some(ESRCH) || permission_denied(&error) => {
             match kernel.get_or_insert_with(load) {
-                Some(processes) => processes
-                    .remove(&pid)
-                    .map_or(IdentityRead::ConfirmedAbsent, IdentityRead::Available),
-                None => IdentityRead::Unavailable,
+                Some(processes) => {
+                    let missing = if error.raw_os_error() == Some(ESRCH) {
+                        IdentityRead::ConfirmedAbsent
+                    } else {
+                        IdentityRead::Unavailable
+                    };
+                    processes
+                        .remove(&pid)
+                        .map_or(missing, IdentityRead::Available)
+                }
+                None => lookup().map_or(IdentityRead::Unavailable, IdentityRead::Available),
             }
         }
-        Err(error) if permission_denied(&error) => kernel
-            .get_or_insert_with(load)
-            .as_mut()
-            .and_then(|processes| processes.remove(&pid))
-            .map_or(IdentityRead::Unavailable, IdentityRead::Available),
         Err(_) => IdentityRead::Unavailable,
     }
 }
@@ -551,8 +555,13 @@ impl Collector {
                 continue;
             }
             let pid = pid as u32;
-            let identity =
-                listed_identity(pid, self.read_bsd_info(pid), &mut kernel, kernel_processes);
+            let identity = listed_identity(
+                pid,
+                self.read_bsd_info(pid),
+                &mut kernel,
+                kernel_processes,
+                || kernel_process(pid),
+            );
             #[cfg(test)]
             let identity = if self.confirmed_absent_identity == Some(pid) {
                 self.confirmed_absent_identity = None;
@@ -889,15 +898,15 @@ mod tests {
         let pid = child.0.id();
         let users = sysinfo::Users::new_with_refreshed_list();
         let expected = bsd_info(pid).unwrap();
-        let kernel = kernel_processes().expect("KERN_PROC_ALL requires native host visibility");
-        let fallback = &kernel[&pid];
+        let fallback = kernel_process(pid).expect("KERN_PROC_PID can read an owned child");
         assert_eq!(fallback.pbi_pid, pid);
         assert_eq!(fallback.pbi_ppid, expected.pbi_ppid);
         assert_eq!(fallback.pbi_uid, expected.pbi_uid);
         assert_eq!(fallback.pbi_start_tvsec, expected.pbi_start_tvsec);
         assert_eq!(fallback.pbi_start_tvusec, expected.pbi_start_tvusec);
-        assert!((1..=5).contains(&fallback.pbi_status));
-        assert!(fallback.pbi_name.iter().any(|byte| *byte != 0));
+        assert_eq!(fallback.pbi_status, expected.pbi_status);
+        assert_eq!(bsd_name(&fallback), bsd_name(&expected));
+        assert!(!bsd_name(&fallback).is_empty());
 
         let mut collector = Collector {
             denied_identity: Some(pid),
@@ -922,6 +931,48 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "host test: KERN_PROC_ALL is denied in the Codex sandbox"]
+    fn kernel_table_and_pid_lookup_agree_on_live_and_zombie_identity() {
+        let mut child = OwnedChild(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        let pid = child.0.id();
+        let fields = |bsd: &proc_bsdinfo| {
+            (
+                bsd.pbi_pid,
+                bsd.pbi_ppid,
+                bsd.pbi_uid,
+                bsd.pbi_start_tvsec,
+                bsd.pbi_start_tvusec,
+                bsd.pbi_status,
+                bsd_name(bsd),
+            )
+        };
+        let live = bsd_info(pid).unwrap();
+        let single = kernel_process(pid).unwrap();
+        let table = kernel_processes().expect("KERN_PROC_ALL requires native host visibility");
+        assert_eq!(fields(&single), fields(&table[&pid]));
+        assert_eq!(fields(&single), fields(&live));
+
+        child.0.kill().unwrap();
+        let mut status = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    status.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        let zombie = kernel_process(pid).unwrap();
+        let table = kernel_processes().unwrap();
+        assert_eq!(zombie.pbi_status, 5);
+        assert_eq!(fields(&zombie), fields(&table[&pid]));
+        assert_eq!(bsd_info(pid).unwrap_err().raw_os_error(), Some(ESRCH));
+    }
+
+    #[test]
     fn reports_unreaped_child_as_zombie_then_removes_it_after_reaping() {
         let mut child = OwnedChild(Command::new("/bin/sleep").arg("30").spawn().unwrap());
         let pid = child.0.id();
@@ -937,9 +988,7 @@ mod tests {
         child.0.kill().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let zombie = loop {
-            let zombie = kernel_processes()
-                .and_then(|mut processes| processes.remove(&pid))
-                .filter(|process| process.pbi_status == 5);
+            let zombie = kernel_process(pid).filter(|process| process.pbi_status == 5);
             if let Some(zombie) = zombie {
                 break zombie;
             }
@@ -947,6 +996,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(zombie.pbi_pid, pid);
+        assert_eq!(bsd_info(pid).unwrap_err().raw_os_error(), Some(ESRCH));
 
         let rows = collector.collect(&users, false, &HashMap::new()).unwrap();
         assert_eq!(
@@ -1140,7 +1190,7 @@ mod pure_tests {
         let classify = |code: i32, table: Option<&[u32]>| {
             let mut kernel =
                 Some(table.map(|pids| pids.iter().map(|&pid| (pid, bsd(pid))).collect()));
-            listed_identity(7, error(code), &mut kernel, || unreachable!())
+            listed_identity(7, error(code), &mut kernel, || unreachable!(), || None)
         };
         let available =
             |identity| matches!(identity, IdentityRead::Available(bsd) if bsd.pbi_pid == 7);
@@ -1159,15 +1209,64 @@ mod pure_tests {
         let mut kernel = None;
         let mut loads = 0;
         for pid in [7, 8] {
-            listed_identity(pid, error(ESRCH), &mut kernel, || {
-                loads += 1;
-                Some([(7, bsd(7)), (8, bsd(8))].into())
-            });
+            listed_identity(
+                pid,
+                error(ESRCH),
+                &mut kernel,
+                || {
+                    loads += 1;
+                    Some([(7, bsd(7)), (8, bsd(8))].into())
+                },
+                || unreachable!(),
+            );
         }
         assert_eq!(loads, 1, "one table read per collection");
         assert!(matches!(
-            listed_identity(9, Ok(bsd(9)), &mut kernel, || unreachable!()),
+            listed_identity(9, Ok(bsd(9)), &mut kernel, || unreachable!(), || unreachable!()),
             IdentityRead::Available(bsd) if bsd.pbi_pid == 9
+        ));
+    }
+
+    #[test]
+    fn listed_pids_use_single_lookup_only_when_the_table_is_unavailable() {
+        for code in [ESRCH, 1, 13] {
+            let mut kernel = None;
+            let mut loads = 0;
+            for pid in [7, 8] {
+                let identity = listed_identity(
+                    pid,
+                    error(code),
+                    &mut kernel,
+                    || {
+                        loads += 1;
+                        None
+                    },
+                    || Some(bsd(pid)),
+                );
+                assert!(matches!(identity, IdentityRead::Available(bsd) if bsd.pbi_pid == pid));
+            }
+            assert_eq!(loads, 1);
+            assert!(matches!(
+                listed_identity(9, error(code), &mut kernel, || unreachable!(), || None),
+                IdentityRead::Unavailable
+            ));
+            let mut kernel = Some(Some(HashMap::new()));
+            let identity = listed_identity(
+                7,
+                error(code),
+                &mut kernel,
+                || unreachable!(),
+                || unreachable!(),
+            );
+            if code == ESRCH {
+                assert!(matches!(identity, IdentityRead::ConfirmedAbsent));
+            } else {
+                assert!(matches!(identity, IdentityRead::Unavailable));
+            }
+        }
+        assert!(matches!(
+            listed_identity(7, error(5), &mut None, || unreachable!(), || unreachable!()),
+            IdentityRead::Unavailable
         ));
     }
 

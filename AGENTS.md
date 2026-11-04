@@ -12,6 +12,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+On the host, also run `cargo test -p gtop-core kernel_table_and_pid_lookup_agree_on_live_and_zombie_identity -- --ignored`.
+
 ## Mutation tests
 
 - `.cargo/mutants.toml` lists the domain files that cargo-mutants mutates. GPUI views, FFI shells, and test code stay out.
