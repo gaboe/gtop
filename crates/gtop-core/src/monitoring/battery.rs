@@ -2,7 +2,6 @@ use super::{BatteryState, Power};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct RawBattery {
-    pub capacity_percent: Option<i64>,
     pub current_capacity: Option<i64>,
     pub max_capacity: Option<i64>,
     pub battery_installed: Option<bool>,
@@ -18,9 +17,18 @@ pub(super) struct RawBattery {
 }
 
 pub(super) fn power(raw: &RawBattery) -> Option<Power> {
-    let percent = u8::try_from(raw.capacity_percent?)
-        .ok()
-        .filter(|value| *value <= 100)?;
+    if raw.battery_installed == Some(false) {
+        return None;
+    }
+    let current_capacity = raw.current_capacity?;
+    let max_capacity = raw.max_capacity.filter(|value| *value > 0)?;
+    let percent = if current_capacity <= 0 {
+        0
+    } else {
+        ((i128::from(current_capacity) * 100 + i128::from(max_capacity) / 2)
+            / i128::from(max_capacity))
+        .clamp(0, 100) as u8
+    };
     let minutes = |value: Option<i64>| {
         value
             .filter(|minutes| (0..65_535).contains(minutes))
@@ -30,6 +38,9 @@ pub(super) fn power(raw: &RawBattery) -> Option<Power> {
         (Some(true), Some(true), _) => BatteryState::Full,
         (_, _, Some(true)) => BatteryState::Charging {
             minutes_to_full: minutes(raw.avg_time_to_full),
+        },
+        _ if raw.amperage_ma.is_some_and(|amperage| amperage < 0) => BatteryState::Discharging {
+            minutes_to_empty: minutes(raw.avg_time_to_empty),
         },
         (Some(false), _, _) => BatteryState::Discharging {
             minutes_to_empty: minutes(raw.avg_time_to_empty),
@@ -74,7 +85,6 @@ mod tests {
 
     fn raw() -> RawBattery {
         RawBattery {
-            capacity_percent: Some(80),
             current_capacity: Some(80),
             max_capacity: Some(100),
             battery_installed: Some(true),
@@ -179,20 +189,25 @@ mod tests {
 
     #[test]
     fn normalizes_capacity_units_and_rejects_missing_or_zero_maximum() {
-        for (current_capacity, max_capacity, expected_percent) in
-            [(80, 100, 80), (4_000, 5_000, 80), (50, 5_000, 1)]
-        {
+        for (current_capacity, max_capacity, expected_percent) in [
+            (80, 100, 80),
+            (4_000, 5_000, 80),
+            (50, 5_000, 1),
+            (2, 3, 67),
+            (6, 5, 100),
+        ] {
             let raw = RawBattery {
-                capacity_percent: None,
                 current_capacity: Some(current_capacity),
                 max_capacity: Some(max_capacity),
                 ..raw()
             };
-            assert_eq!(power(&raw).map(|value| value.percent), Some(expected_percent));
+            assert_eq!(
+                power(&raw).map(|value| value.percent),
+                Some(expected_percent)
+            );
         }
         for max_capacity in [None, Some(0)] {
             let raw = RawBattery {
-                capacity_percent: None,
                 current_capacity: Some(80),
                 max_capacity,
                 ..raw()
@@ -207,7 +222,6 @@ mod tests {
             battery_installed: Some(false),
             current_capacity: Some(0),
             max_capacity: Some(5_000),
-            capacity_percent: None,
             ..raw()
         };
         assert_eq!(power(&absent), None);
@@ -215,7 +229,6 @@ mod tests {
         let empty = RawBattery {
             current_capacity: Some(0),
             max_capacity: Some(5_000),
-            capacity_percent: None,
             ..raw()
         };
         assert_eq!(power(&empty).map(|value| value.percent), Some(0));
@@ -261,7 +274,8 @@ mod tests {
         assert_eq!(power(&RawBattery::default()), None);
         assert_eq!(
             power(&RawBattery {
-                capacity_percent: Some(80),
+                current_capacity: Some(80),
+                max_capacity: Some(100),
                 ..RawBattery::default()
             }),
             None

@@ -198,7 +198,6 @@ pub(super) fn read_battery() -> Option<RawBattery> {
             .map(|value| value as i64)
     };
     Some(RawBattery {
-        capacity_percent: number("CurrentCapacity"),
         current_capacity: number("CurrentCapacity"),
         max_capacity: number("MaxCapacity"),
         battery_installed: boolean("BatteryInstalled"),
