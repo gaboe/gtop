@@ -3,7 +3,7 @@
 //! This module handles the global application state, including system monitoring
 //! and process tracking capabilities.
 
-use crate::monitoring::{collect_ports_by_pid, ProcessMonitor, SystemMonitor};
+use crate::monitoring::{collect_ports_by_pid, PowerSourceTimeRead, ProcessMonitor, SystemMonitor};
 use crate::{perf_enabled, CpuTopology, ProcessData, Snapshot};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -79,7 +79,19 @@ impl Default for AppState {
 
 impl AppState {
     pub fn snapshot(&self, include_environ: bool, include_ports: bool) -> Result<Snapshot, String> {
-        self.snapshot_inner(include_environ, include_ports, None)
+        self.snapshot_inner(
+            include_environ,
+            include_ports,
+            None,
+            PowerSourceTimeRead::Cached,
+        )
+    }
+
+    pub fn snapshot_with_fresh_power_source_times(
+        &self,
+        ports: &std::collections::HashMap<u32, Vec<u16>>,
+    ) -> Result<Snapshot, String> {
+        self.snapshot_inner(false, false, Some(ports), PowerSourceTimeRead::Fresh)
     }
 
     pub fn snapshot_with_cached_ports(
@@ -87,7 +99,12 @@ impl AppState {
         include_environ: bool,
         ports: &std::collections::HashMap<u32, Vec<u16>>,
     ) -> Result<Snapshot, String> {
-        self.snapshot_inner(include_environ, false, Some(ports))
+        self.snapshot_inner(
+            include_environ,
+            false,
+            Some(ports),
+            PowerSourceTimeRead::Cached,
+        )
     }
 
     fn snapshot_inner(
@@ -95,6 +112,7 @@ impl AppState {
         include_environ: bool,
         include_ports: bool,
         cached_ports: Option<&std::collections::HashMap<u32, Vec<u16>>>,
+        power_source_time_read: PowerSourceTimeRead,
     ) -> Result<Snapshot, String> {
         let mut sys = self.sys.lock().map_err(|e| e.to_string())?;
         let mut disks = self.disks.lock().map_err(|e| e.to_string())?;
@@ -147,7 +165,12 @@ impl AppState {
         let process_data = ProcessData::Fresh;
         #[cfg(not(target_os = "macos"))]
         let process_observed_at = ProcessMonitor::get_current_time()?;
-        let stats = system_monitor.collect_stats(&sys, &networks, &disks);
+        let stats = system_monitor.collect_stats_with_power_source_time_read(
+            &sys,
+            &networks,
+            &disks,
+            power_source_time_read,
+        );
         if perf_enabled() {
             eprintln!(
                 "perf tick refresh_us={} collect_us={} procs={}",

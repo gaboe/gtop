@@ -30,7 +30,10 @@ use model::{ProcessKey, Search};
 use process_table::Processes;
 use std::{
     rc::Rc,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -52,6 +55,14 @@ fn refresh_stopped(events: &mut mpsc::Receiver<()>) -> bool {
             Err(mpsc::TryRecvError::Closed) => return true,
         }
     }
+}
+
+fn should_sample(paused: bool, forced: bool) -> bool {
+    !paused || forced
+}
+
+fn take_forced_refresh(forced: &AtomicBool) -> bool {
+    forced.swap(false, Ordering::AcqRel)
 }
 
 fn clamp_moment_row(selected: usize, row_count: usize) -> usize {
@@ -150,6 +161,7 @@ struct Monitor {
     status: String,
     pending_kill: Option<ProcessKey>,
     wake: mpsc::Sender<()>,
+    force_refresh: Arc<AtomicBool>,
     _subscriptions: Vec<Subscription>,
     focus_restore: Option<Subscription>,
     _refresh: Option<Task<()>>,
@@ -194,6 +206,7 @@ impl Monitor {
         let settings_stopping = stopping.clone();
         let history_stopping = stopping.clone();
         let (wake, mut events) = mpsc::channel(1);
+        let force_refresh = Arc::new(AtomicBool::new(false));
         let (settings_writes, mut settings_events) = mpsc::unbounded();
         let entity = cx.entity().downgrade();
         let mut settings_cx = window.to_async(cx);
@@ -281,6 +294,8 @@ impl Monitor {
         let perf = Arc::new(perf::PerfCounters::default());
         let history_perf = perf.clone();
         let port_cache = cached_ports.clone();
+        let port_collection = Arc::new(Mutex::new(()));
+        let port_collection_task = port_collection.clone();
         let ports_task = cx.spawn_in(window, async move |entity, cx| loop {
             let Ok(running) =
                 entity.update_in(cx, |this, window, _| !this.paused && window.is_visible())
@@ -289,8 +304,12 @@ impl Monitor {
             };
             if running {
                 let cache = port_cache.clone();
+                let collection = port_collection_task.clone();
                 cx.background_executor()
                     .spawn(async move {
+                        let _guard = collection
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         let ports = gtop_core::monitoring::collect_ports_by_pid();
                         if let Ok(mut cached) = cache.lock() {
                             *cached = ports;
@@ -303,6 +322,8 @@ impl Monitor {
                 .await;
         });
         let entity = cx.entity().downgrade();
+        let forced_refresh = force_refresh.clone();
+        let port_collection_refresh = port_collection.clone();
         let mut refresh_cx = window.to_async(cx);
         let history_drain = async move {
             let cx = &mut refresh_cx;
@@ -328,6 +349,7 @@ impl Monitor {
             let mut read_errors = HistoryReadErrors::default();
             loop {
                 if history_stopping.get() || refresh_stopped(&mut events) { break; }
+                let forced = take_forced_refresh(&forced_refresh);
                 let Ok((running, ports, seconds, moment, metric, selected_detail)) = entity.update_in(cx, |this, window, cx| {
                     let selected_detail = this.details.as_ref().map(|details| {
                         (
@@ -337,7 +359,7 @@ impl Monitor {
                             details.analysis.is_none(),
                         )
                     });
-                    (!this.paused, window.is_visible() && this.table.read(cx).search.needs_ports(), this.interval, this.moment, this.metric, selected_detail)
+                    (should_sample(this.paused, forced), window.is_visible() && this.table.read(cx).search.needs_ports(), this.interval, this.moment, this.metric, selected_detail)
                 }) else { break; };
                 history_perf.set_refresh_interval(seconds);
                 if moment.is_none() {
@@ -440,15 +462,27 @@ impl Monitor {
                 let previous_metric = cached_metric;
                 let previous_analysis_key = cached_analysis_key;
                 let sample_perf = history_perf.clone();
+                let port_collection_refresh = port_collection_refresh.clone();
                 let result = cx.background_executor().spawn(async move {
                     let start = std::time::Instant::now();
-                    let snapshot = if !ports {
+                    let snapshot = if forced || ports {
+                        let _guard = port_collection_refresh
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let fresh_ports = gtop_core::monitoring::collect_ports_by_pid();
+                        if let Ok(mut cached) = port_cache.lock() {
+                            *cached = fresh_ports.clone();
+                        }
+                        if forced {
+                            state.snapshot_with_fresh_power_source_times(&fresh_ports)
+                        } else {
+                            state.snapshot_with_cached_ports(false, &fresh_ports)
+                        }
+                    } else {
                         match port_cache.lock() {
                             Ok(cached) => state.snapshot_with_cached_ports(false, &cached),
                             Err(_) => state.snapshot(false, false),
                         }
-                    } else {
-                        state.snapshot(false, true)
                     };
                     let sampled_at = Instant::now();
                     let sample_duration = sampled_at.duration_since(start);
@@ -548,7 +582,7 @@ impl Monitor {
                     }
                     match result {
                         Ok(snapshot) => {
-                            if !this.paused {
+                            if !this.paused || forced {
                                 this.observe_sample(&snapshot);
                                 if let Some(writer) = &this._now_json {
                                     let stats = &snapshot.stats;
@@ -727,6 +761,7 @@ impl Monitor {
             status: "Reading system information…".into(),
             pending_kill: None,
             wake,
+            force_refresh,
             _subscriptions: subscriptions,
             focus_restore: None,
             _refresh: Some(refresh),
@@ -744,6 +779,11 @@ impl Monitor {
 
     fn wake(&mut self) {
         let _ = self.wake.try_send(());
+    }
+
+    fn refresh_now(&mut self) {
+        self.force_refresh.store(true, Ordering::Release);
+        self.wake();
     }
 
     fn select_moment(&mut self, selection: history::MomentSelection, cx: &mut Context<Self>) {

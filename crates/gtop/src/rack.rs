@@ -2363,11 +2363,13 @@ impl Monitor {
                             ("D", "disk"),
                             ("TAB", "history"),
                             ("T", "palette"),
+                            ("R", "refresh"),
                         ]
                         .into_iter()
                         .filter(|(key, _)| {
                             !operation_status
-                                && (!compact || matches!(*key, "/" | "J K" | "↵" | "X"))
+                                && (*key != "R" || !self.settings_open)
+                                && (!compact || matches!(*key, "/" | "J K" | "↵" | "X" | "R"))
                         })
                         .map(|(key, text)| keycap(key, text, &t)),
                     )
@@ -2845,6 +2847,7 @@ impl Monitor {
                 cx,
             ),
             "r" if self.settings_open => self.random_palette(window, cx),
+            "r" => self.refresh_now(),
             "escape" => {
                 if self.settings_open {
                     self.settings_open = false;

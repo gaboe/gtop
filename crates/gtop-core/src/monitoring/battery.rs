@@ -10,6 +10,12 @@ pub(super) struct BatteryPowerState {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum PowerSourceTimeRead {
+    Cached,
+    Fresh,
+}
+
+#[derive(Clone, Copy)]
 struct CachedPowerSourceTimes {
     state: BatteryPowerState,
     read_at: Instant,
@@ -26,12 +32,15 @@ impl PowerSourceTimeCache {
         &mut self,
         state: BatteryPowerState,
         now: Instant,
+        read: PowerSourceTimeRead,
         source: impl FnOnce() -> PowerSourceTimes,
     ) -> PowerSourceTimes {
-        if let Some(cached) = self.cached.filter(|cached| {
-            cached.state == state && now.duration_since(cached.read_at) < Duration::from_secs(5)
-        }) {
-            return cached.times;
+        if matches!(read, PowerSourceTimeRead::Cached) {
+            if let Some(cached) = self.cached.filter(|cached| {
+                cached.state == state && now.duration_since(cached.read_at) < Duration::from_secs(5)
+            }) {
+                return cached.times;
+            }
         }
 
         let times = source();
@@ -275,7 +284,12 @@ mod tests {
         let mut cache = PowerSourceTimeCache::default();
         let mut readings = [(Some(85), None), (None, Some(240)), (Some(-1), None)].into_iter();
 
-        let times = cache.read(power_state(true, true), start, || readings.next().unwrap());
+        let times = cache.read(
+            power_state(true, true),
+            start,
+            PowerSourceTimeRead::Cached,
+            || readings.next().unwrap(),
+        );
         assert_eq!(
             parsed_state(power_state(true, true), times),
             BatteryState::Charging {
@@ -286,6 +300,7 @@ mod tests {
         let times = cache.read(
             power_state(false, false),
             start + Duration::from_secs(1),
+            PowerSourceTimeRead::Cached,
             || readings.next().unwrap(),
         );
         assert_eq!(
@@ -298,6 +313,7 @@ mod tests {
         let times = cache.read(
             power_state(true, true),
             start + Duration::from_secs(2),
+            PowerSourceTimeRead::Cached,
             || readings.next().unwrap(),
         );
         assert_eq!(
@@ -314,9 +330,12 @@ mod tests {
         let mut cache = PowerSourceTimeCache::default();
         let mut readings = [(None, Some(240)), (Some(85), None), (None, Some(-1))].into_iter();
 
-        let times = cache.read(power_state(false, false), start, || {
-            readings.next().unwrap()
-        });
+        let times = cache.read(
+            power_state(false, false),
+            start,
+            PowerSourceTimeRead::Cached,
+            || readings.next().unwrap(),
+        );
         assert_eq!(
             parsed_state(power_state(false, false), times),
             BatteryState::Discharging {
@@ -327,6 +346,7 @@ mod tests {
         let times = cache.read(
             power_state(true, true),
             start + Duration::from_secs(1),
+            PowerSourceTimeRead::Cached,
             || readings.next().unwrap(),
         );
         assert_eq!(
@@ -339,6 +359,7 @@ mod tests {
         let times = cache.read(
             power_state(false, false),
             start + Duration::from_secs(2),
+            PowerSourceTimeRead::Cached,
             || readings.next().unwrap(),
         );
         assert_eq!(
@@ -355,13 +376,19 @@ mod tests {
         let mut cache = PowerSourceTimeCache::default();
         let mut calls = 0;
 
-        let first = cache.read(power_state(true, true), start, || {
-            calls += 1;
-            (Some(85), None)
-        });
+        let first = cache.read(
+            power_state(true, true),
+            start,
+            PowerSourceTimeRead::Cached,
+            || {
+                calls += 1;
+                (Some(85), None)
+            },
+        );
         let second = cache.read(
             power_state(true, true),
             start + Duration::from_millis(4_999),
+            PowerSourceTimeRead::Cached,
             || {
                 calls += 1;
                 (Some(90), None)
@@ -379,13 +406,19 @@ mod tests {
         let mut cache = PowerSourceTimeCache::default();
         let mut calls = 0;
 
-        let first = cache.read(power_state(true, true), start, || {
-            calls += 1;
-            (Some(85), None)
-        });
+        let first = cache.read(
+            power_state(true, true),
+            start,
+            PowerSourceTimeRead::Cached,
+            || {
+                calls += 1;
+                (Some(85), None)
+            },
+        );
         let second = cache.read(
             power_state(true, true),
             start + Duration::from_secs(5),
+            PowerSourceTimeRead::Cached,
             || {
                 calls += 1;
                 (Some(-1), None)
@@ -394,6 +427,46 @@ mod tests {
 
         assert_eq!(first, (Some(85), None));
         assert_eq!(second, (Some(-1), None));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn forced_read_refreshes_cache_inside_five_seconds() {
+        let start = Instant::now();
+        let mut cache = PowerSourceTimeCache::default();
+        let mut calls = 0;
+
+        let first = cache.read(
+            power_state(true, true),
+            start,
+            PowerSourceTimeRead::Cached,
+            || {
+                calls += 1;
+                (Some(85), None)
+            },
+        );
+        let forced = cache.read(
+            power_state(true, true),
+            start + Duration::from_secs(1),
+            PowerSourceTimeRead::Fresh,
+            || {
+                calls += 1;
+                (Some(90), None)
+            },
+        );
+        let reused = cache.read(
+            power_state(true, true),
+            start + Duration::from_secs(2),
+            PowerSourceTimeRead::Cached,
+            || {
+                calls += 1;
+                (Some(95), None)
+            },
+        );
+
+        assert_eq!(first, (Some(85), None));
+        assert_eq!(forced, (Some(90), None));
+        assert_eq!(reused, forced);
         assert_eq!(calls, 2);
     }
 

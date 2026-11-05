@@ -21,6 +21,7 @@ mod system_monitor;
 mod temperature_monitor;
 mod types;
 
+pub(crate) use battery::PowerSourceTimeRead;
 pub use gpu_monitor::GpuMonitor;
 pub use gpu_process_monitor::GpuProcessMonitor;
 pub use port_monitor::collect_ports_by_pid;

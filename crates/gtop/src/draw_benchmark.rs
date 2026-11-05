@@ -1,6 +1,8 @@
 #[cfg(target_os = "macos")]
 use super::*;
 #[cfg(target_os = "macos")]
+use std::cell::RefCell;
+#[cfg(target_os = "macos")]
 use std::prelude::v1::test;
 thread_local! {
     static FIXED_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -263,6 +265,7 @@ fn fixture_from_snapshot(
         status: String::new(),
         pending_kill: None,
         wake: mpsc::channel(1).0,
+        force_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         _subscriptions: subscriptions,
         focus_restore: None,
         _refresh: Some(Task::ready(())),
@@ -272,6 +275,118 @@ fn fixture_from_snapshot(
         _perf_writer: Task::ready(()),
         _now_json: None,
     }
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn refresh_key_requests_one_sample_while_paused(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let (_root, visual) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |monitor, cx| {
+            monitor.paused = true;
+            window.focus(&monitor.focus, cx);
+        });
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+
+    visual.simulate_keystrokes("r");
+    visual.simulate_keystrokes("r");
+    visual.run_until_parked();
+    let forced = monitor.read_with(visual, |monitor, _| {
+        crate::take_forced_refresh(&monitor.force_refresh)
+    });
+    assert!(crate::should_sample(true, forced));
+    assert!(monitor.read_with(visual, |monitor, _| monitor.paused));
+    assert!(
+        !monitor.read_with(visual, |monitor, _| crate::take_forced_refresh(
+            &monitor.force_refresh
+        ))
+    );
+    assert!(!crate::should_sample(true, false));
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn refresh_key_types_in_search_without_requesting_a_sample(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let mut monitor = None;
+    let (_root, visual) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| fixture(window, cx));
+        entity.update(cx, |monitor, cx| window.focus(&monitor.focus, cx));
+        monitor = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor.unwrap();
+
+    visual.simulate_keystrokes("/");
+    visual.simulate_keystrokes("r");
+    visual.run_until_parked();
+
+    assert_eq!(
+        monitor.read_with(visual, |monitor, cx| monitor.search.read(cx).value()),
+        "r"
+    );
+    assert!(!monitor.read_with(visual, |monitor, _| monitor
+        .force_refresh
+        .load(std::sync::atomic::Ordering::Acquire)));
+}
+
+#[cfg(target_os = "macos")]
+#[gpui::test]
+async fn refresh_key_in_disk_view_rescans(cx: &mut TestAppContext) {
+    let home = std::env::temp_dir().join(format!("gtop-refresh-key-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    for i in 0..160 {
+        std::fs::write(home.join(format!("file-{i:03}")), [1u8; 4096]).unwrap();
+    }
+    let home_for_fixture = home.clone();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
+    let monitor_for_view = Rc::new(RefCell::new(None));
+    let monitor_slot = monitor_for_view.clone();
+    let (_root, visual) = cx.add_window_view(move |window, cx| {
+        let entity = cx.new(|cx| {
+            let mut monitor = fixture(window, cx);
+            monitor.prepare_disk_scroll_test(home_for_fixture.clone());
+            monitor
+        });
+        entity.update(cx, |monitor, cx| {
+            window.focus(&monitor.focus, cx);
+        });
+        *monitor_slot.borrow_mut() = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let monitor = monitor_for_view.borrow().clone().unwrap();
+
+    visual.simulate_keystrokes("r");
+    visual.run_until_parked();
+
+    assert!(monitor.read_with(visual, |monitor, _| monitor
+        .disk
+        .as_ref()
+        .is_some_and(|disk| disk.folder.is_none())));
+    assert!(!monitor.read_with(visual, |monitor, _| monitor
+        .force_refresh
+        .load(std::sync::atomic::Ordering::Acquire)));
+    monitor.update(visual, |monitor, _| {
+        if let Some(disk) = &mut monitor.disk {
+            disk.close();
+        }
+    });
+    drop(monitor);
+    std::fs::remove_dir_all(home).unwrap();
 }
 
 #[cfg(target_os = "macos")]

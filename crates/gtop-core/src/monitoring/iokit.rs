@@ -20,7 +20,9 @@ use std::{
     time::Instant,
 };
 
-use super::battery::{BatteryPowerState, PowerSourceTimeCache, PowerSourceTimes, RawBattery};
+use super::battery::{
+    BatteryPowerState, PowerSourceTimeCache, PowerSourceTimeRead, PowerSourceTimes, RawBattery,
+};
 
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
@@ -190,12 +192,15 @@ fn dictionary_integer(dictionary: &CFDictionary, key: &'static str) -> Option<i6
 
 static POWER_SOURCE_TIMES: OnceLock<Mutex<PowerSourceTimeCache>> = OnceLock::new();
 
-fn read_power_source_times(state: BatteryPowerState) -> PowerSourceTimes {
+fn read_power_source_times(
+    state: BatteryPowerState,
+    read: PowerSourceTimeRead,
+) -> PowerSourceTimes {
     let cache = POWER_SOURCE_TIMES.get_or_init(|| Mutex::new(PowerSourceTimeCache::default()));
     let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.read(state, Instant::now(), read_power_source_times_now)
+    cache.read(state, Instant::now(), read, read_power_source_times_now)
 }
 
 fn read_power_source_times_now() -> PowerSourceTimes {
@@ -239,7 +244,7 @@ fn read_power_source_times_now() -> PowerSourceTimes {
     (None, None)
 }
 
-pub(super) fn read_battery() -> Option<RawBattery> {
+pub(super) fn read_battery(read: PowerSourceTimeRead) -> Option<RawBattery> {
     let matching = unsafe { IOServiceMatching(c"AppleSmartBattery".as_ptr()) }?;
     let matching = CFRetained::<CFDictionary>::from(&matching);
     let mut iterator = 0;
@@ -274,10 +279,13 @@ pub(super) fn read_battery() -> Option<RawBattery> {
     };
     let is_charging = boolean("IsCharging");
     let external_connected = boolean("ExternalConnected");
-    let (time_to_full, time_to_empty) = read_power_source_times(BatteryPowerState {
-        is_charging,
-        external_connected,
-    });
+    let (time_to_full, time_to_empty) = read_power_source_times(
+        BatteryPowerState {
+            is_charging,
+            external_connected,
+        },
+        read,
+    );
     Some(RawBattery {
         current_capacity: number("CurrentCapacity"),
         max_capacity: number("MaxCapacity"),
@@ -312,7 +320,7 @@ mod tests {
     #[ignore = "measures one AppleSmartBattery registry read"]
     fn battery_read_cost() {
         let start = std::time::Instant::now();
-        let reading = std::hint::black_box(read_battery());
+        let reading = std::hint::black_box(read_battery(PowerSourceTimeRead::Cached));
         println!(
             "one AppleSmartBattery read: elapsed_us={}, found={}",
             start.elapsed().as_micros(),

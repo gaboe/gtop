@@ -3,7 +3,7 @@
 //! This module handles collection and monitoring of system-wide statistics
 //! including CPU, memory, network, and disk usage.
 
-use super::{GpuMonitor, SystemStats, TemperatureMonitor};
+use super::{GpuMonitor, PowerSourceTimeRead, SystemStats, TemperatureMonitor};
 use std::fmt::Debug;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -114,6 +114,21 @@ impl SystemMonitor {
         networks: &Networks,
         disks: &Disks,
     ) -> SystemStats {
+        self.collect_stats_with_power_source_time_read(
+            sys,
+            networks,
+            disks,
+            PowerSourceTimeRead::Cached,
+        )
+    }
+
+    pub(crate) fn collect_stats_with_power_source_time_read(
+        &mut self,
+        sys: &System,
+        networks: &Networks,
+        disks: &Disks,
+        _power_source_time_read: PowerSourceTimeRead,
+    ) -> SystemStats {
         let (network_rx, network_tx) = self.network_rates(
             networks.keys().cloned().collect(),
             network_totals(
@@ -149,7 +164,7 @@ impl SystemMonitor {
             gpus: self.gpu_monitor.collect(),
             temperatures: self.temperature_monitor.collect(),
             #[cfg(target_os = "macos")]
-            power: super::iokit::read_battery()
+            power: super::iokit::read_battery(_power_source_time_read)
                 .as_ref()
                 .and_then(super::battery::power),
             #[cfg(not(target_os = "macos"))]
