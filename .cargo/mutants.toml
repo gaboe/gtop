@@ -42,6 +42,7 @@ exclude_re = [
   '(replace | in )signal_target_is_safe( ->| with |$)',
   '(replace | in )ProcessMonitor::kill_process( ->| with |$)',
   '(replace | in )AppState::kill_process( ->| with |$)',
+  '(replace | in )AppState::kill_process_if_matches( ->| with |$)',
   # Test code: a mutated test helper can turn a child pid into -1 (gsource sent
   # kill(-1, SIGKILL) that way). Never mutate test modules or test files.
   'replace tests::',
