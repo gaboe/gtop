@@ -1,4 +1,48 @@
 use super::{BatteryState, Power};
+use std::time::{Duration, Instant};
+
+pub(super) type PowerSourceTimes = (Option<i64>, Option<i64>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BatteryPowerState {
+    pub(super) is_charging: Option<bool>,
+    pub(super) external_connected: Option<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedPowerSourceTimes {
+    state: BatteryPowerState,
+    read_at: Instant,
+    times: PowerSourceTimes,
+}
+
+#[derive(Default)]
+pub(super) struct PowerSourceTimeCache {
+    cached: Option<CachedPowerSourceTimes>,
+}
+
+impl PowerSourceTimeCache {
+    pub(super) fn read(
+        &mut self,
+        state: BatteryPowerState,
+        now: Instant,
+        source: impl FnOnce() -> PowerSourceTimes,
+    ) -> PowerSourceTimes {
+        if let Some(cached) = self.cached.filter(|cached| {
+            cached.state == state && now.duration_since(cached.read_at) < Duration::from_secs(5)
+        }) {
+            return cached.times;
+        }
+
+        let times = source();
+        self.cached = Some(CachedPowerSourceTimes {
+            state,
+            read_at: now,
+            times,
+        });
+        times
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct RawBattery {
@@ -84,6 +128,25 @@ pub(super) fn power(raw: &RawBattery) -> Option<Power> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn power_state(is_charging: bool, external_connected: bool) -> BatteryPowerState {
+        BatteryPowerState {
+            is_charging: Some(is_charging),
+            external_connected: Some(external_connected),
+        }
+    }
+
+    fn parsed_state(state: BatteryPowerState, times: PowerSourceTimes) -> BatteryState {
+        power(&RawBattery {
+            is_charging: state.is_charging,
+            external_connected: state.external_connected,
+            time_to_full: times.0,
+            time_to_empty: times.1,
+            ..raw()
+        })
+        .unwrap()
+        .state
+    }
 
     fn raw() -> RawBattery {
         RawBattery {
@@ -204,6 +267,134 @@ mod tests {
                 minutes_to_empty: None,
             })
         );
+    }
+
+    #[test]
+    fn refreshes_charging_estimate_after_unplug_and_replug() {
+        let start = Instant::now();
+        let mut cache = PowerSourceTimeCache::default();
+        let mut readings = [(Some(85), None), (None, Some(240)), (Some(-1), None)].into_iter();
+
+        let times = cache.read(power_state(true, true), start, || readings.next().unwrap());
+        assert_eq!(
+            parsed_state(power_state(true, true), times),
+            BatteryState::Charging {
+                minutes_to_full: Some(85),
+            }
+        );
+
+        let times = cache.read(
+            power_state(false, false),
+            start + Duration::from_secs(1),
+            || readings.next().unwrap(),
+        );
+        assert_eq!(
+            parsed_state(power_state(false, false), times),
+            BatteryState::Discharging {
+                minutes_to_empty: Some(240),
+            }
+        );
+
+        let times = cache.read(
+            power_state(true, true),
+            start + Duration::from_secs(2),
+            || readings.next().unwrap(),
+        );
+        assert_eq!(
+            parsed_state(power_state(true, true), times),
+            BatteryState::Charging {
+                minutes_to_full: None,
+            }
+        );
+    }
+
+    #[test]
+    fn refreshes_discharge_estimate_after_plug_and_unplug() {
+        let start = Instant::now();
+        let mut cache = PowerSourceTimeCache::default();
+        let mut readings = [(None, Some(240)), (Some(85), None), (None, Some(-1))].into_iter();
+
+        let times = cache.read(power_state(false, false), start, || {
+            readings.next().unwrap()
+        });
+        assert_eq!(
+            parsed_state(power_state(false, false), times),
+            BatteryState::Discharging {
+                minutes_to_empty: Some(240),
+            }
+        );
+
+        let times = cache.read(
+            power_state(true, true),
+            start + Duration::from_secs(1),
+            || readings.next().unwrap(),
+        );
+        assert_eq!(
+            parsed_state(power_state(true, true), times),
+            BatteryState::Charging {
+                minutes_to_full: Some(85),
+            }
+        );
+
+        let times = cache.read(
+            power_state(false, false),
+            start + Duration::from_secs(2),
+            || readings.next().unwrap(),
+        );
+        assert_eq!(
+            parsed_state(power_state(false, false), times),
+            BatteryState::Discharging {
+                minutes_to_empty: None,
+            }
+        );
+    }
+
+    #[test]
+    fn reuses_same_state_estimate_inside_five_seconds() {
+        let start = Instant::now();
+        let mut cache = PowerSourceTimeCache::default();
+        let mut calls = 0;
+
+        let first = cache.read(power_state(true, true), start, || {
+            calls += 1;
+            (Some(85), None)
+        });
+        let second = cache.read(
+            power_state(true, true),
+            start + Duration::from_millis(4_999),
+            || {
+                calls += 1;
+                (Some(90), None)
+            },
+        );
+
+        assert_eq!(first, (Some(85), None));
+        assert_eq!(second, first);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn refreshes_same_state_estimate_after_five_seconds() {
+        let start = Instant::now();
+        let mut cache = PowerSourceTimeCache::default();
+        let mut calls = 0;
+
+        let first = cache.read(power_state(true, true), start, || {
+            calls += 1;
+            (Some(85), None)
+        });
+        let second = cache.read(
+            power_state(true, true),
+            start + Duration::from_secs(5),
+            || {
+                calls += 1;
+                (Some(-1), None)
+            },
+        );
+
+        assert_eq!(first, (Some(85), None));
+        assert_eq!(second, (Some(-1), None));
+        assert_eq!(calls, 2);
     }
 
     #[test]

@@ -17,10 +17,10 @@ use std::{
     collections::HashMap,
     ptr::NonNull,
     sync::{Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
-use super::battery::RawBattery;
+use super::battery::{BatteryPowerState, PowerSourceTimeCache, PowerSourceTimes, RawBattery};
 
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
@@ -188,23 +188,14 @@ fn dictionary_integer(dictionary: &CFDictionary, key: &'static str) -> Option<i6
         .and_then(|number| number.as_i64())
 }
 
-type PowerSourceTimes = (Option<i64>, Option<i64>);
+static POWER_SOURCE_TIMES: OnceLock<Mutex<PowerSourceTimeCache>> = OnceLock::new();
 
-static POWER_SOURCE_TIMES: OnceLock<Mutex<Option<(Instant, PowerSourceTimes)>>> = OnceLock::new();
-
-fn read_power_source_times() -> PowerSourceTimes {
-    let cache = POWER_SOURCE_TIMES.get_or_init(|| Mutex::new(None));
+fn read_power_source_times(state: BatteryPowerState) -> PowerSourceTimes {
+    let cache = POWER_SOURCE_TIMES.get_or_init(|| Mutex::new(PowerSourceTimeCache::default()));
     let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((read_at, times)) = *cache {
-        if read_at.elapsed() < Duration::from_secs(5) {
-            return times;
-        }
-    }
-    let times = read_power_source_times_now();
-    *cache = Some((Instant::now(), times));
-    times
+    cache.read(state, Instant::now(), read_power_source_times_now)
 }
 
 fn read_power_source_times_now() -> PowerSourceTimes {
@@ -281,13 +272,18 @@ pub(super) fn read_battery() -> Option<RawBattery> {
             .and_then(|dictionary| dictionary_number(dictionary, key))
             .map(|value| value as i64)
     };
-    let (time_to_full, time_to_empty) = read_power_source_times();
+    let is_charging = boolean("IsCharging");
+    let external_connected = boolean("ExternalConnected");
+    let (time_to_full, time_to_empty) = read_power_source_times(BatteryPowerState {
+        is_charging,
+        external_connected,
+    });
     Some(RawBattery {
         current_capacity: number("CurrentCapacity"),
         max_capacity: number("MaxCapacity"),
         battery_installed: boolean("BatteryInstalled"),
-        is_charging: boolean("IsCharging"),
-        external_connected: boolean("ExternalConnected"),
+        is_charging,
+        external_connected,
         fully_charged: boolean("FullyCharged"),
         time_to_full,
         time_to_empty,
@@ -379,6 +375,24 @@ mod tests {
         );
         assert_eq!(dictionary_number(dictionary, "name"), None);
         assert_eq!(dictionary_number(dictionary, "missing"), None);
+    }
+
+    #[test]
+    fn reads_literal_integers_from_a_dictionary() {
+        let keys = [
+            CFString::from_static_str("minutes"),
+            CFString::from_static_str("text"),
+        ];
+        let number = CFNumber::new_f64(85.0);
+        let text = CFString::from_static_str("unknown");
+        let values: [&CFType; 2] = [&number, &text];
+        let dictionary =
+            CFDictionary::<CFString, CFType>::from_slices(&[&*keys[0], &*keys[1]], &values);
+        let dictionary = dictionary.as_opaque();
+
+        assert_eq!(dictionary_integer(dictionary, "minutes"), Some(85));
+        assert_eq!(dictionary_integer(dictionary, "missing"), None);
+        assert_eq!(dictionary_integer(dictionary, "text"), None);
     }
 
     #[test]
