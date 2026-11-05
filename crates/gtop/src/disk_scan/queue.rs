@@ -116,6 +116,7 @@ pub(super) struct TestHooks {
     pub(super) before_open: Option<RouteHook>,
     pub(super) priority: Option<PriorityHook>,
     pub(super) cancel_after: Option<u64>,
+    pub(super) before_stop_check: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     pub(super) after_entry: Option<RouteHook>,
     pub(super) completed: Option<RouteHook>,
     pub(super) abandoned: Option<RouteHook>,
@@ -948,6 +949,10 @@ impl Coordinator<'_, '_> {
         }
     }
     fn stopped(&self, reducer: &Reducer<'_>) -> bool {
+        #[cfg(test)]
+        if let Some(hook) = &self.options.hooks.before_stop_check {
+            hook(reducer.tree.nodes[0].descendants);
+        }
         if self.control.stopped() || matches!(reducer.tree.state, ScanState::Failed(_)) {
             return true;
         }

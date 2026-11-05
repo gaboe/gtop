@@ -1377,6 +1377,32 @@ mod tests {
             .any(|(id, _)| tree.path(id) == temp.0.join("link/data")));
     }
     #[test]
+    fn scan_honors_cancel_request_after_replay_progress() {
+        let temp = Scratch::new();
+        for i in 0..20 {
+            fs::write(temp.0.join(format!("file-{i}")), [1; 4096]).unwrap();
+        }
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let request = cancel.clone();
+        let mut options = queue::Options::default();
+        options.hooks.before_stop_check = Some(std::sync::Arc::new(move |descendants| {
+            if descendants >= 1 {
+                request.store(true, Ordering::Relaxed);
+            }
+        }));
+        let tree = scan_impl(
+            &temp.0,
+            &temp.0,
+            &cancel,
+            |_| {},
+            || ScanUrgency::Background,
+            options,
+        );
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(tree.state, ScanState::Cancelled);
+        assert_eq!(tree.nodes[0].descendants, 1);
+    }
+    #[test]
     fn scan_cancels_after_work_and_keeps_partial_results() {
         let temp = Scratch::new();
         for i in 0..20 {

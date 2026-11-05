@@ -498,6 +498,32 @@ mod tests {
     }
 
     #[test]
+    fn sysinfo_identity_accepts_a_populated_system() {
+        let own_pid = std::process::id();
+        let pid = Pid::from_u32(own_pid);
+        let mut sys = System::new();
+        // sysinfo 0.39.6 apple/system.rs enumerates all PIDs even for Some.
+        // get_proc_list returns None if process churn fills its PID buffer.
+        for _ in 0..20 {
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            if sys.process(pid).is_some() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let start_time = sys
+            .process(pid)
+            .expect("own PID missing after 20 refreshes; sysinfo get_proc_list can return None when enumeration fails or process churn fills its buffer")
+            .start_time();
+        assert!(sysinfo_identity_matches(&sys, own_pid, start_time));
+        assert!(!sysinfo_identity_matches(&sys, own_pid, start_time + 1));
+    }
+
+    #[test]
     fn run_time_counts_from_a_known_start() {
         assert_eq!(run_time(40, 100), 60);
         assert_eq!(run_time(0, 100), 0);
