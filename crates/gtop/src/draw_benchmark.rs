@@ -285,31 +285,66 @@ async fn refresh_key_requests_one_sample_while_paused(cx: &mut TestAppContext) {
         theme::init(cx);
     });
     let mut monitor = None;
+    let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (_root, visual) = cx.add_window_view(|window, cx| {
-        let entity = cx.new(|cx| fixture(window, cx));
-        entity.update(cx, |monitor, cx| {
+        let entity = cx.new(|cx| {
+            let mut monitor = fixture(window, cx);
             monitor.paused = true;
+            monitor.snapshot = None;
+            let (wake, events) = mpsc::channel(1);
+            monitor.wake = wake;
+            let (refresh, _) = Monitor::start_refresh(
+                window,
+                cx,
+                crate::RefreshLoop {
+                    events,
+                    forced_refresh: monitor.force_refresh.clone(),
+                    history_stopping: Rc::new(std::cell::Cell::new(false)),
+                    cached_ports: Arc::new(Mutex::new(Default::default())),
+                    port_collection_refresh: Arc::new(Mutex::new(())),
+                    history_perf: Arc::new(perf::PerfCounters::default()),
+                    source: crate::RefreshSource::Fixture {
+                        snapshot: crate::test_data::snapshot,
+                        samples: samples.clone(),
+                    },
+                },
+            );
+            monitor._refresh = Some(refresh);
             window.focus(&monitor.focus, cx);
+            monitor
         });
         monitor = Some(entity.clone());
         Root::new(entity, window, cx)
     });
     let monitor = monitor.unwrap();
+    visual.run_until_parked();
+    assert_eq!(samples.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     visual.simulate_keystrokes("r");
-    visual.simulate_keystrokes("r");
     visual.run_until_parked();
-    let forced = monitor.read_with(visual, |monitor, _| {
-        crate::take_forced_refresh(&monitor.force_refresh)
-    });
-    assert!(crate::should_sample(true, forced));
+    assert_eq!(samples.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(monitor.read_with(visual, |monitor, _| monitor.paused));
-    assert!(
-        !monitor.read_with(visual, |monitor, _| crate::take_forced_refresh(
-            &monitor.force_refresh
-        ))
+    assert_eq!(
+        monitor.read_with(visual, |monitor, _| monitor
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .stats
+            .memory_used),
+        500
     );
-    assert!(!crate::should_sample(true, false));
+
+    visual.executor().advance_clock(Duration::from_secs(3));
+    visual.run_until_parked();
+    assert_eq!(samples.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    monitor.update(visual, |monitor, _| {
+        monitor.refresh_now();
+        monitor.refresh_now();
+    });
+    visual.run_until_parked();
+    assert_eq!(samples.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(monitor.read_with(visual, |monitor, _| monitor.paused));
 }
 
 #[cfg(target_os = "macos")]

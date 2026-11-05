@@ -615,6 +615,20 @@ impl History {
         self.last_process_sample = None;
         self.process_recording_since = None;
     }
+    pub fn record_sample(
+        &mut self,
+        snapshot: &Snapshot,
+        now: f64,
+        interval: f64,
+        paused: bool,
+    ) -> Result<bool> {
+        if paused {
+            self.suspend();
+            Ok(false)
+        } else {
+            self.record(snapshot, now, interval)
+        }
+    }
     pub fn record(&mut self, snapshot: &Snapshot, now: f64, interval: f64) -> Result<bool> {
         if self.last_sample.is_none_or(|at| now < at) {
             let minute = now as u64 / 60;
@@ -1572,6 +1586,45 @@ mod tests {
         }
         assert!(!history.buckets.is_empty());
     }
+    #[test]
+    fn forced_samples_leave_paused_history_suspended() {
+        let mut snapshot = crate::test_data::snapshot();
+        snapshot.stats.network_totals = Some((100, 200));
+        snapshot.stats.disk_io_totals = Some((300, 400));
+        let mut history = History::default();
+        history.record_sample(&snapshot, 5998., 3., true).unwrap();
+        history.record_sample(&snapshot, 5999., 3., true).unwrap();
+        assert!(history.buckets.is_empty());
+        assert!(history.last_sample.is_none());
+        assert!(history.last_process_sample.is_none());
+        assert!(history.process_recording_since.is_none());
+        history.record_sample(&snapshot, 6000., 3., false).unwrap();
+        history.record_sample(&snapshot, 6003., 3., false).unwrap();
+        for now in [6004., 6005.] {
+            history.record_sample(&snapshot, now, 3., true).unwrap();
+            assert!(history.last_sample.is_none());
+            assert!(history.last_process_sample.is_none());
+            assert!(history.process_recording_since.is_none());
+            assert_eq!(history.io_previous, [None; 4]);
+            assert_eq!(history.buckets.back().unwrap().seconds, 3.001);
+            assert_eq!(
+                history.view(1, now as u64).unwrap().rows[0].1.cpu_seconds,
+                10.5
+            );
+            assert_eq!(
+                history.view(1, now as u64).unwrap().rows[0].1.gpu_seconds,
+                5.25
+            );
+        }
+        history.record_sample(&snapshot, 6006., 3., false).unwrap();
+        assert_eq!(history.buckets.back().unwrap().seconds, 3.001);
+        assert_eq!(history.view(1, 6006).unwrap().rows[0].1.cpu_seconds, 10.5);
+        assert_eq!(history.view(1, 6006).unwrap().rows[0].1.gpu_seconds, 5.25);
+        history.record_sample(&snapshot, 6009., 3., false).unwrap();
+        assert!((history.buckets.back().unwrap().seconds - 6.001).abs() < 0.00001);
+        assert_eq!(history.view(1, 6009).unwrap().rows[0].1.cpu_seconds, 21.);
+    }
+
     #[test]
     fn recording_counts_elapsed_seconds_and_leaves_suspended_minutes_empty() {
         let s = crate::test_data::snapshot();

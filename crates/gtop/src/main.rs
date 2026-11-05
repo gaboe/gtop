@@ -122,6 +122,26 @@ struct ShutdownDrains {
     settings: ShutdownFuture,
 }
 
+#[derive(Clone)]
+enum RefreshSource {
+    System,
+    #[cfg(test)]
+    Fixture {
+        snapshot: fn() -> Snapshot,
+        samples: Arc<std::sync::atomic::AtomicUsize>,
+    },
+}
+
+struct RefreshLoop {
+    events: mpsc::Receiver<()>,
+    forced_refresh: Arc<AtomicBool>,
+    history_stopping: Rc<std::cell::Cell<bool>>,
+    cached_ports: Arc<Mutex<std::collections::HashMap<u32, Vec<u16>>>>,
+    port_collection_refresh: Arc<Mutex<()>>,
+    history_perf: Arc<perf::PerfCounters>,
+    source: RefreshSource,
+}
+
 struct Monitor {
     core: Option<Arc<AppState>>,
     snapshot: Option<Rc<Snapshot>>,
@@ -173,165 +193,37 @@ struct Monitor {
 }
 
 impl Monitor {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let settings = palette::Settings::load();
-        theme::apply(settings.base(), cx);
-        let base = settings.base();
-        let colors = [
-            base.ground,
-            base.plate,
-            base.silk,
-            base.led,
-            base.hot,
-            base.ok,
-        ]
-        .map(|v| cx.new(|cx| InputState::new(window, cx).default_value(format!("#{v:06x}"))));
-        let color_pickers = palette::ColorField::ALL.map(|field| {
-            cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb(field.get(base))))
-        });
-        let mix_name = cx.new(|cx| InputState::new(window, cx).placeholder("Name this mix"));
-        let focus = cx.focus_handle();
-        window.focus(&focus, cx);
-        let search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("name, pid, command or port"));
-        let table = cx.new(|_| {
-            let mut p = Processes::default();
-            p.root_focus = Some(focus.clone());
-            p.base = settings.base();
-            p.cpu_scale = settings.cpu_scale;
-            p.widths = settings.process_widths.clone();
-            p
-        });
-        let stopping = Rc::new(std::cell::Cell::new(false));
-        let settings_stopping = stopping.clone();
-        let history_stopping = stopping.clone();
-        let (wake, mut events) = mpsc::channel(1);
-        let force_refresh = Arc::new(AtomicBool::new(false));
-        let (settings_writes, mut settings_events) = mpsc::unbounded();
+    fn start_refresh(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        inputs: RefreshLoop,
+    ) -> (Task<()>, ShutdownFuture) {
+        let RefreshLoop {
+            mut events,
+            forced_refresh,
+            history_stopping,
+            cached_ports,
+            port_collection_refresh,
+            history_perf,
+            source,
+        } = inputs;
         let entity = cx.entity().downgrade();
-        let mut settings_cx = window.to_async(cx);
-        let settings_drain = async move {
-            let cx = &mut settings_cx;
-            while let Some(settings) = palette::next_settings(&mut settings_events).await {
-                let result = cx
-                    .background_executor()
-                    .spawn(async move { settings.save() })
-                    .await;
-                if settings_stopping.get() {
-                    continue;
-                }
-                if let Err(error) = result {
-                    let _ = entity.update_in(cx, |this, _, cx| {
-                        this.status = format!("Settings could not be saved: {error}");
-                        cx.notify();
-                    });
-                }
-            }
-        }
-        .boxed_local()
-        .shared();
-        let settings_writer = cx.foreground_executor().spawn(settings_drain.clone());
-        let mut subscriptions = vec![
-            cx.subscribe_in(&search, window, |this, input, event, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let query = input.read(cx).value();
-                    let mut changed_ports = false;
-                    this.table.update(cx, |table, cx| {
-                        let rows = &mut *table;
-                        let previous = rows.search.needs_ports();
-                        rows.search = Search::new(&query);
-                        changed_ports = previous != rows.search.needs_ports();
-                        rows.reorder();
-                        if let Some(row) = rows.selected.and_then(|key| rows.row_for(key)) {
-                            table.selected = table.process(row).map(ProcessKey::from);
-                        } else {
-                            table.selected = None;
-                        }
-                        cx.notify();
-                    });
-                    if changed_ports {
-                        this.wake();
-                    }
-                    cx.notify();
-                }
-            }),
-            cx.subscribe_in(&table, window, |this, _, event, window, cx| {
-                window.focus(&this.focus, cx);
-                let process_table::SelectProcess(key) = event;
-                this.settings_open = false;
-                this.select(*key, cx);
-            }),
-            cx.subscribe_in(
-                &table,
-                window,
-                |this, _, event: &process_table::WidthsChanged, window, cx| {
-                    this.settings.process_widths = event.0.clone();
-                    if event.1 {
-                        this.persist_settings(window, cx);
-                    }
-                },
-            ),
-            cx.observe_window_visibility(window, |this, visibility, _, _| {
-                if gtop_core::perf_enabled() {
-                    eprintln!("perf visibility visible={}", visibility.is_visible());
-                }
-                if let Some(disk) = &this.disk {
-                    disk.set_visible(visibility.is_visible());
-                }
-                this.wake();
-            }),
-        ];
-        subscriptions.extend(Self::palette_subscriptions(
-            &colors,
-            &color_pickers,
-            window,
-            cx,
-        ));
-        let cached_ports = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
-            u32,
-            Vec<u16>,
-        >::new()));
-        let perf = Arc::new(perf::PerfCounters::default());
-        let history_perf = perf.clone();
-        let port_cache = cached_ports.clone();
-        let port_collection = Arc::new(Mutex::new(()));
-        let port_collection_task = port_collection.clone();
-        let ports_task = cx.spawn_in(window, async move |entity, cx| loop {
-            let Ok(running) =
-                entity.update_in(cx, |this, window, _| !this.paused && window.is_visible())
-            else {
-                break;
-            };
-            if running {
-                let cache = port_cache.clone();
-                let collection = port_collection_task.clone();
-                cx.background_executor()
-                    .spawn(async move {
-                        let _guard = collection
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let ports = gtop_core::monitoring::collect_ports_by_pid();
-                        if let Ok(mut cached) = cache.lock() {
-                            *cached = ports;
-                        }
-                    })
-                    .await;
-            }
-            cx.background_executor()
-                .timer(Duration::from_secs(10))
-                .await;
-        });
-        let entity = cx.entity().downgrade();
-        let forced_refresh = force_refresh.clone();
-        let port_collection_refresh = port_collection.clone();
         let mut refresh_cx = window.to_async(cx);
         let history_drain = async move {
             let cx = &mut refresh_cx;
-            let core = cx.background_executor().spawn(async { Arc::new(AppState::new()) }).await;
-            if history_stopping.get() || entity.update_in(cx, |this, _, _| this.core = Some(core.clone())).is_err() { return; }
-            let opened = cx.background_executor().spawn(async {
+            let core = match &source {
+                RefreshSource::System => Some(cx.background_executor().spawn(async { Arc::new(AppState::new()) }).await),
+                #[cfg(test)]
+                RefreshSource::Fixture { .. } => None,
+            };
+            if history_stopping.get() || entity.update_in(cx, |this, _, _| this.core = core.clone()).is_err() { return; }
+            let opened = match &source {
+                #[cfg(test)]
+                RefreshSource::Fixture { .. } => Ok(history::History::default()),
+                RefreshSource::System => cx.background_executor().spawn(async {
                 history::History::open(&history::support_path("history.sqlite"), &history::support_path("history.json"), rack::now() as u64)
-            }).await;
+            }).await,
+            };
             let mut history = match opened {
                 Ok(history) => history,
                 Err(error) => {
@@ -350,7 +242,7 @@ impl Monitor {
             loop {
                 if history_stopping.get() || refresh_stopped(&mut events) { break; }
                 let forced = take_forced_refresh(&forced_refresh);
-                let Ok((running, ports, seconds, moment, metric, selected_detail)) = entity.update_in(cx, |this, window, cx| {
+                let Ok((paused, ports, seconds, moment, metric, selected_detail)) = entity.update_in(cx, |this, window, cx| {
                     let selected_detail = this.details.as_ref().map(|details| {
                         (
                             details.key,
@@ -359,15 +251,15 @@ impl Monitor {
                             details.analysis.is_none(),
                         )
                     });
-                    (should_sample(this.paused, forced), window.is_visible() && this.table.read(cx).search.needs_ports(), this.interval, this.moment, this.metric, selected_detail)
+                    (this.paused, window.is_visible() && this.table.read(cx).search.needs_ports(), this.interval, this.moment, this.metric, selected_detail)
                 }) else { break; };
                 history_perf.set_refresh_interval(seconds);
                 if moment.is_none() {
                     cached_moment = None;
                     cached_metric = None;
                 }
-                if !running {
-                    history.suspend();
+                if paused { history.suspend(); }
+                if !should_sample(paused, forced) {
                     let mut history_retry = false;
                     if let Some(selection) = moment {
                         if cached_moment != Some(selection) || cached_metric != Some(metric) {
@@ -402,7 +294,7 @@ impl Monitor {
                     if let Some(key) = pending {
                         let state = core.clone();
                         let stopped = cx.background_executor().spawn(async move {
-                            state.process_stopped(key.pid, key.start_time)
+                            state.as_ref().expect("system source for process control").process_stopped(key.pid, key.start_time)
                         }).await;
                         if history_stopping.get() { break; }
                         let _ = entity.update_in(cx, |this, _, cx| {
@@ -457,6 +349,7 @@ impl Monitor {
                     continue;
                 }
                 let state = core.clone();
+                let source = source.clone();
                 let port_cache=cached_ports.clone();
                 let previous_moment = cached_moment;
                 let previous_metric = cached_metric;
@@ -465,23 +358,33 @@ impl Monitor {
                 let port_collection_refresh = port_collection_refresh.clone();
                 let result = cx.background_executor().spawn(async move {
                     let start = std::time::Instant::now();
-                    let snapshot = if forced || ports {
-                        let _guard = port_collection_refresh
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let fresh_ports = gtop_core::monitoring::collect_ports_by_pid();
-                        if let Ok(mut cached) = port_cache.lock() {
-                            *cached = fresh_ports.clone();
+                    let snapshot = match source {
+                        #[cfg(test)]
+                        RefreshSource::Fixture { snapshot, samples } => {
+                            samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(snapshot())
                         }
-                        if forced {
-                            state.snapshot_with_fresh_power_source_times(&fresh_ports)
-                        } else {
-                            state.snapshot_with_cached_ports(false, &fresh_ports)
-                        }
-                    } else {
-                        match port_cache.lock() {
-                            Ok(cached) => state.snapshot_with_cached_ports(false, &cached),
-                            Err(_) => state.snapshot(false, false),
+                        RefreshSource::System => {
+                            let state = state.expect("initialized system source");
+                            if forced || ports {
+                                let _guard = port_collection_refresh
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let fresh_ports = gtop_core::monitoring::collect_ports_by_pid();
+                                if let Ok(mut cached) = port_cache.lock() {
+                                    *cached = fresh_ports.clone();
+                                }
+                                if forced {
+                                    state.snapshot_with_fresh_power_source_times(&fresh_ports)
+                                } else {
+                                    state.snapshot_with_cached_ports(false, &fresh_ports)
+                                }
+                            } else {
+                                match port_cache.lock() {
+                                    Ok(cached) => state.snapshot_with_cached_ports(false, &cached),
+                                    Err(_) => state.snapshot(false, false),
+                                }
+                            }
                         }
                     };
                     let sampled_at = Instant::now();
@@ -497,7 +400,7 @@ impl Monitor {
 
                         let update = (|| -> history::Result<()> {
                         let history_record_started = std::time::Instant::now();
-                        let recorded = history.record(snapshot, now, seconds as f64);
+                        let recorded = history.record_sample(snapshot, now, seconds as f64, paused);
                         sample_perf.add_history_write(history_record_started.elapsed());
                         recorded?;
                         let minute = now as u64 / 60;
@@ -628,6 +531,170 @@ impl Monitor {
             }).await;
         }.boxed_local().shared();
         let refresh = cx.foreground_executor().spawn(history_drain.clone());
+        (refresh, history_drain)
+    }
+
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let settings = palette::Settings::load();
+        theme::apply(settings.base(), cx);
+        let base = settings.base();
+        let colors = [
+            base.ground,
+            base.plate,
+            base.silk,
+            base.led,
+            base.hot,
+            base.ok,
+        ]
+        .map(|v| cx.new(|cx| InputState::new(window, cx).default_value(format!("#{v:06x}"))));
+        let color_pickers = palette::ColorField::ALL.map(|field| {
+            cx.new(|cx| ColorPickerState::new(window, cx).default_value(rgb(field.get(base))))
+        });
+        let mix_name = cx.new(|cx| InputState::new(window, cx).placeholder("Name this mix"));
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        let search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("name, pid, command or port"));
+        let table = cx.new(|_| {
+            let mut p = Processes::default();
+            p.root_focus = Some(focus.clone());
+            p.base = settings.base();
+            p.cpu_scale = settings.cpu_scale;
+            p.widths = settings.process_widths.clone();
+            p
+        });
+        let stopping = Rc::new(std::cell::Cell::new(false));
+        let settings_stopping = stopping.clone();
+        let history_stopping = stopping.clone();
+        let (wake, events) = mpsc::channel(1);
+        let force_refresh = Arc::new(AtomicBool::new(false));
+        let (settings_writes, mut settings_events) = mpsc::unbounded();
+        let entity = cx.entity().downgrade();
+        let mut settings_cx = window.to_async(cx);
+        let settings_drain = async move {
+            let cx = &mut settings_cx;
+            while let Some(settings) = palette::next_settings(&mut settings_events).await {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { settings.save() })
+                    .await;
+                if settings_stopping.get() {
+                    continue;
+                }
+                if let Err(error) = result {
+                    let _ = entity.update_in(cx, |this, _, cx| {
+                        this.status = format!("Settings could not be saved: {error}");
+                        cx.notify();
+                    });
+                }
+            }
+        }
+        .boxed_local()
+        .shared();
+        let settings_writer = cx.foreground_executor().spawn(settings_drain.clone());
+        let mut subscriptions = vec![
+            cx.subscribe_in(&search, window, |this, input, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let query = input.read(cx).value();
+                    let mut changed_ports = false;
+                    this.table.update(cx, |table, cx| {
+                        let rows = &mut *table;
+                        let previous = rows.search.needs_ports();
+                        rows.search = Search::new(&query);
+                        changed_ports = previous != rows.search.needs_ports();
+                        rows.reorder();
+                        if let Some(row) = rows.selected.and_then(|key| rows.row_for(key)) {
+                            table.selected = table.process(row).map(ProcessKey::from);
+                        } else {
+                            table.selected = None;
+                        }
+                        cx.notify();
+                    });
+                    if changed_ports {
+                        this.wake();
+                    }
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&table, window, |this, _, event, window, cx| {
+                window.focus(&this.focus, cx);
+                let process_table::SelectProcess(key) = event;
+                this.settings_open = false;
+                this.select(*key, cx);
+            }),
+            cx.subscribe_in(
+                &table,
+                window,
+                |this, _, event: &process_table::WidthsChanged, window, cx| {
+                    this.settings.process_widths = event.0.clone();
+                    if event.1 {
+                        this.persist_settings(window, cx);
+                    }
+                },
+            ),
+            cx.observe_window_visibility(window, |this, visibility, _, _| {
+                if gtop_core::perf_enabled() {
+                    eprintln!("perf visibility visible={}", visibility.is_visible());
+                }
+                if let Some(disk) = &this.disk {
+                    disk.set_visible(visibility.is_visible());
+                }
+                this.wake();
+            }),
+        ];
+        subscriptions.extend(Self::palette_subscriptions(
+            &colors,
+            &color_pickers,
+            window,
+            cx,
+        ));
+        let cached_ports = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            u32,
+            Vec<u16>,
+        >::new()));
+        let perf = Arc::new(perf::PerfCounters::default());
+        let history_perf = perf.clone();
+        let port_cache = cached_ports.clone();
+        let port_collection = Arc::new(Mutex::new(()));
+        let port_collection_task = port_collection.clone();
+        let ports_task = cx.spawn_in(window, async move |entity, cx| loop {
+            let Ok(running) =
+                entity.update_in(cx, |this, window, _| !this.paused && window.is_visible())
+            else {
+                break;
+            };
+            if running {
+                let cache = port_cache.clone();
+                let collection = port_collection_task.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let _guard = collection
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let ports = gtop_core::monitoring::collect_ports_by_pid();
+                        if let Ok(mut cached) = cache.lock() {
+                            *cached = ports;
+                        }
+                    })
+                    .await;
+            }
+            cx.background_executor()
+                .timer(Duration::from_secs(10))
+                .await;
+        });
+        let (refresh, history_drain) = Self::start_refresh(
+            window,
+            cx,
+            RefreshLoop {
+                events,
+                forced_refresh: force_refresh.clone(),
+                history_stopping,
+                cached_ports,
+                port_collection_refresh: port_collection,
+                history_perf,
+                source: RefreshSource::System,
+            },
+        );
         let frame_perf = perf.clone();
         let frames = cx.spawn_in(window, async move |entity, cx| {
             let mut previous = None;
