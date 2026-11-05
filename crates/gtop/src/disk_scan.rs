@@ -1382,14 +1382,21 @@ mod tests {
         for i in 0..20 {
             fs::write(temp.0.join(format!("file-{i}")), [1; 4096]).unwrap();
         }
-        let cancel = AtomicBool::new(false);
-        let tree = scan(&temp.0, &temp.0, &cancel, |t| {
-            if t.nodes[0].descendants > 0 {
-                cancel.store(true, Ordering::Relaxed);
-            }
-        });
-        assert_eq!(tree.state, ScanState::Cancelled);
-        assert!(tree.nodes[0].descendants > 0 && tree.nodes[0].descendants < 20);
+        for count in [1, 10, 19] {
+            let cancel = AtomicBool::new(false);
+            let mut options = queue::Options::default();
+            options.hooks.cancel_after = Some(count);
+            let tree = scan_impl(
+                &temp.0,
+                &temp.0,
+                &cancel,
+                |_| {},
+                || ScanUrgency::Background,
+                options,
+            );
+            assert_eq!(tree.state, ScanState::Cancelled);
+            assert_eq!(tree.nodes[0].descendants, count);
+        }
     }
     #[test]
     fn other_device_is_visible_but_has_no_charged_bytes() {

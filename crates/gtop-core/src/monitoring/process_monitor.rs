@@ -307,8 +307,19 @@ impl ProcessMonitor {
 
 #[cfg(any(not(target_os = "macos"), test))]
 fn sysinfo_identity_matches(sys: &System, pid: u32, start_time: u64) -> bool {
-    sys.process(Pid::from_u32(pid))
-        .is_some_and(|process| process.start_time() == start_time)
+    sysinfo_identity_matches_with(pid, start_time, |pid| {
+        sys.process(Pid::from_u32(pid))
+            .map(|process| process.start_time())
+    })
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn sysinfo_identity_matches_with(
+    pid: u32,
+    start_time: u64,
+    lookup: impl FnOnce(u32) -> Option<u64>,
+) -> bool {
+    lookup(pid).is_some_and(|actual| actual == start_time)
 }
 
 /// Seconds since `start_time`, or 0 when the start time is unknown.
@@ -476,13 +487,14 @@ mod tests {
 
     #[test]
     fn sysinfo_identity_needs_the_same_pid_and_start_time() {
-        let own_pid = std::process::id();
-        let mut sys = System::new();
-        ProcessMonitor::refresh(&mut sys, false);
-        let start_time = sys.process(Pid::from_u32(own_pid)).unwrap().start_time();
-        assert!(sysinfo_identity_matches(&sys, own_pid, start_time));
-        assert!(!sysinfo_identity_matches(&sys, own_pid, start_time + 1));
-        assert!(!sysinfo_identity_matches(&sys, i32::MAX as u32, start_time));
+        let pid = 42;
+        let start_time = 1_700_000_000;
+        let processes = HashMap::from([(pid, start_time)]);
+        let lookup = |pid| processes.get(&pid).copied();
+        assert!(sysinfo_identity_matches_with(pid, start_time, lookup));
+        assert!(!sysinfo_identity_matches_with(pid, start_time + 1, lookup));
+        assert!(!sysinfo_identity_matches_with(pid + 1, start_time, lookup));
+        assert!(!sysinfo_identity_matches(&System::new(), pid, start_time));
     }
 
     #[test]
