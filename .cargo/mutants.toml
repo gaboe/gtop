@@ -3,6 +3,7 @@
 # search, sorting, and number formatting. GPUI views, FFI shells, and test code are out.
 
 exclude_globs = [
+  "crates/gtop-disk/src/macos.rs", # getattrlistbulk FFI shell; needs the real filesystem.
   "tests/**", # Integration test sources are not product behavior.
   "**/tests/**", # Nested test fixtures and modules are not product behavior.
   "**/tests.rs", # Out-of-line test modules are not product behavior.
@@ -14,6 +15,7 @@ exclude_globs = [
 ]
 
 examine_globs = [
+  "crates/gtop-disk/src/*.rs",
   "crates/gtop-core/src/lib.rs",
   "crates/gtop-core/src/state.rs",
   "crates/gtop-core/src/monitoring/native_processes.rs",

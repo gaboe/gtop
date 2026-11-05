@@ -83,6 +83,48 @@ pub(super) fn oracle_scan(path: &Path, cancel: &AtomicBool) -> Tree {
 }
 
 #[test]
+fn vendored_scanner_accounting_gate_keeps_production_scanner() {
+    let home = tests::Scratch::new();
+    fs::create_dir(home.0.join("nested")).unwrap();
+    for index in 0..300 {
+        fs::write(
+            home.0.join("nested").join(format!("file-{index}")),
+            [7; 4096],
+        )
+        .unwrap();
+    }
+    fs::hard_link(home.0.join("nested/file-0"), home.0.join("hardlink")).unwrap();
+    symlink("nested", home.0.join("link")).unwrap();
+    fs::File::create(home.0.join("sparse"))
+        .unwrap()
+        .set_len(1 << 30)
+        .unwrap();
+    let cancel = AtomicBool::new(false);
+    let actual = scan(&home.0, &home.0, &cancel, |_| {});
+    let expected = oracle_scan(&home.0, &cancel);
+    assert_eq!(actual.nodes[0].allocated, expected.nodes[0].allocated);
+    let imported = gtop_disk::scan::scan(&home.0, Default::default()).unwrap();
+    let directory_blocks = fs::symlink_metadata(&home.0).unwrap().blocks() * 512
+        + fs::symlink_metadata(home.0.join("nested"))
+            .unwrap()
+            .blocks()
+            * 512;
+    assert!(
+        directory_blocks > 0,
+        "fixture must expose directory allocation"
+    );
+    assert_eq!(
+        imported.bytes + directory_blocks,
+        expected.nodes[0].allocated
+    );
+    assert_ne!(
+        imported.bytes, actual.nodes[0].allocated,
+        "scanner replacement is blocked"
+    );
+    eprintln!("accounting gate: current={} oracle={} imported={} omitted_directory_blocks={directory_blocks}", actual.nodes[0].allocated, expected.nodes[0].allocated, imported.bytes);
+}
+
+#[test]
 fn reducer_matches_serial_oracle_for_stable_filesystem() {
     let home = tests::Scratch::new();
     for index in 0..180 {
