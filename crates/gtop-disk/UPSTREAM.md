@@ -49,11 +49,16 @@ Windows administrator checks and privilege restart functions are removed.
   Scanner leaf results and completed directories retain that exact name.
   `path_of` uses the exact name. Synthetic nodes fall back to their text name.
   A local test covers two invalid UTF-8 names with identical display text.
+  That test constructs nodes because APFS rejects invalid UTF-8 file creation.
+  A separate filesystem test checks exact directory and file names after a scan.
   The node-size test changes from 88 to 104 bytes on 64-bit targets.
 - Directory aggregation saturates file and directory counts.
 - Removal planning tests are retained from the upstream planning section.
   Executor tests are excluded with the removed executors. Gtop's existing
   guarded removal tests remain unchanged.
+- Orphaned documentation for removed items is deleted. The mount-identity
+  test for the removed executor's `Volume` helper is excluded. The adaptive
+  controller test explicitly sets its CPU ceiling after the default changes.
 - The app has a test-only dependency for a shared accounting fixture.
   That fixture compares the production scanner, the independent serial
   oracle, and the imported scanner, including hardlinks, a directory

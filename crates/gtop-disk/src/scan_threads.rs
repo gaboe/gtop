@@ -569,6 +569,7 @@ mod tests {
                 ScanThreads {
                     max_threads: 4,
                     adaptive: true,
+                    system_cpu_limit: Some(0.8),
                     ..ScanThreads::default()
                 },
                 &controller_admission,
