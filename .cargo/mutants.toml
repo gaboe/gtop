@@ -2,6 +2,17 @@
 # Only domain logic is mutated: collectors' pure parsing, state, history, disk scan,
 # search, sorting, and number formatting. GPUI views, FFI shells, and test code are out.
 
+exclude_globs = [
+  "tests/**", # Integration test sources are not product behavior.
+  "**/tests/**", # Nested test fixtures and modules are not product behavior.
+  "**/tests.rs", # Out-of-line test modules are not product behavior.
+  "**/*_tests.rs", # Dedicated test helpers are not product behavior.
+  "crates/gtop/src/test_data.rs", # Process and display fixtures are test helpers.
+  "crates/gtop/src/draw_benchmark.rs", # Drawing benchmark helpers are not product behavior.
+  "crates/gtop/src/screenshots.rs", # Snapshot helpers are not product behavior.
+  "tools/history-bench/**", # Benchmark helper binary is not product behavior.
+]
+
 examine_globs = [
   "crates/gtop-core/src/lib.rs",
   "crates/gtop-core/src/state.rs",
@@ -25,6 +36,8 @@ examine_globs = [
 ]
 
 exclude_re = [
+  # GPUI element builders are drawing glue; width calculations and event behavior remain in scope.
+  'column_widths.rs:.*(cell|handle|handle_left|pin_to_edge)',
   # Sends real signals; a mutant could reach pid <= 1. Never mutate the kill path.
   'signal_target_is_safe',
   'ProcessMonitor::kill_process',
