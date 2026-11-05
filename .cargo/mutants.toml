@@ -52,6 +52,7 @@ exclude_re = [
   # FFI shells: they call IOKit, SMC, or libproc and need real hardware.
   # Only their Drop impls release kernel handles; other Drop impls stay in scope.
   'iokit.rs.*(replace | in )read_battery( ->| with |$)',
+  'iokit.rs.*(replace | in )read_power_source_times( ->| with |$)',
   '(iokit|smc)\.rs.*(replace | in )<impl Drop for (Object|GpuTemperature)>::drop( ->| with |$)',
   'iokit.rs.*(replace | in )(Object::(next|property|children)|Accelerator::(all|name|stats|gpu_time_per_process|number)|StorageDrivers::totals)( ->| with |$)',
   'smc.rs.*(replace | in )GpuTemperature::(hottest|info|read|call)( ->| with |$)',

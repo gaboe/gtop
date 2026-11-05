@@ -8,8 +8,8 @@ pub(super) struct RawBattery {
     pub is_charging: Option<bool>,
     pub external_connected: Option<bool>,
     pub fully_charged: Option<bool>,
-    pub avg_time_to_full: Option<i64>,
-    pub avg_time_to_empty: Option<i64>,
+    pub time_to_full: Option<i64>,
+    pub time_to_empty: Option<i64>,
     pub voltage_mv: Option<i64>,
     pub amperage_ma: Option<i64>,
     pub adapter_watts: Option<i64>,
@@ -31,19 +31,19 @@ pub(super) fn power(raw: &RawBattery) -> Option<Power> {
     };
     let minutes = |value: Option<i64>| {
         value
-            .filter(|minutes| (0..65_535).contains(minutes))
+            .filter(|minutes| *minutes > 0)
             .and_then(|minutes| u32::try_from(minutes).ok())
     };
     let state = match (raw.external_connected, raw.fully_charged, raw.is_charging) {
         (Some(true), Some(true), _) => BatteryState::Full,
         (_, _, Some(true)) => BatteryState::Charging {
-            minutes_to_full: minutes(raw.avg_time_to_full),
+            minutes_to_full: minutes(raw.time_to_full),
         },
         _ if raw.amperage_ma.is_some_and(|amperage| amperage < 0) => BatteryState::Discharging {
-            minutes_to_empty: minutes(raw.avg_time_to_empty),
+            minutes_to_empty: minutes(raw.time_to_empty),
         },
         (Some(false), _, _) => BatteryState::Discharging {
-            minutes_to_empty: minutes(raw.avg_time_to_empty),
+            minutes_to_empty: minutes(raw.time_to_empty),
         },
         (Some(true), _, _) => BatteryState::NotCharging,
         _ => return None,
@@ -93,8 +93,8 @@ mod tests {
             is_charging: Some(true),
             external_connected: Some(true),
             fully_charged: Some(false),
-            avg_time_to_full: Some(85),
-            avg_time_to_empty: Some(240),
+            time_to_full: Some(85),
+            time_to_empty: Some(240),
             voltage_mv: Some(12_000),
             amperage_ma: Some(1_000),
             adapter_watts: Some(90),
@@ -155,8 +155,8 @@ mod tests {
     #[test]
     fn ignores_unknown_and_missing_times_and_optional_readings() {
         let raw = RawBattery {
-            avg_time_to_full: Some(65_535),
-            avg_time_to_empty: None,
+            time_to_full: Some(-1),
+            time_to_empty: None,
             voltage_mv: None,
             amperage_ma: None,
             adapter_watts: None,
@@ -173,6 +173,35 @@ mod tests {
                 system_watts: None,
                 battery_watts: None,
                 adapter_watts: None,
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_zero_negative_and_out_of_range_power_source_times() {
+        for time in [Some(-1), Some(0), Some(i64::MAX), None] {
+            let raw = RawBattery {
+                time_to_full: time,
+                ..raw()
+            };
+            assert_eq!(
+                power(&raw).map(|value| value.state),
+                Some(BatteryState::Charging {
+                    minutes_to_full: None,
+                })
+            );
+        }
+
+        let raw = RawBattery {
+            is_charging: Some(false),
+            external_connected: Some(false),
+            time_to_empty: Some(0),
+            ..raw()
+        };
+        assert_eq!(
+            power(&raw).map(|value| value.state),
+            Some(BatteryState::Discharging {
+                minutes_to_empty: None,
             })
         );
     }
@@ -196,7 +225,7 @@ mod tests {
                 is_charging: Some(false),
                 external_connected: Some(true),
                 fully_charged: Some(false),
-                avg_time_to_empty: Some(240),
+                time_to_empty: Some(240),
                 voltage_mv: Some(12_000),
                 amperage_ma: Some(-800),
                 system_load_mw,
@@ -281,7 +310,7 @@ mod tests {
             fully_charged: Some(false),
             amperage_ma: Some(-800),
             voltage_mv: Some(12_000),
-            avg_time_to_empty: Some(240),
+            time_to_empty: Some(240),
             system_load_mw: Some(70_411),
             ..raw()
         };

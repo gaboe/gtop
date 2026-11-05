@@ -32,18 +32,18 @@ fn gtop_self_cpu(cpu: Option<f32>, logical_cpus: usize, scale: palette::CpuScale
 
 fn battery_readouts(power: &Power) -> [String; 3] {
     let state = match power.state {
-        BatteryState::Charging { minutes_to_full } => format!(
-            "FULL IN {}",
-            minutes_to_full
-                .map(|minutes| format!("{}:{:02}", minutes / 60, minutes % 60))
-                .unwrap_or_else(|| "N/A".into())
-        ),
-        BatteryState::Discharging { minutes_to_empty } => format!(
-            "EMPTY IN {}",
-            minutes_to_empty
-                .map(|minutes| format!("{}:{:02}", minutes / 60, minutes % 60))
-                .unwrap_or_else(|| "N/A".into())
-        ),
+        BatteryState::Charging {
+            minutes_to_full: Some(minutes),
+        } => format!("FULL IN {}:{:02}", minutes / 60, minutes % 60),
+        BatteryState::Charging {
+            minutes_to_full: None,
+        } => "CHARGING".into(),
+        BatteryState::Discharging {
+            minutes_to_empty: Some(minutes),
+        } => format!("EMPTY IN {}:{:02}", minutes / 60, minutes % 60),
+        BatteryState::Discharging {
+            minutes_to_empty: None,
+        } => "ON BATTERY".into(),
         BatteryState::Full => "FULL".into(),
         BatteryState::NotCharging => "NOT CHARGING".into(),
     };
@@ -3278,6 +3278,30 @@ mod tests {
                 adapter_watts: None,
             }),
             ["EMPTY IN 4:00", "70.4", "-9.6"]
+        );
+        assert_eq!(
+            battery_readouts(&Power {
+                percent: 80,
+                state: BatteryState::Charging {
+                    minutes_to_full: None,
+                },
+                system_watts: Some(70.4),
+                battery_watts: Some(12.3),
+                adapter_watts: Some(90),
+            }),
+            ["CHARGING", "70.4", "+12.3"]
+        );
+        assert_eq!(
+            battery_readouts(&Power {
+                percent: 80,
+                state: BatteryState::Discharging {
+                    minutes_to_empty: None,
+                },
+                system_watts: Some(9.6),
+                battery_watts: Some(-9.6),
+                adapter_watts: None,
+            }),
+            ["ON BATTERY", "9.6", "-9.6"]
         );
     }
 

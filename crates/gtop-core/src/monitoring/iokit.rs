@@ -13,9 +13,24 @@ use objc2_io_kit::{
     IORegistryEntryCreateCFProperty, IORegistryEntryGetChildIterator,
     IORegistryEntryGetParentEntry, IOServiceGetMatchingServices, IOServiceMatching,
 };
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    ptr::NonNull,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use super::battery::RawBattery;
+
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    fn IOPSCopyPowerSourcesInfo() -> *const CFType;
+    fn IOPSCopyPowerSourcesList(blob: *const CFType) -> *const CFArray<CFType>;
+    fn IOPSGetPowerSourceDescription(
+        blob: *const CFType,
+        power_source: *const CFType,
+    ) -> *const CFDictionary;
+}
 
 /// An IOKit object handle, released on drop
 #[derive(Debug)]
@@ -164,6 +179,75 @@ fn dictionary_number(dictionary: &CFDictionary, key: &'static str) -> Option<f64
         .and_then(|number| number.as_f64())
 }
 
+fn dictionary_integer(dictionary: &CFDictionary, key: &'static str) -> Option<i64> {
+    let key = CFString::from_static_str(key);
+    let dictionary = unsafe { dictionary.cast_unchecked::<CFString, CFType>() };
+    dictionary
+        .get(&key)
+        .and_then(|value| value.downcast::<CFNumber>().ok())
+        .and_then(|number| number.as_i64())
+}
+
+type PowerSourceTimes = (Option<i64>, Option<i64>);
+
+static POWER_SOURCE_TIMES: OnceLock<Mutex<Option<(Instant, PowerSourceTimes)>>> = OnceLock::new();
+
+fn read_power_source_times() -> PowerSourceTimes {
+    let cache = POWER_SOURCE_TIMES.get_or_init(|| Mutex::new(None));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((read_at, times)) = *cache {
+        if read_at.elapsed() < Duration::from_secs(5) {
+            return times;
+        }
+    }
+    let times = read_power_source_times_now();
+    *cache = Some((Instant::now(), times));
+    times
+}
+
+fn read_power_source_times_now() -> PowerSourceTimes {
+    let Some(blob) = NonNull::new(unsafe { IOPSCopyPowerSourcesInfo() }.cast_mut())
+        .map(|blob| unsafe { CFRetained::<CFType>::from_raw(blob) })
+    else {
+        return (None, None);
+    };
+    let Some(sources) =
+        NonNull::new(unsafe { IOPSCopyPowerSourcesList(&*blob as *const CFType) }.cast_mut())
+            .map(|sources| unsafe { CFRetained::<CFArray<CFType>>::from_raw(sources) })
+    else {
+        return (None, None);
+    };
+
+    for index in 0..sources.len() {
+        let Some(source) = sources.get(index) else {
+            continue;
+        };
+        let description = unsafe {
+            IOPSGetPowerSourceDescription(&*blob as *const CFType, &*source as *const CFType)
+        };
+        let Some(description) = NonNull::new(description.cast_mut()) else {
+            continue;
+        };
+        let description = unsafe { &*description.as_ptr() };
+        let key = CFString::from_static_str("Type");
+        let dictionary = unsafe { description.cast_unchecked::<CFString, CFType>() };
+        let is_internal_battery = dictionary
+            .get(&key)
+            .and_then(|value| value.downcast::<CFString>().ok())
+            .is_some_and(|value| value.to_string() == "InternalBattery");
+        if !is_internal_battery {
+            continue;
+        }
+        return (
+            dictionary_integer(description, "Time to Full Charge"),
+            dictionary_integer(description, "Time to Empty"),
+        );
+    }
+    (None, None)
+}
+
 pub(super) fn read_battery() -> Option<RawBattery> {
     let matching = unsafe { IOServiceMatching(c"AppleSmartBattery".as_ptr()) }?;
     let matching = CFRetained::<CFDictionary>::from(&matching);
@@ -197,6 +281,7 @@ pub(super) fn read_battery() -> Option<RawBattery> {
             .and_then(|dictionary| dictionary_number(dictionary, key))
             .map(|value| value as i64)
     };
+    let (time_to_full, time_to_empty) = read_power_source_times();
     Some(RawBattery {
         current_capacity: number("CurrentCapacity"),
         max_capacity: number("MaxCapacity"),
@@ -204,8 +289,8 @@ pub(super) fn read_battery() -> Option<RawBattery> {
         is_charging: boolean("IsCharging"),
         external_connected: boolean("ExternalConnected"),
         fully_charged: boolean("FullyCharged"),
-        avg_time_to_full: number("AvgTimeToFull"),
-        avg_time_to_empty: number("AvgTimeToEmpty"),
+        time_to_full,
+        time_to_empty,
         voltage_mv: number("Voltage"),
         amperage_ma: number("Amperage"),
         adapter_watts: nested_number(dictionary("AdapterDetails"), "Watts"),
