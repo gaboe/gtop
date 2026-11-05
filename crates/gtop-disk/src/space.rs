@@ -49,8 +49,6 @@ impl SpaceInfo {
 }
 
 /// Read the space on the volume containing `path`.
-
-/// Read the space on the volume containing `path`.
 #[cfg(not(windows))]
 pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
     let stat = rustix::fs::statvfs(path)?;
@@ -68,9 +66,6 @@ pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
         available: stat.f_bavail.saturating_mul(block),
     })
 }
-
-/// The volume a path is on, as Windows names it: `C:\`, a share, or the
-/// folder a volume is mounted on.
 
 /// The device a path's filesystem is mounted from, such as
 /// `/dev/nvme0n1p2`: the mount with the longest prefix of `path` in
@@ -291,9 +286,6 @@ fn attributed_by_platform(root: &Path, path: &Path) -> Attribution {
     compared(root, path, volume_root_for)
 }
 
-/// [`attribution`] with no table to go by on Windows: the volume a path is
-/// mounted on, folded the way Windows folds spellings, so `C:\` and `c:\`.
-
 /// Two platform-named volume roots: one root is one volume.
 #[cfg(any(target_os = "macos", windows))]
 fn compared(root: &Path, path: &Path, volume: impl Fn(&Path) -> Option<PathBuf>) -> Attribution {
@@ -341,8 +333,6 @@ pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     volume_root(&parse_mounts(&table), &path)
 }
-
-/// The top of the volume `path` lives on: its drive, such as `C:\`.
 
 /// Every nested mount is a scan boundary, including bind mounts and
 /// same-device subvolumes. Selecting a mount explicitly makes it a root.
@@ -661,13 +651,6 @@ fn c_chars(field: &[std::ffi::c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Nothing to leave out by path on Windows.
-///
-/// There, the only way into another volume below `root` is a folder that
-/// volume is mounted on, which is a reparse point the walk treats as a link
-/// and does not enter unless links are followed; other drives are separate
-/// trees altogether.
-
 /// A mounted volume the picker can switch the scan to: where it is mounted
 /// and how much room it has. Listed by [`volumes`].
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -836,12 +819,6 @@ pub fn volumes() -> Vec<Volume> {
     sort_by_free_space(&mut volumes);
     volumes
 }
-
-/// Every place a volume is mounted that can be scanned.
-///
-/// Drive roots such as `D:\` and folders a volume is mounted on. Unready
-/// drives (an empty card reader reports a path but no space) are left out,
-/// since there is nothing to measure there.
 
 #[cfg(test)]
 mod tests {

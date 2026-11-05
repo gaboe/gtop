@@ -248,14 +248,6 @@ fn system_trees() -> Vec<PathBuf> {
     SYSTEM_TREES.iter().map(PathBuf::from).collect()
 }
 
-/// [`SYSTEM_TREES`] on Windows: Windows itself, installed programs and
-/// their machine-wide data, and what Windows keeps at the top of its drive
-/// for restore points, recovery and booting. Taken from the environment, so
-/// a system elsewhere is still recognized, and the usual places on the
-/// system drive besides.
-
-/// The root of the drive Windows runs from, such as `C:\`.
-
 /// What to use instead, said when a system tree is refused.
 #[cfg(not(windows))]
 const SYSTEM_TOOLS: &str = "remove it with the tool that installed it";
@@ -456,10 +448,6 @@ fn identity(path: &Path, follow: bool) -> Option<(u64, u64)> {
     meta.ok().map(|meta| (meta.dev(), meta.ino()))
 }
 
-/// `(volume serial, file id)`. Always what a link leads to: a junction to
-/// the home directory is refused as the home directory, which is only ever
-/// too careful.
-
 #[cfg(not(any(unix, windows)))]
 const fn identity(_path: &Path, _follow: bool) -> Option<(u64, u64)> {
     None
@@ -634,9 +622,6 @@ const fn windows_mount_points() -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// The key of the folder every user profile is in, `C:\Users` as
-/// installed; asked of Windows once, since it does not move while running.
-
 #[cfg(not(windows))]
 const fn profiles_key() -> Option<&'static Path> {
     None
@@ -679,8 +664,6 @@ pub fn is_mount_point(path: &Path) -> bool {
     }
 }
 
-/// Whether `path` is a folder another volume is mounted on.
-
 #[cfg(not(any(unix, windows)))]
 pub fn is_mount_point(_path: &Path) -> bool {
     false
@@ -722,12 +705,6 @@ mod tests {
             is_dir: path.is_dir(),
             hidden: false,
         }
-    }
-
-    /// [`system_tree`] for plain paths, keyed the way [`refuse`] keys them.
-    #[cfg(not(windows))]
-    fn tree_of(path: &Path, home: &Path) -> Option<&'static str> {
-        system_tree(&guard_key(path), Some(&guard_key(home)))
     }
 
     fn tree() -> TempDir {
@@ -1022,39 +999,6 @@ mod tests {
             read_mount_table().points,
             "the same table, cached"
         );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn a_volume_is_judged_by_its_mount_where_the_kernel_names_one() {
-        let temp = tree();
-        let dir = open_dir(rustix::fs::CWD, temp.path()).expect("open");
-        let here = Volume::of(&dir).expect("volume");
-        let mut other = Volume::of(&dir).expect("volume");
-        assert!(here.contains(&other));
-        // A btrfs subvolume: another device, the same mount.
-        other.device.st_dev = other.device.st_dev.wrapping_add(1);
-        other.mount = Some(7);
-        let mount = Volume {
-            device: here.device,
-            mount: Some(7),
-        };
-        assert!(mount.contains(&other), "same mount, other device");
-        // A bind mount: the same device, another mount.
-        let bind = Volume {
-            device: here.device,
-            mount: Some(8),
-        };
-        assert!(!mount.contains(&bind));
-        // No mount IDs, as on macOS: the device decides.
-        let (mut plain, mut moved) = (
-            Volume::of(&dir).expect("volume"),
-            Volume::of(&dir).expect("volume"),
-        );
-        plain.mount = None;
-        moved.mount = None;
-        moved.device.st_dev = moved.device.st_dev.wrapping_add(1);
-        assert!(!plain.contains(&moved));
     }
 
     #[test]

@@ -156,9 +156,6 @@ impl ScanProgress {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// The totals of the finished tree, replacing a bulk reader's running
-    /// count: it met the whole volume, and the tree may be less of it.
-
     fn record_error(&self, path: &Path, error: &io::Error) {
         self.errors.fetch_add(1, Ordering::Relaxed);
         // A scan without Full Disk Access can refuse thousands of paths;
@@ -1440,8 +1437,6 @@ mod tests {
         );
         assert_eq!(without.bytes, 100);
     }
-
-    /// Explorer's hidden attribute counts as hidden, as `AppData` has it.
 
     /// A link to a directory: a symbolic link on Unix, a junction on
     /// Windows, which needs no privilege to make. `false` if it could not be
