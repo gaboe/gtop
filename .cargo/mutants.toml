@@ -37,11 +37,11 @@ examine_globs = [
 
 exclude_re = [
   # GPUI element builders are drawing glue; width calculations and event behavior remain in scope.
-  'column_widths.rs:.*(cell|handle|handle_left|pin_to_edge)',
+  'column_widths.rs:.*(replace | in )(cell|handle|handle_left|pin_to_edge)( ->| with |$)',
   # Sends real signals; a mutant could reach pid <= 1. Never mutate the kill path.
-  'signal_target_is_safe',
-  'ProcessMonitor::kill_process',
-  'AppState::kill_process',
+  '(replace | in )signal_target_is_safe( ->| with |$)',
+  '(replace | in )ProcessMonitor::kill_process( ->| with |$)',
+  '(replace | in )AppState::kill_process( ->| with |$)',
   # Test code: a mutated test helper can turn a child pid into -1 (gsource sent
   # kill(-1, SIGKILL) that way). Never mutate test modules or test files.
   'replace tests::',
@@ -50,11 +50,11 @@ exclude_re = [
   '/tests/',
   # FFI shells: they call IOKit, SMC, or libproc and need real hardware.
   # Only their Drop impls release kernel handles; other Drop impls stay in scope.
-  "iokit.rs.*read_battery",
-  '(iokit|smc)\.rs.*<impl Drop for ',
-  "iokit.rs.*(Object::|Accelerator::(all|name|stats|gpu_time_per_process|number)|StorageDrivers::)",
-  "smc.rs.*GpuTemperature::",
-  "temperature_monitor.rs.*TemperatureMonitor::collect",
+  'iokit.rs.*(replace | in )read_battery( ->| with |$)',
+  '(iokit|smc)\.rs.*(replace | in )<impl Drop for (Object|GpuTemperature)>::drop( ->| with |$)',
+  'iokit.rs.*(replace | in )(Object::(next|property|children)|Accelerator::(all|name|stats|gpu_time_per_process|number)|StorageDrivers::totals)( ->| with |$)',
+  'smc.rs.*(replace | in )GpuTemperature::(hottest|info|read|call)( ->| with |$)',
+  'temperature_monitor.rs.*(replace | in )TemperatureMonitor::collect( ->| with |$)',
   # Reads the host's sysctl and ioreg output; the parsers it feeds are tested. The
   # non-macOS variant is not compiled on macOS.
   "lib\\.rs.*replace CpuTopology::detect -> Self with Default::default\\(\\)",
