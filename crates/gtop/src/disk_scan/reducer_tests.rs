@@ -109,18 +109,13 @@ fn vendored_scanner_accounting_gate_keeps_production_scanner() {
             .unwrap()
             .blocks()
             * 512;
-    assert!(
-        directory_blocks > 0,
-        "fixture must expose directory allocation"
-    );
     assert_eq!(
         imported.bytes + directory_blocks,
         expected.nodes[0].allocated
     );
-    assert_ne!(
-        imported.bytes, actual.nodes[0].allocated,
-        "scanner replacement is blocked"
-    );
+    // Matching bytes alone cannot authorize cleanup against an unidentified root.
+    assert_eq!(imported.identity(), None);
+    assert_ne!(actual.nodes[0].identity.inode, 0);
     eprintln!("accounting gate: current={} oracle={} imported={} omitted_directory_blocks={directory_blocks}", actual.nodes[0].allocated, expected.nodes[0].allocated, imported.bytes);
 }
 

@@ -69,9 +69,11 @@ The production scanner is unchanged. This crate is isolated from app code
 except for tests. No treemap UI ships in this slice.
 
 The imported scanner omits directory allocations. The accounting fixture
-records that gap and prevents treating this import as a completed migration.
+compares actual directory blocks, which can be zero on APFS.
 The fixture expects the production scanner and oracle to agree. It expects
-the imported total to differ by the observed directory blocks.
+their total to equal the imported total plus observed directory blocks.
+It also records that the imported root has no filesystem identity.
+Matching bytes alone does not establish the required scanner contract.
 
 Before production use, port descriptor-relative no-follow traversal and
 identity rechecks. Retain scan-time identities for directories and all
