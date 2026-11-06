@@ -83,7 +83,7 @@ pub(super) fn oracle_scan(path: &Path, cancel: &AtomicBool) -> Tree {
 }
 
 #[test]
-fn vendored_scanner_accounting_gate_keeps_production_scanner() {
+fn vendored_scanner_matches_oracle_allocation_and_identity() {
     let home = tests::Scratch::new();
     fs::create_dir(home.0.join("nested")).unwrap();
     for index in 0..300 {
@@ -109,14 +109,17 @@ fn vendored_scanner_accounting_gate_keeps_production_scanner() {
             .unwrap()
             .blocks()
             * 512;
+    assert_eq!(imported.bytes, expected.nodes[0].allocated);
     assert_eq!(
-        imported.bytes + directory_blocks,
-        expected.nodes[0].allocated
+        imported.identity(),
+        Some((
+            actual.nodes[0].identity.device,
+            actual.nodes[0].identity.inode
+        ))
     );
-    // Matching bytes alone cannot authorize cleanup against an unidentified root.
-    assert_eq!(imported.identity(), None);
+    assert!(imported.complete);
     assert_ne!(actual.nodes[0].identity.inode, 0);
-    eprintln!("accounting gate: current={} oracle={} imported={} omitted_directory_blocks={directory_blocks}", actual.nodes[0].allocated, expected.nodes[0].allocated, imported.bytes);
+    eprintln!("accounting gate: current={} oracle={} imported={} observed_directory_blocks={directory_blocks}", actual.nodes[0].allocated, expected.nodes[0].allocated, imported.bytes);
 }
 
 #[test]

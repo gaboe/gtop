@@ -74,11 +74,23 @@ pub struct Node {
     /// Directories at or beneath this node; `1` for a directory. Four
     /// billion is more than any volume holds.
     pub dirs: u32,
-    /// `(device, inode)` for files, used to de-duplicate hardlinks. No file
-    /// has inode zero, which lets `None` cost nothing.
+    /// Observed `(device, inode)` for directories and leaves. Identity is
+    /// independent of whether a file needs hardlink accounting.
     pub inode: Option<(u64, NonZeroU64)>,
     /// The directory could not be read; its contents are unknown.
     pub read_error: bool,
+    /// Local directory blocks, independent of derived subtree totals.
+    pub directory_bytes: u64,
+    /// Unknown entries in this subtree. A completed walk can have errors.
+    pub unreadable: u64,
+    pub entry_errors: u64,
+    pub in_cloud: bool,
+    pub skipped_volume: bool,
+    /// False after cancellation, truncation, or an unreadable descendant.
+    pub complete: bool,
+    /// A second observed name of an inode charged elsewhere.
+    pub shared: bool,
+    pub hardlinked: bool,
     /// Newest write time at or beneath this node, in Unix seconds; `0` when
     /// unknown. Derived for directories by [`aggregate`].
     pub modified: i64,
@@ -107,6 +119,14 @@ impl Node {
             dirs: 1,
             inode: None,
             read_error: false,
+            directory_bytes: 0,
+            unreadable: 0,
+            entry_errors: 0,
+            in_cloud: false,
+            skipped_volume: false,
+            complete: true,
+            shared: false,
+            hardlinked: false,
             modified: 0,
             category: Category::Other,
             reclaim: None,
@@ -125,6 +145,14 @@ impl Node {
             dirs: 0,
             inode: None,
             read_error: false,
+            directory_bytes: 0,
+            unreadable: 0,
+            entry_errors: 0,
+            in_cloud: false,
+            skipped_volume: false,
+            complete: true,
+            shared: false,
+            hardlinked: false,
             modified: 0,
             category: Category::Other,
             reclaim: None,
@@ -145,7 +173,9 @@ impl Node {
         self.children
             .iter()
             .filter(|child| !child.is_dir())
-            .fold(0, |sum, child| child.bytes.saturating_add(sum))
+            .fold(self.directory_bytes, |sum, child| {
+                child.bytes.saturating_add(sum)
+            })
     }
 
     /// Files directly in this directory; `1` for a file.
@@ -356,19 +386,23 @@ fn aggregate_at(node: &mut Node, metric: Metric, depth: usize, seen: Option<&See
         // Every name of a file has the file's size, so one that weighs
         // nothing need not be remembered to be charged once.
         if node.bytes > 0
+            && node.hardlinked
             && let Some(seen) = seen
             && let Some(key) = node.identity()
             && !seen.insert(key)
         {
             node.bytes = 0;
+            node.shared = true;
         }
         return;
     }
 
-    let mut bytes = 0;
+    let mut bytes = node.directory_bytes;
     let mut files = 0;
     let mut dirs: u32 = 1;
-    let mut modified = 0;
+    let mut modified = node.modified;
+    let mut unreadable = node.entry_errors.saturating_add(u64::from(node.read_error));
+    let mut complete = node.complete && !node.read_error;
     if depth < PARALLEL_LEVELS {
         node.children
             .par_iter_mut()
@@ -380,11 +414,15 @@ fn aggregate_at(node: &mut Node, metric: Metric, depth: usize, seen: Option<&See
     }
     for child in &node.children {
         modified = modified.max(child.modified);
+        unreadable = unreadable.saturating_add(child.unreadable);
+        complete &= child.complete;
         // Saturating: a corrupt volume's file table can claim any size.
         bytes = child.bytes.saturating_add(bytes);
         files = child.files.saturating_add(files);
         dirs = child.dirs.saturating_add(dirs);
     }
+    node.unreadable = unreadable;
+    node.complete = complete;
     node.bytes = bytes;
     node.files = files;
     node.dirs = dirs;
@@ -432,7 +470,7 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn a_node_stays_small() {
-        assert_eq!(size_of::<Node>(), 104);
+        assert_eq!(size_of::<Node>(), 136);
     }
 
     #[test]
@@ -465,6 +503,7 @@ mod tests {
         ] {
             let mut file = leaf(name, bytes);
             file.inode = Some((key.0, NonZeroU64::new(key.1).unwrap()));
+            file.hardlinked = true;
             root.children.push(file);
         }
         aggregate_deduped(&mut root, Metric::Bytes, &Seen::new());

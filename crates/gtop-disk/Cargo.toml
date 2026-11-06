@@ -8,6 +8,7 @@ description = "Vendored disk scanning and treemap domain for gtop"
 repository = "https://github.com/gaboe/gtop"
 
 [dependencies]
+libc = "0.2"
 rayon = "1"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }

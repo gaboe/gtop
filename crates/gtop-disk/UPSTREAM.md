@@ -68,27 +68,58 @@ Windows administrator checks and privilege restart functions are removed.
   excluded because it is the bulk enumeration FFI shell. Test files stay
   excluded.
 
-## Scanner migration gate
+## Scanner contract adaptations
 
-The production scanner is unchanged. This crate is isolated from app code
-except for tests. No treemap UI ships in this slice.
+The walker pins the root descriptor. Each directory job reopens its ancestor
+chain with descriptor-relative no-follow opens. It compares the listed device
+and inode before and after each open. Jobs retain no directory descriptors
+while queued. Enumeration uses one descriptor per active worker; reopening
+uses at most two, in addition to the scan's root descriptor.
 
-The imported scanner omits directory allocations. The accounting fixture
-compares actual directory blocks, which can be zero on APFS.
-The fixture expects the production scanner and oracle to agree. It expects
-their total to equal the imported total plus observed directory blocks.
-It also records that the imported root has no filesystem identity.
-Matching bytes alone does not establish the required scanner contract.
+Directory and leaf nodes retain observed device and inode. Hardlink accounting
+uses a separate flag, so identity retention does not require a deduplication
+entry for every ordinary file. Directory allocations remain separate from
+derived subtree bytes. Aggregation includes those allocations and unreadable
+counts. Reaggregation does not count an error or directory allocation twice.
 
-Before production use, port descriptor-relative no-follow traversal and
-identity rechecks. Retain scan-time identities for directories and all
-actionable leaves. Retain cloud entries with their observed local blocks.
-Add subtree coverage for errors, skipped volumes, depth and resource limits.
-Publish completed real subtrees and keep cancellation distinct from success.
-Bound retained tree resources and hardlink tracking. Preserve Data-volume
-aliases and the app's accepted-command, generation, and progress rules.
-Keep the guarded Trash executor as the only execution path.
+Cloud entries retain their names, identities, cloud state, and observed local
+blocks. The walker does not schedule their contents. Symlinks remain leaves.
+The old `follow_links` option now rejects true. A skipped volume or excluded
+alias remains visible with zero charged bytes and incomplete coverage.
+Cancellation, depth truncation, unreadable contents, and resource exhaustion
+cannot produce complete coverage. The walk has a hard depth ceiling of 256.
 
-No replacement benchmark is reported. The brief requires that benchmark
-only if the production scanner switches. The upstream benchmark does not
-establish accounting or safety parity for this import.
+`max_retained_bytes` defaults to 256 MiB of conservative reservations. Each
+entry reserves 1024 bytes plus eight times its full path length. The charge
+covers node capacity, name storage, pending tasks, ancestry, and hardlink set
+overhead. Cached subtrees and completed-subtree clones reserve the same amount.
+Reservations never decrease. Exhaustion stops enumeration and returns partial
+data with `limited` set. This is an allocation budget, not a hard RSS limit.
+The deduplication bitmap adds at most 8 MiB. Enumeration buffers add 64 KiB per
+active worker. Rayon stacks and allocator overhead also contribute to RSS.
+
+Progress retains at most one completed top-level subtree for consumption.
+Publication uses real filesystem nodes with identities and derived totals.
+Optional publication does not exhaust the scan budget. Clones are admitted
+only while total reservations remain below half of the configured budget.
+Repeated consumption does not reset those reservations.
+
+Default scans retain the full disktree worker pool with no adaptive admission.
+Pool workers explicitly use normal macOS QoS. Explicit fixed-size pools use
+the same priority. The scanner does not request Utility QoS.
+
+`examples/scan_contract.rs` is a headless release probe. It prints elapsed
+time, output counts, unreadable count, coverage, cancellation, resource-limit
+state, reservations, and worker count. External `/usr/bin/time -l` measures
+peak RSS.
+
+## Production migration gate
+
+The production scanner remains active pending the app integration and resource
+comparison. The shared fixture compares imported allocation and root identity
+with the existing scanner and independent serial oracle. Matching that fixture
+does not establish the full production contract or resource budget.
+
+The app adapter, removal of old scan code, headless session acceptance, and
+five alternating old/new scans remain before scanner replacement. The guarded
+Trash executor remains the sole removal path. No treemap UI ships here.

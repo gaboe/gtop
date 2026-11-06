@@ -19,7 +19,9 @@ use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType};
+#[cfg(test)]
+use rustix::fs::{Mode, OFlags};
 
 /// Bytes the kernel fills per call: some hundreds of entries.
 const BUFFER_BYTES: usize = 64 * 1024;
@@ -174,7 +176,7 @@ impl Entry {
     /// Whether this is a directory iCloud Drive or a File Provider has
     /// evicted, which listing would make it fetch.
     pub const fn evicted(&self) -> bool {
-        matches!(self.kind, Kind::Directory) && self.flags & SF_DATALESS != 0
+        self.flags & SF_DATALESS != 0
     }
 
     fn named(name: &[u8]) -> (Box<str>, Option<Box<OsStr>>) {
@@ -224,14 +226,19 @@ pub struct ReadDir {
     done: bool,
 }
 
-/// List `dir`, with each entry's size, identity and age. A link at `dir`
-/// itself is followed, as `std::fs::read_dir` follows it.
+/// List `dir` without following a link at its final component.
+#[cfg(test)]
 pub fn read_dir(dir: &Path) -> io::Result<ReadDir> {
     let fd = rustix::fs::open(
         dir,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
+    read_dir_fd(fd)
+}
+
+/// List a directory already pinned and checked by the scanner.
+pub(crate) fn read_dir_fd(fd: OwnedFd) -> io::Result<ReadDir> {
     let buffer = SPARE
         .with_borrow_mut(Option::take)
         .unwrap_or_else(|| vec![0; BUFFER_BYTES / 8].into_boxed_slice());
