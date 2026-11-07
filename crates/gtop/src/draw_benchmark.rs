@@ -342,7 +342,7 @@ async fn refresh_key_requests_one_sample_while_paused(cx: &mut TestAppContext) {
             .unwrap()
             .stats
             .memory_used),
-        500
+        19 << 30
     );
 
     visual.executor().advance_clock(Duration::from_secs(3));

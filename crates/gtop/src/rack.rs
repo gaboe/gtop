@@ -3465,28 +3465,32 @@ mod tests {
 
     impl Render for MemoryWindowLayoutTest {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            memory_window(
-                19 << 30,
-                32 << 30,
-                256 << 20,
-                Some(self.breakdown),
-                self.expanded,
-                &crate::palette::presets()[0].base.tokens(),
-            )
-            .id("memory-window-test")
-            .role(Role::Button)
-            .debug_selector(|| "memory-window-test".into())
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.expanded = !this.expanded;
-                cx.notify();
-            }))
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if toggles_memory_breakdown(event.keystroke.key.as_str()) {
-                    this.expanded = !this.expanded;
-                    cx.notify();
-                }
-            }))
+            div()
+                .size_full()
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if toggles_memory_breakdown(event.keystroke.key.as_str()) {
+                        this.expanded = !this.expanded;
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    memory_window(
+                        19 << 30,
+                        32 << 30,
+                        256 << 20,
+                        Some(self.breakdown),
+                        self.expanded,
+                        &crate::palette::presets()[0].base.tokens(),
+                    )
+                    .id("memory-window-test")
+                    .role(Role::Button)
+                    .debug_selector(|| "memory-window-test".into())
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.expanded = !this.expanded;
+                        cx.notify();
+                    })),
+                )
         }
     }
 
