@@ -25,7 +25,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 
 use rayon::Scope;
@@ -750,15 +750,24 @@ impl PendingDir {
 }
 
 fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
+    scan_blocking_with_pool(root, context, &WALK_POOL, || {
+        build_walk_pool(|builder| builder.build())
+    })
+}
+
+fn scan_blocking_with_pool(
+    root: &Path,
+    context: &Arc<WalkContext>,
+    default_pool: &WalkPoolCache,
+    build_default_pool: impl FnOnce() -> io::Result<rayon::ThreadPool>,
+) -> io::Result<Node> {
     let _ = context.progress.preview_root.set(root.to_path_buf());
     let owned = fixed_pool(context.options.threads)?;
-    let pool = match owned.as_ref() {
-        Some(pool) => pool,
-        None => WALK_POOL
-            .as_ref()
-            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?,
-    };
-    scan_on_pool(root, context, pool)
+    if let Some(pool) = owned {
+        return scan_on_pool(root, context, &pool);
+    }
+    let pool = default_pool.get_or_try_init(build_default_pool)?;
+    scan_on_pool(root, context, &pool)
 }
 
 /// Explicit fixed budgets cover enumeration, the Windows file-table path and
@@ -898,8 +907,25 @@ fn scan_on_pool(
 /// another. Elsewhere the default count. A pool of its own on every
 /// platform all the same: work the UI hands the global pool, such as
 /// re-ranking a tree, must not queue behind a scan's blocking reads.
-static WALK_POOL: LazyLock<io::Result<rayon::ThreadPool>> =
-    LazyLock::new(|| build_walk_pool(|builder| builder.build()));
+#[derive(Default)]
+struct WalkPoolCache(Mutex<Option<Arc<rayon::ThreadPool>>>);
+
+impl WalkPoolCache {
+    fn get_or_try_init(
+        &self,
+        build: impl FnOnce() -> io::Result<rayon::ThreadPool>,
+    ) -> io::Result<Arc<rayon::ThreadPool>> {
+        let mut cache = lock(&self.0);
+        if let Some(pool) = cache.as_ref() {
+            return Ok(Arc::clone(pool));
+        }
+        let built = Arc::new(build()?);
+        *cache = Some(Arc::clone(&built));
+        Ok(built)
+    }
+}
+
+static WALK_POOL: WalkPoolCache = WalkPoolCache(Mutex::new(None));
 
 fn build_walk_pool(
     build: impl FnOnce(
@@ -1807,6 +1833,12 @@ mod parity_tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, symlink};
 
+    fn walk_pool() -> Arc<rayon::ThreadPool> {
+        WALK_POOL
+            .get_or_try_init(|| build_walk_pool(|builder| builder.build()))
+            .unwrap()
+    }
+
     fn pending(root: &Path) -> (Arc<WalkContext>, Arc<PendingDir>) {
         let context = Arc::new(WalkContext {
             known: None,
@@ -1851,7 +1883,7 @@ mod parity_tests {
             let node = finish_tree(
                 lock(&context.root).take().unwrap(),
                 &context.options,
-                WALK_POOL.as_ref().unwrap(),
+                &walk_pool(),
             );
             assert_eq!(node.bytes, 0);
             assert_eq!(node.unreadable, 1);
@@ -1874,7 +1906,7 @@ mod parity_tests {
         let tree = finish_tree(
             lock(&context.root).take().unwrap(),
             &context.options,
-            WALK_POOL.as_ref().unwrap(),
+            &walk_pool(),
         );
         assert_eq!(tree.bytes, 0);
         assert_eq!(tree.unreadable, 1);
@@ -1909,7 +1941,7 @@ mod parity_tests {
         let tree = finish_tree(
             lock(&context.root).take().unwrap(),
             &context.options,
-            WALK_POOL.as_ref().unwrap(),
+            &walk_pool(),
         );
         assert_eq!(tree.bytes, 4096);
         assert_eq!(tree.children.len(), 2);
@@ -1934,6 +1966,60 @@ mod parity_tests {
         );
     }
 
+    #[test]
+    fn default_pool_recovers_after_transient_build_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("visible"), [1; 16]).unwrap();
+        let cache = WalkPoolCache::default();
+        let calls = AtomicUsize::new(0);
+        fn scan(
+            root: &Path,
+            cache: &WalkPoolCache,
+            build_default_pool: impl FnOnce() -> io::Result<rayon::ThreadPool>,
+        ) -> io::Result<Node> {
+            let context = Arc::new(WalkContext {
+                known: None,
+                options: ScanOptions::default(),
+                progress: Arc::default(),
+                root_device: Mutex::new(None),
+                foreign_mounts: OnceLock::new(),
+                never_scanned: OnceLock::new(),
+                root: Mutex::new(None),
+                root_fd: OnceLock::new(),
+            });
+            scan_blocking_with_pool(root, &context, cache, build_default_pool)
+        }
+
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scan(temp.path(), &cache, || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                build_walk_pool(|builder| {
+                    builder
+                        .spawn_handler(|_| {
+                            Err(io::Error::other("injected one-time pool start failure"))
+                        })
+                        .build()
+                })
+            })
+        }))
+        .expect("a pool start error must not unwind the scan caller");
+        assert!(first.is_err());
+
+        let second = scan(temp.path(), &cache, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            build_walk_pool(|builder| builder.build())
+        })
+        .expect("a later default scan must retry pool construction");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(second.complete);
+        assert_eq!(second.files, 1);
+        assert_eq!(
+            second.children[0].filesystem_name(),
+            std::ffi::OsStr::new("visible")
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn compact_unavailable_record_survives_the_core_walk() {
@@ -1944,7 +2030,7 @@ mod parity_tests {
         let tree = finish_tree(
             lock(&context.root).take().unwrap(),
             &context.options,
-            WALK_POOL.as_ref().unwrap(),
+            &walk_pool(),
         );
         assert_eq!(tree.children.len(), 1);
         let child = &tree.children[0];
@@ -1969,7 +2055,7 @@ mod parity_tests {
             let tree = finish_tree(
                 lock(&context.root).take().unwrap(),
                 &context.options,
-                WALK_POOL.as_ref().unwrap(),
+                &walk_pool(),
             );
             assert_eq!(tree.children.len(), 1);
             let child = &tree.children[0];
@@ -2166,7 +2252,7 @@ mod parity_tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn default_pool_workers_use_normal_qos() {
-        let classes: Vec<u32> = WALK_POOL.as_ref().unwrap().broadcast(|_| {
+        let classes: Vec<u32> = walk_pool().broadcast(|_| {
             let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
             let mut relative = 0;
             unsafe {
