@@ -1,7 +1,8 @@
+#[cfg(test)]
+use std::collections::HashSet;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt as _;
 use std::{
-    collections::HashSet,
     fs, io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},

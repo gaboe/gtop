@@ -43,15 +43,15 @@ Windows administrator checks and privilege restart functions are removed.
   CPU sampling uses gtop's existing sysinfo 0.39. The import adds no second
   sysinfo version. No new UI or removal dependency is present.
 - Default scan admission retains upstream's full worker pool. The adaptive
-  governor remains opt-in and its CPU limit defaults to None. No QoS
-  adjustment is added.
+  governor remains opt-in and its CPU limit defaults to None. Pool workers
+  explicitly use normal macOS QoS.
 - `Node` has an optional exact `OsStr` name beside its display name.
   Scanner leaf results and completed directories retain that exact name.
   `path_of` uses the exact name. Synthetic nodes fall back to their text name.
   A local test covers two invalid UTF-8 names with identical display text.
   That test constructs nodes because APFS rejects invalid UTF-8 file creation.
   A separate filesystem test checks exact directory and file names after a scan.
-  The node-size test changes from 88 to 104 bytes on 64-bit targets.
+  The node-size test changes from 88 to 136 bytes on 64-bit targets.
 - Directory aggregation saturates file and directory counts.
 - Removal planning tests are retained from the upstream planning section.
   Executor tests are excluded with the removed executors. Gtop's existing
@@ -59,9 +59,10 @@ Windows administrator checks and privilege restart functions are removed.
 - Orphaned documentation for removed items is deleted. The mount-identity
   test for the removed executor's `Volume` helper is excluded. The adaptive
   controller test explicitly sets its CPU ceiling after the default changes.
-- The app has a test-only dependency for a shared accounting fixture.
-  That fixture compares the production scanner, the independent serial
-  oracle, and the imported scanner, including hardlinks, a directory
+- The app uses this crate for production folder scans and the headless scan flag.
+  The independent serial accounting fixture remains in the app tests.
+  That fixture compares the production scanner with the independent serial
+  oracle, including hardlinks, a directory
   symlink, sparse data, and allocated directory blocks.
 - Formatting follows the destination workspace's `cargo fmt` output.
 - Mutation scope includes the imported domain files. `macos.rs` is
@@ -115,11 +116,25 @@ peak RSS.
 
 ## Production migration gate
 
-The production scanner remains active pending the app integration and resource
-comparison. The shared fixture compares imported allocation and root identity
-with the existing scanner and independent serial oracle. Matching that fixture
-does not establish the full production contract or resource budget.
+The folder view and headless flag use this scanner. The app retains its bounded
+folder projection, command coordinator, and guarded Trash executor. The retired
+recursive scanner is removed in a separate commit.
 
-The app adapter, removal of old scan code, headless session acceptance, and
-five alternating old/new scans remain before scanner replacement. The guarded
-Trash executor remains the sole removal path. No treemap UI ships here.
+The shared fixture compares allocation, item count, unreadable count, and root
+identity with the independent serial oracle. Full-workload resource acceptance
+and five alternating old/new scans remain with the coordinator. Fixture parity
+does not establish a resource budget. No treemap UI ships here.
+
+## Production adapter and review fixes
+
+The caller can pass a root descriptor opened through a checked scope. The
+scanner compares the path observation with that descriptor and never reopens
+the root by pathname. Depth truncation records an unreadable directory.
+
+Completed snapshots finish outside the publication mutex. Nested Rayon work
+can publish another subtree while a snapshot finishes. The one-slot consumer
+retains the first completed snapshot. Every clone is charged before finishing.
+
+Known subtrees retain their defining scan options. Measurement, hidden-entry,
+volume, hardlink, link-following, and metric changes reject reuse. Finite depth
+scans reject reuse because depth is relative to the scan root.

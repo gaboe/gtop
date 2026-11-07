@@ -91,6 +91,20 @@ impl Default for ScanOptions {
     }
 }
 
+impl ScanOptions {
+    fn cache_compatible(&self, requested: &Self) -> bool {
+        self.apparent_size == requested.apparent_size
+            && self.follow_links == requested.follow_links
+            && self.include_hidden == requested.include_hidden
+            && self.one_filesystem == requested.one_filesystem
+            && self.dedup_hardlinks == requested.dedup_hardlinks
+            && self.metric == requested.metric
+            // Depth is relative to each scan root. A wider root changes it.
+            && self.max_depth.is_none()
+            && requested.max_depth.is_none()
+    }
+}
+
 /// Counters a running scan publishes for the UI.
 ///
 /// Plain relaxed atomics: this is a progress meter, not a synchronisation
@@ -238,6 +252,8 @@ pub struct Known {
     /// same form as the root (both canonical).
     pub path: PathBuf,
     pub tree: Arc<Node>,
+    /// Options used to produce this tree. Incompatible scans walk it again.
+    pub options: ScanOptions,
 }
 
 impl ScanHandle {
@@ -461,6 +477,7 @@ impl WalkContext {
         if let Some(known) = &self.known
             && known.path == path
             && known.tree.complete
+            && known.options.cache_compatible(&self.options)
             && known.tree.identity() == node.identity()
         {
             // Cached trees consume the same budget as newly enumerated entries.
@@ -1092,22 +1109,13 @@ fn signal_done(dir: &Arc<PendingDir>, context: &WalkContext) {
         node.complete &= child.complete;
     }
     if dir.depth == 1 && node.complete {
-        let charge = retained_charge(&node, dir.path.as_os_str().len());
-        let mut completed = lock(&context.progress.completed);
-        if completed.is_none()
-            && context
-                .progress
-                .retained_bytes
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                    used.checked_add(charge)
-                        .filter(|next| *next <= context.options.max_retained_bytes / 2)
-                })
-                .is_ok()
-        {
-            let mut snapshot = node.clone();
-            finish_snapshot(&mut snapshot, &context.options);
-            *completed = Some((dir.path.clone(), Arc::new(snapshot)));
-        }
+        publish_completed(
+            &context.progress,
+            &dir.path,
+            &node,
+            &context.options,
+            |snapshot| finish_snapshot(snapshot, &context.options),
+        );
     }
     let Some(parent) = &dir.parent else {
         *lock(&context.root) = Some(node);
@@ -1115,6 +1123,35 @@ fn signal_done(dir: &Arc<PendingDir>, context: &WalkContext) {
     };
     lock(&parent.partial).node.children.push(node);
     signal_done(parent, context);
+}
+
+fn publish_completed(
+    progress: &ScanProgress,
+    path: &Path,
+    node: &Node,
+    options: &ScanOptions,
+    finish: impl FnOnce(&mut Node),
+) {
+    if lock(&progress.completed).is_some() {
+        return;
+    }
+    let charge = retained_charge(node, path.as_os_str().len());
+    if progress
+        .retained_bytes
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(charge)
+                .filter(|next| *next <= options.max_retained_bytes / 2)
+        })
+        .is_err()
+    {
+        return;
+    }
+    let mut snapshot = node.clone();
+    finish(&mut snapshot);
+    let mut completed = lock(&progress.completed);
+    if completed.is_none() {
+        *completed = Some((path.into(), Arc::new(snapshot)));
+    }
 }
 
 /// Charge a hardlinked file once, derive every aggregate from the result,
@@ -1563,8 +1600,20 @@ mod tests {
         write(&locked, "hidden.bin", 22);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        // Running as root would bypass the permission bits entirely.
-        let readable = fs::read_dir(&locked).map(|mut it| it.next().is_some());
+        struct RestorePermissions(PathBuf);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _restore = RestorePermissions(locked.clone());
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "permission test requires an unprivileged user"
+        );
+        let denied = fs::read_dir(&locked).expect_err("fixture directory must deny enumeration");
+        assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
         let progress = Arc::new(ScanProgress::default());
         let context = Arc::new(WalkContext {
             known: None,
@@ -1577,15 +1626,15 @@ mod tests {
             root_fd: OnceLock::new(),
         });
         let tree = scan_blocking(root, &context).expect("scan still succeeds");
-        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o700));
-
         assert_eq!(tree.bytes, 11);
         let node = child(&tree, "locked");
-        if matches!(readable, Ok(false)) {
-            assert!(node.read_error);
-            assert!(progress.snapshot().errors >= 1);
-            assert!(!progress.snapshot().messages.is_empty());
-        }
+        assert!(node.read_error);
+        assert_eq!(node.unreadable, 1);
+        assert_eq!(tree.unreadable, 1);
+        assert!(!node.complete);
+        assert!(!tree.complete);
+        assert_eq!(progress.snapshot().errors, 1);
+        assert!(!progress.snapshot().messages.is_empty());
     }
 
     #[test]
@@ -1658,6 +1707,7 @@ mod tests {
             Some(Known {
                 path: inner,
                 tree: Arc::new(known.clone()),
+                options: options(),
             }),
         );
         let tree = loop {
@@ -2031,3 +2081,7 @@ mod parity_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "scan_review_tests.rs"]
+mod review_tests;
