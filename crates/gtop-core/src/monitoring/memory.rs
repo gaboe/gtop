@@ -117,11 +117,11 @@ mod tests {
         );
 
         assert_eq!(breakdown.wired, 2 * 4096);
-        assert_eq!(breakdown.active, 1 * 4096);
-        assert_eq!(breakdown.compressed, 1 * 4096);
+        assert_eq!(breakdown.active, 4096);
+        assert_eq!(breakdown.compressed, 4096);
         assert_eq!(breakdown.inactive, 3 * 4096);
         assert_eq!(breakdown.purgeable, 2 * 4096);
-        assert_eq!(breakdown.speculative, 1 * 4096);
+        assert_eq!(breakdown.speculative, 4096);
         assert_eq!(breakdown.file_cache, 4 * 4096);
         assert_eq!(breakdown.free, 10 * 4096);
         assert_eq!(breakdown.used_bytes(), 4 * 4096);

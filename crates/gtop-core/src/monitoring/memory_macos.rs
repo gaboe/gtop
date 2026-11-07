@@ -3,8 +3,13 @@ use std::sync::OnceLock;
 
 static HOST: OnceLock<libc::host_t> = OnceLock::new();
 
+unsafe extern "C" {
+    #[link_name = "mach_host_self"]
+    fn host_self() -> libc::mach_port_t;
+}
+
 pub(super) fn sample() -> Option<(MemoryPageCounts, u64)> {
-    let host = *HOST.get_or_init(|| unsafe { libc::mach_host_self() });
+    let host = *HOST.get_or_init(|| unsafe { host_self() });
     let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
     let mut count = libc::HOST_VM_INFO64_COUNT;
     let result = unsafe {
