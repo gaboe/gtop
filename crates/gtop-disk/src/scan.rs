@@ -426,6 +426,19 @@ impl WalkContext {
         if !self.reserve(charge) {
             return Ok(Classified::Skipped);
         }
+        if let Some(error) = entry.unavailable() {
+            let facts = entry.facts(false)?;
+            let mut node = leaf_node(entry.take_name(), NodeKind::Other, &facts);
+            node.raw_name = path.file_name().map(Into::into);
+            node.bytes = 0;
+            node.read_error = true;
+            node.unreadable = 1;
+            node.complete = false;
+            node.in_cloud = facts.evicted;
+            self.progress
+                .record_error(&path, &io::Error::from_raw_os_error(error));
+            return Ok(Classified::Entry(node));
+        }
         let listing = entry.listing()?;
         let facts = entry.facts(self.options.apparent_size)?;
         let kind = match listing {
@@ -500,6 +513,9 @@ impl WalkContext {
 /// entry, and [`crate::macos`] lists a directory with everything a stat
 /// says.
 trait Listed {
+    fn unavailable(&self) -> Option<i32> {
+        None
+    }
     /// The entry's path inside `dir`, the directory it was listed from.
     fn entry_path(&self, dir: &Path) -> PathBuf;
     /// Display name. Paths use the raw filename returned by entry_path.
@@ -607,6 +623,9 @@ impl Listed for Named {
 
 #[cfg(target_os = "macos")]
 impl Listed for crate::macos::Entry {
+    fn unavailable(&self) -> Option<i32> {
+        self.error()
+    }
     fn entry_path(&self, dir: &Path) -> PathBuf {
         self.path(dir)
     }
@@ -733,7 +752,12 @@ impl PendingDir {
 fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
     let _ = context.progress.preview_root.set(root.to_path_buf());
     let owned = fixed_pool(context.options.threads)?;
-    let pool = owned.as_ref().unwrap_or_else(|| &WALK_POOL);
+    let pool = match owned.as_ref() {
+        Some(pool) => pool,
+        None => WALK_POOL
+            .as_ref()
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?,
+    };
     scan_on_pool(root, context, pool)
 }
 
@@ -874,19 +898,25 @@ fn scan_on_pool(
 /// another. Elsewhere the default count. A pool of its own on every
 /// platform all the same: work the UI hands the global pool, such as
 /// re-ranking a tree, must not queue behind a scan's blocking reads.
-static WALK_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
-    let threads = if cfg!(windows) {
-        rayon::current_num_threads().min(16)
-    } else {
-        rayon::current_num_threads()
-    };
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
+static WALK_POOL: LazyLock<io::Result<rayon::ThreadPool>> =
+    LazyLock::new(|| build_walk_pool(|builder| builder.build()));
+
+fn build_walk_pool(
+    build: impl FnOnce(
+        rayon::ThreadPoolBuilder,
+    ) -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError>,
+) -> io::Result<rayon::ThreadPool> {
+    let builder = rayon::ThreadPoolBuilder::new()
         .thread_name(|index| format!("disktree-walk-{index}"))
-        .start_handler(normal_priority)
-        .build()
-        .expect("a thread pool")
-});
+        .start_handler(normal_priority);
+    #[cfg(windows)]
+    let builder = builder.num_threads(
+        thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(16),
+    );
+    build(builder).map_err(io::Error::other)
+}
 
 /// Entries counted before the shared progress counters are touched. Every
 /// worker adding to the same counters per entry keeps one cache line
@@ -970,12 +1000,20 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
         signal_done(dir, context);
         return Vec::new();
     }
+    let listing = open_pending(dir, context).and_then(list);
+    walk_listing(dir, context, listing)
+}
+
+fn walk_listing(
+    dir: &Arc<PendingDir>,
+    context: &WalkContext,
+    listing: io::Result<impl Iterator<Item = io::Result<impl Listed>>>,
+) -> Vec<Arc<PendingDir>> {
     let mut subdirs = Vec::new();
     let mut tally = Tally {
         bytes: lock(&dir.partial).node.directory_bytes,
         ..Tally::default()
     };
-    let listing = open_pending(dir, context).and_then(list);
     match listing {
         Ok(entries) => {
             for entry in entries {
@@ -1813,7 +1851,7 @@ mod parity_tests {
             let node = finish_tree(
                 lock(&context.root).take().unwrap(),
                 &context.options,
-                &WALK_POOL,
+                WALK_POOL.as_ref().unwrap(),
             );
             assert_eq!(node.bytes, 0);
             assert_eq!(node.unreadable, 1);
@@ -1836,7 +1874,7 @@ mod parity_tests {
         let tree = finish_tree(
             lock(&context.root).take().unwrap(),
             &context.options,
-            &WALK_POOL,
+            WALK_POOL.as_ref().unwrap(),
         );
         assert_eq!(tree.bytes, 0);
         assert_eq!(tree.unreadable, 1);
@@ -1871,7 +1909,7 @@ mod parity_tests {
         let tree = finish_tree(
             lock(&context.root).take().unwrap(),
             &context.options,
-            &WALK_POOL,
+            WALK_POOL.as_ref().unwrap(),
         );
         assert_eq!(tree.bytes, 4096);
         assert_eq!(tree.children.len(), 2);
@@ -1879,6 +1917,69 @@ mod parity_tests {
         let snapshot = context.progress.snapshot();
         assert!(snapshot.cancelled);
         assert_eq!(snapshot.files, 1);
+    }
+
+    #[test]
+    fn default_pool_spawn_error_returns_an_error_without_unwinding() {
+        let result = build_walk_pool(|builder| {
+            builder
+                .spawn_handler(|_| Err(io::Error::other("injected default pool spawn failure")))
+                .build()
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected default pool spawn failure")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compact_unavailable_record_survives_the_core_walk() {
+        let temp = tempfile::tempdir().unwrap();
+        let (context, root) = pending(temp.path());
+        let listing = crate::macos::tests::unavailable_listing(temp.path());
+        assert!(walk_listing(&root, &context, Ok(listing)).is_empty());
+        let tree = finish_tree(
+            lock(&context.root).take().unwrap(),
+            &context.options,
+            WALK_POOL.as_ref().unwrap(),
+        );
+        assert_eq!(tree.children.len(), 1);
+        let child = &tree.children[0];
+        assert_eq!(child.filesystem_name(), std::ffi::OsStr::new("x"));
+        assert_eq!(child.bytes, 0);
+        assert!(child.read_error);
+        assert_eq!(child.unreadable, 1);
+        assert_eq!(tree.unreadable, 1);
+        assert!(!tree.complete);
+        assert_eq!(context.progress.snapshot().errors, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unavailable_observed_directory_is_not_traversed_or_charged() {
+        use std::os::unix::ffi::OsStrExt;
+        for fallback in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (context, root) = pending(temp.path());
+            let listing = crate::macos::tests::observed_unavailable_listing(temp.path(), fallback);
+            assert!(walk_listing(&root, &context, Ok(listing)).is_empty());
+            let tree = finish_tree(
+                lock(&context.root).take().unwrap(),
+                &context.options,
+                WALK_POOL.as_ref().unwrap(),
+            );
+            assert_eq!(tree.children.len(), 1);
+            let child = &tree.children[0];
+            assert_eq!(child.filesystem_name().as_bytes(), &[0xff]);
+            assert_eq!(child.identity(), Some((7, 42)));
+            assert!(child.in_cloud && child.read_error);
+            assert_eq!(child.bytes, 0);
+            assert_eq!(tree.unreadable, 1);
+            assert!(!tree.complete);
+        }
     }
 
     struct Cloud {
@@ -2065,7 +2166,7 @@ mod parity_tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn default_pool_workers_use_normal_qos() {
-        let classes: Vec<u32> = WALK_POOL.broadcast(|_| {
+        let classes: Vec<u32> = WALK_POOL.as_ref().unwrap().broadcast(|_| {
             let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
             let mut relative = 0;
             unsafe {

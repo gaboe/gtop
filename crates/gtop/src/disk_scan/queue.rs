@@ -74,7 +74,7 @@ fn coordinate(
                 let result = scan(shared);
                 let _ = sender.send(result);
             });
-        let Ok(_worker) = worker else {
+        let Ok(worker) = worker else {
             tree.state = ScanState::Failed("Could not start scan worker".into());
             progress(&tree);
             return tree;
@@ -93,6 +93,7 @@ fn coordinate(
             }
             match receiver.recv_timeout(Duration::from_millis(25)) {
                 Ok(result) => {
+                    let _ = worker.join();
                     let snapshot = scan_progress.snapshot();
                     match result {
                         Ok(node) => {
@@ -125,6 +126,7 @@ fn coordinate(
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = worker.join();
                     tree.state = ScanState::Failed("Scan worker stopped without a result".into());
                     progress(&tree);
                     return tree;

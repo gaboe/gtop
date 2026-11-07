@@ -114,6 +114,7 @@ pub struct Entry {
     inode: u64,
     links: u32,
     flags: u32,
+    error: Option<i32>,
 }
 
 impl Entry {
@@ -173,8 +174,12 @@ impl Entry {
         self.links > 1
     }
 
-    /// Whether this is a directory iCloud Drive or a File Provider has
-    /// evicted, which listing would make it fetch.
+    /// The OS error that left this named entry unavailable.
+    pub const fn error(&self) -> Option<i32> {
+        self.error
+    }
+
+    /// Whether this entry is evicted by iCloud Drive or a File Provider.
     pub const fn evicted(&self) -> bool {
         self.flags & SF_DATALESS != 0
     }
@@ -208,6 +213,7 @@ impl Entry {
             inode: stat.st_ino,
             links: u32::from(stat.st_nlink),
             flags: stat.st_flags,
+            error: None,
         }
     }
 }
@@ -368,15 +374,25 @@ impl ReadDir {
         };
         let name = cursor.name()?;
         if error != 0 {
-            let error = io::Error::from_raw_os_error(error.cast_signed());
-            return Ok((Err(error), length));
+            return Ok((
+                Ok(cursor.unavailable(common, name, error.cast_signed())?),
+                length,
+            ));
         }
+        let attributes_at = cursor.at;
         let entry = if common & MEASURED == MEASURED {
             cursor.entry(file, name)?
         } else {
             None
         };
-        Ok((entry.map_or_else(|| self.stat(name), Ok), length))
+        let entry = entry.map_or_else(|| self.stat(name), Ok).or_else(|error| {
+            let mut cursor = Cursor {
+                record,
+                at: attributes_at,
+            };
+            cursor.unavailable(common, name, error.raw_os_error().unwrap_or(libc::EIO))
+        });
+        Ok((entry, length))
     }
 
     /// An entry the file system described only in part, read the ordinary
@@ -440,6 +456,55 @@ impl<'a> Cursor<'a> {
             .ok_or_else(malformed)
     }
 
+    fn unavailable(&mut self, common: u32, name: &[u8], error: i32) -> io::Result<Entry> {
+        let device = if common & ATTR_CMN_DEVID != 0 {
+            i64::from(self.u32()?.cast_signed()).cast_unsigned()
+        } else {
+            0
+        };
+        let kind = if common & ATTR_CMN_OBJTYPE != 0 {
+            match self.u32()? {
+                VDIR => Kind::Directory,
+                VLNK => Kind::Link,
+                VREG => Kind::File,
+                _ => Kind::Other,
+            }
+        } else {
+            Kind::Other
+        };
+        let modified = if common & ATTR_CMN_MODTIME != 0 {
+            let seconds = self.u64()?.cast_signed();
+            self.u64()?;
+            seconds
+        } else {
+            0
+        };
+        let flags = if common & ATTR_CMN_FLAGS != 0 {
+            self.u32()?
+        } else {
+            0
+        };
+        let inode = if common & ATTR_CMN_FILEID != 0 {
+            self.u64()?
+        } else {
+            0
+        };
+        let (name, exact) = Entry::named(name);
+        Ok(Entry {
+            name,
+            exact,
+            kind,
+            apparent: 0,
+            allocated: 0,
+            modified,
+            device,
+            inode,
+            links: 0,
+            flags,
+            error: Some(error),
+        })
+    }
+
     /// The attributes after the name, every one of them asked for; `None`
     /// for a file whose sizes the file system left out.
     fn entry(&mut self, file: u32, name: &[u8]) -> io::Result<Option<Entry>> {
@@ -478,16 +543,100 @@ impl<'a> Cursor<'a> {
             inode,
             links,
             flags,
+            error: None,
         }))
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    pub(crate) fn unavailable_listing(root: &Path) -> ReadDir {
+        let mut record = [0u8; 40];
+        for (at, value) in [
+            (0, 40u32),
+            (4, 0xa0000001),
+            (24, libc::EACCES as u32),
+            (28, 8),
+            (32, 2),
+        ] {
+            record[at..at + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        record[36] = b'x';
+        listing_from_record(root, &record)
+    }
+
+    pub(crate) fn observed_unavailable_listing(root: &Path, fallback: bool) -> ReadDir {
+        let mut record = vec![0u8; if fallback { 80 } else { 64 }];
+        let length = record.len() as u32;
+        let common = if fallback {
+            MEASURED
+        } else {
+            ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FLAGS | ATTR_CMN_FILEID
+        };
+        let flags_at = if fallback { 60 } else { 44 };
+        let name_at = flags_at + 12;
+        for (at, value) in [
+            (0, length),
+            (
+                4,
+                common | ATTR_CMN_NAME | ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR,
+            ),
+            (24, if fallback { 0 } else { libc::EACCES as u32 }),
+            (28, name_at as u32 - 28),
+            (32, 2),
+            (36, 7),
+            (40, VDIR),
+            (flags_at, SF_DATALESS),
+            (flags_at + 4, 42),
+        ] {
+            record[at..at + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        record[name_at] = 0xff;
+        listing_from_record(root, &record)
+    }
+
+    fn listing_from_record(root: &Path, record: &[u8]) -> ReadDir {
+        let mut reader = read_dir(root).unwrap();
+        let buffer = reader.buffer.as_mut().unwrap();
+        for (target, bytes) in buffer.iter_mut().zip(record.chunks(8)) {
+            *target = u64::from_ne_bytes(bytes.try_into().unwrap());
+        }
+        reader.remaining = 1;
+        reader.done = true;
+        reader
+    }
+
+    #[test]
+    fn named_unavailable_bulk_record_keeps_the_observation() {
+        let root = TempDir::new().unwrap();
+        let reader = unavailable_listing(root.path());
+        let (entry, length) = reader.record().unwrap();
+        let entry = entry.expect("named unavailable observation");
+        assert_eq!(length, 40);
+        assert_eq!(entry.file_name(), OsStr::new("x"));
+        assert_eq!(entry.allocated(), 0);
+    }
+
+    #[test]
+    fn unavailable_bulk_metadata_preserves_raw_names_identity_and_cloud_flags() {
+        let root = TempDir::new().unwrap();
+        for fallback in [false, true] {
+            let entry = observed_unavailable_listing(root.path(), fallback)
+                .next()
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.file_name().as_bytes(), &[0xff]);
+            assert_eq!(entry.identity(), (7, 42));
+            assert!(entry.evicted());
+            assert!(entry.error().is_some());
+            assert_eq!(entry.allocated(), 0);
+        }
+    }
 
     fn listed(dir: &Path) -> Vec<Entry> {
         let mut entries: Vec<Entry> = read_dir(dir)

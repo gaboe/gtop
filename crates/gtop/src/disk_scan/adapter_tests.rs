@@ -175,3 +175,100 @@ fn depth_limit_keeps_unknown_coverage_visible_on_production_path() {
     assert!(row.unreadable > 0);
     assert_ne!(row.identity.inode, 0);
 }
+
+#[test]
+fn scan_child_panic_returns_failure_and_services_the_next_command() {
+    let root = Path::new("/fixture");
+    let worker = std::thread::spawn(move || {
+        let (commands, requests) = std::sync::mpsc::channel();
+        commands.send(true).unwrap();
+        commands.send(false).unwrap();
+        requests
+            .iter()
+            .take(2)
+            .map(|panic| {
+                coordinate(
+                    Tree::new(root),
+                    root,
+                    &AtomicBool::new(false),
+                    &mut |_| {},
+                    &mut || Urgency::Foreground,
+                    move |_| {
+                        if panic {
+                            panic!("injected scanner panic");
+                        }
+                        Ok(directory("fixture", 1))
+                    },
+                )
+                .state
+            })
+            .collect::<Vec<_>>()
+    });
+    let states = worker
+        .join()
+        .expect("command worker survives scanner panic");
+    assert!(matches!(states[0], ScanState::Failed(_)));
+    assert_eq!(states[1], ScanState::Complete);
+}
+
+#[test]
+fn unavailable_named_leaf_projects_as_one_unreadable_item() {
+    let root = Path::new("/fixture");
+    let mut source = directory("fixture", 1);
+    let mut entry = DiskNode::entry("x", NodeKind::Other, 0);
+    entry.read_error = true;
+    entry.unreadable = 1;
+    entry.complete = false;
+    source.children.push(entry);
+    gtop_disk::tree::aggregate(&mut source, Default::default());
+    let tree = project(root, root, &source);
+    let folder = tree.folder(root, 0, false);
+    assert_eq!(folder.items, 1);
+    assert_eq!(folder.errors, 1);
+    assert_eq!(folder.rows.len(), 1);
+    assert_eq!(folder.rows[0].path, root.join("x"));
+    assert_eq!(folder.rows[0].allocated, 0);
+    assert_eq!(folder.rows[0].unreadable, 1);
+    assert!(folder.cleanable.is_empty());
+    assert!(!tree.coverage_complete);
+}
+
+#[test]
+fn scan_start_error_publishes_failure_and_services_the_next_command() {
+    let worker = std::thread::spawn(|| {
+        let root = Path::new("/fixture");
+        let (commands, requests) = std::sync::mpsc::channel();
+        commands.send(true).unwrap();
+        commands.send(false).unwrap();
+        requests
+            .iter()
+            .take(2)
+            .map(|fail| {
+                let mut published = Vec::new();
+                let tree = coordinate(
+                    Tree::new(root),
+                    root,
+                    &AtomicBool::new(false),
+                    &mut |tree| published.push(tree.state.clone()),
+                    &mut || Urgency::Foreground,
+                    move |_| {
+                        if fail {
+                            Err(io::Error::other("injected pool spawn failure"))
+                        } else {
+                            Ok(directory("fixture", 1))
+                        }
+                    },
+                );
+                assert_eq!(published.last(), Some(&tree.state));
+                tree.state
+            })
+            .collect::<Vec<_>>()
+    });
+    let states = worker
+        .join()
+        .expect("command worker survives startup error");
+    assert!(
+        matches!(&states[0], ScanState::Failed(error) if error.contains("injected pool spawn failure"))
+    );
+    assert_eq!(states[1], ScanState::Complete);
+}
