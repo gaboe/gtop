@@ -3584,7 +3584,8 @@ mod tests {
         assert!(!view.read_with(visual, |view, _| view.expanded));
         assert!(visual.debug_bounds("memory-row-Wired").is_none());
 
-        visual.update(|window, cx| view.read(cx).focus.focus(window, cx));
+        let focus = view.read_with(visual, |view, _| view.focus.clone());
+        visual.update(|window, cx| focus.focus(window, cx));
         visual.simulate_keystrokes("b");
         visual.update(|window, cx| window.draw(cx).clear(cx));
         assert!(view.read_with(visual, |view, _| view.expanded));
