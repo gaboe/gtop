@@ -1297,6 +1297,7 @@ fn memory_window(
         .map(MemoryBreakdown::used_bytes)
         .unwrap_or(memory_used);
     let mut memory = win(t)
+        .debug_selector(move || format!("memory-gauge-{memory_used}"))
         .child(
             div()
                 .flex()

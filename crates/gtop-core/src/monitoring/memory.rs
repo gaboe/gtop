@@ -100,6 +100,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_attributes_do_not_remove_active_queue_pages() {
+        let m = breakdown(MemoryPageCounts { wired: 1, active: 4, inactive: 4, file_backed: 4, free: 1, ..Default::default() }, 4096, 10 * 4096);
+        assert_eq!(m.active, 4 * 4096);
+        assert_eq!(m.inactive, 4 * 4096);
+        assert_eq!(m.total_bytes(), 10 * 4096);
+    }
+
+    #[test]
+    fn speculative_pages_are_removed_from_free_only() {
+        let m = breakdown(MemoryPageCounts { wired: 1, active: 4, inactive: 2, speculative: 1, file_backed: 1, free: 3, ..Default::default() }, 4096, 10 * 4096);
+        assert_eq!(m.free, 2 * 4096);
+        assert_eq!(m.active, 4 * 4096);
+        assert_eq!(m.inactive, 2 * 4096);
+        assert_eq!(m.speculative, 4096);
+        assert_eq!(m.total_bytes(), 10 * 4096);
+    }
+
+    #[test]
+    fn active_purgeable_attribute_is_visible_without_changing_queue_totals() {
+        let m = breakdown(MemoryPageCounts { wired: 1, active: 6, purgeable: 2, free: 3, ..Default::default() }, 4096, 10 * 4096);
+        assert_eq!(m.purgeable, 2 * 4096);
+        assert_eq!(m.active, 6 * 4096);
+        assert_eq!(m.total_bytes(), 10 * 4096);
+    }
+
+    #[test]
     fn page_groups_remove_overlaps_and_add_up_to_total() {
         let breakdown = breakdown(
             MemoryPageCounts {
