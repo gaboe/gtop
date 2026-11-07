@@ -112,11 +112,12 @@ fn fixed_snapshot() -> Snapshot {
         wired: 4 << 30,
         active: 12 << 30,
         compressed: 3 << 30,
-        inactive: 5 << 29,
+        inactive: 7 << 30,
         purgeable: 1 << 30,
         speculative: 1 << 29,
         file_cache: 4 << 30,
         free: 5 << 30,
+        other: 1 << 29,
     });
     s
 }
@@ -129,7 +130,10 @@ fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
 #[cfg(target_os = "macos")]
 #[gpui::test]
 async fn memory_card_production_disclosure_handlers_restore_focus(cx: &mut TestAppContext) {
-    cx.update(|cx| { gpui_component::init(cx); theme::init(cx); });
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
     let (monitor, visual) = cx.add_window_view(|window, cx| {
         let mut snapshot = test_data::snapshot();
         snapshot.stats.memory_used = 31 << 30;
@@ -137,19 +141,44 @@ async fn memory_card_production_disclosure_handlers_restore_focus(cx: &mut TestA
         fixture_from_snapshot(snapshot, window, cx)
     });
     visual.simulate_resize(gpui::size(px(1800.), px(1400.)));
-    visual.update(|window, cx| { let focus = monitor.read(cx).focus.clone(); focus.focus(window, cx); window.draw(cx).clear(cx); });
+    visual.update(|window, cx| {
+        let focus = monitor.read(cx).focus.clone();
+        focus.focus(window, cx);
+        window.draw(cx).clear(cx);
+    });
+    assert!(visual.debug_bounds("memory-row-Wired").is_none());
     visual.simulate_keystrokes("/");
-    visual.update(|window, cx| assert_eq!(window.focused(cx), Some(monitor.read(cx).search.read(cx).focus_handle(cx))));
+    visual.update(|window, cx| {
+        assert_eq!(
+            window.focused(cx),
+            Some(monitor.read(cx).search.read(cx).focus_handle(cx))
+        )
+    });
     let card = visual.debug_bounds("memory-window").unwrap();
     visual.simulate_click(card.center(), gpui::Modifiers::default());
-    visual.update(|window, cx| assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone())));
+    visual
+        .update(|window, cx| assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone())));
     assert!(monitor.read_with(visual, |m, _| m.memory_expanded));
     visual.update(|window, cx| window.draw(cx).clear(cx));
-    for selector in ["memory-row-Wired", "memory-row-Active", "memory-row-Compressed", "memory-row-Inactive", "memory-row-Speculative", "memory-row-Free", "memory-row-Other", "memory-row-of which Purgeable", "memory-row-of which File cache"] {
-        assert!(visual.debug_bounds(selector).is_some(), "missing {selector}");
+    for selector in [
+        "memory-row-Wired",
+        "memory-row-Active",
+        "memory-row-Compressed",
+        "memory-row-Inactive",
+        "memory-row-Speculative",
+        "memory-row-Free",
+        "memory-row-Other",
+        "memory-row-of which Purgeable",
+        "memory-row-of which File cache",
+    ] {
+        assert!(
+            visual.debug_bounds(selector).is_some(),
+            "missing {selector}"
+        );
     }
     visual.simulate_keystrokes("b");
     assert!(!monitor.read_with(visual, |m, _| m.memory_expanded));
+    assert!(monitor.read_with(visual, |m, cx| m.search.read(cx).value().is_empty()));
     visual.update(|window, cx| window.draw(cx).clear(cx));
     assert!(visual.debug_bounds("memory-row-Wired").is_none());
     visual.simulate_keystrokes("b");
@@ -158,18 +187,25 @@ async fn memory_card_production_disclosure_handlers_restore_focus(cx: &mut TestA
     let card = visual.debug_bounds("memory-window").unwrap();
     visual.simulate_click(card.center(), gpui::Modifiers::default());
     assert!(!monitor.read_with(visual, |m, _| m.memory_expanded));
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(visual.debug_bounds("memory-row-Wired").is_none());
 }
 
 #[cfg(target_os = "macos")]
 #[gpui::test]
 async fn memory_card_gauge_keeps_recorded_used_value(cx: &mut TestAppContext) {
-    cx.update(|cx| { gpui_component::init(cx); theme::init(cx); });
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
     for has_breakdown in [true, false] {
         let (_, visual) = cx.add_window_view(|window, cx| {
             let mut snapshot = test_data::snapshot();
             snapshot.stats.memory_used = 31 << 30;
             snapshot.stats.memory_free = 1 << 30;
-            if !has_breakdown { snapshot.stats.memory_breakdown = None; }
+            if !has_breakdown {
+                snapshot.stats.memory_breakdown = None;
+            }
             fixture_from_snapshot(snapshot, window, cx)
         });
         visual.simulate_resize(gpui::size(px(1800.), px(1400.)));

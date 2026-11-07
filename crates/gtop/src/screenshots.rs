@@ -99,11 +99,12 @@ fn snapshot() -> Snapshot {
         wired: 4 << 30,
         active: 12 << 30,
         compressed: 3 << 30,
-        inactive: 5 << 29,
+        inactive: 7 << 30,
         purgeable: 1 << 30,
         speculative: 1 << 29,
         file_cache: 4 << 30,
         free: 5 << 30,
+        other: 1 << 29,
     });
     s.swap_used = 256 << 20;
     s.uptime = 172_800;

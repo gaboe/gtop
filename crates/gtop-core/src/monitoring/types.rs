@@ -151,15 +151,18 @@ pub struct SystemStats {
     pub power: Option<Power>,
 }
 
-/// Exclusive physical-memory page groups used by the Memory window.
+/// Physical-memory queues and overlapping attributes used by the Memory window.
 #[derive(Serialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemoryBreakdown {
     pub wired: u64,
     pub active: u64,
     pub compressed: u64,
     pub inactive: u64,
+    /// Overlaps the physical queues. Do not add to the total.
     pub purgeable: u64,
     pub speculative: u64,
+    /// Overlaps active, inactive, and speculative pages. Do not add to the total.
     pub file_cache: u64,
     pub free: u64,
+    pub other: u64,
 }

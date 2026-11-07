@@ -1153,57 +1153,15 @@ fn readout(name: &str, value: String, t: &Tokens) -> Div {
         .child(display)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MemoryPageGroup {
-    Used,
-    Reclaimable,
-    Free,
-}
-
-impl MemoryPageGroup {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Used => "USED",
-            Self::Reclaimable => "RECLAIMABLE",
-            Self::Free => "FREE",
-        }
-    }
-
-    fn total(self, memory: MemoryBreakdown) -> u64 {
-        match self {
-            Self::Used => memory.used_bytes(),
-            Self::Reclaimable => memory.reclaimable_bytes(),
-            Self::Free => memory.free,
-        }
-    }
-
-    fn color(self, t: &Tokens) -> u32 {
-        match self {
-            Self::Used => palette::mix(t.base.led, t.base.ground, 0.32),
-            Self::Reclaimable => palette::mix(t.base.ok, t.base.ground, 0.32),
-            Self::Free => palette::mix(t.silk_dim, t.base.ground, 0.18),
-        }
-    }
-}
-
-fn memory_items(memory: MemoryBreakdown) -> [(&'static str, u64, MemoryPageGroup); 8] {
+fn memory_items(memory: MemoryBreakdown) -> [(&'static str, u64); 7] {
     [
-        ("Wired", memory.wired, MemoryPageGroup::Used),
-        ("Active/App", memory.active, MemoryPageGroup::Used),
-        ("Compressed", memory.compressed, MemoryPageGroup::Used),
-        ("Inactive", memory.inactive, MemoryPageGroup::Reclaimable),
-        ("Purgeable", memory.purgeable, MemoryPageGroup::Reclaimable),
-        (
-            "Speculative",
-            memory.speculative,
-            MemoryPageGroup::Reclaimable,
-        ),
-        (
-            "File cache",
-            memory.file_cache,
-            MemoryPageGroup::Reclaimable,
-        ),
-        ("Free", memory.free, MemoryPageGroup::Free),
+        ("Wired", memory.wired),
+        ("Active", memory.active),
+        ("Compressed", memory.compressed),
+        ("Inactive", memory.inactive),
+        ("Speculative", memory.speculative),
+        ("Free", memory.free),
+        ("Other", memory.other),
     ]
 }
 
@@ -1273,16 +1231,31 @@ fn memory_group(name: &str, value: u64, total: u64, t: &Tokens) -> Stateful<Div>
 }
 
 fn memory_breakdown_rows(memory: MemoryBreakdown, total: u64, t: &Tokens) -> Div {
-    let mut rows = div().flex().flex_col().gap(px(2.));
-    let mut previous_group = None;
-    for (name, value, group) in memory_items(memory) {
-        if previous_group != Some(group) {
-            rows = rows.child(memory_group(group.label(), group.total(memory), total, t));
-            previous_group = Some(group);
-        }
-        rows = rows.child(memory_row(name, value, total, group.color(t), t));
+    let color = palette::mix(t.base.led, t.base.ground, 0.32);
+    let mut rows = div().flex().flex_col().gap(px(2.)).child(memory_group(
+        "PHYSICAL PAGES",
+        memory.total_bytes(),
+        total,
+        t,
+    ));
+    for (name, value) in memory_items(memory) {
+        rows = rows.child(memory_row(name, value, total, color, t));
     }
-    rows
+    rows.child(label("OVERLAPPING COUNTERS · NOT ADDED", t))
+        .child(memory_row(
+            "of which Purgeable",
+            memory.purgeable,
+            total,
+            color,
+            t,
+        ))
+        .child(memory_row(
+            "of which File cache",
+            memory.file_cache,
+            total,
+            color,
+            t,
+        ))
 }
 
 fn memory_window(
@@ -1293,21 +1266,23 @@ fn memory_window(
     expanded: bool,
     t: &Tokens,
 ) -> Div {
-    let memory_used = breakdown
-        .map(MemoryBreakdown::used_bytes)
-        .unwrap_or(memory_used);
     let mut memory = win(t)
-        .debug_selector(move || format!("memory-gauge-{memory_used}"))
         .child(
             div()
                 .flex()
                 .gap(px(10.))
-                .child(div().flex_1().child(label("MEM GB", t)).child(lit(
-                    format!("{:.1}", memory_used as f64 / 1e9),
-                    22.,
-                    memory_used as f64 / memory_total.max(1) as f64 > 0.92,
-                    t,
-                )))
+                .child(
+                    div()
+                        .flex_1()
+                        .debug_selector(move || format!("memory-gauge-{memory_used}"))
+                        .child(label("MEM GB", t))
+                        .child(lit(
+                            format!("{:.1}", memory_used as f64 / 1e9),
+                            22.,
+                            memory_used as f64 / memory_total.max(1) as f64 > 0.92,
+                            t,
+                        )),
+                )
                 .child(readout(
                     "Swap GB",
                     format!("{:.1}", swap_used as f64 / 1e9),
@@ -3450,147 +3425,38 @@ fn purgeable_label(bytes: u64) -> Option<String> {
 mod tests {
     use super::{
         battery_readouts, cpu_segments, div, draw_readout_text, gtop_self_cpu, history_cell,
-        lit_unit, memory_items, memory_share, memory_window, purgeable_label,
-        toggles_memory_breakdown, vfd_digit_width, Bounds, DrawMetrics, FocusHandle, KeyDownEvent,
-        MemoryPageGroup, Path, Pixels, Role, Tokens, DIGIT_GHOST_TEST_TEXTS, UNIT_GLYPHS,
-        UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES, WIN_DOT_CACHE_MAX_ENTRY_VERTICES,
-        WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
+        lit_unit, memory_items, memory_share, purgeable_label, toggles_memory_breakdown,
+        vfd_digit_width, Bounds, DrawMetrics, Path, Pixels, Tokens, DIGIT_GHOST_TEST_TEXTS,
+        UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES,
+        WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
     };
-    use gpui::{prelude::*, px, Modifiers, TestAppContext, Window};
-    use gtop_core::monitoring::{BatteryState, MemoryBreakdown, Power};
-
-    struct MemoryWindowLayoutTest {
-        expanded: bool,
-        breakdown: MemoryBreakdown,
-        focus: FocusHandle,
-    }
-
-    impl Render for MemoryWindowLayoutTest {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .track_focus(&self.focus)
-                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if toggles_memory_breakdown(event.keystroke.key.as_str()) {
-                        this.expanded = !this.expanded;
-                        cx.notify();
-                    }
-                }))
-                .child(
-                    memory_window(
-                        19 << 30,
-                        32 << 30,
-                        256 << 20,
-                        Some(self.breakdown),
-                        self.expanded,
-                        &crate::palette::presets()[0].base.tokens(),
-                    )
-                    .id("memory-window-test")
-                    .role(Role::Button)
-                    .debug_selector(|| "memory-window-test".into())
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.expanded = !this.expanded;
-                        cx.notify();
-                    })),
-                )
-        }
-    }
-
-    fn sample_memory_breakdown() -> MemoryBreakdown {
-        MemoryBreakdown {
-            wired: 4 << 30,
-            active: 12 << 30,
-            compressed: 3 << 30,
-            inactive: 5 << 29,
-            purgeable: 1 << 30,
-            speculative: 1 << 29,
-            file_cache: 4 << 30,
-            free: 5 << 30,
-        }
-    }
+    use gpui::{prelude::*, px, TestAppContext, Window};
+    use gtop_core::monitoring::{BatteryState, Power};
 
     #[test]
-    fn memory_rows_show_each_exclusive_page_group_and_share() {
-        let rows = memory_items(sample_memory_breakdown());
-
+    fn memory_rows_partition_total_without_adding_attributes() {
+        let memory = crate::test_data::snapshot().stats.memory_breakdown.unwrap();
+        let rows = memory_items(memory);
         assert_eq!(
-            rows.map(|(name, _, _)| name),
+            rows.map(|(name, _)| name),
             [
                 "Wired",
-                "Active/App",
+                "Active",
                 "Compressed",
                 "Inactive",
-                "Purgeable",
                 "Speculative",
-                "File cache",
                 "Free",
+                "Other"
             ]
         );
         assert_eq!(
-            rows.map(|(_, _, group)| group),
-            [
-                MemoryPageGroup::Used,
-                MemoryPageGroup::Used,
-                MemoryPageGroup::Used,
-                MemoryPageGroup::Reclaimable,
-                MemoryPageGroup::Reclaimable,
-                MemoryPageGroup::Reclaimable,
-                MemoryPageGroup::Reclaimable,
-                MemoryPageGroup::Free,
-            ]
+            rows.map(|(_, value)| value).into_iter().sum::<u64>(),
+            32 << 30
         );
+        assert_eq!(memory.total_bytes(), 32 << 30);
         assert_eq!(memory_share(8, 32), 0.25);
         assert!(toggles_memory_breakdown("b"));
         assert!(!toggles_memory_breakdown("m"));
-    }
-
-    #[gpui::test]
-    async fn memory_window_expands_and_collapses_all_page_rows(cx: &mut TestAppContext) {
-        let (view, visual) = cx.add_window_view(|_, cx| MemoryWindowLayoutTest {
-            expanded: false,
-            breakdown: sample_memory_breakdown(),
-            focus: cx.focus_handle(),
-        });
-        visual.run_until_parked();
-        visual.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(visual.debug_bounds("memory-row-Wired").is_none());
-
-        let card = visual.debug_bounds("memory-window-test").unwrap();
-        visual.simulate_click(card.center(), Modifiers::default());
-        visual.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(view.read_with(visual, |view, _| view.expanded));
-        for (row, selector) in [
-            ("Wired", "memory-row-Wired"),
-            ("Active/App", "memory-row-Active/App"),
-            ("Compressed", "memory-row-Compressed"),
-            ("Inactive", "memory-row-Inactive"),
-            ("Purgeable", "memory-row-Purgeable"),
-            ("Speculative", "memory-row-Speculative"),
-            ("File cache", "memory-row-File cache"),
-            ("Free", "memory-row-Free"),
-        ] {
-            assert!(
-                visual.debug_bounds(selector).is_some(),
-                "missing visible memory row {row}"
-            );
-        }
-        assert!(visual.debug_bounds("memory-group-used").is_some());
-        assert!(visual.debug_bounds("memory-group-reclaimable").is_some());
-        assert!(visual.debug_bounds("memory-group-free").is_some());
-
-        let card = visual.debug_bounds("memory-window-test").unwrap();
-        visual.simulate_click(card.center(), Modifiers::default());
-        visual.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(!view.read_with(visual, |view, _| view.expanded));
-        assert!(visual.debug_bounds("memory-row-Wired").is_none());
-
-        let focus = view.read_with(visual, |view, _| view.focus.clone());
-        visual.update(|window, cx| focus.focus(window, cx));
-        visual.simulate_keystrokes("b");
-        visual.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(view.read_with(visual, |view, _| view.expanded));
-        assert!(visual.debug_bounds("memory-row-Wired").is_some());
     }
 
     #[test]

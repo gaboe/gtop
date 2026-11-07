@@ -1,23 +1,14 @@
 use super::types::MemoryBreakdown;
 
 impl MemoryBreakdown {
-    pub fn used_bytes(self) -> u64 {
+    pub fn total_bytes(self) -> u64 {
         self.wired
             .saturating_add(self.active)
             .saturating_add(self.compressed)
-    }
-
-    pub fn reclaimable_bytes(self) -> u64 {
-        self.inactive
-            .saturating_add(self.purgeable)
+            .saturating_add(self.inactive)
             .saturating_add(self.speculative)
-            .saturating_add(self.file_cache)
-    }
-
-    pub fn total_bytes(self) -> u64 {
-        self.used_bytes()
-            .saturating_add(self.reclaimable_bytes())
             .saturating_add(self.free)
+            .saturating_add(self.other)
     }
 }
 
@@ -48,50 +39,29 @@ pub(super) fn breakdown(
     total_bytes: u64,
 ) -> MemoryBreakdown {
     let pages = total_bytes / page_size.max(1);
-    let file_backed_active = counts.file_backed.min(counts.active);
-    let file_backed_inactive = counts
-        .file_backed
-        .saturating_sub(file_backed_active)
-        .min(counts.inactive);
-    let inactive_after_file_cache = counts.inactive.saturating_sub(file_backed_inactive);
-    let purgeable_inactive = counts.purgeable.min(inactive_after_file_cache);
-    let speculative_inactive = counts
-        .speculative
-        .min(inactive_after_file_cache.saturating_sub(purgeable_inactive));
-
     let sampled_free = counts.free.min(pages);
     let mut remaining = pages - sampled_free;
-
+    let speculative = counts.speculative.min(sampled_free);
     let wired = take_pages(counts.wired, &mut remaining, page_size);
-    let active = take_pages(
-        counts.active.saturating_sub(file_backed_active),
-        &mut remaining,
-        page_size,
-    );
+    let active = take_pages(counts.active, &mut remaining, page_size);
     let compressed = take_pages(counts.compressed, &mut remaining, page_size);
-    let inactive = take_pages(
-        inactive_after_file_cache
-            .saturating_sub(purgeable_inactive)
-            .saturating_sub(speculative_inactive),
-        &mut remaining,
-        page_size,
-    );
-    let purgeable = take_pages(counts.purgeable, &mut remaining, page_size);
-    let speculative = take_pages(counts.speculative, &mut remaining, page_size);
-    let file_cache = take_pages(counts.file_backed, &mut remaining, page_size);
+    let inactive = take_pages(counts.inactive, &mut remaining, page_size);
 
-    // File-backed pages overlap active and inactive counts. Purgeable and speculative pages
-    // overlap inactive counts. Assign those subgroups once. Free reserves the sampled free
-    // pages and absorbs any remaining physical memory so the rows cannot exceed the total.
+    // VM free includes speculative pages. Split that known intersection once.
+    // File-backed and purgeable counters overlap the queues, but do not identify
+    // their intersections. Keep them as non-additive "of which" attributes instead
+    // of guessing which queue to subtract from. Other holds unclassified memory
+    // and sub-page bytes. Capping queue counts handles inconsistent samples.
     MemoryBreakdown {
         wired,
         active,
         compressed,
         inactive,
-        purgeable,
-        speculative,
-        file_cache,
-        free: total_bytes - (pages - sampled_free - remaining) * page_size,
+        purgeable: counts.purgeable.min(pages).saturating_mul(page_size),
+        speculative: speculative.saturating_mul(page_size),
+        file_cache: counts.file_backed.min(pages).saturating_mul(page_size),
+        free: (sampled_free - speculative).saturating_mul(page_size),
+        other: total_bytes - (pages - remaining) * page_size,
     }
 }
 
@@ -101,15 +71,39 @@ mod tests {
 
     #[test]
     fn file_attributes_do_not_remove_active_queue_pages() {
-        let m = breakdown(MemoryPageCounts { wired: 1, active: 4, inactive: 4, file_backed: 4, free: 1, ..Default::default() }, 4096, 10 * 4096);
+        let m = breakdown(
+            MemoryPageCounts {
+                wired: 1,
+                active: 4,
+                inactive: 4,
+                file_backed: 4,
+                free: 1,
+                ..Default::default()
+            },
+            4096,
+            10 * 4096,
+        );
         assert_eq!(m.active, 4 * 4096);
         assert_eq!(m.inactive, 4 * 4096);
+        assert_eq!(m.file_cache, 4 * 4096);
         assert_eq!(m.total_bytes(), 10 * 4096);
     }
 
     #[test]
     fn speculative_pages_are_removed_from_free_only() {
-        let m = breakdown(MemoryPageCounts { wired: 1, active: 4, inactive: 2, speculative: 1, file_backed: 1, free: 3, ..Default::default() }, 4096, 10 * 4096);
+        let m = breakdown(
+            MemoryPageCounts {
+                wired: 1,
+                active: 4,
+                inactive: 2,
+                speculative: 1,
+                file_backed: 1,
+                free: 3,
+                ..Default::default()
+            },
+            4096,
+            10 * 4096,
+        );
         assert_eq!(m.free, 2 * 4096);
         assert_eq!(m.active, 4 * 4096);
         assert_eq!(m.inactive, 2 * 4096);
@@ -119,7 +113,17 @@ mod tests {
 
     #[test]
     fn active_purgeable_attribute_is_visible_without_changing_queue_totals() {
-        let m = breakdown(MemoryPageCounts { wired: 1, active: 6, purgeable: 2, free: 3, ..Default::default() }, 4096, 10 * 4096);
+        let m = breakdown(
+            MemoryPageCounts {
+                wired: 1,
+                active: 6,
+                purgeable: 2,
+                free: 3,
+                ..Default::default()
+            },
+            4096,
+            10 * 4096,
+        );
         assert_eq!(m.purgeable, 2 * 4096);
         assert_eq!(m.active, 6 * 4096);
         assert_eq!(m.total_bytes(), 10 * 4096);
@@ -143,15 +147,14 @@ mod tests {
         );
 
         assert_eq!(breakdown.wired, 2 * 4096);
-        assert_eq!(breakdown.active, 4096);
+        assert_eq!(breakdown.active, 5 * 4096);
         assert_eq!(breakdown.compressed, 4096);
-        assert_eq!(breakdown.inactive, 3 * 4096);
+        assert_eq!(breakdown.inactive, 6 * 4096);
         assert_eq!(breakdown.purgeable, 2 * 4096);
         assert_eq!(breakdown.speculative, 4096);
         assert_eq!(breakdown.file_cache, 4 * 4096);
-        assert_eq!(breakdown.free, 10 * 4096);
-        assert_eq!(breakdown.used_bytes(), 4 * 4096);
-        assert_eq!(breakdown.reclaimable_bytes(), 10 * 4096);
+        assert_eq!(breakdown.free, 2 * 4096);
+        assert_eq!(breakdown.other, 7 * 4096);
         assert_eq!(breakdown.total_bytes(), 24 * 4096);
     }
 
@@ -173,6 +176,24 @@ mod tests {
         );
 
         assert_eq!(breakdown.total_bytes(), 10 * 4096);
-        assert_eq!(breakdown.free, 8 * 4096);
+        assert_eq!(breakdown.free, 0);
+        assert_eq!(breakdown.speculative, 8 * 4096);
+    }
+
+    #[test]
+    fn unclassified_memory_and_subpage_bytes_stay_out_of_free() {
+        let m = breakdown(
+            MemoryPageCounts {
+                active: 1,
+                free: 1,
+                ..Default::default()
+            },
+            4096,
+            3 * 4096 + 7,
+        );
+        assert_eq!(m.active, 4096);
+        assert_eq!(m.free, 4096);
+        assert_eq!(m.other, 4096 + 7);
+        assert_eq!(m.total_bytes(), 3 * 4096 + 7);
     }
 }
