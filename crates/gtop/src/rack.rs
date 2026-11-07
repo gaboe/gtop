@@ -1211,7 +1211,7 @@ fn memory_share(value: u64, total: u64) -> f32 {
     value as f32 / total.max(1) as f32
 }
 
-fn memory_row(name: &str, value: u64, total: u64, color: u32, t: &Tokens) -> Div {
+fn memory_row(name: &str, value: u64, total: u64, color: u32, t: &Tokens) -> Stateful<Div> {
     let share = memory_share(value, total);
     div()
         .id(format!("memory-row-{name}"))
@@ -1248,7 +1248,7 @@ fn memory_row(name: &str, value: u64, total: u64, color: u32, t: &Tokens) -> Div
         )
 }
 
-fn memory_group(name: &str, value: u64, total: u64, t: &Tokens) -> Div {
+fn memory_group(name: &str, value: u64, total: u64, t: &Tokens) -> Stateful<Div> {
     div()
         .id(format!("memory-group-{}", name.to_lowercase()))
         .debug_selector({
@@ -1802,17 +1802,17 @@ impl Monitor {
                     t,
                 )),
         );
-        tower = tower.child({
-            let mut memory = memory_window(
-                stats.memory_used,
-                stats.memory_total,
-                stats.swap_used,
-                stats.memory_breakdown,
-                self.memory_expanded,
-                t,
-            );
-            if stats.memory_breakdown.is_some() {
-                memory = memory
+        let memory = memory_window(
+            stats.memory_used,
+            stats.memory_total,
+            stats.swap_used,
+            stats.memory_breakdown,
+            self.memory_expanded,
+            t,
+        );
+        tower = if stats.memory_breakdown.is_some() {
+            tower.child(
+                memory
                     .id("memory-window")
                     .role(Role::Button)
                     .debug_selector(|| "memory-window".into())
@@ -1820,10 +1820,11 @@ impl Monitor {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.memory_expanded = !this.memory_expanded;
                         cx.notify();
-                    }));
-            }
-            memory
-        });
+                    })),
+            )
+        } else {
+            tower.child(memory)
+        };
         tower = tower.child(
             win(t)
                 .id("disk-open")
@@ -3449,10 +3450,10 @@ mod tests {
     use super::{
         battery_readouts, cpu_segments, div, draw_readout_text, gtop_self_cpu, history_cell,
         lit_unit, memory_items, memory_share, memory_window, purgeable_label,
-        toggles_memory_breakdown, vfd_digit_width, Bounds, DrawMetrics, MemoryPageGroup, Path,
-        Pixels, Tokens, DIGIT_GHOST_TEST_TEXTS, UNIT_GLYPHS, UNIT_GLYPH_TEST_BOUNDS,
-        WIN_DOT_CACHE_MAX_BYTES, WIN_DOT_CACHE_MAX_ENTRY_VERTICES, WIN_DOT_CACHE_MAX_VERTICES,
-        WIN_DOT_CACHE_SLOTS,
+        toggles_memory_breakdown, vfd_digit_width, Bounds, DrawMetrics, KeyDownEvent,
+        MemoryPageGroup, Path, Pixels, Role, Tokens, DIGIT_GHOST_TEST_TEXTS, UNIT_GLYPHS,
+        UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES, WIN_DOT_CACHE_MAX_ENTRY_VERTICES,
+        WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
     };
     use gpui::{prelude::*, px, Modifiers, TestAppContext, Window};
     use gtop_core::monitoring::{BatteryState, MemoryBreakdown, Power};
@@ -3551,18 +3552,18 @@ mod tests {
         visual.simulate_click(card.center(), Modifiers::default());
         visual.update(|window, cx| window.draw(cx).clear(cx));
         assert!(view.read_with(visual, |view, _| view.expanded));
-        for row in [
-            "Wired",
-            "Active/App",
-            "Compressed",
-            "Inactive",
-            "Purgeable",
-            "Speculative",
-            "File cache",
-            "Free",
+        for (row, selector) in [
+            ("Wired", "memory-row-Wired"),
+            ("Active/App", "memory-row-Active/App"),
+            ("Compressed", "memory-row-Compressed"),
+            ("Inactive", "memory-row-Inactive"),
+            ("Purgeable", "memory-row-Purgeable"),
+            ("Speculative", "memory-row-Speculative"),
+            ("File cache", "memory-row-File cache"),
+            ("Free", "memory-row-Free"),
         ] {
             assert!(
-                visual.debug_bounds(&format!("memory-row-{row}")).is_some(),
+                visual.debug_bounds(selector).is_some(),
                 "missing visible memory row {row}"
             );
         }
