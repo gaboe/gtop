@@ -20,6 +20,7 @@ examine_globs = [
   "crates/gtop-core/src/monitoring/process_monitor.rs",
   "crates/gtop-core/src/monitoring/port_monitor.rs",
   "crates/gtop-core/src/monitoring/system_monitor.rs",
+  "crates/gtop-core/src/monitoring/memory.rs",
   "crates/gtop-core/src/monitoring/battery.rs",
   "crates/gtop-core/src/monitoring/smc.rs",
   "crates/gtop-core/src/monitoring/iokit.rs",
@@ -50,6 +51,7 @@ exclude_re = [
   '_tests\.rs:',
   '/tests/',
   # FFI shells: they call IOKit, SMC, or libproc and need real hardware.
+  'memory_macos.rs', # Calls host_statistics64 and reads the Mach page size.
   # Only their Drop impls release kernel handles; other Drop impls stay in scope.
   'iokit.rs.*(replace | in )read_battery( ->| with |$)',
   'iokit.rs.*(replace | in )read_power_source_times( ->| with |$)',

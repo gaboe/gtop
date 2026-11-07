@@ -140,6 +140,12 @@ impl SystemMonitor {
         );
         let disk_stats = self.calculate_disk_stats_with(disks, real_free_bytes);
         let load_average = System::load_average();
+        #[cfg(target_os = "macos")]
+        let memory_breakdown = super::memory_macos::sample().map(|(pages, page_size)| {
+            super::memory::breakdown(pages, page_size, sys.total_memory())
+        });
+        #[cfg(not(target_os = "macos"))]
+        let memory_breakdown = None;
 
         SystemStats {
             cpu_usage: sys.cpus().iter().map(|cpu| cpu.cpu_usage()).collect(),
@@ -148,6 +154,7 @@ impl SystemMonitor {
             swap_used: sys.used_swap(),
             memory_free: sys.total_memory() - sys.used_memory(),
             memory_cached: 0,
+            memory_breakdown,
             uptime: System::uptime(),
             load_avg: [load_average.one, load_average.five, load_average.fifteen],
             network_totals: self.network_totals,

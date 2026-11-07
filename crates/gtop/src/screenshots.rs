@@ -95,6 +95,16 @@ fn snapshot() -> Snapshot {
     s.memory_used = 19 << 30;
     s.memory_free = 13 << 30;
     s.memory_cached = 4 << 30;
+    s.memory_breakdown = Some(gtop_core::monitoring::MemoryBreakdown {
+        wired: 4 << 30,
+        active: 12 << 30,
+        compressed: 3 << 30,
+        inactive: 5 << 29,
+        purgeable: 1 << 30,
+        speculative: 1 << 29,
+        file_cache: 4 << 30,
+        free: 5 << 30,
+    });
     s.swap_used = 256 << 20;
     s.uptime = 172_800;
     s.load_avg = [2.4, 2.1, 1.8];
@@ -198,15 +208,17 @@ fn readme_screenshots() {
     let monitor = monitor.unwrap();
     let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/screenshots");
     std::fs::create_dir_all(&output).unwrap();
-    for (name, history, detail) in [
-        ("live", None, false),
-        ("detail", None, true),
-        ("history24h", Some(2), false),
+    for (name, history, detail, memory) in [
+        ("live", None, false, false),
+        ("memory", None, false, true),
+        ("detail", None, true, false),
+        ("history24h", Some(2), false, false),
     ] {
         cx.update(|cx| {
             monitor.update(cx, |m, cx| {
                 m.view = history;
                 m.details = None;
+                m.memory_expanded = memory;
                 if detail {
                     m.select(
                         ProcessKey::from(&m.snapshot.as_ref().unwrap().processes[0]),

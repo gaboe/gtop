@@ -119,6 +119,8 @@ pub struct SystemStats {
     pub memory_free: u64,
     /// Cached memory in bytes
     pub memory_cached: u64,
+    /// Exclusive macOS VM page groups in bytes, when the VM API returned a sample.
+    pub memory_breakdown: Option<MemoryBreakdown>,
     /// Swap in use in bytes, from the same memory refresh.
     pub swap_used: u64,
     /// System uptime in seconds
@@ -147,4 +149,17 @@ pub struct SystemStats {
     pub temperatures: Vec<Temperature>,
     /// Battery and power readings, or `None` when no battery is available.
     pub power: Option<Power>,
+}
+
+/// Exclusive physical-memory page groups used by the Memory window.
+#[derive(Serialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryBreakdown {
+    pub wired: u64,
+    pub active: u64,
+    pub compressed: u64,
+    pub inactive: u64,
+    pub purgeable: u64,
+    pub speculative: u64,
+    pub file_cache: u64,
+    pub free: u64,
 }

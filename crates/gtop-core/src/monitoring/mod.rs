@@ -11,6 +11,9 @@ mod gpu_monitor;
 mod gpu_process_monitor;
 #[cfg(target_os = "macos")]
 mod iokit;
+mod memory;
+#[cfg(target_os = "macos")]
+mod memory_macos;
 #[cfg(target_os = "macos")]
 mod native_processes;
 mod port_monitor;

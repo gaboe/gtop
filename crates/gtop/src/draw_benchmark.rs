@@ -108,6 +108,16 @@ fn fixed_snapshot() -> Snapshot {
     s.stats.memory_total = 32 << 30;
     s.stats.memory_used = 19 << 30;
     s.stats.memory_free = 13 << 30;
+    s.stats.memory_breakdown = Some(gtop_core::monitoring::MemoryBreakdown {
+        wired: 4 << 30,
+        active: 12 << 30,
+        compressed: 3 << 30,
+        inactive: 5 << 29,
+        purgeable: 1 << 30,
+        speculative: 1 << 29,
+        file_cache: 4 << 30,
+        free: 5 << 30,
+    });
     s
 }
 
@@ -228,6 +238,7 @@ fn fixture_from_snapshot(
         details: None,
         panel_resize: details::PanelResize::default(),
         disk: None,
+        memory_expanded: false,
         paused: false,
         history,
         moment: None,
