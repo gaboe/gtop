@@ -1424,7 +1424,7 @@ mod tests {
         path.canonicalize().unwrap()
     }
     #[test]
-    fn scan_priority_tracks_visibility_and_defaults_to_utility() {
+    fn scan_priority_keeps_normal_qos_across_visibility_changes() {
         fn current_qos_class() -> u32 {
             let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
             let mut priority = 0;
@@ -1440,25 +1440,25 @@ mod tests {
         assert!(!priority.applied_foreground);
         assert_eq!(
             current_qos_class(),
-            libc::qos_class_t::QOS_CLASS_UTILITY as u32
+            libc::qos_class_t::QOS_CLASS_DEFAULT as u32
         );
 
         foreground.store(true, Ordering::Release);
         priority.update();
         assert_eq!(
             current_qos_class(),
-            libc::qos_class_t::QOS_CLASS_USER_INITIATED as u32
+            libc::qos_class_t::QOS_CLASS_DEFAULT as u32
         );
 
         foreground.store(false, Ordering::Release);
         priority.update();
         assert_eq!(
             current_qos_class(),
-            libc::qos_class_t::QOS_CLASS_UTILITY as u32
+            libc::qos_class_t::QOS_CLASS_DEFAULT as u32
         );
     }
     #[test]
-    fn worker_without_visibility_scans_at_utility() {
+    fn worker_without_visibility_scans_at_normal_priority() {
         let home = scratch();
         fs::write(home.join("file"), [1; 4096]).unwrap();
         let mut disk = Disk::with_home(home.clone());
