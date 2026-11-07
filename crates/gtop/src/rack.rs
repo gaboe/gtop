@@ -3461,12 +3461,14 @@ mod tests {
     struct MemoryWindowLayoutTest {
         expanded: bool,
         breakdown: MemoryBreakdown,
+        focus: FocusHandle,
     }
 
     impl Render for MemoryWindowLayoutTest {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .size_full()
+                .track_focus(&self.focus)
                 .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                     if toggles_memory_breakdown(event.keystroke.key.as_str()) {
                         this.expanded = !this.expanded;
@@ -3544,9 +3546,10 @@ mod tests {
 
     #[gpui::test]
     async fn memory_window_expands_and_collapses_all_page_rows(cx: &mut TestAppContext) {
-        let (view, visual) = cx.add_window_view(|_, _| MemoryWindowLayoutTest {
+        let (view, visual) = cx.add_window_view(|_, cx| MemoryWindowLayoutTest {
             expanded: false,
             breakdown: sample_memory_breakdown(),
+            focus: cx.focus_handle(),
         });
         visual.run_until_parked();
         visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -3581,6 +3584,7 @@ mod tests {
         assert!(!view.read_with(visual, |view, _| view.expanded));
         assert!(visual.debug_bounds("memory-row-Wired").is_none());
 
+        visual.update(|window, cx| view.read(cx).focus.focus(window, cx));
         visual.simulate_keystrokes("b");
         visual.update(|window, cx| window.draw(cx).clear(cx));
         assert!(view.read_with(visual, |view, _| view.expanded));
