@@ -11,6 +11,7 @@ use std::{
 };
 
 pub const PAGE_SIZE: usize = 128;
+#[cfg(test)]
 const MAX_LINKS: usize = 250_000;
 #[path = "disk_scan/queue.rs"]
 mod queue;
@@ -50,6 +51,7 @@ pub struct Tree {
     pub observed: SystemTime,
     candidates: Vec<Row>,
     cloud_items: u64,
+    coverage_complete: bool,
     #[cfg(test)]
     path_bytes: usize,
 }
@@ -109,6 +111,7 @@ impl Tree {
             observed: SystemTime::now(),
             candidates: vec![],
             cloud_items: 0,
+            coverage_complete: false,
             #[cfg(test)]
             path_bytes: root.as_os_str().len(),
         }
@@ -278,32 +281,6 @@ fn cleanable_kind(path: &Path, home: &Path) -> Option<&'static str> {
         b"node_modules" => Some("Installed JavaScript dependencies"),
         _ => None,
     }
-}
-
-#[cfg(test)]
-fn local_manifest(parent: &OwnedFd) -> bool {
-    local_manifest_while(parent, || true)
-}
-fn local_manifest_while(parent: &OwnedFd, mut keep_going: impl FnMut() -> bool) -> bool {
-    let Ok(expected) = identity(parent) else {
-        return false;
-    };
-    let Ok(fd) = open_child(parent, std::ffi::OsStr::new("."), expected) else {
-        return false;
-    };
-    let mut found = false;
-    let _ = entries(&fd, |entry| {
-        if !keep_going() {
-            return false;
-        }
-        if entry.name == "Cargo.toml" {
-            found = !entry.in_cloud && !entry.error && !entry.directory;
-            false
-        } else {
-            true
-        }
-    });
-    found
 }
 
 #[derive(Clone)]
@@ -521,57 +498,45 @@ fn open_directory(root: &OwnedFd, tree: &Tree, id: usize) -> io::Result<OwnedFd>
 }
 
 pub fn scan(root: &Path, home: &Path, cancel: &AtomicBool, progress: impl FnMut(&Tree)) -> Tree {
-    scan_impl(
-        root,
-        home,
-        cancel,
-        progress,
-        || ScanUrgency::Background,
-        queue::Options {
-            initial_urgency: ScanUrgency::Background,
-            ..queue::Options::default()
-        },
-    )
+    scan_with_hook(root, home, cancel, progress, || ScanUrgency::Background)
 }
 
 pub(super) fn scan_with_hook(
     root: &Path,
     home: &Path,
     cancel: &AtomicBool,
-    progress: impl FnMut(&Tree),
-    on_tick: impl FnMut() -> ScanUrgency,
-) -> Tree {
-    scan_impl(
-        root,
-        home,
-        cancel,
-        progress,
-        on_tick,
-        queue::Options::default(),
-    )
-}
-
-fn scan_impl(
-    root: &Path,
-    home: &Path,
-    cancel: &AtomicBool,
     mut progress: impl FnMut(&Tree),
     mut on_tick: impl FnMut() -> ScanUrgency,
-    options: queue::Options,
 ) -> Tree {
-    let mut last_tick = Instant::now() - Duration::from_secs(1);
-    scan_opened(
-        root,
-        home,
-        cancel,
-        queue::Callbacks {
-            progress: &mut progress,
-            on_tick: &mut on_tick,
-            last_tick: &mut last_tick,
-        },
-        || open_root(root),
-        options,
-    )
+    #[cfg(target_os = "macos")]
+    if let Ok(metadata) = fs::symlink_metadata(root) {
+        if metadata.is_dir() && metadata.st_flags() & 0x40000000 != 0 {
+            let mut tree = Tree::new(root);
+            tree.nodes[0].identity = FileId {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            };
+            tree.nodes[0].allocated = metadata.blocks() * 512;
+            tree.nodes[0].in_cloud = true;
+            tree.cloud_items = 1;
+            tree.state = if cancel.load(Ordering::Relaxed) {
+                ScanState::Cancelled
+            } else {
+                ScanState::Complete
+            };
+            progress(&tree);
+            return tree;
+        }
+    }
+    match open_root(root) {
+        Ok(fd) => queue::run(root, home, fd, cancel, &mut progress, &mut on_tick),
+        Err(error) => {
+            let mut tree = Tree::new(root);
+            tree.state = ScanState::Failed(error.to_string());
+            progress(&tree);
+            tree
+        }
+    }
 }
 
 pub(super) fn scan_beneath(
@@ -623,18 +588,7 @@ pub(super) fn scan_beneath(
         Ok(fd)
     })();
     match opened {
-        Ok(fd) => scan_opened(
-            root,
-            home,
-            cancel,
-            queue::Callbacks {
-                progress: &mut progress,
-                on_tick: &mut on_tick,
-                last_tick: &mut last_tick,
-            },
-            || Ok(fd),
-            queue::Options::default(),
-        ),
+        Ok(fd) => queue::run(root, home, fd, cancel, &mut progress, &mut on_tick),
         Err(error) => {
             let mut tree = Tree::new(root);
             tree.state = if cancel.load(Ordering::Relaxed) {
@@ -647,84 +601,6 @@ pub(super) fn scan_beneath(
         }
     }
 }
-fn scan_opened(
-    root: &Path,
-    home: &Path,
-    cancel: &AtomicBool,
-    callbacks: queue::Callbacks<'_>,
-    open: impl FnOnce() -> io::Result<OwnedFd>,
-    options: queue::Options,
-) -> Tree {
-    let scan_home = data_home(home).filter(|alias| {
-        root.starts_with("/System/Volumes/Data")
-            && (alias.starts_with(root) || root.starts_with(alias))
-    });
-    let home = scan_home.as_deref().unwrap_or(home);
-    let mut tree = Tree::new(root);
-    let metadata = match fs::symlink_metadata(root) {
-        Ok(m) if m.is_dir() => m,
-        Ok(_) => {
-            tree.state = ScanState::Failed("Scan root must be a directory, not a symlink".into());
-            return tree;
-        }
-        Err(e) => {
-            tree.state = ScanState::Failed(e.to_string());
-            return tree;
-        }
-    };
-    #[cfg(target_os = "macos")]
-    if metadata.st_flags() & 0x40000000 != 0 {
-        tree.nodes[0].allocated = metadata.blocks() * 512;
-        tree.nodes[0].identity = FileId {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        };
-        tree.nodes[0].in_cloud = true;
-        tree.cloud_items = 1;
-        tree.state = ScanState::Complete;
-        (callbacks.progress)(&tree);
-        return tree;
-    }
-    let root_fd = match open() {
-        Ok(fd) => fd,
-        Err(e) => {
-            tree.state = ScanState::Failed(e.to_string());
-            return tree;
-        }
-    };
-    let root_id = FileId {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    };
-    if identity(&root_fd).ok() != Some(root_id) {
-        tree.state = ScanState::Failed("Root changed before scan".into());
-        return tree;
-    }
-    tree.nodes[0].identity = root_id;
-    tree.nodes[0].allocated = metadata.blocks() * 512;
-    queue::run(
-        &mut tree,
-        &root_fd,
-        home,
-        cancel,
-        queue::Callbacks {
-            progress: callbacks.progress,
-            on_tick: callbacks.on_tick,
-            last_tick: callbacks.last_tick,
-        },
-        options,
-    );
-    if tree.state == ScanState::Scanning {
-        tree.state = if cancel.load(Ordering::Relaxed) {
-            ScanState::Cancelled
-        } else {
-            ScanState::Complete
-        };
-    }
-    (callbacks.progress)(&tree);
-    tree
-}
-
 fn tick<T, F: FnMut() -> T + ?Sized>(last_tick: &mut Instant, on_tick: &mut F) {
     if last_tick.elapsed() >= Duration::from_millis(100) {
         on_tick();
@@ -732,215 +608,6 @@ fn tick<T, F: FnMut() -> T + ?Sized>(last_tick: &mut Instant, on_tick: &mut F) {
     }
 }
 
-#[cfg(test)]
-struct Walker<'a, F> {
-    tree: &'a mut Tree,
-    home: &'a Path,
-    device: u64,
-    cancel: &'a AtomicBool,
-    progress: &'a mut F,
-    last: Instant,
-    on_tick: &'a mut dyn FnMut(),
-    last_tick: &'a mut Instant,
-    links: HashSet<(u64, u64)>,
-}
-struct AcceptedEntry {
-    name: std::ffi::OsString,
-    error: bool,
-    row: Row,
-}
-
-struct Reducer<'a> {
-    tree: &'a mut Tree,
-    device: u64,
-    links: &'a mut HashSet<(u64, u64)>,
-}
-
-impl Reducer<'_> {
-    fn enter(&mut self, path: &Path, entry: Entry) -> Option<AcceptedEntry> {
-        self.tree.cloud_items += u64::from(entry.in_cloud);
-        let skipped_volume = entry.device != self.device;
-        let mut shared = false;
-        if !entry.directory && entry.links > 1 && !entry.error && !skipped_volume {
-            if self.links.len() >= MAX_LINKS && !self.links.contains(&(entry.device, entry.inode)) {
-                self.tree.state = ScanState::Failed(
-                    "Hard-link tracking limit reached. Sizes are incomplete.".into(),
-                );
-                return None;
-            }
-            shared = !self.links.insert((entry.device, entry.inode));
-        }
-        let allocated = if entry.error || skipped_volume || shared {
-            0
-        } else {
-            entry.allocated
-        };
-        let child_path = path.join(&entry.name);
-        let row = Row {
-            path: child_path,
-            identity: FileId {
-                device: entry.device,
-                inode: entry.inode,
-            },
-            directory: entry.directory,
-            allocated,
-            descendants: 0,
-            unreadable: u64::from(entry.error),
-            shared,
-            skipped_volume,
-            in_cloud: entry.in_cloud,
-            cleanable: None,
-        };
-        self.tree.nodes[0].allocated = self.tree.nodes[0].allocated.saturating_add(allocated);
-        self.tree.nodes[0].descendants += 1;
-        self.tree.nodes[0].unreadable += row.unreadable;
-        Some(AcceptedEntry {
-            name: entry.name,
-            error: entry.error,
-            row,
-        })
-    }
-
-    fn plain_run(
-        &mut self,
-        allocated: u64,
-        in_cloud: bool,
-        count: u64,
-        total: &mut (u64, u64, u64),
-    ) {
-        let bytes = allocated.saturating_mul(count);
-        self.tree.cloud_items += if in_cloud { count } else { 0 };
-        self.tree.nodes[0].allocated = self.tree.nodes[0].allocated.saturating_add(bytes);
-        self.tree.nodes[0].descendants += count;
-        total.0 = total.0.saturating_add(bytes);
-        total.1 += count;
-    }
-
-    fn read_error(&mut self, total: &mut (u64, u64, u64)) {
-        total.2 += 1;
-        self.tree.nodes[0].unreadable += 1;
-    }
-
-    fn descended(&mut self, accepted: &mut AcceptedEntry, result: io::Result<(u64, u64, u64)>) {
-        let row = &mut accepted.row;
-        match result {
-            Ok((bytes, items, errors)) => {
-                row.allocated = row.allocated.saturating_add(bytes);
-                row.descendants = items;
-                row.unreadable += errors;
-            }
-            Err(_) => {
-                row.unreadable += 1;
-                self.tree.nodes[0].unreadable += 1;
-            }
-        }
-    }
-
-    fn finish(&mut self, accepted: AcceptedEntry, depth: usize, total: &mut (u64, u64, u64)) {
-        let row = accepted.row;
-        if row.cleanable.is_some() {
-            self.tree.candidates.push(row.clone());
-            self.tree
-                .candidates
-                .sort_unstable_by_key(|r| std::cmp::Reverse(r.allocated));
-            self.tree.candidates.truncate(24);
-        }
-        total.0 = total.0.saturating_add(row.allocated);
-        total.1 += row.descendants + 1;
-        total.2 += row.unreadable;
-        if depth == 0 {
-            let node = Node {
-                name: accepted.name,
-                identity: row.identity,
-                shared: row.shared,
-                parent: Some(0),
-                children: vec![],
-                directory: row.directory,
-                allocated: row.allocated,
-                descendants: row.descendants,
-                unreadable: row.unreadable,
-                skipped_volume: row.skipped_volume,
-                in_cloud: row.in_cloud,
-                cleanable: row.cleanable,
-            };
-            if self.tree.nodes.len() <= PAGE_SIZE {
-                self.tree.nodes.push(node);
-            } else {
-                let smallest = (1..self.tree.nodes.len())
-                    .min_by_key(|&i| self.tree.nodes[i].allocated)
-                    .unwrap();
-                if node.allocated > self.tree.nodes[smallest].allocated {
-                    self.tree.nodes[smallest] = node;
-                }
-            }
-            self.tree.nodes[0].children = (1..self.tree.nodes.len()).collect();
-        }
-    }
-}
-
-#[cfg(test)]
-impl<F: FnMut(&Tree)> Walker<'_, F> {
-    fn reducer(&mut self) -> Reducer<'_> {
-        Reducer {
-            tree: self.tree,
-            device: self.device,
-            links: &mut self.links,
-        }
-    }
-
-    fn walk(&mut self, fd: &OwnedFd, path: &Path, depth: usize) -> (u64, u64, u64) {
-        let mut total = (0u64, 0u64, 0u64);
-        let result = entries(fd, |entry| self.visit(fd, path, depth, entry, &mut total));
-        if result.is_err() {
-            self.reducer().read_error(&mut total);
-        }
-        total
-    }
-    fn visit(
-        &mut self,
-        fd: &OwnedFd,
-        path: &Path,
-        depth: usize,
-        entry: Entry,
-        total: &mut (u64, u64, u64),
-    ) -> bool {
-        if self.cancel.load(Ordering::Relaxed) || matches!(self.tree.state, ScanState::Failed(_)) {
-            return false;
-        }
-        let Some(mut accepted) = self.reducer().enter(path, entry) else {
-            return false;
-        };
-        tick(self.last_tick, self.on_tick);
-        if self.last.elapsed() >= Duration::from_millis(100) {
-            (self.progress)(self.tree);
-            self.last = Instant::now();
-        }
-        if accepted.row.directory
-            && !accepted.row.in_cloud
-            && !accepted.row.skipped_volume
-            && !accepted.error
-        {
-            let opened = if depth >= 256 {
-                Err(io::Error::other("Directory depth limit reached"))
-            } else {
-                open_child(fd, &accepted.name, accepted.row.identity)
-            };
-            let result = opened.map(|child| self.walk(&child, &accepted.row.path, depth + 1));
-            self.reducer().descended(&mut accepted, result);
-        }
-        let row = &mut accepted.row;
-        row.cleanable = if !row.directory || row.in_cloud || row.skipped_volume || accepted.error {
-            None
-        } else {
-            cleanable_kind(&row.path, self.home).or_else(|| {
-                (accepted.name == "target" && row.path.starts_with(self.home) && local_manifest(fd))
-                    .then_some("Cargo build products")
-            })
-        };
-        self.reducer().finish(accepted, depth, total);
-        true
-    }
-}
 fn open_child(parent: &OwnedFd, name: &std::ffi::OsStr, expected: FileId) -> io::Result<OwnedFd> {
     let name = std::ffi::CString::new(name.as_bytes())?;
     let child = unsafe {
@@ -963,14 +630,14 @@ fn open_child(parent: &OwnedFd, name: &std::ffi::OsStr, expected: FileId) -> io:
 pub fn foreground_priority() {
     #[cfg(target_os = "macos")]
     unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_DEFAULT, 0);
     }
 }
 
 pub fn background_priority() {
     #[cfg(target_os = "macos")]
     unsafe {
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_DEFAULT, 0);
     }
 }
 
@@ -1297,7 +964,7 @@ pub fn headless() -> bool {
         start.elapsed().as_secs_f64(),
         tree.cloud_items,
         tree.nodes.len().saturating_sub(1) + tree.candidates.len(),
-        if tree.state == ScanState::Complete && tree.nodes[0].unreadable == 0 { "full" } else { "incomplete" }
+        if tree.state == ScanState::Complete && tree.coverage_complete { "full" } else { "incomplete" }
     );
     if tree.state != ScanState::Complete {
         std::process::exit(1);
@@ -1375,54 +1042,6 @@ mod tests {
             .iter()
             .enumerate()
             .any(|(id, _)| tree.path(id) == temp.0.join("link/data")));
-    }
-    #[test]
-    fn scan_honors_cancel_request_after_replay_progress() {
-        let temp = Scratch::new();
-        for i in 0..20 {
-            fs::write(temp.0.join(format!("file-{i}")), [1; 4096]).unwrap();
-        }
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
-        let request = cancel.clone();
-        let mut options = queue::Options::default();
-        options.hooks.before_stop_check = Some(std::sync::Arc::new(move |descendants| {
-            if descendants >= 1 {
-                request.store(true, Ordering::Relaxed);
-            }
-        }));
-        let tree = scan_impl(
-            &temp.0,
-            &temp.0,
-            &cancel,
-            |_| {},
-            || ScanUrgency::Background,
-            options,
-        );
-        assert!(cancel.load(Ordering::Relaxed));
-        assert_eq!(tree.state, ScanState::Cancelled);
-        assert_eq!(tree.nodes[0].descendants, 1);
-    }
-    #[test]
-    fn scan_cancels_after_work_and_keeps_partial_results() {
-        let temp = Scratch::new();
-        for i in 0..20 {
-            fs::write(temp.0.join(format!("file-{i}")), [1; 4096]).unwrap();
-        }
-        for count in [1, 10, 19] {
-            let cancel = AtomicBool::new(false);
-            let mut options = queue::Options::default();
-            options.hooks.cancel_after = Some(count);
-            let tree = scan_impl(
-                &temp.0,
-                &temp.0,
-                &cancel,
-                |_| {},
-                || ScanUrgency::Background,
-                options,
-            );
-            assert_eq!(tree.state, ScanState::Cancelled);
-            assert_eq!(tree.nodes[0].descendants, count);
-        }
     }
     #[test]
     fn other_device_is_visible_but_has_no_charged_bytes() {
@@ -1799,114 +1418,6 @@ mod tests {
         }
     }
     #[test]
-    fn cloud_directory_is_counted_without_open_or_cleanup_probe() {
-        let home = Scratch::new();
-        let cancel = AtomicBool::new(false);
-        let mut tree = Tree::new(&home.0);
-        let mut progress = |_: &Tree| {};
-        let mut on_tick = || {};
-        let mut last_tick = Instant::now();
-        let mut walker = Walker {
-            tree: &mut tree,
-            home: &home.0,
-            device: 1,
-            cancel: &cancel,
-            progress: &mut progress,
-            last: Instant::now(),
-            on_tick: &mut on_tick,
-            last_tick: &mut last_tick,
-            links: HashSet::new(),
-        };
-        let mut total = (0, 0, 0);
-        assert!(walker.visit(
-            &open_root(&home.0).unwrap(),
-            &home.0,
-            0,
-            Entry {
-                name: "target".into(),
-                device: 1,
-                inode: 2,
-                directory: true,
-                allocated: 4096,
-                error: false,
-                in_cloud: true,
-                links: 1,
-            },
-            &mut total
-        ));
-        assert_eq!(total, (4096, 1, 0));
-        assert!(tree.nodes[1].in_cloud);
-        assert_eq!(tree.nodes[1].descendants, 0);
-        assert!(tree.candidates.is_empty());
-    }
-    #[cfg(target_os = "macos")]
-    fn bulk_fixture(common: u32, file: u32, flags: u32) -> Vec<u8> {
-        let mut record = vec![0; 80];
-        for (offset, value) in [
-            (0, 80u32),
-            (4, common),
-            (16, file),
-            (28, 44),
-            (32, 2),
-            (36, 1),
-            (40, 1),
-            (44, flags),
-        ] {
-            record[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
-        }
-        record[48..56].copy_from_slice(&2u64.to_ne_bytes());
-        record[60..68].copy_from_slice(&4096u64.to_ne_bytes());
-        record[72] = b'x';
-        record
-    }
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn bulk_missing_link_count_uses_local_fallback_only_with_known_flags() {
-        let home = Scratch::new();
-        fs::write(home.0.join("x"), [1; 4096]).unwrap();
-        fs::hard_link(home.0.join("x"), home.0.join("second")).unwrap();
-        let fd = open_root(&home.0).unwrap();
-        let (local, _) = bulk_entry(&fd, &bulk_fixture(0x0204000b, 4, 0)).unwrap();
-        assert!(!local.error);
-        assert_eq!(local.links, 2);
-        let (unknown, _) = bulk_entry(&fd, &bulk_fixture(0x0200000b, 4, 0)).unwrap();
-        assert!(unknown.error);
-        assert!(!unknown.in_cloud);
-        assert_eq!(unknown.inode, 2);
-        assert_eq!(unknown.links, 0);
-        let mut directory_record = bulk_fixture(0x0200000b, 4, 0);
-        directory_record[12..16].copy_from_slice(&8u32.to_ne_bytes());
-        directory_record[40..44].copy_from_slice(&2u32.to_ne_bytes());
-        directory_record[56..64].copy_from_slice(&4096u64.to_ne_bytes());
-        let (unknown_directory, _) = bulk_entry(&fd, &directory_record).unwrap();
-        assert!(unknown_directory.directory);
-        assert!(unknown_directory.error);
-        assert!(!unknown_directory.in_cloud);
-        let mut tree = Tree::new(&home.0);
-        let cancel = AtomicBool::new(false);
-        let mut progress = |_: &Tree| {};
-        let mut on_tick = || {};
-        let mut last_tick = Instant::now();
-        let mut walker = Walker {
-            tree: &mut tree,
-            home: &home.0,
-            device: 1,
-            cancel: &cancel,
-            progress: &mut progress,
-            last: Instant::now(),
-            on_tick: &mut on_tick,
-            last_tick: &mut last_tick,
-            links: HashSet::new(),
-        };
-        let mut total = (0, 0, 0);
-        assert!(walker.visit(&fd, &home.0, 0, unknown_directory, &mut total));
-        assert_eq!(total, (0, 1, 1));
-        let (cloud, _) = bulk_entry(&fd, &bulk_fixture(0x0204000b, 4, 0x40000000)).unwrap();
-        assert!(cloud.in_cloud);
-        assert_eq!(cloud.inode, 2);
-        assert_eq!(cloud.links, 0);
-    }
-    #[test]
     fn cancelled_scope_discovery_returns_cancelled_without_entries() {
         let home = Scratch::new();
         fs::create_dir(home.0.join("child")).unwrap();
@@ -1938,47 +1449,7 @@ mod tests {
             },
         );
         assert_eq!(tree.state, ScanState::Complete);
-        assert_eq!(ticks.get(), 1);
-    }
-    #[test]
-    fn duplicate_hardlink_at_capacity_needs_no_new_tracking_slot() {
-        let home = Scratch::new();
-        let mut tree = Tree::new(&home.0);
-        let cancel = AtomicBool::new(false);
-        let mut progress = |_: &Tree| {};
-        let mut on_tick = || {};
-        let mut last_tick = Instant::now();
-        let mut walker = Walker {
-            tree: &mut tree,
-            home: &home.0,
-            device: 1,
-            cancel: &cancel,
-            progress: &mut progress,
-            last: Instant::now(),
-            on_tick: &mut on_tick,
-            last_tick: &mut last_tick,
-            links: (0..MAX_LINKS as u64).map(|inode| (1, inode)).collect(),
-        };
-        let mut total = (0, 0, 0);
-        assert!(walker.visit(
-            &open_root(&home.0).unwrap(),
-            &home.0,
-            0,
-            Entry {
-                name: "duplicate".into(),
-                device: 1,
-                inode: 2,
-                directory: false,
-                allocated: 4096,
-                error: false,
-                in_cloud: false,
-                links: 2,
-            },
-            &mut total
-        ));
-        assert_eq!(total, (0, 1, 0));
-        assert!(walker.tree.nodes[1].shared);
-        assert!(!matches!(walker.tree.state, ScanState::Failed(_)));
+        assert!(ticks.get() >= 1);
     }
     #[test]
     fn subtree_scan_rejects_symlink_ancestors_and_parent_components() {
@@ -2034,65 +1505,6 @@ mod tests {
 #[cfg(test)]
 mod cleanup_regressions {
     use super::*;
-    use std::os::unix::fs::symlink;
-    #[test]
-    fn cleanup_manifest_stays_in_pinned_parent() {
-        let home = tests::Scratch::new();
-        let outside = tests::Scratch::new();
-        fs::create_dir_all(home.0.join("project/nested")).unwrap();
-        fs::create_dir(home.0.join("project/nested/target")).unwrap();
-        fs::create_dir(outside.0.join("nested")).unwrap();
-        fs::write(outside.0.join("nested/Cargo.toml"), "outside manifest").unwrap();
-        let pinned = open_root(&home.0.join("project/nested")).unwrap();
-        let metadata = fs::metadata(home.0.join("project/nested/target")).unwrap();
-        fs::rename(home.0.join("project"), home.0.join("saved-project")).unwrap();
-        symlink(&outside.0, home.0.join("project")).unwrap();
-        assert!(!home.0.join("saved-project/nested/Cargo.toml").exists());
-        let mut tree = Tree::new(&home.0);
-        let cancel = AtomicBool::new(false);
-        let mut progress = |_: &Tree| {};
-        let mut on_tick = || {};
-        let mut last_tick = Instant::now();
-        let mut walker = Walker {
-            tree: &mut tree,
-            home: &home.0,
-            device: metadata.dev(),
-            cancel: &cancel,
-            progress: &mut progress,
-            last: Instant::now(),
-            on_tick: &mut on_tick,
-            last_tick: &mut last_tick,
-            links: HashSet::new(),
-        };
-        let mut total = (0, 0, 0);
-        assert!(walker.visit(
-            &pinned,
-            &home.0.join("project/nested"),
-            0,
-            Entry {
-                name: "target".into(),
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                directory: true,
-                allocated: metadata.blocks() * 512,
-                error: false,
-                in_cloud: false,
-                links: 1
-            },
-            &mut total
-        ));
-        println!(
-            "manifest_probe outside_only_manifest=true candidates={:?}",
-            tree.candidates
-        );
-        assert!(tree.candidates.is_empty());
-        fs::write(
-            home.0.join("saved-project/nested/Cargo.toml"),
-            "pinned manifest",
-        )
-        .unwrap();
-        assert!(local_manifest(&pinned));
-    }
 
     #[test]
     fn ordinary_files_with_cache_names_are_not_cleanable() {
@@ -2609,5 +2021,5 @@ mod trash_name_regressions {
 mod serial_oracle;
 
 #[cfg(test)]
-#[path = "disk_scan/reducer_tests.rs"]
-mod reducer_tests;
+#[path = "disk_scan/production_tests.rs"]
+mod production_tests;

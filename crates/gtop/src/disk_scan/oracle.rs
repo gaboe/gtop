@@ -228,95 +228,21 @@ impl<F: FnMut(&Tree)> Walker<'_, F> {
     }
 }
 
-pub(super) fn replay(
-    path: &Path,
-    tape: &[(usize, Entry)],
-    at_capacity: bool,
-    cut: usize,
-) -> (Tree, (u64, u64, u64)) {
-    replay_with_device(path, tape, at_capacity, cut, 1)
-}
-
-pub(super) fn replay_with_device(
-    path: &Path,
-    tape: &[(usize, Entry)],
-    at_capacity: bool,
-    cut: usize,
-    device: u64,
-) -> (Tree, (u64, u64, u64)) {
-    let mut tree = Tree::new(path);
-    tree.nodes[0].allocated = u64::MAX - 8192;
-    let cancel = AtomicBool::new(false);
-    let mut progress = |_: &Tree| {};
-    let mut on_tick = || {};
-    let mut last_tick = Instant::now();
-    let fd = open_root(path).unwrap();
-    let mut walker = Walker {
-        tree: &mut tree,
-        home: path,
-        device,
-        cancel: &cancel,
-        progress: &mut progress,
-        last: Instant::now(),
-        on_tick: &mut on_tick,
-        last_tick: &mut last_tick,
-        links: if at_capacity {
-            (0..MAX_LINKS as u64).map(|inode| (device, inode)).collect()
-        } else {
-            HashSet::new()
-        },
+fn local_manifest(parent: &OwnedFd) -> bool {
+    let Ok(expected) = identity(parent) else {
+        return false;
     };
-    let mut total = (0, 0, 0);
-    for (index, (depth, entry)) in tape.iter().enumerate() {
-        cancel.store(index >= cut, Ordering::Relaxed);
-        if !walker.visit(&fd, path, *depth, entry.clone(), &mut total) {
-            break;
-        }
-    }
-    if tree.state == ScanState::Scanning {
-        tree.state = if cancel.load(Ordering::Relaxed) {
-            ScanState::Cancelled
+    let Ok(fd) = open_child(parent, std::ffi::OsStr::new("."), expected) else {
+        return false;
+    };
+    let mut found = false;
+    let _ = entries(&fd, |entry| {
+        if entry.name == "Cargo.toml" {
+            found = !entry.in_cloud && !entry.error && !entry.directory;
+            false
         } else {
-            ScanState::Complete
-        };
-    }
-    (tree, total)
-}
-
-thread_local! {
-    static CUT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    static VISITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static CUT_REACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-fn entries(fd: &OwnedFd, mut visit: impl FnMut(Entry) -> bool) -> io::Result<()> {
-    if CUT.get().is_none() {
-        return super::entries(fd, visit);
-    }
-    super::entries(fd, |entry| {
-        if VISITED.get() >= CUT.get().unwrap() {
-            CUT_REACHED.set(true);
-            return false;
+            true
         }
-        VISITED.set(VISITED.get() + 1);
-        visit(entry)
-    })
-}
-pub(super) fn scan_until(root: &Path, cut: u64) -> Tree {
-    CUT.set(Some(cut));
-    VISITED.set(0);
-    CUT_REACHED.set(false);
-    let mut tree = scan_opened(
-        root,
-        root,
-        &AtomicBool::new(false),
-        |_| {},
-        &mut || {},
-        &mut Instant::now(),
-        || open_root(root),
-    );
-    if CUT_REACHED.get() {
-        tree.state = ScanState::Cancelled;
-    }
-    CUT.set(None);
-    tree
+    });
+    found
 }

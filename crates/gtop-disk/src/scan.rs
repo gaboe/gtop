@@ -319,6 +319,31 @@ pub fn scan_with_progress(
     options: ScanOptions,
     progress: Arc<ScanProgress>,
 ) -> io::Result<Node> {
+    scan_with_root(root, None, options, progress)
+}
+
+/// Scan a root that the caller opened through a checked directory chain.
+/// The path observation must still match the pinned descriptor. The scanner
+/// never reopens the root by pathname after that check.
+pub fn scan_opened_with_progress(
+    root: &Path,
+    directory: OwnedFd,
+    options: ScanOptions,
+    progress: Arc<ScanProgress>,
+) -> io::Result<Node> {
+    scan_with_root(root, Some(directory), options, progress)
+}
+
+fn scan_with_root(
+    root: &Path,
+    directory: Option<OwnedFd>,
+    options: ScanOptions,
+    progress: Arc<ScanProgress>,
+) -> io::Result<Node> {
+    let root_fd = OnceLock::new();
+    if let Some(directory) = directory {
+        let _ = root_fd.set(directory);
+    }
     let context = Arc::new(WalkContext {
         known: None,
         options,
@@ -327,7 +352,7 @@ pub fn scan_with_progress(
         foreign_mounts: OnceLock::new(),
         never_scanned: OnceLock::new(),
         root: Mutex::new(None),
-        root_fd: OnceLock::new(),
+        root_fd,
     });
     let result = scan_blocking(root, &context);
     progress.finish();
@@ -744,12 +769,14 @@ fn scan_on_pool(
         root_node.complete = false;
         return Ok(root_node);
     }
-    let fd = rustix::fs::open(root, directory_flags(), Mode::empty())?;
-    let opened = rustix::fs::fstat(&fd)?;
+    if context.root_fd.get().is_none() {
+        let fd = rustix::fs::open(root, directory_flags(), Mode::empty())?;
+        let _ = context.root_fd.set(fd);
+    }
+    let opened = rustix::fs::fstat(context.root_fd.get().expect("pinned scan root"))?;
     if Some((opened.st_dev as u64, opened.st_ino)) != root_node.identity() {
         return Err(io::Error::other("Root changed before scan"));
     }
-    let _ = context.root_fd.set(fd);
     *lock(&context.root_device) = Some(device_of(&root_meta));
     let canonical = root.canonicalize()?;
     let mut never = crate::space::never_scanned(root, &canonical);
@@ -947,6 +974,11 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
                         if dir.depth >= context.options.max_depth.unwrap_or(256).min(256) {
                             let mut node = node;
                             node.complete = false;
+                            node.read_error = true;
+                            context.progress.record_error(
+                                &path,
+                                &io::Error::other("Directory depth limit reached"),
+                            );
                             lock(&dir.partial).node.children.push(node);
                         } else {
                             let child = Arc::new(PendingDir::new(
