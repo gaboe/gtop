@@ -3450,7 +3450,7 @@ mod tests {
     use super::{
         battery_readouts, cpu_segments, div, draw_readout_text, gtop_self_cpu, history_cell,
         lit_unit, memory_items, memory_share, memory_window, purgeable_label,
-        toggles_memory_breakdown, vfd_digit_width, Bounds, DrawMetrics, KeyDownEvent,
+        toggles_memory_breakdown, vfd_digit_width, Bounds, DrawMetrics, FocusHandle, KeyDownEvent,
         MemoryPageGroup, Path, Pixels, Role, Tokens, DIGIT_GHOST_TEST_TEXTS, UNIT_GLYPHS,
         UNIT_GLYPH_TEST_BOUNDS, WIN_DOT_CACHE_MAX_BYTES, WIN_DOT_CACHE_MAX_ENTRY_VERTICES,
         WIN_DOT_CACHE_MAX_VERTICES, WIN_DOT_CACHE_SLOTS,
