@@ -512,19 +512,15 @@ pub(super) fn scan_with_hook(
     #[cfg(target_os = "macos")]
     if let Ok(metadata) = fs::symlink_metadata(root) {
         if metadata.is_dir() && metadata.st_flags() & 0x40000000 != 0 {
-            let mut tree = Tree::new(root);
-            tree.nodes[0].identity = FileId {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            };
-            tree.nodes[0].allocated = metadata.blocks() * 512;
-            tree.nodes[0].in_cloud = true;
-            tree.cloud_items = 1;
-            tree.state = if cancel.load(Ordering::Relaxed) {
-                ScanState::Cancelled
-            } else {
-                ScanState::Complete
-            };
+            let tree = cloud_root_tree(
+                root,
+                FileId {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                },
+                metadata.blocks(),
+                cancel.load(Ordering::Relaxed),
+            );
             progress(&tree);
             return tree;
         }
@@ -538,6 +534,20 @@ pub(super) fn scan_with_hook(
             tree
         }
     }
+}
+
+fn cloud_root_tree(root: &Path, identity: FileId, blocks: u64, cancelled: bool) -> Tree {
+    let mut tree = Tree::new(root);
+    tree.nodes[0].identity = identity;
+    tree.nodes[0].allocated = blocks * 512;
+    tree.nodes[0].in_cloud = true;
+    tree.cloud_items = 1;
+    tree.state = if cancelled {
+        ScanState::Cancelled
+    } else {
+        ScanState::Complete
+    };
+    tree
 }
 
 pub(super) fn scan_beneath(
@@ -956,21 +966,28 @@ pub fn headless() -> bool {
     let start = Instant::now();
     let tree = scan(&root, &root, &AtomicBool::new(false), |_| {});
     println!(
+        "{}",
+        headless_output(&root, &tree, start.elapsed().as_secs_f64())
+    );
+    if tree.state != ScanState::Complete {
+        std::process::exit(1);
+    }
+    true
+}
+
+fn headless_output(root: &Path, tree: &Tree, wall_seconds: f64) -> String {
+    format!(
         "disk_scan root={} state={:?} allocated={} items={} errors={} wall_seconds={:.6} cloud_items={} retained_rows={} coverage={}",
         root.display(),
         tree.state,
         tree.nodes[0].allocated,
         tree.nodes[0].descendants,
         tree.nodes[0].unreadable,
-        start.elapsed().as_secs_f64(),
+        wall_seconds,
         tree.cloud_items,
         tree.nodes.len().saturating_sub(1) + tree.candidates.len(),
         if tree.state == ScanState::Complete && tree.coverage_complete { "full" } else { "incomplete" }
-    );
-    if tree.state != ScanState::Complete {
-        std::process::exit(1);
-    }
-    true
+    )
 }
 
 #[cfg(test)]
@@ -2013,6 +2030,112 @@ mod trash_name_regressions {
             assert_eq!(existing_after.dev(), existing_id.device);
             assert_eq!(existing_after.ino(), existing_id.inode);
         }
+    }
+
+    #[test]
+    fn cloud_root_uses_allocated_bytes_and_cancelled_state() {
+        let root = Path::new("/fixture/cloud");
+        let id = FileId {
+            device: 7,
+            inode: 11,
+        };
+        let tree = cloud_root_tree(root, id, 3, false);
+        assert_eq!(tree.nodes[0].identity.device, 7);
+        assert_eq!(tree.nodes[0].identity.inode, 11);
+        assert_eq!(tree.nodes[0].allocated, 1536);
+        assert!(tree.nodes[0].in_cloud);
+        assert_eq!(tree.cloud_items, 1);
+        assert_eq!(tree.state, ScanState::Complete);
+
+        let cancelled = cloud_root_tree(root, id, 3, true);
+        assert_eq!(cancelled.state, ScanState::Cancelled);
+    }
+
+    #[test]
+    fn headless_output_reports_scan_totals_and_coverage() {
+        let root = Path::new("/fixture");
+        let mut tree = Tree::new(root);
+        tree.state = ScanState::Complete;
+        tree.nodes[0].allocated = 4096;
+        tree.nodes[0].descendants = 5;
+        tree.nodes[0].unreadable = 1;
+        tree.cloud_items = 2;
+        tree.coverage_complete = true;
+        tree.nodes.extend((0..4).map(|_| Node {
+            name: "row".into(),
+            identity: FileId {
+                device: 1,
+                inode: 1,
+            },
+            shared: false,
+            parent: Some(0),
+            children: vec![],
+            directory: true,
+            allocated: 0,
+            descendants: 0,
+            unreadable: 0,
+            skipped_volume: false,
+            in_cloud: false,
+            cleanable: None,
+        }));
+        tree.candidates.extend((0..3).map(|_| Row {
+            path: root.join("candidate"),
+            identity: FileId {
+                device: 1,
+                inode: 1,
+            },
+            directory: true,
+            allocated: 0,
+            descendants: 0,
+            unreadable: 0,
+            shared: false,
+            skipped_volume: false,
+            in_cloud: false,
+            cleanable: Some("cache"),
+        }));
+        assert_eq!(
+            headless_output(root, &tree, 1.25),
+            "disk_scan root=/fixture state=Complete allocated=4096 items=5 errors=1 wall_seconds=1.250000 cloud_items=2 retained_rows=7 coverage=full"
+        );
+        tree.coverage_complete = false;
+        assert!(headless_output(root, &tree, 0.0).ends_with("coverage=incomplete"));
+    }
+
+    #[test]
+    fn headless_is_false_for_the_test_process_arguments() {
+        assert!(!headless());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn priority_functions_set_default_qos_on_the_current_thread() {
+        let check = |set_priority: fn()| {
+            std::thread::spawn(move || unsafe {
+                    assert_eq!(
+                        libc::pthread_set_qos_class_self_np(
+                            libc::qos_class_t::QOS_CLASS_BACKGROUND,
+                            0
+                        ),
+                        0
+                    );
+                    set_priority();
+                    let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+                    let mut priority = 0;
+                    assert_eq!(
+                        libc::pthread_get_qos_class_np(
+                            libc::pthread_self(),
+                            &mut class,
+                            &mut priority,
+                        ),
+                        0
+                    );
+                    assert_eq!(class as u32, libc::qos_class_t::QOS_CLASS_DEFAULT as u32);
+                })
+                .join()
+                .unwrap();
+        };
+        check(foreground_priority);
+        check(background_priority);
     }
 }
 

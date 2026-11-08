@@ -118,10 +118,6 @@ fn coordinate(
                         tree.state = ScanState::Cancelled;
                     }
                     progress(&tree);
-                    if cancel.load(Ordering::Relaxed) && tree.state != ScanState::Cancelled {
-                        tree.state = ScanState::Cancelled;
-                        progress(&tree);
-                    }
                     return tree;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -139,16 +135,20 @@ fn coordinate(
                 tree.nodes[0].descendants = snapshot.files.saturating_add(snapshot.dirs);
                 tree.nodes[0].unreadable = snapshot.errors;
                 if let Some((path, completed)) = scan_progress.take_completed() {
-                    if path.parent() == Some(root.as_path()) {
-                        let row = node_row(&path, &completed, home, None);
-                        retain_row(&mut tree, row);
-                    }
+                    retain_completed(&mut tree, &root, &path, &completed, home);
                 }
                 progress(&tree);
                 last_report = Instant::now();
             }
         }
     })
+}
+
+fn retain_completed(tree: &mut Tree, root: &Path, path: &Path, completed: &DiskNode, home: &Path) {
+    if path.parent() == Some(root) {
+        let row = node_row(path, completed, home, None);
+        retain_row(tree, row);
+    }
 }
 
 fn descendants(node: &DiskNode) -> u64 {
@@ -190,6 +190,10 @@ fn node_row(path: &Path, node: &DiskNode, home: &Path, parent: Option<&DiskNode>
     }
 }
 
+fn data_home_overlaps(root: &Path, alias: &Path) -> bool {
+    root.starts_with("/System/Volumes/Data") && (alias.starts_with(root) || root.starts_with(alias))
+}
+
 fn retain_row(tree: &mut Tree, row: Row) {
     let node = Node {
         name: row.path.file_name().unwrap_or_default().into(),
@@ -227,10 +231,7 @@ fn retain_row(tree: &mut Tree, row: Row) {
 }
 
 fn project(root: &Path, home: &Path, source: &DiskNode) -> Tree {
-    let scan_home = data_home(home).filter(|alias| {
-        root.starts_with("/System/Volumes/Data")
-            && (alias.starts_with(root) || root.starts_with(alias))
-    });
+    let scan_home = data_home(home).filter(|alias| data_home_overlaps(root, alias));
     let home = scan_home.as_deref().unwrap_or(home);
     let mut tree = Tree::new(root);
     let row = node_row(root, source, home, None);
