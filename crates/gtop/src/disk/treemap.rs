@@ -247,7 +247,7 @@ impl Disk {
 }
 
 impl Monitor {
-    pub(crate) fn treemap_workspace(&self, _window: &Window, cx: &mut Context<Self>) -> Div {
+    pub(crate) fn treemap_workspace(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let disk = self.disk.as_ref().unwrap();
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
         let hierarchy = disk
@@ -535,7 +535,71 @@ impl Monitor {
                 .child(div().bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule)).p(px(8.))
                     .child("D Top · ↑ ↓ select · Enter open · Backspace up · X Trash")
                     .child(div().text_size(px(10.)).child("Observed sizes. Unknown space has no tile area. Hover informs; click selects."))))
-            .children(self.disk_panel(crate::details::DetailWidth::new(360.), cx))
+            .child(self.resizable_disk_inspector(window, cx))
+    }
+
+    fn resizable_disk_inspector(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let width = self
+            .settings
+            .disk_inspector_width
+            .for_window(window.bounds().size.width.into());
+        let handle = crate::column_widths::handle_left()
+            .debug_selector(|| "disk-inspector-resize".into())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let disk = this.disk.as_mut().unwrap();
+                    if event.click_count == 2 {
+                        disk.inspector_resize.finish();
+                        this.settings.disk_inspector_width = Default::default();
+                        this.persist_settings(window, cx);
+                    } else {
+                        disk.inspector_resize.begin(
+                            event.position.x.into(),
+                            this.settings
+                                .disk_inspector_width
+                                .for_window(window.bounds().size.width.into()),
+                        );
+                    }
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                }),
+            );
+        let events = crate::column_widths::events(
+            cx,
+            self.disk.as_ref().unwrap().inspector_resize.active(),
+            |_, _, _, _| {},
+            |this, event, window, cx| {
+                if let Some(width) = this
+                    .disk
+                    .as_ref()
+                    .unwrap()
+                    .inspector_resize
+                    .width_at(event.position.x.into())
+                {
+                    this.settings.disk_inspector_width =
+                        width.for_window(window.bounds().size.width.into());
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            },
+            |this, _, window, cx| {
+                if this.disk.as_mut().unwrap().inspector_resize.finish() {
+                    this.persist_settings(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            },
+        );
+        div()
+            .relative()
+            .h_full()
+            .flex_shrink_0()
+            .w(px(width.pixels()))
+            .children(self.disk_panel(crate::details::DetailWidth::new(width.pixels()), cx))
+            .child(handle)
+            .child(events)
     }
 
     pub(super) fn treemap_inspector(&self, cx: &mut Context<Self>) -> Div {
@@ -544,13 +608,20 @@ impl Monitor {
         let root = folder.hierarchy.as_ref().unwrap();
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
         let mut selection = div()
+            .id("disk-selection")
+            .debug_selector(|| "disk-selection".into())
             .flex_shrink_0()
+            .min_w_0()
+            .overflow_hidden()
             .py(px(8.))
             .child(crate::rack::label("SELECTION", &t));
         if let Some(row) = disk.map_row() {
             selection = selection
                 .child(
                     div()
+                        .id("disk-selection-name")
+                        .debug_selector(|| "disk-selection-name".into())
+                        .min_w_0()
                         .font_family("Archivo Display")
                         .text_size(px(24.))
                         .truncate()
@@ -564,6 +635,16 @@ impl Monitor {
                 )
                 .child(current_path(row.path.display().to_string()))
                 .child(crate::rack::lit(bytes(row.allocated), 42., false, &t))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .child(format!("{} bytes", row.allocated)),
+                )
+                .children(
+                    disk.selection_details()
+                        .into_iter()
+                        .map(|text| div().min_w_0().text_size(px(10.)).child(text)),
+                )
                 .child(
                     Button::new("map-trash")
                         .label("Review cleanup · X")
@@ -658,6 +739,132 @@ impl Monitor {
                     .min_h_0()
                     .child(list),
             )
+            .child(self.disk_volume_readout())
+    }
+
+    fn disk_volume_readout(&self) -> Stateful<Div> {
+        let t = self.draft.unwrap_or(self.settings.base()).tokens();
+        let disk = self.disk.as_ref().unwrap();
+        let volume = disk.volume.as_ref();
+        let space = volume.and_then(|v| v.space);
+        let identity = volume.map_or("Unknown", |v| v.identity_label());
+        let free = space.map_or_else(
+            || "Unknown".into(),
+            |v| format!("{} free", bytes(v.available)),
+        );
+        div()
+            .id("disk-volume")
+            .debug_selector(|| "disk-volume".into())
+            .flex_shrink_0()
+            .min_w_0()
+            .overflow_hidden()
+            .border_t_1()
+            .border_color(rgb(t.rule))
+            .py(px(8.))
+            .child(crate::rack::label("SCAN VOLUME", &t))
+            .child(
+                div()
+                    .id("disk-volume-identity")
+                    .debug_selector(|| "disk-volume-identity".into())
+                    .role(Role::Label)
+                    .aria_label(identity.to_string())
+                    .truncate()
+                    .text_size(px(10.))
+                    .child(identity.to_string()),
+            )
+            .child(crate::rack::lit(free, 22., false, &t))
+            .child(
+                div()
+                    .id("disk-volume-space")
+                    .debug_selector(|| "disk-volume-space".into())
+                    .role(Role::Label)
+                    .aria_label(space.map_or_else(
+                        || "Free Unknown · Used Unknown · Total Unknown".into(),
+                        |v| {
+                            format!(
+                                "{} free · {} used · {} total",
+                                bytes(v.available),
+                                bytes(v.used()),
+                                bytes(v.total)
+                            )
+                        },
+                    ))
+                    .text_size(px(10.))
+                    .child(space.map_or_else(
+                        || "Used Unknown · Total Unknown".into(),
+                        |v| format!("{} used · {} total", bytes(v.used()), bytes(v.total)),
+                    )),
+            )
+    }
+}
+
+impl Disk {
+    fn selection_details(&self) -> Vec<String> {
+        let Some(folder) = &self.folder else {
+            return vec![];
+        };
+        let Some(root) = &folder.hierarchy else {
+            return vec![];
+        };
+        let Some(TileKind::Node { crumbs }) = &self.map.selected else {
+            return vec![];
+        };
+        let Some(node) = root.resolve(crumbs) else {
+            return vec![];
+        };
+        let parent = crumbs
+            .split_last()
+            .and_then(|(_, parent)| root.resolve(parent));
+        let parent_bytes = parent.map_or(root.bytes, |node| node.bytes);
+        let scan = self
+            .scan_bytes
+            .or_else(|| (folder.path == folder.root).then_some(root.bytes));
+        let scan_share = scan.map_or_else(
+            || "Unknown".into(),
+            |denom| inspector_model::share(node.bytes, denom),
+        );
+        let mut coverage = vec![];
+        if node.in_cloud {
+            coverage.push("Cloud content was not read".to_string());
+        }
+        if node.skipped_volume {
+            coverage.push("Other volume was not scanned".to_string());
+        }
+        if !node.complete || node.read_error {
+            coverage.push("Incomplete; size can contain more".to_string());
+        }
+        if node.unreadable > 0 {
+            coverage.push(format!("{} unreadable entries", node.unreadable));
+        }
+        if node.shared {
+            coverage.push("Counted elsewhere".to_string());
+        }
+        if coverage.is_empty() {
+            coverage.push("Complete observed coverage".to_string());
+        }
+        let last_write = if node.modified <= 0 {
+            "Unknown".into()
+        } else {
+            chrono::DateTime::from_timestamp(node.modified, 0).map_or_else(
+                || "Unknown".into(),
+                |date| date.format("%Y-%m-%d %H:%M UTC").to_string(),
+            )
+        };
+        vec![
+            format!(
+                "{} of parent · {} bytes",
+                inspector_model::share(node.bytes, parent_bytes),
+                parent_bytes
+            ),
+            format!(
+                "{scan_share} of scan root · {}",
+                scan.map_or_else(|| "Unknown bytes".into(), |v| format!("{v} bytes"))
+            ),
+            format!("{} files · {} directories", node.files, node.dirs),
+            format!("Newest subtree write · {last_write}"),
+            "Kind · Pending classification".into(),
+            coverage.join(" · "),
+        ]
     }
 }
 
@@ -936,6 +1143,262 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn inspector_fixed_sections_resize_persist_and_unknown_volume(cx: &mut TestAppContext) {
+        use futures::StreamExt;
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+        let long = root
+            .children
+            .iter()
+            .position(|node| node.name.starts_with("a-very-long"))
+            .unwrap();
+        disk.map_select(TileKind::Node { crumbs: vec![long] });
+        let (writes, mut saved) = futures::channel::mpsc::unbounded();
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            monitor.settings_writes = Some(writes);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        for (width, height) in [(1480., 930.), (1200., 720.)] {
+            visual.simulate_resize(size(px(width), px(height)));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let selection = visual.debug_bounds("disk-selection").unwrap();
+            let name = visual.debug_bounds("disk-selection-name").unwrap();
+            let volume = visual.debug_bounds("disk-volume").unwrap();
+            let list = visual.debug_bounds("map-folder-list").unwrap();
+            let canvas = visual.debug_bounds("disk-treemap").unwrap();
+            assert!(name.size.width <= selection.size.width);
+            assert!(selection.right() <= px(width));
+            assert!(volume.bottom() <= px(height));
+            assert!(
+                list.size.height > px(20.),
+                "middle must remain usable: {list:?}"
+            );
+            assert!(canvas.size.width >= px(600.));
+            assert!(list.top() >= selection.bottom());
+            assert!(list.bottom() <= volume.top());
+            let first = visual.debug_bounds("map-entry-0").unwrap();
+            visual.update(|window, cx| {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: list.center(),
+                        pressed_button: None,
+                        modifiers: Modifiers::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    ScrollWheelEvent {
+                        position: list.center(),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(-10000.))),
+                        modifiers: Modifiers::default(),
+                        touch_phase: TouchPhase::Moved,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(visual.debug_bounds("disk-selection").unwrap(), selection);
+            assert_eq!(visual.debug_bounds("disk-volume").unwrap(), volume);
+            assert!(visual
+                .debug_bounds("map-entry-0")
+                .is_none_or(|bounds| bounds != first));
+            monitor.update(visual, |monitor, cx| {
+                monitor
+                    .disk
+                    .as_mut()
+                    .unwrap()
+                    .map
+                    .list_scroll
+                    .scroll_to_item(0, ScrollStrategy::Top);
+                cx.notify();
+            });
+        }
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let start = visual
+            .debug_bounds("disk-inspector-resize")
+            .unwrap()
+            .center();
+        let end = start - point(px(110.), px(0.));
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: start,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: end,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: end,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        });
+        let stored = saved.next().await.unwrap();
+        assert_eq!(stored.disk_inspector_width.pixels(), 490.);
+        assert_eq!(stored.detail_width, crate::details::DetailWidth::default());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        stored.save_to(&path).unwrap();
+        monitor.update(visual, |monitor, cx| {
+            monitor.settings = crate::palette::Settings::load_from(&path);
+            cx.notify();
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let inspector = visual.debug_bounds("disk-selection").unwrap();
+        assert_eq!(inspector.size.width, px(464.));
+        let position = visual
+            .debug_bounds("disk-inspector-resize")
+            .unwrap()
+            .center();
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position,
+                    button: MouseButton::Left,
+                    click_count: 2,
+                    modifiers: Modifiers::default(),
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+            window.dispatch_event(
+                MouseUpEvent {
+                    position,
+                    button: MouseButton::Left,
+                    click_count: 2,
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        });
+        assert_eq!(
+            saved.next().await.unwrap().disk_inspector_width,
+            inspector_model::InspectorWidth::default()
+        );
+        monitor.update(visual, |monitor, cx| {
+            let root = Path::new("/Volumes/External/projects");
+            monitor.disk.as_mut().unwrap().volume = Some(
+                gtop_disk::inspector::VolumeReadout::query_with(root, |received| {
+                    assert_eq!(received, root);
+                    Ok((
+                        "External · /dev/disk9".into(),
+                        gtop_disk::space::SpaceInfo {
+                            total: 100,
+                            free: 40,
+                            available: 30,
+                        },
+                    ))
+                }),
+            );
+            cx.notify();
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let tree = window.debug_a11y_tree_json().unwrap();
+            assert!(tree.contains("External · /dev/disk9"), "{tree}");
+            assert!(
+                tree.contains("30 B free · 60 B used · 100 B total"),
+                "{tree}"
+            );
+        });
+        monitor.update(visual, |monitor, cx| {
+            monitor.disk.as_mut().unwrap().volume =
+                Some(gtop_disk::inspector::VolumeReadout::query_with(
+                    Path::new("/Volumes/External/projects"),
+                    |_| Err(std::io::Error::other("injected query failure")),
+                ));
+            cx.notify();
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let tree = window.debug_a11y_tree_json().unwrap();
+            assert!(
+                tree.contains("Free Unknown · Used Unknown · Total Unknown"),
+                "{tree}"
+            );
+            assert!(!tree.contains("30 B free"));
+        });
+        monitor.update(visual, |monitor, _| monitor.disk = None);
+    }
+
+    #[test]
+    fn inspector_selection_metadata_preserves_scan_denominator_while_browsing() {
+        let mut disk = snapshot_disk();
+        let root = disk
+            .folder
+            .as_ref()
+            .unwrap()
+            .hierarchy
+            .as_ref()
+            .unwrap()
+            .clone();
+        let index = root
+            .children
+            .iter()
+            .position(|node| &*node.name == "projects")
+            .unwrap();
+        let mut viewed = root.children[index].clone();
+        viewed.modified = 1_700_000_000;
+        viewed.in_cloud = true;
+        viewed.complete = false;
+        viewed.unreadable = 3;
+        let bytes = viewed.bytes;
+        let files = viewed.files;
+        let dirs = viewed.dirs;
+        disk.folder.as_mut().unwrap().hierarchy = Some(Arc::new(viewed));
+        disk.folder.as_mut().unwrap().path.push("projects");
+        disk.map_select(TileKind::Node { crumbs: vec![] });
+        let lines = disk.selection_details();
+        assert_eq!(lines[0], format!("100.0% of parent · {bytes} bytes"));
+        assert_eq!(
+            lines[1],
+            format!(
+                "{} of scan root · {} bytes",
+                inspector_model::share(bytes, root.bytes),
+                root.bytes
+            )
+        );
+        assert_eq!(lines[2], format!("{files} files · {dirs} directories"));
+        assert_eq!(lines[3], "Newest subtree write · 2023-11-14 22:13 UTC");
+        assert_eq!(lines[4], "Kind · Pending classification");
+        assert!(lines[5].contains("Cloud content was not read"));
+        assert!(lines[5].contains("Incomplete"));
+        assert!(lines[5].contains("3 unreadable entries"));
+    }
+
+    #[gpui::test]
     async fn treemap_other_members_remain_reachable(cx: &mut TestAppContext) {
         cx.update(init);
         for count in [97, 320] {
@@ -1155,7 +1618,7 @@ mod tests {
             .unwrap();
             cx.capture_screenshot(handle.into())
                 .unwrap()
-                .save(output.join(format!("treemap-{width:.0}x{height:.0}.png")))
+                .save(output.join(format!("inspector-{width:.0}x{height:.0}.png")))
                 .unwrap();
         }
     }
@@ -1225,6 +1688,21 @@ mod tests {
         };
         let (sender, _) = mpsc::sync_channel(1);
         Disk {
+            inspector_resize: Default::default(),
+            volume: Some(gtop_disk::inspector::VolumeReadout::query_with(
+                &path,
+                |_| {
+                    Ok((
+                        "Data · /dev/disk3s5".into(),
+                        gtop_disk::space::SpaceInfo {
+                            total: 1 << 40,
+                            free: 120 << 30,
+                            available: 94 << 30,
+                        },
+                    ))
+                },
+            )),
+            scan_bytes: Some(root.bytes),
             map: Default::default(),
             open: true,
             session: Some(ScanSession {

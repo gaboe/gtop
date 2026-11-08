@@ -651,6 +651,25 @@ fn c_chars(field: &[std::ffi::c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Exact mount and device for a space query, without the Finder Data-volume alias.
+#[cfg(target_os = "macos")]
+pub fn scan_volume_identity(path: &Path) -> io::Result<String> {
+    let stat = rustix::fs::statfs(path)?;
+    let mount = c_chars(&stat.f_mntonname);
+    let device = c_chars(&stat.f_mntfromname);
+    if mount.is_empty() || device.is_empty() {
+        return Err(io::Error::other("Unknown volume"));
+    }
+    Ok(format!("{mount} · {device}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn scan_volume_identity(path: &Path) -> io::Result<String> {
+    let device = device_for(path).ok_or_else(|| io::Error::other("Unknown volume"))?;
+    let mount = volume_root_for(path).ok_or_else(|| io::Error::other("Unknown mount"))?;
+    Ok(format!("{} · {device}", mount.display()))
+}
+
 /// A mounted volume the picker can switch the scan to: where it is mounted
 /// and how much room it has. Listed by [`volumes`].
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

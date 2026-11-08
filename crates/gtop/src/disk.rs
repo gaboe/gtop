@@ -20,6 +20,7 @@ use std::{
     time::Instant,
 };
 
+pub(crate) mod inspector_model;
 pub(crate) mod treemap;
 
 #[derive(Default)]
@@ -124,6 +125,9 @@ struct ScanSession {
 }
 
 pub(super) struct Disk {
+    inspector_resize: inspector_model::InspectorResize,
+    volume: Option<gtop_disk::inspector::VolumeReadout>,
+    scan_bytes: Option<u64>,
     map: treemap::MapState,
     pub open: bool,
     session: Option<ScanSession>,
@@ -173,6 +177,9 @@ impl Disk {
             .spawn(move || worker(receiver, output, worker_home, worker_foreground))
             .expect("start disk worker");
         let mut disk = Self {
+            inspector_resize: Default::default(),
+            volume: None,
+            scan_bytes: None,
             map: Default::default(),
             open: true,
             session: None,
@@ -233,6 +240,7 @@ impl Disk {
     fn apply_outcome(&mut self, generation: u64, outcome: ScanState) {
         if let Some(session) = self.session.as_mut().filter(|s| s.generation == generation) {
             session.outcome = Some(outcome);
+            self.volume = Some(gtop_disk::inspector::VolumeReadout::query(&session.root));
         }
     }
     fn apply_expiry(&mut self, generation: u64) {
@@ -240,6 +248,8 @@ impl Disk {
             return;
         }
         self.folder = None;
+        self.volume = None;
+        self.scan_bytes = None;
         self.map = Default::default();
         self.invalidate_proposal();
         if self.open {
@@ -284,6 +294,9 @@ impl Disk {
                 self.map = Default::default();
             }
             self.selected = self.selected.min(folder.rows.len().saturating_sub(1));
+            if folder.path == folder.root {
+                self.scan_bytes = Some(folder.allocated);
+            }
             self.folder = Some(folder);
             return true;
         }
@@ -344,6 +357,8 @@ impl Disk {
         }
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = cancel;
+        self.volume = Some(gtop_disk::inspector::VolumeReadout::query(&root));
+        self.scan_bytes = None;
         self.session = Some(ScanSession {
             root,
             generation,
@@ -1302,7 +1317,12 @@ impl Monitor {
                     .debug_selector(|| "disk-body".into())
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
+                    .when(
+                        disk.folder
+                            .as_ref()
+                            .is_none_or(|folder| folder.hierarchy.is_none()),
+                        |body| body.overflow_y_scroll(),
+                    )
                     .track_scroll(&disk.scroll),
             );
 

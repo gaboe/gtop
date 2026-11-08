@@ -34,6 +34,7 @@ examine_globs = [
   "crates/gtop/src/history.rs",
   "crates/gtop/src/history/store.rs",
   "crates/gtop/src/disk_scan.rs",
+  "crates/gtop/src/disk/inspector_model.rs",
   "crates/gtop/src/disk_scan/queue.rs",
   "crates/gtop/src/perf.rs",
 ]

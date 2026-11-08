@@ -332,6 +332,8 @@ pub struct Settings {
     pub cpu_scale: CpuScale,
     #[serde(default, deserialize_with = "read_detail_width")]
     pub detail_width: crate::details::DetailWidth,
+    #[serde(default)]
+    pub disk_inspector_width: crate::disk::inspector_model::InspectorWidth,
     #[serde(default, deserialize_with = "read_widths")]
     pub process_widths: crate::column_widths::Widths,
     #[serde(default, deserialize_with = "read_widths")]
@@ -634,6 +636,36 @@ mod tests {
         assert_eq!(stored.detail_width, settings.detail_width);
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn disk_inspector_width_defaults_without_losing_old_settings() {
+        use crate::disk::inspector_model::InspectorWidth;
+        let old = r#"{"active":2,"saved":[],"cpu_scale":"Core","detail_width":455}"#;
+        let mut settings: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(settings.active, 2);
+        assert_eq!(settings.cpu_scale, CpuScale::Core);
+        assert_eq!(settings.detail_width.pixels(), 455.);
+        assert_eq!(settings.disk_inspector_width, InspectorWidth::default());
+        settings.disk_inspector_width = InspectorWidth::new(497.);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        settings.save_to(&path).unwrap();
+        let stored = Settings::load_from(&path);
+        assert_eq!(stored.disk_inspector_width.pixels(), 497.);
+        assert_eq!(stored.detail_width.pixels(), 455.);
+        for (value, expected) in [
+            ("null", 380.),
+            ("\"bad\"", 380.),
+            ("1", 280.),
+            ("900", 560.),
+        ] {
+            let stored: Settings = serde_json::from_str(&format!(
+                r#"{{"active":0,"saved":[],"disk_inspector_width":{value}}}"#
+            ))
+            .unwrap();
+            assert_eq!(stored.disk_inspector_width.pixels(), expected);
+        }
     }
 
     #[test]

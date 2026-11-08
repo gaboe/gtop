@@ -5,6 +5,7 @@ pub mod classify;
 pub mod filter;
 pub mod identity;
 pub mod insights;
+pub mod inspector;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod removal;
