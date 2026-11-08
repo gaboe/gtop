@@ -1362,6 +1362,113 @@ mod tests {
         monitor.update(visual, |monitor, _| monitor.disk = None);
     }
 
+    #[gpui::test]
+    async fn closing_treemap_finishes_an_interrupted_inspector_resize(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(4);
+        disk.sender = sender;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let original_width = monitor.read_with(visual, |monitor, _| {
+            monitor
+                .settings
+                .disk_inspector_width
+                .for_window(1200.)
+                .pixels()
+        });
+        let handle = visual
+            .debug_bounds("disk-inspector-resize")
+            .unwrap()
+            .center();
+
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: handle,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        });
+        visual.simulate_keystrokes("d");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        });
+        assert!(!monitor.read_with(visual, |monitor, _| monitor.disk.as_ref().unwrap().open));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        let top_release = visual.debug_bounds("memory-window").unwrap().center();
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: top_release,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        });
+        visual.simulate_keystrokes("d");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        let canvas = visual.debug_bounds("disk-treemap").unwrap();
+        let down = canvas.center();
+        let moved = down + point(px(120.), px(0.));
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: down,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: moved,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        });
+        assert_eq!(
+            monitor.read_with(visual, |monitor, _| {
+                monitor
+                    .settings
+                    .disk_inspector_width
+                    .for_window(1200.)
+                    .pixels()
+            }),
+            original_width
+        );
+        monitor.update(visual, |monitor, _| monitor.disk = None);
+    }
+
     #[test]
     fn inspector_selection_metadata_preserves_scan_denominator_while_browsing() {
         let mut disk = snapshot_disk();
@@ -1411,6 +1518,44 @@ mod tests {
         disk.mailbox.lock().unwrap().scan_bytes = Some((0, 1));
         disk.consume_mailbox();
         assert_eq!(disk.scan_bytes, Some(root.bytes + 1));
+    }
+
+    #[test]
+    fn inspector_nested_selection_uses_parent_and_scan_root_denominators() {
+        let mut disk = snapshot_disk();
+        let root = disk
+            .folder
+            .as_ref()
+            .unwrap()
+            .hierarchy
+            .as_ref()
+            .unwrap()
+            .clone();
+        let projects = root
+            .children
+            .iter()
+            .position(|node| &*node.name == "projects")
+            .unwrap();
+        let gtop = root.children[projects]
+            .children
+            .iter()
+            .position(|node| &*node.name == "gtop")
+            .unwrap();
+        let target = root.children[projects].children[gtop]
+            .children
+            .iter()
+            .position(|node| &*node.name == "target")
+            .unwrap();
+        let target_bytes = root.children[projects].children[gtop].children[target].bytes;
+        disk.map_select(TileKind::Node {
+            crumbs: vec![projects, gtop, target],
+        });
+
+        let lines = disk.selection_details();
+
+        assert_eq!(target_bytes, 3_145_728);
+        assert_eq!(lines[0], "92.3% of parent · 3407872 bytes");
+        assert_eq!(lines[1], "68.1% of scan root · 4620288 bytes");
     }
 
     #[gpui::test]
@@ -1717,6 +1862,7 @@ mod tests {
                     ))
                 },
             )),
+            volume_query: Arc::new(gtop_disk::inspector::VolumeReadout::query),
             scan_bytes: Some(root.bytes),
             map: Default::default(),
             open: true,

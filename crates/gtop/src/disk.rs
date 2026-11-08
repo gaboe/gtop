@@ -128,6 +128,7 @@ struct ScanSession {
 pub(super) struct Disk {
     inspector_resize: inspector_model::InspectorResize,
     volume: Option<gtop_disk::inspector::VolumeReadout>,
+    volume_query: Arc<dyn Fn(&Path) -> gtop_disk::inspector::VolumeReadout + Send + Sync>,
     scan_bytes: Option<u64>,
     map: treemap::MapState,
     pub open: bool,
@@ -180,6 +181,7 @@ impl Disk {
         let mut disk = Self {
             inspector_resize: Default::default(),
             volume: None,
+            volume_query: Arc::new(gtop_disk::inspector::VolumeReadout::query),
             scan_bytes: None,
             map: Default::default(),
             open: true,
@@ -215,6 +217,7 @@ impl Disk {
             return;
         }
         self.open = false;
+        self.inspector_resize.finish();
         self.set_visible(false);
         self.invalidate_proposal();
     }
@@ -223,6 +226,7 @@ impl Disk {
             return;
         }
         self.open = true;
+        self.inspector_resize.finish();
         self.set_visible(visible);
         if self.folder.is_none()
             && !self
@@ -239,10 +243,19 @@ impl Disk {
             .map_or(0, |session| session.generation)
     }
     fn apply_outcome(&mut self, generation: u64, outcome: ScanState) {
-        if let Some(session) = self.session.as_mut().filter(|s| s.generation == generation) {
-            session.outcome = Some(outcome);
-            self.volume = Some(gtop_disk::inspector::VolumeReadout::query(&session.root));
+        let root =
+            if let Some(session) = self.session.as_mut().filter(|s| s.generation == generation) {
+                session.outcome = Some(outcome);
+                Some(session.root.clone())
+            } else {
+                None
+            };
+        if let Some(root) = root {
+            self.refresh_volume(&root);
         }
+    }
+    fn refresh_volume(&mut self, root: &Path) {
+        self.volume = Some((self.volume_query)(root));
     }
     fn apply_expiry(&mut self, generation: u64) {
         if generation != self.generation() {
@@ -284,7 +297,8 @@ impl Disk {
         if let Some(status) = status {
             if self.sending {
                 if let Some(session) = &self.session {
-                    self.volume = Some(gtop_disk::inspector::VolumeReadout::query(&session.root));
+                    let root = session.root.clone();
+                    self.refresh_volume(&root);
                 }
             }
             self.status = status;
@@ -364,7 +378,7 @@ impl Disk {
         }
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = cancel;
-        self.volume = Some(gtop_disk::inspector::VolumeReadout::query(&root));
+        self.refresh_volume(&root);
         self.scan_bytes = None;
         self.session = Some(ScanSession {
             root,
@@ -1479,6 +1493,96 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn volume_query_follows_scan_lifecycle_root_and_replaces_success_with_unknown() {
+        use gtop_disk::space::SpaceInfo;
+
+        let home = PathBuf::from("/Users/test-home");
+        let root = PathBuf::from("/Volumes/External/projects");
+        let queried = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let query_paths = queried.clone();
+        let query_calls = calls.clone();
+        let (sender, _receiver) = mpsc::sync_channel(4);
+        let (wake, events) = futures::channel::mpsc::channel(1);
+        let mailbox = Arc::new(Mutex::new(Mailbox {
+            wake: Some(wake),
+            ..Mailbox::default()
+        }));
+        let mut disk = Disk {
+            inspector_resize: Default::default(),
+            volume: None,
+            volume_query: Arc::new(move |received| {
+                query_paths.lock().unwrap().push(received.to_path_buf());
+                if query_calls.fetch_add(1, Ordering::Relaxed) >= 2 {
+                    gtop_disk::inspector::VolumeReadout::query_with(received, |_| {
+                        Err(std::io::Error::other("injected volume failure"))
+                    })
+                } else {
+                    gtop_disk::inspector::VolumeReadout::query_with(received, |_| {
+                        Ok((
+                            "External · /dev/test".into(),
+                            SpaceInfo {
+                                total: 100,
+                                free: 40,
+                                available: 30,
+                            },
+                        ))
+                    })
+                }
+            }),
+            scan_bytes: None,
+            map: Default::default(),
+            open: true,
+            session: None,
+            navigation: 0,
+            home: home.clone(),
+            sender,
+            mailbox: mailbox.clone(),
+            events: Some(events),
+            cancel: Arc::new(AtomicBool::new(false)),
+            foreground: Arc::new(AtomicBool::new(false)),
+            folder: None,
+            selected: 0,
+            confirmation: None,
+            proposal_id: 0,
+            sending: false,
+            scroll: ScrollHandle::new(),
+            row_children: Default::default(),
+            status: String::new(),
+        };
+
+        disk.start(root.clone(), true);
+        assert_eq!(disk.volume.as_ref().unwrap().root, root);
+        assert_eq!(
+            disk.volume.as_ref().unwrap().identity_label(),
+            "External · /dev/test"
+        );
+        assert_eq!(disk.volume.as_ref().unwrap().space.unwrap().available, 30);
+        let generation = disk.generation();
+
+        disk.apply_outcome(generation, ScanState::Complete);
+        assert_eq!(disk.volume.as_ref().unwrap().root, root);
+        assert_eq!(
+            disk.volume.as_ref().unwrap().identity_label(),
+            "External · /dev/test"
+        );
+        assert_eq!(disk.volume.as_ref().unwrap().space.unwrap().available, 30);
+
+        disk.sending = true;
+        mailbox.lock().unwrap().status = Some("Trash completed".into());
+        disk.consume_mailbox();
+        assert_eq!(disk.status, "Trash completed");
+        assert_eq!(disk.volume.as_ref().unwrap().root, root);
+        assert_eq!(disk.volume.as_ref().unwrap().identity_label(), "Unknown");
+        assert_eq!(disk.volume.as_ref().unwrap().space, None);
+        assert_eq!(
+            *queried.lock().unwrap(),
+            vec![root.clone(), root.clone(), root]
+        );
+        assert_ne!(disk.home, disk.volume.as_ref().unwrap().root);
     }
     #[test]
     fn scan_priority_keeps_normal_qos_across_visibility_changes() {
