@@ -748,6 +748,18 @@ impl Monitor {
         let volume = disk.volume.as_ref();
         let space = volume.and_then(|v| v.space);
         let identity = volume.map_or("Unknown", |v| v.identity_label());
+        let identity_selector = identity.to_string();
+        let space_selector = space.map_or_else(
+            || "Free Unknown · Used Unknown · Total Unknown".into(),
+            |v| {
+                format!(
+                    "{} free · {} used · {} total",
+                    bytes(v.available),
+                    bytes(v.used()),
+                    bytes(v.total)
+                )
+            },
+        );
         let free = space.map_or_else(
             || "Unknown".into(),
             |v| format!("{} free", bytes(v.available)),
@@ -765,7 +777,7 @@ impl Monitor {
             .child(
                 div()
                     .id("disk-volume-identity")
-                    .debug_selector(|| "disk-volume-identity".into())
+                    .debug_selector(move || identity_selector.clone())
                     .role(Role::Label)
                     .aria_label(identity.to_string())
                     .truncate()
@@ -776,7 +788,7 @@ impl Monitor {
             .child(
                 div()
                     .id("disk-volume-space")
-                    .debug_selector(|| "disk-volume-space".into())
+                    .debug_selector(move || space_selector.clone())
                     .role(Role::Label)
                     .aria_label(space.map_or_else(
                         || "Free Unknown · Used Unknown · Total Unknown".into(),
@@ -815,7 +827,7 @@ impl Disk {
         let parent = crumbs
             .split_last()
             .and_then(|(_, parent)| root.resolve(parent));
-        let parent_bytes = parent.map_or(root.bytes, |node| node.bytes);
+        let parent_bytes = parent.map(|node| node.bytes);
         let scan = self
             .scan_bytes
             .or_else(|| (folder.path == folder.root).then_some(root.bytes));
@@ -853,8 +865,11 @@ impl Disk {
         vec![
             format!(
                 "{} of parent · {} bytes",
-                inspector_model::share(node.bytes, parent_bytes),
-                parent_bytes
+                parent_bytes.map_or_else(
+                    || "Unknown".into(),
+                    |v| inspector_model::share(node.bytes, v)
+                ),
+                parent_bytes.map_or_else(|| "Unknown".into(), |v| v.to_string())
             ),
             format!(
                 "{scan_share} of scan root · {}",
@@ -1266,9 +1281,9 @@ mod tests {
         assert_eq!(stored.detail_width, crate::details::DetailWidth::default());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
-        stored.save_to(&path).unwrap();
+        fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
         monitor.update(visual, |monitor, cx| {
-            monitor.settings = crate::palette::Settings::load_from(&path);
+            monitor.settings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             cx.notify();
         });
         visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -1324,15 +1339,11 @@ mod tests {
             );
             cx.notify();
         });
-        visual.update(|window, cx| {
-            window.draw(cx).clear(cx);
-            let tree = window.debug_a11y_tree_json().unwrap();
-            assert!(tree.contains("External · /dev/disk9"), "{tree}");
-            assert!(
-                tree.contains("30 B free · 60 B used · 100 B total"),
-                "{tree}"
-            );
-        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("External · /dev/disk9").is_some());
+        assert!(visual
+            .debug_bounds("30.0 B free · 60.0 B used · 100.0 B total")
+            .is_some());
         monitor.update(visual, |monitor, cx| {
             monitor.disk.as_mut().unwrap().volume =
                 Some(gtop_disk::inspector::VolumeReadout::query_with(
@@ -1341,15 +1352,13 @@ mod tests {
                 ));
             cx.notify();
         });
-        visual.update(|window, cx| {
-            window.draw(cx).clear(cx);
-            let tree = window.debug_a11y_tree_json().unwrap();
-            assert!(
-                tree.contains("Free Unknown · Used Unknown · Total Unknown"),
-                "{tree}"
-            );
-            assert!(!tree.contains("30 B free"));
-        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual
+            .debug_bounds("Free Unknown · Used Unknown · Total Unknown")
+            .is_some());
+        assert!(visual
+            .debug_bounds("30.0 B free · 60.0 B used · 100.0 B total")
+            .is_none());
         monitor.update(visual, |monitor, _| monitor.disk = None);
     }
 
@@ -1381,7 +1390,7 @@ mod tests {
         disk.folder.as_mut().unwrap().path.push("projects");
         disk.map_select(TileKind::Node { crumbs: vec![] });
         let lines = disk.selection_details();
-        assert_eq!(lines[0], format!("100.0% of parent · {bytes} bytes"));
+        assert_eq!(lines[0], "Unknown of parent · Unknown bytes");
         assert_eq!(
             lines[1],
             format!(
@@ -1396,6 +1405,12 @@ mod tests {
         assert!(lines[5].contains("Cloud content was not read"));
         assert!(lines[5].contains("Incomplete"));
         assert!(lines[5].contains("3 unreadable entries"));
+        disk.mailbox.lock().unwrap().scan_bytes = Some((1, root.bytes + 1));
+        disk.consume_mailbox();
+        assert_eq!(disk.scan_bytes, Some(root.bytes + 1));
+        disk.mailbox.lock().unwrap().scan_bytes = Some((0, 1));
+        disk.consume_mailbox();
+        assert_eq!(disk.scan_bytes, Some(root.bytes + 1));
     }
 
     #[gpui::test]

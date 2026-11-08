@@ -93,6 +93,10 @@ pub struct Folder {
     pub observed: SystemTime,
 }
 impl Tree {
+    pub fn observed_bytes(&self) -> u64 {
+        self.nodes[0].allocated
+    }
+
     fn new(root: &Path) -> Self {
         let node = Node {
             name: std::ffi::OsString::new(),
@@ -1457,6 +1461,7 @@ mod tests {
         assert_eq!(tree.nodes.len(), PAGE_SIZE + 1);
         let folder = tree.folder(&home.0, 0, false);
         assert_eq!(folder.allocated, total);
+        assert_eq!(tree.observed_bytes(), total);
         assert_eq!(folder.items, 600);
         assert_eq!(folder.smaller_items, 600 - PAGE_SIZE as u64);
         assert!(folder

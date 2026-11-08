@@ -106,6 +106,7 @@ struct Mailbox {
     #[cfg(test)]
     scan_gate: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
     outcome: Option<(u64, ScanState)>,
+    scan_bytes: Option<(u64, u64)>,
     resume: Option<u64>,
     folder: Option<(u64, u64, Folder)>,
     status: Option<String>,
@@ -263,8 +264,12 @@ impl Disk {
         let status = mailbox.status.take();
         let proposal = mailbox.proposal.take();
         let outcome = mailbox.outcome.take();
+        let scan_bytes = mailbox.scan_bytes.take();
         let resume = mailbox.resume.take();
         drop(mailbox);
+        if let Some((_, bytes)) = scan_bytes.filter(|(g, _)| *g == self.generation()) {
+            self.scan_bytes = Some(bytes);
+        }
         if let Some((generation, outcome)) = outcome {
             self.apply_outcome(generation, outcome);
         }
@@ -277,6 +282,11 @@ impl Disk {
             self.apply_proposal(g, id, result);
         }
         if let Some(status) = status {
+            if self.sending {
+                if let Some(session) = &self.session {
+                    self.volume = Some(gtop_disk::inspector::VolumeReadout::query(&session.root));
+                }
+            }
             self.status = status;
             self.sending = false;
         }
@@ -294,9 +304,6 @@ impl Disk {
                 self.map = Default::default();
             }
             self.selected = self.selected.min(folder.rows.len().saturating_sub(1));
-            if folder.path == folder.root {
-                self.scan_bytes = Some(folder.allocated);
-            }
             self.folder = Some(folder);
             return true;
         }
@@ -590,6 +597,7 @@ fn publish(
     }
     let folder = tree.folder(path, page, cached);
     let mut mailbox = output.lock().unwrap();
+    mailbox.scan_bytes = Some((generation, tree.observed_bytes()));
     mailbox.folder = Some((generation, navigation, folder));
     mailbox.notify();
 }
@@ -601,6 +609,7 @@ fn publish_browse(
     home: &Path,
     control: ScanControl<'_>,
 ) -> bool {
+    output.lock().unwrap().scan_bytes = Some((control.identity.0, tree.observed_bytes()));
     let ScanControl {
         token,
         priority,
