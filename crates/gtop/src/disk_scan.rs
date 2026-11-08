@@ -10,6 +10,10 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant, SystemTime},
 };
+#[cfg(test)]
+thread_local! {
+    static HEADLESS_TEST_ARGS: std::cell::RefCell<Option<Vec<std::ffi::OsString>>> = const { std::cell::RefCell::new(None) };
+}
 
 pub const PAGE_SIZE: usize = 128;
 #[cfg(test)]
@@ -954,25 +958,53 @@ pub fn system_root() -> PathBuf {
 }
 
 pub fn headless() -> bool {
-    let args: Vec<_> = std::env::args_os().collect();
-    if args.get(1).is_none_or(|a| a != "--disk-scan") {
-        return false;
+    #[cfg(test)]
+    let args = HEADLESS_TEST_ARGS
+        .with(|args| args.borrow_mut().take())
+        .unwrap_or_else(|| std::env::args_os().collect());
+    #[cfg(not(test))]
+    let args = std::env::args_os();
+
+    let mut output = io::stdout().lock();
+    match headless_with(args, &mut output).expect("write disk scan report") {
+        HeadlessOutcome::NotHandled => false,
+        HeadlessOutcome::Complete => true,
+        HeadlessOutcome::Incomplete => std::process::exit(1),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HeadlessOutcome {
+    NotHandled,
+    Complete,
+    Incomplete,
+}
+
+fn headless_with(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    output: &mut impl io::Write,
+) -> io::Result<HeadlessOutcome> {
+    let mut args = args.into_iter().skip(1);
+    if args.next().is_none_or(|arg| arg != "--disk-scan") {
+        return Ok(HeadlessOutcome::NotHandled);
     }
     let root = args
-        .get(2)
+        .next()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()));
     background_priority();
     let start = Instant::now();
     let tree = scan(&root, &root, &AtomicBool::new(false), |_| {});
-    println!(
+    writeln!(
+        output,
         "{}",
         headless_output(&root, &tree, start.elapsed().as_secs_f64())
-    );
-    if tree.state != ScanState::Complete {
-        std::process::exit(1);
-    }
-    true
+    )?;
+    Ok(if tree.state == ScanState::Complete {
+        HeadlessOutcome::Complete
+    } else {
+        HeadlessOutcome::Incomplete
+    })
 }
 
 fn headless_output(root: &Path, tree: &Tree, wall_seconds: f64) -> String {
@@ -2052,57 +2084,57 @@ mod trash_name_regressions {
     }
 
     #[test]
-    fn headless_output_reports_scan_totals_and_coverage() {
-        let root = Path::new("/fixture");
-        let mut tree = Tree::new(root);
-        tree.state = ScanState::Complete;
-        tree.nodes[0].allocated = 4096;
-        tree.nodes[0].descendants = 5;
-        tree.nodes[0].unreadable = 1;
-        tree.cloud_items = 2;
-        tree.coverage_complete = true;
-        tree.nodes.extend((0..4).map(|_| Node {
-            name: "row".into(),
-            identity: FileId {
-                device: 1,
-                inode: 1,
-            },
-            shared: false,
-            parent: Some(0),
-            children: vec![],
-            directory: true,
-            allocated: 0,
-            descendants: 0,
-            unreadable: 0,
-            skipped_volume: false,
-            in_cloud: false,
-            cleanable: None,
-        }));
-        tree.candidates.extend((0..3).map(|_| Row {
-            path: root.join("candidate"),
-            identity: FileId {
-                device: 1,
-                inode: 1,
-            },
-            directory: true,
-            allocated: 0,
-            descendants: 0,
-            unreadable: 0,
-            shared: false,
-            skipped_volume: false,
-            in_cloud: false,
-            cleanable: Some("cache"),
-        }));
-        assert_eq!(
-            headless_output(root, &tree, 1.25),
-            "disk_scan root=/fixture state=Complete allocated=4096 items=5 errors=1 wall_seconds=1.250000 cloud_items=2 retained_rows=7 coverage=full"
-        );
-        tree.coverage_complete = false;
-        assert!(headless_output(root, &tree, 0.0).ends_with("coverage=incomplete"));
+    fn headless_with_scans_requested_path_and_writes_report() {
+        let home = tests::Scratch::new();
+        fs::write(home.0.join("data"), b"file contents").unwrap();
+        let args = vec![
+            "gtop".into(),
+            "--disk-scan".into(),
+            home.0.as_os_str().to_owned(),
+        ];
+        let mut output = Vec::new();
+        let outcome = headless_with(args, &mut output).unwrap();
+        let line = String::from_utf8(output).unwrap();
+        assert_eq!(outcome, HeadlessOutcome::Complete);
+        assert!(line.starts_with(&format!(
+            "disk_scan root={} state=Complete ",
+            home.0.display()
+        )));
+        assert!(line.contains(" items=1 "));
+        assert!(line.ends_with(" coverage=full\n"));
     }
 
     #[test]
-    fn headless_is_false_for_the_test_process_arguments() {
+    fn headless_with_reports_incomplete_scan_status() {
+        let home = tests::Scratch::new();
+        let missing = home.0.join("missing");
+        let args = vec![
+            "gtop".into(),
+            "--disk-scan".into(),
+            missing.into_os_string(),
+        ];
+        let mut output = Vec::new();
+        let outcome = headless_with(args, &mut output).unwrap();
+        assert_eq!(outcome, HeadlessOutcome::Incomplete);
+        assert!(String::from_utf8(output).unwrap().contains("state=Failed"));
+    }
+
+    #[test]
+    fn headless_wrapper_returns_true_when_scan_command_is_handled() {
+        let home = tests::Scratch::new();
+        fs::write(home.0.join("data"), b"file contents").unwrap();
+        HEADLESS_TEST_ARGS.with(|args| {
+            *args.borrow_mut() = Some(vec![
+                "gtop".into(),
+                "--disk-scan".into(),
+                home.0.as_os_str().to_owned(),
+            ]);
+        });
+        assert!(headless());
+    }
+
+    #[test]
+    fn headless_wrapper_returns_false_without_scan_command() {
         assert!(!headless());
     }
 
