@@ -20,7 +20,7 @@ use std::{
     time::Instant,
 };
 
-mod treemap;
+pub(crate) mod treemap;
 
 #[derive(Default)]
 enum Retention {
@@ -240,6 +240,7 @@ impl Disk {
             return;
         }
         self.folder = None;
+        self.map = Default::default();
         self.invalidate_proposal();
         if self.open {
             self.start_over();
@@ -1367,11 +1368,11 @@ impl Monitor {
             assert!(start.elapsed() < std::time::Duration::from_secs(10));
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        disk.selected = 126;
+        disk.select_map_entry_for_test(95);
         self.disk = Some(disk);
     }
     pub(super) fn disk_selected_for_test(&self) -> usize {
-        self.disk.as_ref().unwrap().selected
+        self.disk.as_ref().unwrap().selected_map_entry_for_test()
     }
     pub(super) fn prepare_disk_draw_benchmark(&mut self) {
         let disk = Disk::new(false);
@@ -1706,11 +1707,17 @@ mod tests {
         let mut cloud = folder.rows[0].clone();
         cloud.path = home.join("missing-cloud-item");
         cloud.in_cloud = true;
+        let hierarchy = Arc::make_mut(folder.hierarchy.as_mut().unwrap());
+        let node = &mut hierarchy.children[0];
+        node.name = "missing-cloud-item".into();
+        node.raw_name = None;
+        node.in_cloud = true;
         folder.rows[0] = cloud;
         disk.folder = Some(folder);
         let (sender, receiver) = mpsc::sync_channel(1);
         disk.sender = sender;
 
+        assert!(disk.key("down"));
         assert!(disk.key("x"));
 
         assert!(matches!(
@@ -2038,12 +2045,14 @@ mod tests {
         let mut disk = Disk::with_home(home.clone());
         let folder = receive(&mut disk, ScanState::Complete);
         let row = folder.rows[0].clone();
+        let other = folder.rows[1].path.clone();
         disk.folder = Some(folder);
+        disk.key("down");
         disk.request_trash(&row);
         let (generation, proposal_id, result) = receive_proposal(&disk);
         disk.key("down");
         assert!(!disk.apply_proposal(generation, proposal_id, result));
-        assert_eq!(disk.selected, 1);
+        assert_eq!(disk.map_row().unwrap().path, other);
         assert!(disk.confirmation.is_none());
         assert!(!disk.sending);
         drop(disk);

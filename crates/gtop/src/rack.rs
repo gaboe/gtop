@@ -2521,7 +2521,7 @@ impl Monitor {
                             ("B", "memory"),
                             ("SPACE", "pause"),
                             ("X", "kill"),
-                            ("D", "disk"),
+                            ("D", "treemap"),
                             ("TAB", "history"),
                             ("T", "palette"),
                             ("R", "refresh"),

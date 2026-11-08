@@ -133,12 +133,29 @@ fn node_path(root: &Node, base: &Path, crumbs: &[usize]) -> Option<PathBuf> {
 }
 
 impl Disk {
+    #[cfg(test)]
+    pub(super) fn select_map_entry_for_test(&mut self, index: usize) {
+        let root = self.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+        let kind = self.map.entries(root)[index].kind.clone();
+        self.map_select(kind);
+    }
+
+    #[cfg(test)]
+    pub(super) fn selected_map_entry_for_test(&self) -> usize {
+        let root = self.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+        self.map
+            .entries(root)
+            .iter()
+            .position(|entry| Some(&entry.kind) == self.map.selected.as_ref())
+            .unwrap()
+    }
+
     fn map_select(&mut self, kind: TileKind) {
         self.invalidate_proposal();
         self.map.selected = Some(kind);
     }
 
-    fn map_row(&self) -> Option<disk_scan::Row> {
+    pub(super) fn map_row(&self) -> Option<disk_scan::Row> {
         let folder = self.folder.as_ref()?;
         let root = folder.hierarchy.as_ref()?;
         let TileKind::Node { crumbs } = self.map.selected.as_ref()? else {
@@ -322,7 +339,11 @@ impl Monitor {
                             window.paint_quad(quad(
                                 rect,
                                 Corners::default(),
-                                rgb(t.base.plate),
+                                rgb(if selected.as_ref() == Some(&tile.kind) {
+                                    t.selection
+                                } else {
+                                    t.base.plate
+                                }),
                                 Edges::all(px(1.)),
                                 rgb(edge),
                                 BorderStyle::Solid,
@@ -346,8 +367,25 @@ impl Monitor {
                                 bounds.origin + point(px(band.x), px(band.y)),
                                 size(px(band.w), px(band.h)),
                             );
+                            let minimum_height = if tile.header.is_some() { 12. } else { 16. };
+                            if mask.size.width < px(44.) || mask.size.height < px(minimum_height) {
+                                continue;
+                            }
+                            let size_line = tile.header.map(|_| {
+                                window.text_system().shape_line(
+                                    size_text.clone().into(),
+                                    px(11.),
+                                    &[TextRun {
+                                        len: size_text.len(),
+                                        font: font("JetBrains Mono"),
+                                        color: rgb(t.base.silk).into(),
+                                        ..Default::default()
+                                    }],
+                                    None,
+                                )
+                            });
                             let label = if tile.header.is_some() {
-                                format!("{name}  {size_text}")
+                                name
                             } else {
                                 format!("{name} {size_text}")
                             };
@@ -362,8 +400,13 @@ impl Monitor {
                                 }],
                                 None,
                             );
+                            let mut name_mask = mask;
+                            if let Some(line) = &size_line {
+                                name_mask.size.width =
+                                    (mask.size.width - line.width - px(12.)).max(px(0.));
+                            }
                             window.with_content_mask(
-                                Some(ContentMask { bounds: mask }),
+                                Some(ContentMask { bounds: name_mask }),
                                 |window| {
                                     let _ = line.paint(
                                         mask.origin + point(px(4.), px(1.)),
@@ -375,6 +418,24 @@ impl Monitor {
                                     );
                                 },
                             );
+                            if let Some(line) = size_line {
+                                window.with_content_mask(
+                                    Some(ContentMask { bounds: mask }),
+                                    |window| {
+                                        let _ = line.paint(
+                                            point(
+                                                mask.right() - line.width - px(4.),
+                                                mask.top() + px(1.),
+                                            ),
+                                            px(17.),
+                                            TextAlign::Left,
+                                            None,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                );
+                            }
                         }
                         // The selection edge stays visible over descendants.
                         if let Some(tile) = paint_frame
@@ -582,6 +643,11 @@ impl Monitor {
 }
 
 #[cfg(all(test, target_os = "macos"))]
+pub(crate) fn capture_test_build(output: PathBuf) {
+    tests::capture(output);
+}
+
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use std::prelude::v1::test;
@@ -663,6 +729,38 @@ mod tests {
         crate::theme::init(cx);
     }
 
+    #[test]
+    fn map_selection_uses_raw_names_and_observed_identity() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut disk = snapshot_disk();
+        let folder = disk.folder.as_mut().unwrap();
+        let root = Arc::make_mut(folder.hierarchy.as_mut().unwrap());
+        for (index, byte) in [0xff, 0xfe].into_iter().enumerate() {
+            let raw = std::ffi::OsString::from_vec(vec![b'f', byte]);
+            let node = &mut root.children[index];
+            node.name = raw.to_string_lossy().into_owned().into();
+            node.raw_name = Some(raw.into_boxed_os_str());
+            node.inode = Some((42, std::num::NonZeroU64::new(index as u64 + 10).unwrap()));
+        }
+        for (index, byte) in [0xff, 0xfe].into_iter().enumerate() {
+            disk.map_select(TileKind::Node {
+                crumbs: vec![index],
+            });
+            let row = disk.map_row().unwrap();
+            assert_eq!(
+                row.path,
+                Path::new("/Users/demo").join(std::ffi::OsString::from_vec(vec![b'f', byte]))
+            );
+            assert_eq!(
+                row.identity,
+                disk_scan::FileId {
+                    device: 42,
+                    inode: index as u64 + 10
+                }
+            );
+        }
+    }
+
     #[gpui::test]
     async fn treemap_real_click_navigation_other_and_immediate_focus(cx: &mut TestAppContext) {
         cx.update(init);
@@ -676,6 +774,10 @@ mod tests {
         });
         visual.simulate_resize(size(px(1480.), px(930.)));
         visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            visual.debug_bounds("memory-window").is_none(),
+            "Treemap must use the whole window without the system tower"
+        );
         let (position, kind, path) = monitor.read_with(visual, |monitor, _| {
             let disk = monitor.disk.as_ref().unwrap();
             let folder = disk.folder.as_ref().unwrap();
@@ -687,6 +789,42 @@ mod tests {
             let band = tile.header.unwrap();
             (frame.origin + point(px(band.x + band.w / 2.), px(band.y + band.h / 2.)), tile.kind.clone(),
                 node_path(root, &folder.path, tile.crumbs()).unwrap())
+        });
+        let (leaf_position, leaf_kind) = monitor.read_with(visual, |monitor, _| {
+            let frame = monitor.disk.as_ref().unwrap().map.frame.borrow();
+            let leaf = frame
+                .tiles
+                .iter()
+                .find(|tile| tile.depth == 3 && tile.header.is_none())
+                .unwrap();
+            let position = frame.origin
+                + point(
+                    px(leaf.rect.x + leaf.rect.w / 2.),
+                    px(leaf.rect.y + leaf.rect.h / 2.),
+                );
+            assert_eq!(
+                treemap::hit(
+                    &frame.tiles,
+                    (position.x - frame.origin.x).as_f32(),
+                    (position.y - frame.origin.y).as_f32()
+                )
+                .unwrap()
+                .kind,
+                leaf.kind
+            );
+            (position, leaf.kind.clone())
+        });
+        visual.simulate_click(leaf_position, Modifiers::default());
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.update(|window, cx| window.simulate_mouse_move(position, cx));
+        monitor.read_with(visual, |monitor, _| {
+            assert_eq!(
+                monitor.disk.as_ref().unwrap().map.selected.as_ref(),
+                Some(&leaf_kind),
+                "hover must not change the selected action target"
+            );
         });
         visual.simulate_click(position, Modifiers::default());
         visual.update(|window, cx| {
@@ -768,6 +906,13 @@ mod tests {
             assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
         });
         assert!(!monitor.read_with(visual, |monitor, _| monitor.disk.as_ref().unwrap().open));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("memory-window").is_some());
+        visual.simulate_keystrokes("d");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        assert!(monitor.read_with(visual, |monitor, _| monitor.disk.as_ref().unwrap().open));
         monitor.update(visual, |monitor, _| monitor.disk = None);
     }
 
@@ -777,8 +922,11 @@ mod tests {
         let output = PathBuf::from(
             std::env::var_os("GTOP_TREEMAP_RENDER_DIR").expect("capture output directory"),
         );
+        capture(output);
+    }
+
+    pub(super) fn capture(output: PathBuf) {
         fs::create_dir_all(&output).unwrap();
-        let fixture = Fixture::new();
         let mut cx = HeadlessAppContext::with_platform(
             Arc::new(gpui_apple::AppleTextSystem::new()),
             Arc::new(gpui_kit_assets::Assets),
@@ -801,7 +949,7 @@ mod tests {
                 .unwrap();
         }
         for (width, height) in [(1480., 930.), (1200., 720.)] {
-            let mut disk = fixture.disk();
+            let mut disk = snapshot_disk();
             let index = disk
                 .folder
                 .as_ref()
@@ -835,6 +983,96 @@ mod tests {
                 .unwrap()
                 .save(output.join(format!("treemap-{width:.0}x{height:.0}.png")))
                 .unwrap();
+        }
+    }
+
+    fn snapshot_disk() -> Disk {
+        use gtop_disk::tree::{aggregate, NodeKind};
+        fn file(name: &str, bytes: u64) -> Node {
+            Node::entry(name, NodeKind::File, bytes)
+        }
+        fn dir(name: &str, children: Vec<Node>) -> Node {
+            let mut node = Node::directory(name);
+            node.children = children;
+            aggregate(&mut node, Metric::Bytes);
+            node
+        }
+        let mut unknown = dir("unknown", vec![file("observed", 32 << 10)]);
+        unknown.complete = false;
+        unknown.unreadable = 1;
+        let root = Arc::new(dir(
+            "Home",
+            vec![
+                dir(
+                    "projects",
+                    vec![dir(
+                        "gtop",
+                        vec![
+                            dir(
+                                "target",
+                                vec![file("binary", 2 << 20), file("symbols", 1 << 20)],
+                            ),
+                            file("equal-a", 128 << 10),
+                            file("equal-b", 128 << 10),
+                            file("zero", 0),
+                        ],
+                    )],
+                ),
+                dir(
+                    &"a-very-long-directory-name-".repeat(7),
+                    vec![file("document", 512 << 10)],
+                ),
+                dir(
+                    "tiny",
+                    (0..160)
+                        .map(|i| file(&format!("file-{i:03}"), 4096))
+                        .collect(),
+                ),
+                unknown,
+            ],
+        ));
+        let path = PathBuf::from("/Users/demo");
+        let folder = Folder {
+            hierarchy: Some(root.clone()),
+            root: path.clone(),
+            path: path.clone(),
+            state: ScanState::Complete,
+            allocated: root.bytes,
+            items: root.files + u64::from(root.dirs) - 1,
+            errors: 1,
+            rows: vec![],
+            cleanable: vec![],
+            page: 0,
+            pages: 1,
+            cached: false,
+            smaller_items: 0,
+            smaller_bytes: 0,
+            observed: std::time::SystemTime::now(),
+        };
+        let (sender, _) = mpsc::sync_channel(1);
+        Disk {
+            map: Default::default(),
+            open: true,
+            session: Some(ScanSession {
+                root: path.clone(),
+                generation: 1,
+                outcome: Some(ScanState::Complete),
+            }),
+            navigation: 0,
+            home: path,
+            sender,
+            mailbox: Arc::new(Mutex::new(Mailbox::default())),
+            events: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            foreground: Arc::new(AtomicBool::new(false)),
+            folder: Some(folder),
+            selected: 0,
+            confirmation: None,
+            proposal_id: 0,
+            sending: false,
+            scroll: ScrollHandle::new(),
+            row_children: Default::default(),
+            status: "Complete · observed sizes".into(),
         }
     }
 }

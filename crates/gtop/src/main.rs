@@ -968,6 +968,11 @@ impl Render for Monitor {
 actions!(gtop, [Quit, ToggleView, PreviousView]);
 
 fn main() {
+    #[cfg(all(test, target_os = "macos"))]
+    if let Some(output) = std::env::var_os("GTOP_TREEMAP_SHOTS") {
+        disk::treemap::capture_test_build(output.into());
+        return;
+    }
     if disk_scan::headless() {
         return;
     }

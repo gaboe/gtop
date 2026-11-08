@@ -1199,9 +1199,9 @@ fn disk_keyboard_scroll_reveals_selected_row_after_summary() {
         w.draw(cx).clear(cx);
     })
     .unwrap();
-    assert_eq!(cx.update(|cx| m.read(cx).disk_selected_for_test()), 127);
-    let body = visual.debug_bounds("disk-body").unwrap();
-    let selected = visual.debug_bounds("disk-row-127").unwrap();
+    assert_eq!(cx.update(|cx| m.read(cx).disk_selected_for_test()), 96);
+    let body = visual.debug_bounds("map-folder-list").unwrap();
+    let selected = visual.debug_bounds("map-entry-other").unwrap();
     println!("selected={selected:?} viewport={body:?}");
     assert!(selected.top() >= body.top());
     assert!(selected.bottom() <= body.bottom());
