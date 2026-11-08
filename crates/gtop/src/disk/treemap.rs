@@ -11,7 +11,12 @@ pub(super) struct MapState {
     hovered: Option<TileKind>,
     frame: Rc<RefCell<MapFrame>>,
     list_scroll: UniformListScrollHandle,
-    listing: RefCell<Option<(Arc<Node>, Rc<Vec<Entry>>)>>,
+    listing: RefCell<Option<Listing>>,
+}
+
+struct Listing {
+    root: Arc<Node>,
+    entries: Rc<Vec<Entry>>,
 }
 
 #[derive(Default)]
@@ -25,13 +30,16 @@ struct MapFrame {
 impl MapState {
     fn entries(&self, root: &Arc<Node>) -> Rc<Vec<Entry>> {
         let mut listing = self.listing.borrow_mut();
-        if let Some((source, entries)) = &*listing {
-            if Arc::ptr_eq(source, root) {
-                return entries.clone();
+        if let Some(cached) = &*listing {
+            if Arc::ptr_eq(&cached.root, root) {
+                return cached.entries.clone();
             }
         }
         let entries = Rc::new(entries(root));
-        *listing = Some((root.clone(), entries.clone()));
+        *listing = Some(Listing {
+            root: root.clone(),
+            entries: entries.clone(),
+        });
         entries
     }
 }
@@ -50,7 +58,7 @@ fn entries(root: &Node) -> Vec<Entry> {
             .enumerate()
             .filter(|(_, child)| child.bytes > 0)
             .collect();
-        children.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
+        children.sort_by_key(|(_, child)| std::cmp::Reverse(child.bytes));
         let kept = children.len().min(LayoutOptions::default().max_children);
         for (index, child) in &children[..kept] {
             crumbs.push(*index);
@@ -180,7 +188,7 @@ impl Disk {
                     self.map_select(entry.kind.clone());
                     self.map
                         .list_scroll
-                        .scroll_to_item(next, ScrollStrategy::default());
+                        .scroll_to_item(next, ScrollStrategy::Nearest);
                 }
             }
             "enter" | "right" => {
@@ -505,9 +513,16 @@ impl Monitor {
                         let entry = &entries[index];
                         let kind = entry.kind.clone();
                         let active = selected.as_ref() == Some(&kind);
+                        let other = matches!(kind, TileKind::Others { .. });
                         div()
                             .id(("map-entry", index))
-                            .debug_selector(move || format!("map-entry-{index}"))
+                            .debug_selector(move || {
+                                if other {
+                                    "map-entry-other".into()
+                                } else {
+                                    format!("map-entry-{index}")
+                                }
+                            })
                             .role(Role::ListItem)
                             .aria_label(entry.label.clone())
                             .aria_selected(active)
@@ -734,9 +749,7 @@ mod tests {
         });
         visual.update(|window, cx| window.draw(cx).clear(cx));
         let list = visual.debug_bounds("map-folder-list").unwrap();
-        let other = visual
-            .debug_bounds(&format!("map-entry-{other_index}"))
-            .unwrap();
+        let other = visual.debug_bounds("map-entry-other").unwrap();
         assert!(other.top() >= list.top() && other.bottom() <= list.bottom());
         visual.simulate_click(other.center(), Modifiers::default());
         visual.update(|window, cx| {
