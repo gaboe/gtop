@@ -60,7 +60,22 @@ fn entries(root: &Node) -> Vec<Entry> {
             .collect();
         children.sort_by_key(|(_, child)| std::cmp::Reverse(child.bytes));
         let kept = children.len().min(LayoutOptions::default().max_children);
-        for (index, child) in &children[..kept] {
+        for (rank, (index, child)) in children.iter().enumerate() {
+            if rank == kept {
+                out.push(Entry {
+                    kind: TileKind::Others {
+                        crumbs: crumbs.clone(),
+                        count: children.len() - kept,
+                    },
+                    label: format!(
+                        "Other · {} items · {}",
+                        children.len() - kept,
+                        bytes(children[kept..].iter().map(|(_, node)| node.bytes).sum())
+                    ),
+                    depth: crumbs.len(),
+                });
+            }
+
             crumbs.push(*index);
             out.push(Entry {
                 kind: TileKind::Node {
@@ -69,24 +84,10 @@ fn entries(root: &Node) -> Vec<Entry> {
                 label: format!("{} · {}{}", child.name, bytes(child.bytes), coverage(child)),
                 depth: crumbs.len() - 1,
             });
-            if crumbs.len() < LayoutOptions::default().max_depth as usize {
+            if rank < kept && crumbs.len() < LayoutOptions::default().max_depth as usize {
                 visit(child, crumbs, out);
             }
             crumbs.pop();
-        }
-        if children.len() > kept {
-            out.push(Entry {
-                kind: TileKind::Others {
-                    crumbs: crumbs.clone(),
-                    count: children.len() - kept,
-                },
-                label: format!(
-                    "Other · {} items · {}",
-                    children.len() - kept,
-                    bytes(children[kept..].iter().map(|(_, node)| node.bytes).sum())
-                ),
-                depth: crumbs.len(),
-            });
         }
         for (index, child) in node
             .children
@@ -209,6 +210,24 @@ impl Disk {
                 }
             }
             "enter" | "right" => {
+                if let Some(selected @ TileKind::Others { .. }) = &self.map.selected {
+                    let entries = self.map.entries(&root);
+                    if let Some(next) = entries
+                        .iter()
+                        .position(|entry| &entry.kind == selected)
+                        .and_then(|index| {
+                            entries
+                                .get(index + 1)
+                                .map(|entry| (index + 1, entry.kind.clone()))
+                        })
+                    {
+                        self.map_select(next.1);
+                        self.map
+                            .list_scroll
+                            .scroll_to_item(next.0, ScrollStrategy::Nearest);
+                    }
+                    return true;
+                }
                 if let Some(row) = self
                     .map_row()
                     .filter(|row| row.directory && !row.in_cloud && !row.skipped_volume)
@@ -914,6 +933,161 @@ mod tests {
         });
         assert!(monitor.read_with(visual, |monitor, _| monitor.disk.as_ref().unwrap().open));
         monitor.update(visual, |monitor, _| monitor.disk = None);
+    }
+
+    #[gpui::test]
+    async fn treemap_other_members_remain_reachable(cx: &mut TestAppContext) {
+        cx.update(init);
+        for count in [97, 320] {
+            let fixture = Fixture(
+                std::env::temp_dir().join(format!("gtop-other-{}-{count}", std::process::id())),
+            );
+            fs::create_dir_all(&fixture.0).unwrap();
+            for i in 0..96 {
+                fs::write(fixture.0.join(format!("large-{i:03}")), [1; 8192]).unwrap();
+            }
+            fs::create_dir_all(fixture.0.join("omitted-dir")).unwrap();
+            fs::write(fixture.0.join("omitted-dir/inside"), [1; 4096]).unwrap();
+            for i in 97..count {
+                fs::write(fixture.0.join(format!("small-{i:03}")), [1; 4096]).unwrap();
+            }
+            let path = fixture.0.canonicalize().unwrap();
+            let mut disk = Disk::with_home(path.clone());
+            wait_folder(&mut disk, &path);
+            let mut children = disk
+                .folder
+                .as_ref()
+                .unwrap()
+                .hierarchy
+                .as_ref()
+                .unwrap()
+                .children
+                .iter()
+                .collect::<Vec<_>>();
+            children.sort_by_key(|child| std::cmp::Reverse(child.bytes));
+            let omitted = children[96..]
+                .iter()
+                .map(|node| path.join(node.filesystem_name()))
+                .collect::<Vec<_>>();
+            assert!(omitted.contains(&path.join("omitted-dir")));
+            let (monitor, visual) = cx.add_window_view(|window, cx| {
+                let mut monitor = crate::draw_benchmark::fixture(window, cx);
+                monitor.disk = Some(disk);
+                window.focus(&monitor.focus, cx);
+                monitor
+            });
+            visual.simulate_resize(size(px(1200.), px(720.)));
+            for _ in 0..97 {
+                visual.simulate_keystrokes("down");
+                visual.update(|window, cx| {
+                    assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                });
+            }
+            monitor.read_with(visual, |monitor, _| {
+                assert!(monitor.disk.as_ref().unwrap().map_row().is_none())
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let other = visual.debug_bounds("map-entry-other").unwrap();
+            visual.simulate_click(other.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            visual.simulate_keystrokes("enter");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            for (index, expected) in omitted.iter().enumerate() {
+                if index > 0 {
+                    visual.simulate_keystrokes("down");
+                    visual.update(|window, cx| {
+                        assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                    });
+                }
+                monitor.read_with(visual, |monitor, _| {
+                    assert_eq!(
+                        monitor.disk.as_ref().unwrap().map_row().map(|row| row.path),
+                        Some(expected.clone()),
+                        "child {} must be reachable",
+                        index + 97
+                    )
+                });
+            }
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let list = visual.debug_bounds("map-folder-list").unwrap();
+            let last = visual
+                .debug_bounds(if count == 97 {
+                    "map-entry-97"
+                } else {
+                    "map-entry-320"
+                })
+                .unwrap();
+            assert!(last.top() >= list.top() && last.bottom() <= list.bottom());
+            for _ in 1..omitted.len() {
+                visual.simulate_keystrokes("up");
+            }
+            let directory_index = omitted
+                .iter()
+                .position(|item| item == &path.join("omitted-dir"))
+                .unwrap();
+            for _ in 0..directory_index {
+                visual.simulate_keystrokes("down");
+            }
+            visual.simulate_keystrokes("enter");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            monitor.update(visual, |monitor, _| {
+                wait_folder(monitor.disk.as_mut().unwrap(), &path.join("omitted-dir"))
+            });
+            visual.simulate_keystrokes("backspace");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            monitor.update(visual, |monitor, _| {
+                wait_folder(monitor.disk.as_mut().unwrap(), &path)
+            });
+            if count > 97 {
+                for _ in 0..97 {
+                    visual.simulate_keystrokes("down");
+                }
+                visual.simulate_keystrokes("enter");
+                visual.update(|window, cx| {
+                    assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                });
+                let file_index = omitted
+                    .iter()
+                    .position(|item| {
+                        item.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("small-")
+                    })
+                    .unwrap();
+                for _ in 0..file_index {
+                    visual.simulate_keystrokes("down");
+                }
+                visual.simulate_keystrokes("x");
+                visual.update(|window, cx| {
+                    assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                });
+                monitor.update(visual, |monitor, _| {
+                    let disk = monitor.disk.as_mut().unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while disk.confirmation.is_none() && Instant::now() < deadline {
+                        disk.consume_mailbox();
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert_eq!(
+                        disk.confirmation.as_ref().map(|proposal| &proposal.path),
+                        Some(&omitted[file_index]),
+                        "{}",
+                        disk.status
+                    );
+                });
+                assert!(omitted[file_index].exists());
+            }
+            monitor.update(visual, |monitor, _| monitor.disk = None);
+        }
     }
 
     #[test]
