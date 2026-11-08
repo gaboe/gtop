@@ -125,7 +125,7 @@ pub struct LayoutOptions {
 impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
-            max_depth: 3,
+            max_depth: 4,
             padding: 1.0,
             min_tile: 5.0,
             max_children: 96,
@@ -679,5 +679,85 @@ mod tests {
         };
         let ratio = area_of("src") / area_of("unit_test.txt");
         assert!((ratio - 3.0).abs() < 0.05, "ratio {ratio}");
+    }
+
+    #[test]
+    fn nested_fixture_has_finite_contained_disjoint_tiles_and_reachable_headers() {
+        let mut unknown = dir("unknown", vec![file("observed", 400)]);
+        unknown.complete = false;
+        unknown.unreadable = 1;
+        let root = dir(
+            "fixture",
+            vec![
+                dir(
+                    "projects",
+                    vec![dir(
+                        "gtop",
+                        vec![
+                            dir("target", vec![file("binary", 7000), file("symbols", 3000)]),
+                            file("equal-a", 2000),
+                            file("equal-b", 2000),
+                            file("zero", 0),
+                        ],
+                    )],
+                ),
+                dir(&"long/path/".repeat(60), vec![file("long-name", 5000)]),
+                unknown,
+                dir(
+                    "tiny",
+                    (0..1000).map(|i| file(&format!("tiny-{i}"), 10)).collect(),
+                ),
+            ],
+        );
+        for (width, height) in [(1100., 740.), (820., 530.)] {
+            let area = Rect::new(0., 0., width, height);
+            let tiles = layout(&root, &[], area, Metric::Bytes, &LayoutOptions::default());
+            assert!(tiles.iter().any(|tile| tile.depth == 3));
+            assert!(
+                tiles
+                    .iter()
+                    .any(|tile| matches!(tile.kind, TileKind::Others { count: 904, .. }))
+            );
+            for (i, tile) in tiles.iter().enumerate() {
+                let r = tile.rect;
+                assert!([r.x, r.y, r.w, r.h].into_iter().all(f32::is_finite));
+                assert!(r.w >= 0. && r.h >= 0. && r.x >= 0. && r.y >= 0.);
+                assert!(r.right() <= width + 0.01 && r.bottom() <= height + 0.01);
+                if let Some(header) = tile.header {
+                    assert_eq!(
+                        hit(&tiles, header.x + header.w / 2., header.y + header.h / 2.)
+                            .unwrap()
+                            .kind,
+                        tile.kind
+                    );
+                }
+                for other in &tiles[i + 1..] {
+                    let descendant =
+                        other.depth > tile.depth && other.crumbs().starts_with(tile.crumbs());
+                    if descendant {
+                        assert!(other.rect.x >= r.x && other.rect.right() <= r.right() + 0.01);
+                        assert!(other.rect.y >= tile.header.unwrap().bottom());
+                        assert!(other.rect.bottom() <= r.bottom() + 0.01);
+                    } else {
+                        let intersection = (r.right().min(other.rect.right())
+                            - r.x.max(other.rect.x))
+                        .max(0.)
+                            * (r.bottom().min(other.rect.bottom()) - r.y.max(other.rect.y)).max(0.);
+                        assert!(
+                            intersection < 0.1,
+                            "unrelated tiles overlap: {tile:?}, {other:?}"
+                        );
+                    }
+                }
+            }
+            let painted_area: f32 = tiles
+                .iter()
+                .map(|tile| tile.header.unwrap_or(tile.rect).area())
+                .sum();
+            assert!(
+                painted_area <= area.area() + 0.1,
+                "headers and terminal tiles must not count the same area twice"
+            );
+        }
     }
 }

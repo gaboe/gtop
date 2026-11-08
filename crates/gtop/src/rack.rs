@@ -2600,9 +2600,11 @@ impl Monitor {
             .bg(rgb(t.base.ground))
             .text_color(rgb(t.base.silk))
             .font_family("JetBrains Mono")
-            .text_size(px(12.))
-            .child(self.tower(&t, cx))
-            .child(right);
+            .text_size(px(12.));
+        if self.disk.as_ref().is_some_and(|disk| disk.open) {
+            return root.child(self.treemap_workspace(window, cx));
+        }
+        root = root.child(self.tower(&t, cx)).child(right);
         if self.settings_open {
             root = root.child(self.palette_panel(&t, window, cx));
         } else if self.moment.is_some() {

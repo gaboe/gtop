@@ -20,6 +20,8 @@ use std::{
     time::Instant,
 };
 
+mod treemap;
+
 #[derive(Default)]
 enum Retention {
     #[default]
@@ -122,6 +124,7 @@ struct ScanSession {
 }
 
 pub(super) struct Disk {
+    map: treemap::MapState,
     pub open: bool,
     session: Option<ScanSession>,
     navigation: u64,
@@ -170,6 +173,7 @@ impl Disk {
             .spawn(move || worker(receiver, output, worker_home, worker_foreground))
             .expect("start disk worker");
         let mut disk = Self {
+            map: Default::default(),
             open: true,
             session: None,
             navigation: 0,
@@ -268,6 +272,16 @@ impl Disk {
         if let Some((_, _, folder)) =
             folder.filter(|(g, n, _)| *g == self.generation() && *n == self.navigation)
         {
+            let same_hierarchy = self.folder.as_ref().is_some_and(|previous| {
+                match (&previous.hierarchy, &folder.hierarchy) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                }
+            });
+            if !same_hierarchy {
+                self.map = Default::default();
+            }
             self.selected = self.selected.min(folder.rows.len().saturating_sub(1));
             self.folder = Some(folder);
             return true;
@@ -336,6 +350,7 @@ impl Disk {
         });
         self.invalidate_proposal();
         self.navigation = 0;
+        self.map = Default::default();
         self.selected = 0;
         self.folder = None;
     }
@@ -360,6 +375,7 @@ impl Disk {
             return;
         }
         self.invalidate_proposal();
+        self.map = Default::default();
         self.selected = 0;
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = token;
@@ -463,12 +479,19 @@ impl Disk {
         if !self.open {
             return false;
         }
+        if key == "d" {
+            self.close();
+            return true;
+        }
         if self.confirmation.is_some() {
             match key {
                 "y" | "enter" => self.confirm(self.proposal_id),
                 "n" | "escape" => self.confirmation = None,
                 _ => {}
             }
+            return true;
+        }
+        if self.map_key(key) {
             return true;
         }
         match key {
@@ -964,7 +987,13 @@ impl Monitor {
         let disk = self.disk.as_ref().filter(|d| d.open)?;
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
         let mut body = div().flex().flex_col().gap(px(6.)).px(px(12.)).py(px(10.));
-        if let Some(folder) = &disk.folder {
+        if disk
+            .folder
+            .as_ref()
+            .is_some_and(|folder| folder.hierarchy.is_some())
+        {
+            body = self.treemap_inspector(cx);
+        } else if let Some(folder) = &disk.folder {
             let state = match &folder.state {
                 ScanState::Scanning => "Scanning · partial sizes".into(),
                 ScanState::Complete => {
@@ -1303,9 +1332,7 @@ impl Monitor {
                         this.panel_resize.finish();
                         cx.notify();
                     })),
-            )
-            .child(self.panel_resize_handle(cx))
-            .child(self.panel_resize_events(cx));
+            );
         Some(panel)
     }
 }

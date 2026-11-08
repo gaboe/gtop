@@ -50,6 +50,7 @@ pub struct Node {
 }
 #[derive(Debug)]
 pub struct Tree {
+    hierarchy: Option<std::sync::Arc<gtop_disk::tree::Node>>,
     pub nodes: Vec<Node>,
     pub root: PathBuf,
     pub state: ScanState,
@@ -75,6 +76,7 @@ pub struct Row {
 }
 #[derive(Clone, Debug)]
 pub struct Folder {
+    pub hierarchy: Option<std::sync::Arc<gtop_disk::tree::Node>>,
     pub root: PathBuf,
     pub path: PathBuf,
     pub state: ScanState,
@@ -110,6 +112,7 @@ impl Tree {
             cleanable: None,
         };
         Self {
+            hierarchy: None,
             nodes: vec![node],
             root: root.into(),
             state: ScanState::Scanning,
@@ -246,6 +249,7 @@ impl Tree {
             .map(|&id| self.nodes[id].allocated)
             .sum();
         Folder {
+            hierarchy: (id == 0).then(|| self.hierarchy.clone()).flatten(),
             root: self.root.clone(),
             path: self.path(id),
             state: self.state.clone(),

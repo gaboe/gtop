@@ -123,7 +123,7 @@ fn fixed_snapshot() -> Snapshot {
 }
 
 #[cfg(target_os = "macos")]
-fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
+pub(super) fn fixture(window: &mut Window, cx: &mut Context<Monitor>) -> Monitor {
     fixture_from_snapshot(fixed_snapshot(), window, cx)
 }
 

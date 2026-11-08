@@ -99,6 +99,7 @@ fn coordinate(
                         Ok(node) => {
                             let observed = tree.observed;
                             tree = project(&root, home, &node);
+                            tree.hierarchy = Some(Arc::new(node));
                             tree.observed = observed;
                             tree.state = if cancel.load(Ordering::Relaxed) || snapshot.cancelled {
                                 ScanState::Cancelled
