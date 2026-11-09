@@ -483,73 +483,125 @@ impl Disk {
     pub(super) fn map_visit(&mut self, path: PathBuf) {
         self.map.history.visit(path);
     }
-    pub(super) fn map_controls_key(&mut self, key: &str) -> bool {
-        if (self.map.controls.disclosure.is_some() || !self.map.filtering) && self.controls_key(key)
-        {
-            return true;
+    pub(super) fn release_map_keyboard(&mut self) {
+        self.map.controls.disclosure = None;
+        self.map.siblings = None;
+        self.map.filtering = false;
+        self.map.leave_findings_navigation();
+    }
+
+    // Filter text and Enter survive a pointer-opened disclosure. Esc dismisses
+    // that disclosure first. All other contexts have exactly one key owner.
+    pub(super) fn keyboard_owner(&self, key: &str) -> KeyboardOwner {
+        if self.confirmation.is_some() {
+            KeyboardOwner::Confirmation
+        } else if self.map.filtering && key != "escape" {
+            KeyboardOwner::Filter
+        } else if self.map.controls.disclosure.is_some() {
+            KeyboardOwner::Disclosure
+        } else if self.map.siblings.is_some() {
+            KeyboardOwner::Siblings
+        } else if self.map.filtering {
+            KeyboardOwner::Filter
+        } else if self.map.finding_cursor.is_some() {
+            KeyboardOwner::Findings
+        } else {
+            KeyboardOwner::Map
         }
-        if !self.map.filtering
-            && self.map.finding_cursor.is_some()
-            && matches!(
-                key,
-                "up" | "k" | "down" | "j" | "tab" | "shift-tab" | "enter" | "escape"
-            )
-        {
-            return self.map_key(key);
-        }
-        self.map.finding_cursor = None;
-        if self.map.filtering {
-            match key {
-                "escape" => {
-                    self.map.filter.clear();
-                    self.map.committed_filter.clear();
-                    self.map.filtering = false;
-                    self.map.applied = false;
-                }
-                "enter" => {
-                    self.map.filtering = false;
-                    self.map.applied = true;
-                    self.map.committed_filter = self.map.filter.clone();
-                    *self.map.listing.borrow_mut() = None;
-                }
-                "backspace" => {
-                    self.map.filter.pop();
-                }
-                "space" => self.map.filter.push(' '),
-                key if key.chars().count() == 1 => self.map.filter.push_str(key),
-                _ => {}
-            }
-            return true;
-        }
-        if let Some(path) = self.map.siblings.clone() {
-            let siblings = self.map_siblings(&path);
-            match key {
-                "escape" => self.map.siblings = None,
-                "down" | "j" | "tab" | "up" | "k" | "shift-tab" => {
-                    self.map.sibling_index = if matches!(key, "down" | "j" | "tab") {
-                        (self.map.sibling_index + 1).min(siblings.len().saturating_sub(1))
-                    } else {
-                        self.map.sibling_index.saturating_sub(1)
-                    };
-                    self.map
-                        .sibling_scroll
-                        .scroll_to_item(self.map.sibling_index, ScrollStrategy::Nearest);
-                }
-                "enter" => {
-                    if let Some(path) = siblings.get(self.map.sibling_index) {
-                        self.enter(path.clone());
+    }
+
+    pub(super) fn toggle_siblings(&mut self, path: &Path) {
+        self.invalidate_proposal();
+        self.map.controls.disclosure = None;
+        self.map.filtering = false;
+        self.map.leave_findings_navigation();
+        self.map.sibling_index = 0;
+        self.map.siblings = if self.map.siblings.as_deref() == Some(path) {
+            None
+        } else {
+            Some(path.to_path_buf())
+        };
+    }
+
+    pub(super) fn map_controls_key(&mut self, owner: KeyboardOwner, key: &str) -> bool {
+        match owner {
+            KeyboardOwner::Confirmation => unreachable!("Disk::key owns cleanup confirmation"),
+            KeyboardOwner::Disclosure => self.controls_key(key),
+            KeyboardOwner::Filter => {
+                self.map.finding_cursor = None;
+                match key {
+                    "escape" => {
+                        self.map.filter.clear();
+                        self.map.committed_filter.clear();
+                        self.map.filtering = false;
+                        self.map.applied = false;
                     }
+                    "enter" => {
+                        self.map.controls.disclosure = None;
+                        self.map.filtering = false;
+                        self.map.applied = true;
+                        self.map.committed_filter = self.map.filter.clone();
+                        *self.map.listing.borrow_mut() = None;
+                    }
+                    "backspace" => {
+                        self.map.filter.pop();
+                    }
+                    "space" => self.map.filter.push(' '),
+                    key if key.chars().count() == 1 => self.map.filter.push_str(key),
+                    _ => {}
                 }
-                _ => return self.map_command(key),
+                true
             }
-            return true;
+            KeyboardOwner::Siblings => {
+                if matches!(key, "s" | "v" | "?") {
+                    return self.controls_key(key);
+                }
+                if key == "/" {
+                    return self.map_command(key);
+                }
+                let path = self.map.siblings.clone().unwrap();
+                let siblings = self.map_siblings(&path);
+                match key {
+                    "escape" => self.map.siblings = None,
+                    "down" | "j" | "tab" | "up" | "k" | "shift-tab" => {
+                        self.map.sibling_index = if matches!(key, "down" | "j" | "tab") {
+                            (self.map.sibling_index + 1).min(siblings.len().saturating_sub(1))
+                        } else {
+                            self.map.sibling_index.saturating_sub(1)
+                        };
+                        self.map
+                            .sibling_scroll
+                            .scroll_to_item(self.map.sibling_index, ScrollStrategy::Nearest);
+                    }
+                    "enter" => {
+                        if let Some(path) = siblings.get(self.map.sibling_index) {
+                            self.enter(path.clone());
+                        }
+                    }
+                    _ => {}
+                }
+                true
+            }
+            KeyboardOwner::Findings
+                if matches!(
+                    key,
+                    "up" | "k" | "down" | "j" | "tab" | "shift-tab" | "enter" | "escape"
+                ) =>
+            {
+                self.map_key(key)
+            }
+            KeyboardOwner::Findings | KeyboardOwner::Map => {
+                self.map.finding_cursor = None;
+                self.controls_key(key) || self.map_command(key)
+            }
         }
-        self.map_command(key)
     }
 
     fn map_command(&mut self, key: &str) -> bool {
         match key {
             "/" => {
+                self.invalidate_proposal();
+                self.map.siblings = None;
                 self.map.filtering = true;
             }
             "m" => self.set_map_mode(self.map.mode.next()),
@@ -709,7 +761,7 @@ impl Disk {
     }
 
     fn map_select(&mut self, kind: TileKind) {
-        self.map.finding_cursor = None;
+        self.release_map_keyboard();
         self.invalidate_proposal();
         self.map.selected = Some(kind);
         self.map.pending_selection = None;
@@ -754,6 +806,7 @@ impl Disk {
             .findings(&root, self.folder.as_ref().unwrap().observed);
         let locations = finding_locations(&findings);
         if key == "w" && !locations.is_empty() {
+            self.invalidate_proposal();
             self.map.finding_cursor = Some(0);
             self.map
                 .finding_scroll
@@ -1325,13 +1378,7 @@ impl Monitor {
                                 .rack(&t)
                                 .small()
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    let map = &mut this.disk.as_mut().unwrap().map;
-                                    map.sibling_index = 0;
-                                    map.siblings = if map.siblings.as_ref() == Some(&sibling_path) {
-                                        None
-                                    } else {
-                                        Some(sibling_path.clone())
-                                    };
+                                    this.disk.as_mut().unwrap().toggle_siblings(&sibling_path);
                                     window.focus(&this.focus, cx);
                                     cx.notify();
                                 })),
@@ -1757,8 +1804,8 @@ impl Monitor {
                         .role(Role::List)
                         .flex()
                         .flex_col()
-                        .flex_1()
-                        .min_h(px(76.))
+                        .h(px(76.))
+                        .flex_shrink_0()
                         .child(finding_list),
                 )
             })
@@ -2724,11 +2771,11 @@ mod tests {
     #[test]
     fn fix1_reopening_filter_keeps_preview_geometry() {
         let mut disk = snapshot_disk();
-        disk.map_controls_key("/");
-        disk.map_controls_key("t");
-        disk.map_controls_key("enter");
-        disk.map_controls_key("/");
-        disk.map_controls_key("z");
+        disk.key("/");
+        disk.key("t");
+        disk.key("enter");
+        disk.key("/");
+        disk.key("z");
         assert!(disk.map.filtering);
         assert!(disk.map.applied);
         assert_eq!(disk.map.committed_filter, "t");
@@ -4500,18 +4547,8 @@ mod tests {
             (1200., 720., "scanning"),
         ] {
             let mut disk = insights_snapshot_disk();
-            if state == "keys" {
-                disk.controls_key("?");
-            }
-            if state == "source" {
-                disk.controls_key("s");
-            }
-            if state == "view" {
-                disk.controls_key("v");
-            }
             if state == "scanning" {
                 disk.session.as_mut().unwrap().activity = ScanActivity::Running;
-                disk.session.as_mut().unwrap().outcome = None;
                 disk.folder.as_mut().unwrap().state = ScanState::Scanning;
             }
             let folder = disk.folder.as_ref().unwrap();
@@ -4523,6 +4560,18 @@ mod tests {
                 .find(|finding| !finding.children.is_empty())
                 .unwrap();
             disk.inspect_finding(stale.locations()[0].clone());
+            match state {
+                "keys" => {
+                    disk.controls_key("?");
+                }
+                "source" => {
+                    disk.controls_key("s");
+                }
+                "view" => {
+                    disk.controls_key("v");
+                }
+                _ => {}
+            }
             let handle = cx
                 .open_window(size(px(width), px(height)), |window, cx| {
                     let monitor = cx.new(|cx| {
@@ -4657,13 +4706,116 @@ mod tests {
 
     const AGE_NOW: i64 = 1_800_000_000;
 
-    fn click_controls_fix1(visual: &mut VisualTestContext, monitor: &Entity<Monitor>, selector: &'static str) {
+    fn click_controls_fix1(
+        visual: &mut VisualTestContext,
+        monitor: &Entity<Monitor>,
+        selector: &'static str,
+    ) {
         visual.update(|window, cx| window.draw(cx).clear(cx));
         let bounds = visual.debug_bounds(selector).expect(selector);
         visual.simulate_click(bounds.center(), Modifiers::default());
         visual.update(|window, cx| {
             assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
         });
+    }
+
+    fn key_controls_fix1(visual: &mut VisualTestContext, monitor: &Entity<Monitor>, key: &str) {
+        visual.simulate_keystrokes(key);
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+    }
+
+    #[gpui::test]
+    async fn controls_v2_fix1_owner_transitions_and_escape(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = insights_snapshot_disk();
+        disk.remember_map_root(&disk.folder.clone().unwrap());
+        let (sender, commands) = mpsc::sync_channel(32);
+        disk.sender = sender;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        macro_rules! owner {
+            ($expected:expr) => {
+                monitor.read_with(visual, |monitor, _| {
+                    assert_eq!(
+                        monitor.disk.as_ref().unwrap().keyboard_owner("down"),
+                        $expected
+                    );
+                })
+            };
+        }
+        owner!(KeyboardOwner::Map);
+        key_controls_fix1(visual, &monitor, "w");
+        owner!(KeyboardOwner::Findings);
+        key_controls_fix1(visual, &monitor, "down");
+        monitor.read_with(visual, |monitor, _| {
+            assert_eq!(monitor.disk.as_ref().unwrap().map.finding_cursor, Some(1));
+        });
+        key_controls_fix1(visual, &monitor, "enter");
+        key_controls_fix1(visual, &monitor, "escape");
+        owner!(KeyboardOwner::Map);
+        key_controls_fix1(visual, &monitor, "w");
+        click_controls_fix1(visual, &monitor, "map-filter");
+        owner!(KeyboardOwner::Filter);
+        key_controls_fix1(visual, &monitor, "a");
+        click_controls_fix1(visual, &monitor, "controls-view");
+        owner!(KeyboardOwner::Filter);
+        key_controls_fix1(visual, &monitor, "b");
+        key_controls_fix1(visual, &monitor, "escape");
+        owner!(KeyboardOwner::Filter);
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert_eq!(disk.map.filter, "ab");
+            assert!(disk.map.controls.disclosure.is_none());
+        });
+        key_controls_fix1(visual, &monitor, "escape");
+        owner!(KeyboardOwner::Map);
+        key_controls_fix1(visual, &monitor, "w");
+        owner!(KeyboardOwner::Findings);
+        click_controls_fix1(visual, &monitor, "controls-view");
+        owner!(KeyboardOwner::Disclosure);
+        key_controls_fix1(visual, &monitor, "down");
+        key_controls_fix1(visual, &monitor, "enter");
+        monitor.read_with(visual, |monitor, _| {
+            assert_eq!(monitor.disk.as_ref().unwrap().map.draw_depth(), 5);
+        });
+        owner!(KeyboardOwner::Map);
+        for trigger in ["controls-source", "controls-view", "controls-help"] {
+            monitor.update(visual, |monitor, cx| {
+                let disk = monitor.disk.as_mut().unwrap();
+                disk.folder.as_mut().unwrap().path = disk.home.join("worktrees");
+                cx.notify();
+            });
+            click_controls_fix1(visual, &monitor, "map-siblings-1");
+            owner!(KeyboardOwner::Siblings);
+            key_controls_fix1(visual, &monitor, "z");
+            key_controls_fix1(visual, &monitor, "down");
+            click_controls_fix1(visual, &monitor, trigger);
+            owner!(KeyboardOwner::Disclosure);
+            monitor.read_with(visual, |monitor, _| {
+                assert!(monitor.disk.as_ref().unwrap().map.siblings.is_none());
+            });
+            key_controls_fix1(visual, &monitor, "z");
+            key_controls_fix1(visual, &monitor, "escape");
+            owner!(KeyboardOwner::Map);
+            click_controls_fix1(visual, &monitor, "map-siblings-1");
+            key_controls_fix1(visual, &monitor, "/");
+            owner!(KeyboardOwner::Filter);
+            key_controls_fix1(visual, &monitor, "q");
+            key_controls_fix1(visual, &monitor, "enter");
+            owner!(KeyboardOwner::Map);
+            key_controls_fix1(visual, &monitor, "escape");
+        }
+        assert!(
+            commands.try_recv().is_err(),
+            "switching owners never executes a menu row"
+        );
     }
 
     #[gpui::test]
@@ -4702,7 +4854,8 @@ mod tests {
                 assert!(disk.apply_proposal(
                     generation,
                     proposal,
-                    Confirmation::new(&path, allocated, identity, &fixture.0).map_err(|e| e.to_string()),
+                    Confirmation::new(&path, allocated, identity, &fixture.0)
+                        .map_err(|e| e.to_string()),
                 ));
                 assert!(disk.confirmation.is_some());
                 cx.notify();
@@ -4713,16 +4866,23 @@ mod tests {
                 assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
             });
             while let Ok(command) = commands.try_recv() {
-                assert!(!matches!(command, Command::Trash(..)), "menu Enter must never confirm Trash");
+                assert!(
+                    !matches!(command, Command::Trash(..)),
+                    "menu Enter must never confirm Trash"
+                );
             }
             monitor.update(visual, |monitor, cx| {
                 let disk = monitor.disk.as_mut().unwrap();
                 assert!(disk.confirmation.is_none());
-                assert!(!disk.apply_proposal(
-                    generation,
-                    proposal,
-                    Confirmation::new(&path, allocated, identity, &fixture.0).map_err(|e| e.to_string()),
-                ), "opening a menu also rejects a late Prepare reply");
+                assert!(
+                    !disk.apply_proposal(
+                        generation,
+                        proposal,
+                        Confirmation::new(&path, allocated, identity, &fixture.0)
+                            .map_err(|e| e.to_string()),
+                    ),
+                    "opening a menu also rejects a late Prepare reply"
+                );
                 disk.map.controls.disclosure = None;
                 cx.notify();
             });
@@ -4735,6 +4895,7 @@ mod tests {
         cx.update(init);
         let (sender, commands) = mpsc::sync_channel(32);
         let mut disk = insights_snapshot_disk();
+        disk.remember_map_root(&disk.folder.clone().unwrap());
         disk.sender = sender;
         let home = disk.folder.as_ref().unwrap().path.clone();
         let child = home.join("worktrees");
@@ -4750,6 +4911,8 @@ mod tests {
                 monitor.disk.as_mut().unwrap().folder.as_mut().unwrap().path = child.clone();
                 cx.notify();
             });
+            key_controls_fix1(visual, &monitor, "/");
+            key_controls_fix1(visual, &monitor, "a");
             click_controls_fix1(visual, &monitor, trigger);
             click_controls_fix1(visual, &monitor, "map-siblings-1");
             visual.simulate_keystrokes("down");
@@ -4758,8 +4921,12 @@ mod tests {
             });
             monitor.read_with(visual, |monitor, _| {
                 let disk = monitor.disk.as_ref().unwrap();
-                assert_eq!(disk.map.sibling_index, 1, "siblings take keys from {trigger}");
+                assert_eq!(
+                    disk.map.sibling_index, 1,
+                    "siblings take keys from {trigger}"
+                );
                 assert!(disk.map.controls.disclosure.is_none());
+                assert!(!disk.map.filtering);
             });
             visual.simulate_keystrokes("enter");
             visual.update(|window, cx| {
@@ -4817,11 +4984,17 @@ mod tests {
         disk.enter(path.clone());
         assert!(matches!(commands.try_recv().unwrap(), Command::Browse(..)));
         assert!(disk.scan_shelf_status().starts_with("Scanning"));
-        for state in [ScanState::Scanning, ScanState::Cancelled, ScanState::Failed("denied".into()), ScanState::Complete] {
+        for state in [
+            ScanState::Scanning,
+            ScanState::Cancelled,
+            ScanState::Failed("denied".into()),
+            ScanState::Complete,
+        ] {
             let mut folder = disk.folder.as_ref().unwrap().clone();
             folder.path = path.clone();
             folder.state = state.clone();
-            disk.mailbox.lock().unwrap().folder = Some((disk.generation(), disk.navigation, folder));
+            disk.mailbox.lock().unwrap().folder =
+                Some((disk.generation(), disk.navigation, folder));
             disk.consume_mailbox();
             let expected = match state {
                 ScanState::Scanning => "Scanning",
@@ -4829,7 +5002,11 @@ mod tests {
                 ScanState::Failed(_) => "Failed",
                 _ => "Complete",
             };
-            assert!(disk.scan_shelf_status().starts_with(expected), "{}", disk.scan_shelf_status());
+            assert!(
+                disk.scan_shelf_status().starts_with(expected),
+                "{}",
+                disk.scan_shelf_status()
+            );
         }
     }
 
@@ -4852,8 +5029,14 @@ mod tests {
         monitor.update(visual, |monitor, cx| {
             let disk = monitor.disk.as_mut().unwrap();
             let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
-            let index = root.children.iter().position(|node| &*node.name == "worktrees").unwrap();
-            disk.map_select(TileKind::Node { crumbs: vec![index] });
+            let index = root
+                .children
+                .iter()
+                .position(|node| &*node.name == "worktrees")
+                .unwrap();
+            disk.map_select(TileKind::Node {
+                crumbs: vec![index],
+            });
             cx.notify();
         });
         visual.simulate_keystrokes("x");
@@ -4866,7 +5049,10 @@ mod tests {
             assert!(disk.map.previous_result);
         });
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(visual.debug_bounds("controls-previous-result").is_some(), "retained data has a warning independent of action status");
+        assert!(
+            visual.debug_bounds("controls-previous-result").is_some(),
+            "retained data has a warning independent of action status"
+        );
     }
 
     #[gpui::test]
@@ -4874,8 +5060,13 @@ mod tests {
         cx.update(init);
         let mut disk = insights_snapshot_disk();
         let folder = disk.folder.as_ref().unwrap();
-        let findings = disk.map.findings(folder.hierarchy.as_ref().unwrap(), folder.observed);
-        let stale = findings.iter().find(|finding| !finding.children.is_empty()).unwrap();
+        let findings = disk
+            .map
+            .findings(folder.hierarchy.as_ref().unwrap(), folder.observed);
+        let stale = findings
+            .iter()
+            .find(|finding| !finding.children.is_empty())
+            .unwrap();
         disk.inspect_finding(stale.locations()[0].clone());
         let (_, visual) = cx.add_window_view(|window, cx| {
             let mut monitor = crate::draw_benchmark::fixture(window, cx);
@@ -4888,7 +5079,10 @@ mod tests {
             let area = visual.debug_bounds("disk-findings").unwrap();
             let row = visual.debug_bounds("disk-finding-0").unwrap();
             let rows = area.size.height.as_f32() / row.size.height.as_f32();
-            assert!((rows - rows.round()).abs() < 0.01, "findings viewport ends on a whole row at {width}x{height}: {rows}");
+            assert!(
+                (rows - rows.round()).abs() < 0.01,
+                "findings viewport ends on a whole row at {width}x{height}: {rows}"
+            );
         }
     }
 

@@ -75,10 +75,22 @@ impl Disk {
     }
 
     pub(super) fn scan_shelf_status(&self) -> String {
-        let state = self
+        let running = self
             .session
             .as_ref()
-            .and_then(|session| session.outcome.as_ref());
+            .is_some_and(|session| session.activity == ScanActivity::Running);
+        let state = if running {
+            None
+        } else {
+            self.folder
+                .as_ref()
+                .map(|folder| &folder.state)
+                .or_else(|| {
+                    self.session
+                        .as_ref()
+                        .and_then(|session| session.outcome.as_ref())
+                })
+        };
         let label = match state {
             Some(ScanState::Complete) => "Complete",
             Some(ScanState::Cancelled) => "Cancelled · partial sizes",
@@ -126,6 +138,8 @@ impl Disk {
     }
 
     fn toggle_controls_menu(&mut self, menu: Disclosure) {
+        self.invalidate_proposal();
+        self.map.leave_findings_navigation();
         let controls = &mut self.map.controls;
         controls.disclosure = if controls.disclosure == Some(menu) {
             None
@@ -137,8 +151,10 @@ impl Disk {
     }
 
     fn run_controls_command(&mut self, command: Command) {
+        self.invalidate_proposal();
         if !matches!(command, Command::Menu(_)) {
             self.map.controls.disclosure = None;
+            self.map.siblings = None;
         }
         match command {
             Command::Key(key) => match key {
@@ -270,7 +286,18 @@ impl Monitor {
                 "Change… · S",
                 Command::Menu(Disclosure::Source),
                 cx,
-            ));
+            ))
+            .when(disk.map.previous_result, |row| {
+                row.child(
+                    div()
+                        .id("controls-previous-result")
+                        .debug_selector(|| "controls-previous-result".into())
+                        .role(Role::Status)
+                        .text_size(px(10.))
+                        .text_color(rgb(t.base.hot))
+                        .child("Previous result"),
+                )
+            });
         let location = div()
             .flex()
             .items_center()

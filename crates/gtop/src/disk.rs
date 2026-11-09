@@ -23,6 +23,16 @@ use std::{
 pub(crate) mod inspector_model;
 pub(crate) mod treemap;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardOwner {
+    Confirmation,
+    Disclosure,
+    Siblings,
+    Filter,
+    Findings,
+    Map,
+}
+
 #[derive(Default)]
 enum Retention {
     #[default]
@@ -655,6 +665,7 @@ impl Disk {
         }
         self.proposal_id = proposal;
         self.confirmation = None;
+        self.release_map_keyboard();
         self.set_status("Checking cleanup path…");
     }
 
@@ -705,7 +716,8 @@ impl Disk {
             self.close();
             return true;
         }
-        if self.confirmation.is_some() {
+        let owner = self.keyboard_owner(key);
+        if owner == KeyboardOwner::Confirmation {
             match key {
                 "y" | "enter" => self.confirm(self.proposal_id),
                 "n" | "escape" => self.confirmation = None,
@@ -713,7 +725,7 @@ impl Disk {
             }
             return true;
         }
-        if self.map_controls_key(key) {
+        if self.map_controls_key(owner, key) {
             return true;
         }
         if key == "d" {
