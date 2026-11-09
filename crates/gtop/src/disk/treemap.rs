@@ -3078,6 +3078,35 @@ mod tests {
     }
 
     #[test]
+    fn fix1_closed_cancel_reply_preserves_restart_selection() {
+        let mut disk = snapshot_disk();
+        let root = Arc::make_mut(disk.folder.as_mut().unwrap().hierarchy.as_mut().unwrap());
+        root.children[0].inode = Some((42, std::num::NonZeroU64::new(99).unwrap()));
+        disk.map_select(TileKind::Node { crumbs: vec![0] });
+        let selected = disk.map_row().unwrap();
+        let complete = disk.folder.clone().unwrap();
+        let (sender, _pending) = mpsc::sync_channel(8);
+        disk.sender = sender;
+        disk.start_over();
+        disk.close();
+        let mut cancelled = complete.clone();
+        Arc::make_mut(cancelled.hierarchy.as_mut().unwrap()).children.clear();
+        cancelled.state = ScanState::Cancelled;
+        {
+            let mut mailbox = disk.mailbox.lock().unwrap();
+            mailbox.folder = Some((disk.generation(), 0, cancelled));
+            mailbox.outcome = Some((disk.generation(), ScanState::Cancelled));
+        }
+        disk.consume_mailbox();
+        disk.reopen(std::time::Instant::now(), false);
+        disk.mailbox.lock().unwrap().folder = Some((disk.generation(), 0, complete));
+        assert!(disk.consume_mailbox());
+        let restored = disk.map_row().expect("restart must restore the selected item");
+        assert_eq!(restored.path, selected.path);
+        assert_eq!(restored.identity, selected.identity);
+    }
+
+    #[test]
     fn fix1_replacement_scan_restores_selection() {
         for option in [false, true] {
             let mut disk = snapshot_disk();

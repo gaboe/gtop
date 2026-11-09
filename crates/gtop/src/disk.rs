@@ -2530,6 +2530,67 @@ mod tests {
     }
 
     #[test]
+    fn fix1_close_cancels_browse_and_trash_refresh() {
+        close_cancels_followup_scan(false);
+    }
+    #[test]
+    fn fix1_close_cancels_trash_refresh() {
+        close_cancels_followup_scan(true);
+    }
+    fn close_cancels_followup_scan(trash: bool) {
+            let home = scratch();
+            fs::create_dir(home.join("child")).unwrap();
+            fs::write(home.join("child/item"), [1; 4096]).unwrap();
+            let mut disk = Disk::with_home(home.clone());
+            let _ = receive(&mut disk, ScanState::Complete);
+            disk.browse(home.join("child"), 0);
+            let folder = receive(&mut disk, ScanState::Complete);
+            let (sender, receiver) = mpsc::sync_channel(4);
+            disk.sender = sender;
+            if trash {
+                let row = &folder.rows[0];
+                disk.confirmation = Some(
+                    Confirmation::new(&row.path, row.allocated, row.identity, &home).unwrap(),
+                );
+                disk.confirm(disk.proposal_id);
+                assert!(matches!(receiver.recv().unwrap(), Command::Trash(..)));
+            } else {
+                disk.browse(home.join("child"), 0);
+                assert!(matches!(receiver.recv().unwrap(), Command::Browse(..)));
+            }
+            let token = disk.cancel.clone();
+            disk.close();
+            let cancelled = token.load(Ordering::Relaxed);
+            drop(disk);
+            fs::remove_dir_all(home).unwrap();
+            assert!(cancelled, "close must cancel the scan, trash={trash}");
+    }
+
+    #[test]
+    fn fix1_reopen_delivers_restart_with_one_free_queue_slot() {
+        let home = scratch();
+        let mut disk = Disk::with_home(home.clone());
+        let _ = receive(&mut disk, ScanState::Complete);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        disk.sender = sender;
+        disk.start_over();
+        receiver.recv().unwrap();
+        disk.close();
+        receiver.recv().unwrap();
+        let generation = disk.generation();
+        disk.reopen(Instant::now(), false);
+        let commands: Vec<_> = receiver.try_iter().collect();
+        let scans = commands.iter().filter(|c| matches!(c, Command::Scan(..))).count();
+        assert_eq!(scans, 1, "the only queue slot must deliver the restart");
+        assert!(disk.open);
+        assert_eq!(disk.generation(), generation + 1);
+        assert!(!disk.cancel.load(Ordering::Relaxed));
+        assert_eq!(disk.status, "Scanning…");
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn reopening_restarts_a_closed_scan_with_its_root_and_options() {
         let home = scratch();
         let mut disk = Disk::with_home(home.clone());
