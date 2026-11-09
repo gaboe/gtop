@@ -2361,6 +2361,217 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    async fn fix4_cancel_after_progress_folder_reports_cancelled(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        let mut progress = disk.folder.clone().unwrap();
+        progress.hierarchy = None;
+        progress.state = ScanState::Scanning;
+        let (sender, _pending) = mpsc::sync_channel(4);
+        disk.sender = sender;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let rescan = visual.debug_bounds("disk-rescan").unwrap();
+        visual.simulate_click(rescan.center(), Modifiers::default());
+        let generation = monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert_eq!(disk.status, "Scanning…");
+            disk.generation()
+        });
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            disk.mailbox.lock().unwrap().folder = Some((generation, 0, progress.clone()));
+            assert!(disk.consume_mailbox());
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert!(disk.folder.as_ref().unwrap().hierarchy.is_none());
+            assert!(!disk.map.previous_result);
+        });
+        let cancel_button = visual.debug_bounds("disk-cancel").unwrap();
+        visual.simulate_click(cancel_button.center(), Modifiers::default());
+        let cancel = monitor.read_with(visual, |monitor, _| {
+            monitor.disk.as_ref().unwrap().cancel.clone()
+        });
+        assert!(cancel.load(Ordering::Relaxed));
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            let mut terminal = progress;
+            terminal.state = ScanState::Cancelled;
+            let generation = disk.generation();
+            let mut mailbox = disk.mailbox.lock().unwrap();
+            mailbox.folder = Some((generation, 0, terminal));
+            mailbox.outcome = Some((generation, ScanState::Cancelled));
+            drop(mailbox);
+            assert!(disk.consume_mailbox());
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("disk-status").is_some());
+        monitor.read_with(visual, |monitor, _| {
+            assert_eq!(monitor.disk.as_ref().unwrap().status, "Scan cancelled.");
+        });
+    }
+
+    #[gpui::test]
+    async fn fix4_cancel_after_hidden_rescan_progress_reports_cancelled(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        let mut progress = disk.folder.clone().unwrap();
+        progress.hierarchy = None;
+        progress.state = ScanState::Scanning;
+        let (sender, _pending) = mpsc::sync_channel(4);
+        disk.sender = sender;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let rescan = visual.debug_bounds("disk-rescan").unwrap();
+        visual.simulate_click(rescan.center(), Modifiers::default());
+        let first_generation = monitor.read_with(visual, |monitor, _| {
+            monitor.disk.as_ref().unwrap().generation()
+        });
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            disk.mailbox.lock().unwrap().folder = Some((first_generation, 0, progress.clone()));
+            assert!(disk.consume_mailbox());
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert!(disk.folder.as_ref().unwrap().hierarchy.is_none());
+            assert!(!disk.map.previous_result);
+        });
+        let hidden = visual.debug_bounds("map-hidden").unwrap();
+        visual.simulate_click(hidden.center(), Modifiers::default());
+        let generation = monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert!(disk.generation() > first_generation);
+            assert!(disk.status.contains("Scanning with new options"));
+            disk.generation()
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let cancel_button = visual.debug_bounds("disk-cancel").unwrap();
+        visual.simulate_click(cancel_button.center(), Modifiers::default());
+        assert!(monitor.read_with(visual, |monitor, _| {
+            monitor
+                .disk
+                .as_ref()
+                .unwrap()
+                .cancel
+                .load(Ordering::Relaxed)
+        }));
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            let mut terminal = progress;
+            terminal.state = ScanState::Cancelled;
+            let mut mailbox = disk.mailbox.lock().unwrap();
+            mailbox.folder = Some((generation, 0, terminal));
+            mailbox.outcome = Some((generation, ScanState::Cancelled));
+            drop(mailbox);
+            assert!(disk.consume_mailbox());
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("disk-status").is_some());
+        monitor.read_with(visual, |monitor, _| {
+            assert_eq!(monitor.disk.as_ref().unwrap().status, "Scan cancelled.");
+        });
+    }
+
+    #[gpui::test]
+    async fn fix4_failure_after_progress_folder_reports_failure(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        let mut progress = disk.folder.clone().unwrap();
+        progress.hierarchy = None;
+        progress.state = ScanState::Scanning;
+        let (sender, _pending) = mpsc::sync_channel(4);
+        disk.sender = sender;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let rescan = visual.debug_bounds("disk-rescan").unwrap();
+        visual.simulate_click(rescan.center(), Modifiers::default());
+        let generation = monitor.read_with(visual, |monitor, _| {
+            monitor.disk.as_ref().unwrap().generation()
+        });
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            disk.mailbox.lock().unwrap().folder = Some((generation, 0, progress.clone()));
+            assert!(disk.consume_mailbox());
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("disk-status").is_some());
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert!(disk.folder.as_ref().unwrap().hierarchy.is_none());
+            assert!(!disk.map.previous_result);
+        });
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            let error = "disk vanished";
+            let mut terminal = progress;
+            terminal.state = ScanState::Failed(error.into());
+            let mut mailbox = disk.mailbox.lock().unwrap();
+            mailbox.folder = Some((generation, 0, terminal));
+            mailbox.outcome = Some((generation, ScanState::Failed(error.into())));
+            drop(mailbox);
+            assert!(disk.consume_mailbox());
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("disk-status").is_some());
+        monitor.read_with(visual, |monitor, _| {
+            assert_eq!(
+                monitor.disk.as_ref().unwrap().status,
+                "Scan failed: disk vanished"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn fix4_top_disk_entry_opens_disk_and_keeps_treemap_focus(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        disk.open = false;
+        let (sender, _pending) = mpsc::sync_channel(4);
+        disk.sender = sender;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("disk-open-hint").is_some());
+        let disk_entry = visual.debug_bounds("disk-open").unwrap();
+        visual.simulate_click(disk_entry.center(), Modifiers::default());
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        });
+        assert!(monitor.read_with(visual, |monitor, _| { monitor.disk.as_ref().unwrap().open }));
+        visual.simulate_keystrokes("m");
+        assert!(monitor.read_with(visual, |monitor, _| {
+            monitor.disk.as_ref().unwrap().map.mode == Mode::Files
+        }));
+    }
+
     #[test]
     fn fix1_rejected_history_preserves_next_destination() {
         let mut disk = snapshot_disk();
@@ -3692,6 +3903,21 @@ mod tests {
                 )))
                 .unwrap();
         }
+        let handle = cx
+            .open_window(size(px(1200.), px(720.)), |window, cx| {
+                let monitor = cx.new(|cx| crate::draw_benchmark::fixture(window, cx));
+                cx.new(|cx| gpui_component::Root::new(monitor, window, cx))
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        cx.capture_screenshot(handle.into())
+            .unwrap()
+            .save(output.join("top-disk-entry-1200x720.png"))
+            .unwrap();
     }
 
     const AGE_NOW: i64 = 1_800_000_000;

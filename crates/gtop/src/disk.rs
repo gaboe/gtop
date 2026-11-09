@@ -295,15 +295,15 @@ impl Disk {
                     }
                 }
             }
-            if self.folder.is_none() {
+            if self.status_kind == StatusKind::Scan(generation) {
                 match &outcome {
+                    ScanState::Complete => self.clear_status(),
                     ScanState::Cancelled => self.set_status("Scan cancelled."),
-                    ScanState::Failed(error) => self.set_status(format!("Scan failed: {error}")),
-                    _ => {}
+                    ScanState::Failed(error) => {
+                        self.set_status(format!("Scan failed: {error}"));
+                    }
+                    ScanState::Scanning => {}
                 }
-            }
-            if outcome == ScanState::Complete && self.status_kind == StatusKind::Scan(generation) {
-                self.clear_status();
             }
             self.refresh_volume(&root);
         }
@@ -1422,29 +1422,33 @@ impl Monitor {
                                     })),
                             )
                             .child(
-                                Button::new("disk-cancel")
-                                    .label("Cancel")
-                                    .rack(&t)
-                                    .small()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.disk
-                                            .as_ref()
-                                            .unwrap()
-                                            .cancel
-                                            .store(true, Ordering::Relaxed);
-                                        cx.notify();
-                                    })),
+                                div().debug_selector(|| "disk-cancel".into()).child(
+                                    Button::new("disk-cancel")
+                                        .label("Cancel")
+                                        .rack(&t)
+                                        .small()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.disk
+                                                .as_ref()
+                                                .unwrap()
+                                                .cancel
+                                                .store(true, Ordering::Relaxed);
+                                            cx.notify();
+                                        })),
+                                ),
                             )
                             .child(
-                                Button::new("disk-rescan")
-                                    .label("Start over")
-                                    .rack(&t)
-                                    .small()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let d = this.disk.as_mut().unwrap();
-                                        d.start_over();
-                                        cx.notify();
-                                    })),
+                                div().debug_selector(|| "disk-rescan".into()).child(
+                                    Button::new("disk-rescan")
+                                        .label("Start over")
+                                        .rack(&t)
+                                        .small()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let d = this.disk.as_mut().unwrap();
+                                            d.start_over();
+                                            cx.notify();
+                                        })),
+                                ),
                             ),
                     ),
             )
