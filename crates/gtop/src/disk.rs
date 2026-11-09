@@ -259,7 +259,7 @@ impl Disk {
                 None
             };
         if let Some(root) = root {
-            if self.status.starts_with("Previous result") {
+            if self.map.previous_result {
                 let message = match &outcome {
                     ScanState::Failed(error) => {
                         Some(format!("Previous result. Replacement failed: {error}"))
@@ -342,7 +342,7 @@ impl Disk {
                     .folder
                     .as_ref()
                     .is_some_and(|old| old.hierarchy.is_some())
-                && self.status.starts_with("Previous result")
+                && self.map.previous_result
             {
                 if !matches!(folder.state, ScanState::Scanning) {
                     self.status = match &folder.state {
@@ -355,8 +355,9 @@ impl Disk {
                 }
                 return true;
             }
-            if folder.hierarchy.is_some() && self.status.starts_with("Previous result") {
+            if folder.hierarchy.is_some() && self.map.previous_result {
                 self.status.clear();
+                self.map.previous_result = false;
             }
             let same_hierarchy = self.folder.as_ref().is_some_and(|previous| {
                 match (&previous.hierarchy, &folder.hierarchy) {
@@ -365,7 +366,7 @@ impl Disk {
                     _ => false,
                 }
             });
-            if !same_hierarchy {
+            if !same_hierarchy || self.map.pending_selection.is_some() {
                 self.restore_map_selection(&folder);
             }
             self.selected = self.selected.min(folder.rows.len().saturating_sub(1));
@@ -439,14 +440,6 @@ impl Disk {
         } else {
             None
         };
-        let previous_folder = if replacement {
-            self.folder.clone().map(|mut folder| {
-                folder.state = ScanState::Scanning;
-                folder
-            })
-        } else {
-            None
-        };
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = cancel;
         self.refresh_volume(&root);
@@ -462,10 +455,8 @@ impl Disk {
         self.map.reset_navigation();
         self.selected = 0;
         self.map.pending_selection = previous_selection;
-        self.folder = previous_folder;
-        if self.folder.is_some() {
-            self.status = "Previous result is stale. Scanning replacement…".into();
-        }
+        self.folder = None;
+        self.status = "Scanning…".into();
     }
     fn start_over(&mut self) {
         let root = self

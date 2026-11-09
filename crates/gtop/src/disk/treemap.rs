@@ -25,6 +25,7 @@ pub(super) struct MapState {
     list_scroll: UniformListScrollHandle,
     listing: RefCell<Option<Listing>>,
     matches: RefCell<Option<FilterCache>>,
+    pub(super) previous_result: bool,
     pub(super) pending_selection: Option<disk_scan::Row>,
     #[cfg(test)]
     clock: Option<i64>,
@@ -71,6 +72,8 @@ impl MapState {
     }
     pub(super) fn reset_navigation(&mut self) {
         self.selected = None;
+        self.pending_selection = None;
+        self.previous_result = false;
         self.hovered = None;
         self.viewport = Viewport::default();
         self.siblings = None;
@@ -197,7 +200,24 @@ fn entries_filtered(
                     label: format!(
                         "Other · {} items · {}",
                         children.len() - kept,
-                        bytes(children[kept..].iter().map(|(_, node)| node.bytes).sum())
+                        bytes(
+                            children[kept..]
+                                .iter()
+                                .map(|(index, node)| {
+                                    let mut path = crumbs.clone();
+                                    path.push(*index);
+                                    matches.map_or(node.bytes, |found| {
+                                        found.keep(&path).map_or(0, |keep| {
+                                            gtop_disk::filter::Matches::value(
+                                                keep,
+                                                node,
+                                                Metric::Bytes,
+                                            )
+                                        })
+                                    })
+                                })
+                                .sum()
+                        )
                     ),
                     depth: crumbs.len(),
                 });
@@ -431,6 +451,7 @@ impl Disk {
     }
 
     fn change_scan_option(&mut self, hidden: bool) {
+        let folder = self.folder.clone();
         let previous = self.options.clone();
         if hidden {
             self.options.include_hidden = !self.options.include_hidden;
@@ -442,7 +463,20 @@ impl Disk {
         if self.generation() == generation {
             self.options = previous;
         } else {
-            self.status = "Previous result is stale. Scanning with new options…".into();
+            self.folder = folder.map(|mut folder| {
+                folder.state = ScanState::Scanning;
+                folder
+            });
+            self.map.previous_result = self
+                .folder
+                .as_ref()
+                .is_some_and(|folder| folder.hierarchy.is_some());
+            self.status = if self.map.previous_result {
+                "Previous result is stale. Scanning with new options…"
+            } else {
+                "Scanning with new options…"
+            }
+            .into();
         }
     }
 
@@ -927,7 +961,17 @@ impl Monitor {
             );
         let path = disk.folder.as_ref().map_or_else(
             || self.disk.as_ref().unwrap().status.clone(),
-            |folder| folder.path.display().to_string(),
+            |folder| {
+                format!(
+                    "{}{}",
+                    folder.path.display(),
+                    if disk.map.previous_result {
+                        " · Previous result"
+                    } else {
+                        ""
+                    }
+                )
+            },
         );
         let mut crumbs = div().flex().flex_wrap().gap(px(4.));
         if let Some(folder) = &disk.folder {
@@ -1691,6 +1735,27 @@ mod tests {
                 "unchanged redraw searches"
             )
         });
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            let root = disk
+                .folder
+                .as_ref()
+                .unwrap()
+                .hierarchy
+                .as_ref()
+                .unwrap()
+                .clone();
+            disk.map.filter.push_str("-edited");
+            disk.map.matches(&root);
+            assert_eq!(disk.map.filter_searches.get(), searches + 1);
+            disk.map.mode = Mode::Files;
+            disk.map.matches(&root);
+            assert_eq!(disk.map.filter_searches.get(), searches + 2);
+            disk.map.mode = Mode::Age;
+            let changed_tree = Arc::new((*root).clone());
+            disk.map.matches(&changed_tree);
+            assert_eq!(disk.map.filter_searches.get(), searches + 3);
+        });
         visual.simulate_keystrokes("escape");
         visual.update(|window, cx| {
             assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
@@ -1741,6 +1806,8 @@ mod tests {
                     .rect;
                 assert!((rect.x - (old.x * scale + anchor_x * (1. - scale) + 37.)).abs() < 0.001);
                 assert!((rect.w - old.w * scale).abs() < 0.001);
+                assert!((rect.y - (old.y * scale + anchor_y * (1. - scale) - 11.)).abs() < 0.001);
+                assert!((rect.h - old.h * scale).abs() < 0.001);
             }
             let mut points = Vec::new();
             for y in (5..extent.height.as_f32() as usize).step_by(13) {
@@ -1860,10 +1927,13 @@ mod tests {
         });
         visual.simulate_resize(size(px(1200.), px(720.)));
         visual.update(|window, cx| window.draw(cx).clear(cx));
+        let canvas = visual.debug_bounds("disk-treemap").unwrap();
+        assert!(
+            canvas.size.height > px(100.),
+            "sibling choices must leave the canvas usable"
+        );
         let menu = visual.debug_bounds("map-sibling-menu").unwrap();
         assert!(menu.size.height <= px(160.));
-        let canvas = visual.debug_bounds("disk-treemap").unwrap();
-        assert!(canvas.size.height > px(100.));
         for _ in 0..399 {
             visual.simulate_keystrokes("down");
             visual.update(|window, cx| {
@@ -1884,14 +1954,29 @@ mod tests {
         monitor.update(visual, |monitor, cx| {
             let disk = monitor.disk.as_mut().unwrap();
             disk.map.siblings = Some("/Users/demo/sibling-000-long-directory-name".into());
-            disk.map.sibling_index = 399;
+            disk.map.sibling_index = 0;
             disk.map
                 .sibling_scroll
-                .scroll_to_item(399, ScrollStrategy::Nearest);
+                .scroll_to_item(0, ScrollStrategy::Nearest);
             cx.notify();
         });
         visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position: menu.center(),
+                    delta: ScrollDelta::Pixels(point(px(0.), px(-20000.))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Moved,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         let last_bounds = visual.debug_bounds("map-sibling-entry-399").unwrap();
+        assert!(last_bounds.top() >= menu.top() && last_bounds.bottom() <= menu.bottom());
         visual.simulate_click(last_bounds.center(), Modifiers::default());
         visual.update(|window, cx| {
             assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
@@ -1900,6 +1985,97 @@ mod tests {
             panic!("browse")
         };
         assert_eq!(path, last);
+    }
+
+    #[gpui::test]
+    async fn fix1_filter_preview_changes_only_highlights(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(snapshot_disk());
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let rectangles = |visual: &gpui::VisualTestContext| {
+            monitor.read_with(visual, |monitor, _| {
+                monitor
+                    .disk
+                    .as_ref()
+                    .unwrap()
+                    .map
+                    .frame
+                    .borrow()
+                    .tiles
+                    .iter()
+                    .map(|tile| (tile.kind.clone(), tile.rect))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let unfiltered = rectangles(visual);
+        for key in ["/", "t", "a", "r", "g", "e", "t"] {
+            visual.simulate_keystrokes(key);
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(rectangles(visual), unfiltered);
+        }
+        visual.simulate_keystrokes("enter");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert_ne!(rectangles(visual), unfiltered);
+        for key in ["/", "z", "backspace"] {
+            visual.simulate_keystrokes(key);
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(
+                rectangles(visual),
+                unfiltered,
+                "editing an applied query previews without filtering geometry"
+            );
+        }
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(rectangles(visual), unfiltered);
+    }
+
+    #[test]
+    fn fix1_terminal_folder_reply_keeps_previous_label() {
+        for state in [
+            ScanState::Cancelled,
+            ScanState::Failed("root missing".into()),
+        ] {
+            let mut disk = snapshot_disk();
+            let (sender, _pending) = mpsc::sync_channel(4);
+            disk.sender = sender;
+            disk.change_scan_option(true);
+            let mut failed = disk.folder.clone().unwrap();
+            failed.hierarchy = None;
+            failed.state = state.clone();
+            disk.mailbox.lock().unwrap().folder = Some((disk.generation(), 0, failed));
+            assert!(disk.consume_mailbox());
+            assert_eq!(disk.folder.as_ref().unwrap().state, state);
+            assert!(disk.folder.as_ref().unwrap().hierarchy.is_some());
+            assert!(disk.status.starts_with("Previous result"));
+            assert!(!disk.status.contains("Scanning"));
+        }
+        let mut disk = snapshot_disk();
+        let (sender, _pending) = mpsc::sync_channel(4);
+        disk.sender = sender;
+        disk.start("/new-root".into(), false);
+        disk.mailbox.lock().unwrap().outcome = Some((disk.generation(), ScanState::Cancelled));
+        disk.consume_mailbox();
+        assert_eq!(disk.status, "Scan cancelled.");
+        assert!(disk.folder.is_none());
     }
 
     #[test]
@@ -2021,10 +2197,12 @@ mod tests {
             monitor
         });
         visual.simulate_resize(size(px(1200.), px(720.)));
-        visual.simulate_keystrokes("+ / t");
-        visual.update(|window, cx| {
-            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
-        });
+        for key in ["+", "/", "t"] {
+            visual.simulate_keystrokes(key);
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+        }
         visual.update(|window, cx| window.draw(cx).clear(cx));
         for selector in [
             "map-reset",
