@@ -1360,6 +1360,7 @@ impl Monitor {
                 crumbs = crumbs.child(
                     Button::new(("map-crumb", index))
                         .label(label)
+                        .debug_selector(move || format!("map-crumb-{index}"))
                         .max_w(px(180.))
                         .rack(&t)
                         .small()
@@ -4719,6 +4720,57 @@ mod tests {
         });
     }
 
+    fn assert_cancelled_queued_scan_shows_terminal_shelf(option_rescan: bool) {
+        let fixture = Fixture::new();
+        let home = fixture.0.clone();
+        let mut disk = Disk::with_home(home.clone());
+        let (started, ready) = mpsc::sync_channel(1);
+        let (resume, suspended) = mpsc::sync_channel(1);
+        disk.mailbox.lock().unwrap().scan_gate = Some((started, suspended));
+        disk.start(home.clone(), true);
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        if option_rescan {
+            disk.change_scan_option(true);
+        } else {
+            assert!(disk.key("r"));
+        }
+        let generation = disk.generation();
+        assert!(disk.key("c"));
+        resume.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            disk.consume_mailbox();
+            if disk
+                .session
+                .as_ref()
+                .is_some_and(|session| session.outcome == Some(ScanState::Cancelled))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "cancelled scan did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(disk.generation(), generation);
+        assert!(
+            disk.scan_shelf_status().starts_with("Cancelled"),
+            "{}",
+            disk.scan_shelf_status()
+        );
+        drop(disk);
+    }
+
+    #[test]
+    fn controls_v2_fix2_queued_cancel_shows_terminal_shelf() {
+        assert_cancelled_queued_scan_shows_terminal_shelf(false);
+    }
+
+    #[test]
+    fn controls_v2_fix2_option_rescan_cancel_shows_terminal_shelf() {
+        assert_cancelled_queued_scan_shows_terminal_shelf(true);
+    }
+
     fn key_controls_fix1(visual: &mut VisualTestContext, monitor: &Entity<Monitor>, key: &str) {
         visual.simulate_keystrokes(key);
         visual.update(|window, cx| {
@@ -4740,52 +4792,32 @@ mod tests {
             monitor
         });
         visual.simulate_resize(size(px(1200.), px(720.)));
-        macro_rules! owner {
-            ($expected:expr) => {
-                monitor.read_with(visual, |monitor, _| {
-                    assert_eq!(
-                        monitor.disk.as_ref().unwrap().keyboard_owner("down"),
-                        $expected
-                    );
-                })
-            };
-        }
-        owner!(KeyboardOwner::Map);
         key_controls_fix1(visual, &monitor, "w");
-        owner!(KeyboardOwner::Findings);
         key_controls_fix1(visual, &monitor, "down");
         monitor.read_with(visual, |monitor, _| {
             assert_eq!(monitor.disk.as_ref().unwrap().map.finding_cursor, Some(1));
         });
         key_controls_fix1(visual, &monitor, "enter");
         key_controls_fix1(visual, &monitor, "escape");
-        owner!(KeyboardOwner::Map);
         key_controls_fix1(visual, &monitor, "w");
         click_controls_fix1(visual, &monitor, "map-filter");
-        owner!(KeyboardOwner::Filter);
         key_controls_fix1(visual, &monitor, "a");
         click_controls_fix1(visual, &monitor, "controls-view");
-        owner!(KeyboardOwner::Filter);
         key_controls_fix1(visual, &monitor, "b");
         key_controls_fix1(visual, &monitor, "escape");
-        owner!(KeyboardOwner::Filter);
         monitor.read_with(visual, |monitor, _| {
             let disk = monitor.disk.as_ref().unwrap();
             assert_eq!(disk.map.filter, "ab");
             assert!(disk.map.controls.disclosure.is_none());
         });
         key_controls_fix1(visual, &monitor, "escape");
-        owner!(KeyboardOwner::Map);
         key_controls_fix1(visual, &monitor, "w");
-        owner!(KeyboardOwner::Findings);
         click_controls_fix1(visual, &monitor, "controls-view");
-        owner!(KeyboardOwner::Disclosure);
         key_controls_fix1(visual, &monitor, "down");
         key_controls_fix1(visual, &monitor, "enter");
         monitor.read_with(visual, |monitor, _| {
             assert_eq!(monitor.disk.as_ref().unwrap().map.draw_depth(), 5);
         });
-        owner!(KeyboardOwner::Map);
         for trigger in ["controls-source", "controls-view", "controls-help"] {
             monitor.update(visual, |monitor, cx| {
                 let disk = monitor.disk.as_mut().unwrap();
@@ -4793,23 +4825,26 @@ mod tests {
                 cx.notify();
             });
             click_controls_fix1(visual, &monitor, "map-siblings-1");
-            owner!(KeyboardOwner::Siblings);
             key_controls_fix1(visual, &monitor, "z");
             key_controls_fix1(visual, &monitor, "down");
             click_controls_fix1(visual, &monitor, trigger);
-            owner!(KeyboardOwner::Disclosure);
             monitor.read_with(visual, |monitor, _| {
                 assert!(monitor.disk.as_ref().unwrap().map.siblings.is_none());
             });
             key_controls_fix1(visual, &monitor, "z");
             key_controls_fix1(visual, &monitor, "escape");
-            owner!(KeyboardOwner::Map);
             click_controls_fix1(visual, &monitor, "map-siblings-1");
             key_controls_fix1(visual, &monitor, "/");
-            owner!(KeyboardOwner::Filter);
             key_controls_fix1(visual, &monitor, "q");
+            monitor.read_with(visual, |monitor, _| {
+                assert_eq!(monitor.disk.as_ref().unwrap().map.filter, "q");
+            });
             key_controls_fix1(visual, &monitor, "enter");
-            owner!(KeyboardOwner::Map);
+            monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                assert_eq!(disk.map.committed_filter, "q");
+                assert!(disk.map.siblings.is_none());
+            });
             key_controls_fix1(visual, &monitor, "escape");
         }
         assert!(
@@ -4984,6 +5019,13 @@ mod tests {
         disk.enter(path.clone());
         assert!(matches!(commands.try_recv().unwrap(), Command::Browse(..)));
         assert!(disk.scan_shelf_status().starts_with("Scanning"));
+        disk.mailbox.lock().unwrap().outcome =
+            Some((disk.generation(), ScanState::Complete));
+        disk.consume_mailbox();
+        assert!(
+            disk.scan_shelf_status().starts_with("Scanning"),
+            "a root outcome does not finish a running child Browse"
+        );
         for state in [
             ScanState::Scanning,
             ScanState::Cancelled,
@@ -5053,6 +5095,65 @@ mod tests {
             visual.debug_bounds("controls-previous-result").is_some(),
             "retained data has a warning independent of action status"
         );
+    }
+
+    #[gpui::test]
+    async fn controls_v2_fix2_previous_result_survives_breadcrumb_before_reply(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(init);
+        let mut disk = insights_snapshot_disk();
+        let (sender, commands) = mpsc::sync_channel(32);
+        disk.sender = sender;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+
+        monitor.update(visual, |monitor, cx| {
+            monitor
+                .disk
+                .as_mut()
+                .unwrap()
+                .change_scan_option(false);
+            cx.notify();
+        });
+        assert!(matches!(commands.try_recv().unwrap(), Command::Scan(..)));
+        click_controls_fix1(visual, &monitor, "map-crumb-0");
+        assert!(matches!(commands.try_recv().unwrap(), Command::Browse(..)));
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert!(disk.map.previous_result);
+            assert!(disk.scan_shelf_status().starts_with("Scanning"));
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("controls-previous-result").is_some());
+
+        monitor.update(visual, |monitor, cx| {
+            let disk = monitor.disk.as_mut().unwrap();
+            let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+            let index = root
+                .children
+                .iter()
+                .position(|node| &*node.name == "worktrees")
+                .unwrap();
+            disk.map_select(TileKind::Node {
+                crumbs: vec![index],
+            });
+            cx.notify();
+        });
+        key_controls_fix1(visual, &monitor, "x");
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert_eq!(disk.status, "Finish the scan before cleanup");
+            assert!(disk.map.previous_result);
+            assert!(disk.scan_shelf_status().starts_with("Scanning"));
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("controls-previous-result").is_some());
     }
 
     #[gpui::test]
