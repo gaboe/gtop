@@ -80,6 +80,10 @@ struct MapFrame {
 }
 
 impl MapState {
+    pub(super) fn leave_findings_navigation(&mut self) {
+        self.finding_cursor = None;
+    }
+
     fn findings(
         &self,
         root: &Arc<Node>,
@@ -1423,7 +1427,6 @@ impl Monitor {
                             .small()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let disk = this.disk.as_mut().unwrap();
-                                disk.map.finding_cursor = None;
                                 disk.set_map_mode(mode);
                                 window.focus(&this.focus, cx);
                                 cx.notify();
@@ -1451,7 +1454,6 @@ impl Monitor {
                         .small()
                         .on_click(cx.listener(move |this, _, window, cx| {
                             let disk = this.disk.as_mut().unwrap();
-                            disk.map.finding_cursor = None;
                             disk.map_command(key);
                             window.focus(&this.focus, cx);
                             cx.notify();
@@ -5200,6 +5202,155 @@ mod tests {
                 finding_cursor, None,
                 "{selector} Down leaves findings navigation"
             );
+        }
+    }
+
+    #[gpui::test]
+    async fn pointer_controls_leave_findings_navigation(cx: &mut TestAppContext) {
+        use gtop_disk::tree::{aggregate, NodeKind};
+        cx.update(init);
+        let mut disk = insights_snapshot_disk();
+        let mut left = Node::directory("left");
+        left.children
+            .push(Node::entry("Cargo.toml", NodeKind::File, 1));
+        let mut target = Node::directory("target");
+        target
+            .children
+            .push(Node::entry("build", NodeKind::File, 256 << 20));
+        left.children.push(target);
+        let mut right = Node::directory("right");
+        right.children.push(Node::entry("small", NodeKind::File, 1));
+        let folder = disk.folder.as_mut().unwrap();
+        let root = Arc::make_mut(folder.hierarchy.as_mut().unwrap());
+        root.children = vec![left, right];
+        aggregate(root, Metric::Bytes);
+        gtop_disk::classify::classify(root);
+        let original = folder.clone();
+        disk.remember_map_root(&original);
+        disk.map_visit(original.path.clone());
+        disk.map_select(TileKind::Node { crumbs: vec![0] });
+        let (sender, commands) = mpsc::sync_channel(32);
+        disk.sender = sender;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1480.), px(930.)));
+        visual.simulate_keystrokes("enter");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        let Command::Browse(path, _, generation, navigation, _) = commands.try_recv().unwrap()
+        else {
+            panic!("browse left");
+        };
+        assert_eq!(path, original.path.join("left"));
+        let mut folder = original.clone();
+        folder.path = path;
+        folder.hierarchy = Some(Arc::new(
+            original.hierarchy.as_ref().unwrap().children[0].clone(),
+        ));
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            disk.mailbox.lock().unwrap().folder = Some((generation, navigation, folder));
+            assert!(disk.consume_mailbox());
+        });
+        for key in ["enter", "escape"] {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.simulate_keystrokes("w");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            monitor.read_with(visual, |monitor, _| {
+                assert_eq!(monitor.disk.as_ref().unwrap().map.finding_cursor, Some(0))
+            });
+            let arrow = visual.debug_bounds("map-siblings-1").unwrap();
+            visual.simulate_click(arrow.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(visual.debug_bounds("map-sibling-menu").is_some());
+            if key == "enter" {
+                visual.simulate_keystrokes("down");
+                visual.update(|window, cx| {
+                    assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                });
+                monitor.read_with(visual, |monitor, _| {
+                    assert_eq!(
+                        monitor.disk.as_ref().unwrap().map.sibling_index,
+                        1,
+                        "Down moves the visible sibling menu"
+                    )
+                });
+            }
+            visual.simulate_keystrokes(key);
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            if key == "enter" {
+                assert!(
+                    matches!(commands.try_recv(), Ok(Command::Browse(path, ..)) if path == original.path.join("right"))
+                );
+            }
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(
+                visual.debug_bounds("map-sibling-menu").is_none(),
+                "first key closes the menu"
+            );
+        }
+        let child_folder = monitor.read_with(visual, |monitor, _| {
+            monitor.disk.as_ref().unwrap().folder.clone().unwrap()
+        });
+        for selector in [
+            "map-depth-less",
+            "map-depth-more",
+            "map-reset",
+            "map-mode-0",
+            "map-mode-1",
+            "map-mode-2",
+            "map-back",
+            "map-forward",
+            "map-filter",
+            "disk-inspector-resize",
+            "disk-cancel",
+            "map-choose-folder",
+            "map-hidden",
+            "map-apparent",
+            "disk-rescan",
+        ] {
+            let mut disk = insights_snapshot_disk();
+            disk.remember_map_root(&original);
+            disk.folder = Some(child_folder.clone());
+            let (sender, _pending) = mpsc::sync_channel(32);
+            disk.sender = sender;
+            monitor.update(visual, |monitor, _| monitor.disk = Some(disk));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.simulate_keystrokes("w");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            monitor.read_with(visual, |monitor, _| {
+                assert_eq!(
+                    monitor.disk.as_ref().unwrap().map.finding_cursor,
+                    Some(0),
+                    "{selector} starts in findings"
+                )
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let bounds = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(bounds.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                let focused = window.focused(cx);
+                assert!(focused.is_some(), "{selector} keeps keyboard focus");
+                assert_eq!(
+                    monitor.read(cx).disk.as_ref().unwrap().map.finding_cursor,
+                    None,
+                    "{selector} leaves findings"
+                );
+            });
         }
     }
 

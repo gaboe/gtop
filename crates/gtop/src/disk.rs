@@ -1474,6 +1474,10 @@ impl Monitor {
             ));
         }
         let mut panel = div()
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                this.disk.as_mut().unwrap().map.leave_findings_navigation();
+                cx.notify();
+            }))
             .relative()
             .child(crate::rack::screws(&t, "disk"))
             .flex()
