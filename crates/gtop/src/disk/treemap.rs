@@ -5018,8 +5018,7 @@ mod tests {
         disk.enter(path.clone());
         assert!(matches!(commands.try_recv().unwrap(), Command::Browse(..)));
         assert!(disk.scan_shelf_status().starts_with("Scanning"));
-        disk.mailbox.lock().unwrap().outcome =
-            Some((disk.generation(), ScanState::Complete));
+        disk.mailbox.lock().unwrap().outcome = Some((disk.generation(), ScanState::Complete));
         disk.consume_mailbox();
         assert!(
             disk.scan_shelf_status().starts_with("Scanning"),
@@ -5113,11 +5112,7 @@ mod tests {
         visual.simulate_resize(size(px(1200.), px(720.)));
 
         monitor.update(visual, |monitor, cx| {
-            monitor
-                .disk
-                .as_mut()
-                .unwrap()
-                .change_scan_option(false);
+            monitor.disk.as_mut().unwrap().change_scan_option(false);
             cx.notify();
         });
         assert!(matches!(commands.try_recv().unwrap(), Command::Scan(..)));
