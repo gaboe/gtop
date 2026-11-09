@@ -3090,7 +3090,9 @@ mod tests {
         disk.start_over();
         disk.close();
         let mut cancelled = complete.clone();
-        Arc::make_mut(cancelled.hierarchy.as_mut().unwrap()).children.clear();
+        Arc::make_mut(cancelled.hierarchy.as_mut().unwrap())
+            .children
+            .clear();
         cancelled.state = ScanState::Cancelled;
         {
             let mut mailbox = disk.mailbox.lock().unwrap();
@@ -3101,7 +3103,9 @@ mod tests {
         disk.reopen(std::time::Instant::now(), false);
         disk.mailbox.lock().unwrap().folder = Some((disk.generation(), 0, complete));
         assert!(disk.consume_mailbox());
-        let restored = disk.map_row().expect("restart must restore the selected item");
+        let restored = disk
+            .map_row()
+            .expect("restart must restore the selected item");
         assert_eq!(restored.path, selected.path);
         assert_eq!(restored.identity, selected.identity);
     }
@@ -3442,12 +3446,13 @@ mod tests {
                 assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
             });
         }
-        let Command::Scan(_, true, first_token, first_generation, first_options) =
+        let Command::Scan(_, true, first_token, first_generation, first_options, _) =
             pending.try_recv().unwrap()
         else {
             panic!("first scan");
         };
-        let Command::Scan(root, true, _, generation, options) = pending.try_recv().unwrap() else {
+        let Command::Scan(root, true, _, generation, options, _) = pending.try_recv().unwrap()
+        else {
             panic!("second scan while first pending");
         };
         assert!(first_token.load(Ordering::Relaxed));
@@ -3474,7 +3479,7 @@ mod tests {
             Some(vec![PathBuf::from("/Volumes/External/chosen")])
         });
         visual.run_until_parked();
-        let Command::Scan(chosen, false, _, chosen_generation, _) = pending.try_recv().unwrap()
+        let Command::Scan(chosen, false, _, chosen_generation, _, _) = pending.try_recv().unwrap()
         else {
             panic!("chosen root scan");
         };
@@ -4603,7 +4608,11 @@ mod tests {
                 force: false,
                 options: Default::default(),
                 outcome: Some(ScanState::Complete),
-                closed_while_scanning: false,
+                view: crate::disk::ScanView {
+                    path: folder.path.clone(),
+                    page: 0,
+                },
+                activity: crate::disk::ScanActivity::Finished,
             }),
             navigation: 0,
             home: path,
