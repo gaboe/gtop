@@ -11,6 +11,7 @@ pub(super) struct MapState {
     mode: Mode,
     depth: u32,
     filter: String,
+    committed_filter: String,
     filtering: bool,
     applied: bool,
     viewport: Viewport,
@@ -25,6 +26,7 @@ pub(super) struct MapState {
     list_scroll: UniformListScrollHandle,
     listing: RefCell<Option<Listing>>,
     matches: RefCell<Option<FilterCache>>,
+    committed_matches: RefCell<Option<FilterCache>>,
     pub(super) previous_result: bool,
     pub(super) pending_selection: Option<disk_scan::Row>,
     #[cfg(test)]
@@ -81,21 +83,36 @@ impl MapState {
         *self.listing.borrow_mut() = None;
     }
     fn matches(&self, root: &Arc<Node>) -> Option<Rc<gtop_disk::filter::Matches>> {
-        let mut cache = self.matches.borrow_mut();
+        self.cached_matches(root, &self.filter, &self.matches)
+    }
+    fn layout_matches(&self, root: &Arc<Node>) -> Option<Rc<gtop_disk::filter::Matches>> {
+        if !self.applied {
+            return None;
+        }
+        if self.committed_filter == self.filter {
+            return self.matches(root);
+        }
+        self.cached_matches(root, &self.committed_filter, &self.committed_matches)
+    }
+    fn cached_matches(
+        &self,
+        root: &Arc<Node>,
+        query: &str,
+        cache: &RefCell<Option<FilterCache>>,
+    ) -> Option<Rc<gtop_disk::filter::Matches>> {
+        let mut cache = cache.borrow_mut();
         if let Some(cached) = cache.as_ref() {
-            if Arc::ptr_eq(&cached.root, root)
-                && cached.query == self.filter
-                && cached.mode == self.mode
+            if Arc::ptr_eq(&cached.root, root) && cached.query == query && cached.mode == self.mode
             {
                 return cached.matches.clone();
             }
         }
         #[cfg(test)]
         self.filter_searches.set(self.filter_searches.get() + 1);
-        let matches = gtop_disk::filter::filter(root, &[], &self.filter).map(Rc::new);
+        let matches = gtop_disk::filter::filter(root, &[], query).map(Rc::new);
         *cache = Some(FilterCache {
             root: root.clone(),
-            query: self.filter.clone(),
+            query: query.to_owned(),
             mode: self.mode,
             matches: matches.clone(),
         });
@@ -107,13 +124,13 @@ impl MapState {
             if Arc::ptr_eq(&cached.root, root)
                 && cached.mode == self.mode
                 && cached.depth == self.draw_depth()
-                && cached.filter == self.filter
+                && cached.filter == self.committed_filter
                 && cached.applied == self.applied
             {
                 return cached.entries.clone();
             }
         }
-        let matches = self.matches(root);
+        let matches = self.layout_matches(root);
         let rows = entries_filtered(
             root,
             self.mode.metric(),
@@ -129,7 +146,7 @@ impl MapState {
             root: root.clone(),
             mode: self.mode,
             depth: self.draw_depth(),
-            filter: self.filter.clone(),
+            filter: self.committed_filter.clone(),
             entries: entries.clone(),
             applied: self.applied,
         });
@@ -329,12 +346,14 @@ impl Disk {
             match key {
                 "escape" => {
                     self.map.filter.clear();
+                    self.map.committed_filter.clear();
                     self.map.filtering = false;
                     self.map.applied = false;
                 }
                 "enter" => {
                     self.map.filtering = false;
                     self.map.applied = true;
+                    self.map.committed_filter = self.map.filter.clone();
                     *self.map.listing.borrow_mut() = None;
                 }
                 "backspace" => {
@@ -376,7 +395,6 @@ impl Disk {
         match key {
             "/" => {
                 self.map.filtering = true;
-                self.map.applied = false;
             }
             "m" => self.set_map_mode(self.map.mode.next()),
             "[" | "]" => self.map.depth = draw_depth(self.map.draw_depth(), key == "]"),
@@ -396,6 +414,7 @@ impl Disk {
             ) {
                 Escape::Filter => {
                     self.map.filter.clear();
+                    self.map.committed_filter.clear();
                     self.map.applied = false;
                 }
                 Escape::Viewport => self.map.viewport = Viewport::default(),
@@ -650,9 +669,11 @@ impl Monitor {
         let mode = disk.map.mode;
         let depth = disk.map.draw_depth();
         let viewport = disk.map.viewport;
-        let filter = disk.map.filter.clone();
-        let matches = hierarchy.as_ref().and_then(|root| disk.map.matches(root));
-        let paint_matches = matches.clone();
+        let filter = disk.map.committed_filter.clone();
+        let matches = hierarchy
+            .as_ref()
+            .and_then(|root| disk.map.layout_matches(root));
+        let paint_matches = hierarchy.as_ref().and_then(|root| disk.map.matches(root));
         let applied = disk.map.applied;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1719,7 +1740,7 @@ mod tests {
                 assert_eq!(painted.3, fill, "age fill {label}");
             }
         });
-        for key in ["/", "n", "o", "m", "a", "t", "c", "h"] {
+        for key in ["/", "n", "o", "m", "a", "t", "c", "h", "enter", "/", "z"] {
             visual.simulate_keystrokes(key);
             visual.update(|window, cx| {
                 assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
@@ -2032,7 +2053,8 @@ mod tests {
             assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
         });
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        assert_ne!(rectangles(visual), unfiltered);
+        let applied_rectangles = rectangles(visual);
+        assert_ne!(applied_rectangles, unfiltered);
         for key in ["/", "z", "backspace"] {
             visual.simulate_keystrokes(key);
             visual.update(|window, cx| {
@@ -2041,7 +2063,7 @@ mod tests {
             visual.update(|window, cx| window.draw(cx).clear(cx));
             assert_eq!(
                 rectangles(visual),
-                unfiltered,
+                applied_rectangles,
                 "editing an applied query previews without filtering geometry"
             );
         }
@@ -2092,13 +2114,16 @@ mod tests {
         disk.map_controls_key("/");
         disk.map_controls_key("z");
         assert!(disk.map.filtering);
-        assert!(!disk.map.applied, "editing must only highlight matches");
+        assert!(disk.map.applied);
+        assert_eq!(disk.map.committed_filter, "t");
+        assert_eq!(disk.map.filter, "tz");
     }
 
     #[test]
     fn fix1_filtered_list_has_no_obsolete_other() {
         let mut disk = snapshot_disk();
         disk.map.filter = "file-159".into();
+        disk.map.committed_filter = disk.map.filter.clone();
         disk.map.applied = true;
         let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
         let rows = disk.map.entries(root);
