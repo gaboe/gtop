@@ -477,7 +477,8 @@ impl Disk {
         self.map.history.visit(path);
     }
     pub(super) fn map_controls_key(&mut self, key: &str) -> bool {
-        if self.map.finding_cursor.is_some()
+        if !self.map.filtering
+            && self.map.finding_cursor.is_some()
             && matches!(
                 key,
                 "up" | "k" | "down" | "j" | "tab" | "shift-tab" | "enter" | "escape"
@@ -1447,7 +1448,9 @@ impl Monitor {
                         .rack(&t)
                         .small()
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.disk.as_mut().unwrap().map_command(key);
+                            let disk = this.disk.as_mut().unwrap();
+                            disk.map.finding_cursor = None;
+                            disk.map_command(key);
                             window.focus(&this.focus, cx);
                             cx.notify();
                         })),
@@ -4827,6 +4830,45 @@ mod tests {
         let root = folder.hierarchy.as_ref().unwrap().clone();
         let findings = disk.map.findings(&root, folder.observed);
         let rows = finding_locations(&findings);
+        let fixture_path = |parts: &[&str]| {
+            let mut node = root.as_ref();
+            let mut crumbs = Vec::new();
+            for part in parts {
+                let (index, child) = node
+                    .children
+                    .iter()
+                    .enumerate()
+                    .find(|(_, child)| child.filesystem_name() == std::ffi::OsStr::new(part))
+                    .unwrap_or_else(|| panic!("fixture path component {part:?} exists"));
+                crumbs.push(index);
+                node = child;
+            }
+            crumbs
+        };
+        let expected_paths = [
+            fixture_path(&["worktrees"]),
+            fixture_path(&[".cache"]),
+            fixture_path(&["experiments", "old-parser"]),
+            fixture_path(&["experiments", "old-parser"]),
+            fixture_path(&["experiments", "old-layout"]),
+            fixture_path(&["experiments", "fresh-editor", "node_modules"]),
+        ];
+        assert_eq!(rows.len(), expected_paths.len());
+        for (row, expected) in rows.iter().zip(expected_paths.iter()) {
+            assert_eq!(&row.1, expected, "finding path comes from fixture names");
+        }
+        assert_eq!(
+            rows[2].1,
+            fixture_path(&["experiments", "old-parser"]),
+            "the subtotal header selects its first matching child"
+        );
+        assert_ne!(
+            rows[2].1,
+            fixture_path(&["experiments"]),
+            "the subtotal header never selects the mixed parent"
+        );
+        assert_eq!(rows[3].1, fixture_path(&["experiments", "old-parser"]));
+        assert_eq!(rows[4].1, fixture_path(&["experiments", "old-layout"]));
         let selectors = [
             "disk-finding-0",
             "disk-finding-1",
@@ -4957,6 +4999,87 @@ mod tests {
                 assert!(!scratch.0.join(".Trash").exists());
             }
         }
+    }
+
+    #[gpui::test]
+    async fn findings_filter_input_wins_after_filter_button_click(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = insights_snapshot_disk();
+        let initial_selection = TileKind::Node { crumbs: vec![] };
+        disk.map_select(initial_selection.clone());
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        visual.simulate_keystrokes("w");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        let filter = visual.debug_bounds("map-filter").unwrap();
+        visual.simulate_click(filter.center(), Modifiers::default());
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.simulate_keystrokes("j");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.simulate_keystrokes("enter");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert_eq!(disk.map.filter, "j");
+            assert_eq!(disk.map.committed_filter, "j");
+            assert!(disk.map.applied);
+            assert!(!disk.map.filtering);
+            assert_eq!(disk.map.selected, Some(initial_selection.clone()));
+        });
+
+        visual.simulate_keystrokes("w");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.simulate_keystrokes("/");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.simulate_keystrokes("k");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.simulate_keystrokes("enter");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert_eq!(disk.map.filter, "jk");
+            assert_eq!(disk.map.committed_filter, "jk");
+            assert_eq!(disk.map.selected, Some(initial_selection.clone()));
+        });
+
+        visual.simulate_keystrokes("/");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert!(disk.map.filter.is_empty());
+            assert!(!disk.map.filtering);
+            assert_eq!(disk.map.selected, Some(initial_selection));
+        });
     }
 
     fn kinds_snapshot_disk() -> Disk {

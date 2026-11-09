@@ -322,6 +322,74 @@ mod tests {
     }
 
     #[test]
+    fn worktree_contains_nested_build_output_without_overlapping_findings() {
+        let mut root = home();
+        let codex = root
+            .children
+            .iter_mut()
+            .find(|node| &*node.name == ".codex")
+            .unwrap();
+        let worktrees = codex
+            .children
+            .iter_mut()
+            .find(|node| &*node.name == "worktrees")
+            .unwrap();
+        let branch = worktrees
+            .children
+            .iter_mut()
+            .find(|node| &*node.name == "a1")
+            .unwrap();
+        branch.children.push(file("Cargo.toml", 1, 1));
+        branch.children.push(dir(
+            "target",
+            vec![file("build-output", 128 * 1024 * 1024, 1)],
+        ));
+        let root = scan(root);
+
+        let found = worth_a_look(&root, NOW, usize::MAX);
+        let worktree_findings: Vec<_> = found
+            .iter()
+            .filter(|item| matches!(item.finding, Finding::Worktrees { .. }))
+            .collect();
+        assert_eq!(worktree_findings.len(), 1);
+        assert_eq!(
+            &*root.resolve(&worktree_findings[0].crumbs).unwrap().name,
+            "worktrees"
+        );
+        assert!(matches!(
+            worktree_findings[0].finding,
+            Finding::Worktrees { count: 2, .. }
+        ));
+        let mut branch_target = worktree_findings[0].crumbs.clone();
+        let worktrees = root.resolve(&branch_target).unwrap();
+        let branch = worktrees
+            .children
+            .iter()
+            .position(|node| &*node.name == "a1")
+            .unwrap();
+        branch_target.push(branch);
+        let branch_node = root.resolve(&branch_target).unwrap();
+        let target = branch_node
+            .children
+            .iter()
+            .position(|node| &*node.name == "target")
+            .unwrap();
+        branch_target.push(target);
+        assert!(found.iter().all(|item| {
+            item.locations()
+                .iter()
+                .all(|path| !path.starts_with(&branch_target))
+        }));
+
+        let locations: Vec<_> = found.iter().flat_map(Candidate::locations).collect();
+        for (index, path) in locations.iter().enumerate() {
+            for other in &locations[index + 1..] {
+                assert!(!path.starts_with(other) && !other.starts_with(path));
+            }
+        }
+    }
+
+    #[test]
     fn stale_subtotal_addresses_only_matching_children_and_never_the_mixed_parent() {
         let root = home();
         let found = worth_a_look(&root, NOW, 24);
