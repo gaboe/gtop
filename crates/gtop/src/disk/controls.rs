@@ -445,6 +445,7 @@ impl Monitor {
         let controls = &disk.map.controls;
         let t = self.draft.unwrap_or(self.settings.base()).tokens();
         let mut panel = div()
+            .occlude()
             .debug_selector(|| "controls-disclosure".into())
             .absolute()
             .top(px(70.))

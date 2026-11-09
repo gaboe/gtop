@@ -4660,6 +4660,15 @@ mod tests {
     async fn controls_v2_reachability_and_immediate_focus(cx: &mut TestAppContext) {
         cx.update(init);
         let mut disk = insights_snapshot_disk();
+        let folder = disk.folder.as_ref().unwrap();
+        let findings = disk
+            .map
+            .findings(folder.hierarchy.as_ref().unwrap(), folder.observed);
+        let old_experiments = findings
+            .iter()
+            .find(|finding| !finding.children.is_empty())
+            .unwrap();
+        disk.inspect_finding(old_experiments.locations()[0].clone());
         let (sender, pending) = mpsc::sync_channel(32);
         disk.sender = sender;
         let (monitor, visual) = cx.add_window_view(|window, cx| {
@@ -4697,6 +4706,12 @@ mod tests {
             let navigation = visual.debug_bounds("controls-navigation").unwrap();
             let findings = visual.debug_bounds("disk-findings").unwrap();
             let list = visual.debug_bounds("map-folder-list").unwrap();
+            let finding = visual.debug_bounds("disk-finding-0").unwrap();
+            assert!(finding.top() >= findings.top() && finding.bottom() <= findings.bottom());
+            for selector in ["map-entry-0", "map-entry-1"] {
+                let row = visual.debug_bounds(selector).unwrap();
+                assert!(row.top() >= list.top() && row.bottom() <= list.bottom());
+            }
             assert!(shelf.bottom() <= navigation.top());
             assert!(findings.size.height >= px(76.));
             assert!(list.size.height >= px(52.), "two file rows fit: {list:?}");
@@ -4803,20 +4818,32 @@ mod tests {
             ));
         }
         for index in 0..7 {
+            let before = monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                (
+                    disk.map.draw_depth(),
+                    disk.map.viewport.scale,
+                    disk.options.clone(),
+                )
+            });
             key!("v");
             for _ in 0..index {
                 key!("down");
             }
             key!("enter");
             monitor.read_with(visual, |monitor, _| {
-                assert!(monitor
-                    .disk
-                    .as_ref()
-                    .unwrap()
-                    .map
-                    .controls
-                    .disclosure
-                    .is_none())
+                let disk = monitor.disk.as_ref().unwrap();
+                assert!(disk.map.controls.disclosure.is_none());
+                match index {
+                    0 => assert_eq!(disk.map.draw_depth(), before.0.saturating_sub(1).max(1)),
+                    1 => assert_eq!(disk.map.draw_depth(), (before.0 + 1).min(16)),
+                    2 => assert!(disk.map.viewport.scale > before.1),
+                    3 => assert!(disk.map.viewport.scale < before.1),
+                    4 => assert_eq!(disk.map.viewport, Viewport::default()),
+                    5 => assert_eq!(disk.options.include_hidden, !before.2.include_hidden),
+                    6 => assert_eq!(disk.options.apparent_size, !before.2.apparent_size),
+                    _ => unreachable!(),
+                }
             });
             if index >= 5 {
                 assert!(matches!(
@@ -4858,6 +4885,15 @@ mod tests {
             {
                 if keyboard {
                     key!("s");
+                    monitor.read_with(visual, |monitor, _| {
+                        let disk = monitor.disk.as_ref().unwrap();
+                        assert!(
+                            disk.map.controls.disclosure == Some(controls::Disclosure::Source),
+                            "source open for {index}; filtering={} open={}",
+                            disk.map.filtering,
+                            disk.open
+                        );
+                    });
                     for _ in 0..index {
                         key!("down");
                     }
@@ -4872,9 +4908,20 @@ mod tests {
                         assert!(!options.files && options.directories && !options.multiple);
                         Some(vec![PathBuf::from("/Volumes/External/controls-v2")])
                     });
+                    focus!();
                     visual.run_until_parked();
+                    focus!();
                 }
-                let Command::Scan(path, false, _, _, _, _) = pending.try_recv().unwrap() else {
+                monitor.read_with(visual, |monitor, _| {
+                    assert!(
+                        !monitor.disk.as_ref().unwrap().map.filtering,
+                        "source clicks do not activate Filter below the menu"
+                    )
+                });
+                let command = pending
+                    .try_recv()
+                    .unwrap_or_else(|error| panic!("source {index}, keyboard={keyboard}: {error}"));
+                let Command::Scan(path, false, _, _, _, _) = command else {
                     panic!("source starts a scan");
                 };
                 let expected = match index {
