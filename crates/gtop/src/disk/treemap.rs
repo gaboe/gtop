@@ -1565,7 +1565,10 @@ impl Monitor {
             );
         }
         legend = legend.child("//// Rebuildable or reclaimable · inspect before cleanup");
-        div().flex().size_full().gap(px(8.)).min_w_0()
+        div().capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+            this.disk.as_mut().unwrap().map.leave_findings_navigation();
+            cx.notify();
+        })).flex().size_full().gap(px(8.)).min_w_0()
             .child(div().flex().flex_col().flex_1().min_w_0().min_h_0().gap(px(8.))
                 .child(div().bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule_hi)).p(px(12.))
                     .child(crate::rack::label(if disk.options.apparent_size { "TREEMAP · APPARENT SIZE" } else { "TREEMAP · ALLOCATED BLOCKS" }, &t))
