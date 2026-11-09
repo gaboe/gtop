@@ -2762,7 +2762,11 @@ mod tests {
         let (sender, _pending) = mpsc::sync_channel(4);
         disk.sender = sender;
         disk.start("/new-root".into(), false);
-        disk.mailbox.lock().unwrap().outcome = Some((disk.generation(), ScanState::Cancelled));
+        disk.mailbox.lock().unwrap().outcome.push_back((
+            disk.generation(),
+            0,
+            ScanState::Cancelled,
+        ));
         disk.consume_mailbox();
         assert_eq!(disk.status, "Scan cancelled.");
         assert!(disk.folder.is_none());
@@ -2984,7 +2988,9 @@ mod tests {
             let disk = monitor.disk.as_mut().unwrap();
             let mut mailbox = disk.mailbox.lock().unwrap();
             mailbox.folder = Some((generation, 0, completed_folder));
-            mailbox.outcome = Some((generation, ScanState::Complete));
+            mailbox
+                .outcome
+                .push_back((generation, 0, ScanState::Complete));
             drop(mailbox);
             assert!(disk.consume_mailbox());
         });
@@ -3043,7 +3049,9 @@ mod tests {
             let generation = disk.generation();
             let mut mailbox = disk.mailbox.lock().unwrap();
             mailbox.folder = Some((generation, 0, terminal));
-            mailbox.outcome = Some((generation, ScanState::Cancelled));
+            mailbox
+                .outcome
+                .push_back((generation, 0, ScanState::Cancelled));
             drop(mailbox);
             assert!(disk.consume_mailbox());
         });
@@ -3114,7 +3122,9 @@ mod tests {
             terminal.state = ScanState::Cancelled;
             let mut mailbox = disk.mailbox.lock().unwrap();
             mailbox.folder = Some((generation, 0, terminal));
-            mailbox.outcome = Some((generation, ScanState::Cancelled));
+            mailbox
+                .outcome
+                .push_back((generation, 0, ScanState::Cancelled));
             drop(mailbox);
             assert!(disk.consume_mailbox());
         });
@@ -3166,7 +3176,9 @@ mod tests {
             terminal.state = ScanState::Failed(error.into());
             let mut mailbox = disk.mailbox.lock().unwrap();
             mailbox.folder = Some((generation, 0, terminal));
-            mailbox.outcome = Some((generation, ScanState::Failed(error.into())));
+            mailbox
+                .outcome
+                .push_back((generation, 0, ScanState::Failed(error.into())));
             drop(mailbox);
             assert!(disk.consume_mailbox());
         });
@@ -3245,7 +3257,11 @@ mod tests {
             disk.sender = sender;
             disk.change_scan_option(true);
             let generation = disk.generation();
-            disk.mailbox.lock().unwrap().outcome = Some((generation, state.clone()));
+            disk.mailbox
+                .lock()
+                .unwrap()
+                .outcome
+                .push_back((generation, 0, state.clone()));
             disk.consume_mailbox();
             assert!(!disk.status.contains("Scanning"), "{}", disk.status);
             assert!(disk.status.contains("Previous result"), "{}", disk.status);
@@ -3288,7 +3304,9 @@ mod tests {
         {
             let mut mailbox = disk.mailbox.lock().unwrap();
             mailbox.folder = Some((disk.generation(), 0, cancelled));
-            mailbox.outcome = Some((disk.generation(), ScanState::Cancelled));
+            mailbox
+                .outcome
+                .push_back((disk.generation(), 0, ScanState::Cancelled));
         }
         disk.consume_mailbox();
         disk.reopen(std::time::Instant::now(), false);
@@ -4793,7 +4811,137 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         visual.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(visual.debug_bounds("map-cancel").is_none());
+        assert!(visual.debug_bounds("disk-cancel").is_none());
+    }
+
+    #[test]
+    fn controls_v2_fix3_shelf_command_end_retention_table() {
+        let fixture = Fixture::shared_pair();
+        let mut scanned = Disk::with_home(fixture.0.clone());
+        wait_folder(&mut scanned, &fixture.0);
+        let row = scanned.folder.as_ref().unwrap().rows[0].clone();
+        drop(scanned);
+        for command in [
+            "root scan",
+            "option rescan",
+            "child Browse",
+            "Trash refresh",
+        ] {
+            for (end, state, label) in [
+                ("Complete", ScanState::Complete, "Complete"),
+                ("Partial", ScanState::Complete, "Partial · partial sizes"),
+                (
+                    "Failed",
+                    ScanState::Failed("denied".into()),
+                    "Failed · partial sizes",
+                ),
+                (
+                    "Cancelled running",
+                    ScanState::Cancelled,
+                    "Cancelled · partial sizes",
+                ),
+                (
+                    "Cancelled queued",
+                    ScanState::Cancelled,
+                    "Cancelled · partial sizes",
+                ),
+            ] {
+                for retained in ["none", "without hierarchy", "with hierarchy"] {
+                    for previous in [false, true] {
+                        let mut disk = insights_snapshot_disk();
+                        let (sender, commands) = mpsc::sync_channel(32);
+                        disk.sender = sender;
+                        let mut folder = disk.folder.take().unwrap();
+                        folder.state = ScanState::Scanning;
+                        folder.errors = 0;
+                        if retained == "without hierarchy" {
+                            folder.hierarchy = None;
+                        }
+                        disk.folder = Some(folder.clone());
+                        let root = disk.session.as_ref().unwrap().root.clone();
+                        match command {
+                            "root scan" => disk.start(root, true),
+                            "option rescan" => disk.change_scan_option(true),
+                            "child Browse" => disk.browse(root.join("worktrees"), 0),
+                            "Trash refresh" => {
+                                disk.confirmation = Some(
+                                    Confirmation::new(
+                                        &row.path,
+                                        row.allocated,
+                                        row.identity,
+                                        &fixture.0,
+                                    )
+                                    .unwrap(),
+                                );
+                                disk.confirm(disk.proposal_id);
+                            }
+                            _ => unreachable!(),
+                        }
+                        let accepted = commands.try_recv().unwrap();
+                        assert!(match command {
+                            "root scan" | "option rescan" => matches!(accepted, Command::Scan(..)),
+                            "child Browse" => matches!(accepted, Command::Browse(..)),
+                            "Trash refresh" => matches!(accepted, Command::Trash(..)),
+                            _ => unreachable!(),
+                        });
+                        assert!(disk.session.as_ref().unwrap().outcome.is_none());
+                        disk.folder = (retained != "none").then_some(folder);
+                        disk.map.previous_result = previous;
+                        disk.scan_bytes = Some(0);
+                        let session = disk.session.as_mut().unwrap();
+                        session.activity = ScanActivity::Running;
+                        session.outcome = Some(ScanState::Complete);
+                        assert_eq!(
+                            disk.scan_shelf_status(),
+                            "Scanning · partial sizes · 0.0 B observed · 0 unreadable",
+                            "{command}/{end}/{retained}/{previous} while running",
+                        );
+                        let generation = disk.generation();
+                        if matches!(end, "Complete" | "Partial") {
+                            let mut current = insights_snapshot_disk().folder.unwrap();
+                            current.state = ScanState::Complete;
+                            current.errors = u64::from(end == "Partial");
+                            Arc::make_mut(current.hierarchy.as_mut().unwrap()).complete = true;
+                            disk.mailbox.lock().unwrap().folder =
+                                Some((generation, disk.navigation, current));
+                        }
+                        disk.mailbox.lock().unwrap().outcome.push_back((
+                            generation,
+                            disk.navigation,
+                            state.clone(),
+                        ));
+                        disk.consume_mailbox();
+                        assert!(disk.session.as_ref().unwrap().activity == ScanActivity::Finished);
+                        let unreadable = u64::from(end == "Partial");
+                        assert_eq!(
+                            disk.scan_shelf_status(),
+                            format!("{label} · 0.0 B observed · {unreadable} unreadable"),
+                            "{command}/{end}/{retained}/{previous}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn controls_v2_fix3_terminal_identity_does_not_end_newer_command() {
+        let mut disk = insights_snapshot_disk();
+        let (sender, commands) = mpsc::sync_channel(32);
+        disk.sender = sender;
+        let root = disk.session.as_ref().unwrap().root.clone();
+        disk.browse(root.join("worktrees"), 0);
+        let generation = disk.generation();
+        let navigation = disk.navigation;
+        disk.apply_outcome(generation - 1, navigation, ScanState::Cancelled);
+        disk.apply_outcome(generation, navigation - 1, ScanState::Complete);
+        assert!(disk.scan_shelf_status().starts_with("Scanning"));
+        disk.apply_outcome(generation, navigation, ScanState::Cancelled);
+        assert!(disk.scan_shelf_status().starts_with("Cancelled"));
+        disk.browse(root, 0);
+        disk.apply_outcome(generation, navigation, ScanState::Failed("old".into()));
+        assert!(disk.scan_shelf_status().starts_with("Scanning"));
+        assert_eq!(commands.try_iter().count(), 2);
     }
 
     #[gpui::test]
@@ -5099,7 +5247,11 @@ mod tests {
         disk.enter(path.clone());
         assert!(matches!(commands.try_recv().unwrap(), Command::Browse(..)));
         assert!(disk.scan_shelf_status().starts_with("Scanning"));
-        disk.mailbox.lock().unwrap().outcome = Some((disk.generation(), ScanState::Complete));
+        disk.mailbox
+            .lock()
+            .unwrap()
+            .outcome
+            .push_back((disk.generation(), 0, ScanState::Complete));
         disk.consume_mailbox();
         assert!(
             disk.scan_shelf_status().starts_with("Scanning"),
@@ -5114,8 +5266,19 @@ mod tests {
             let mut folder = disk.folder.as_ref().unwrap().clone();
             folder.path = path.clone();
             folder.state = state.clone();
+            if state == ScanState::Complete {
+                folder.errors = 0;
+                Arc::make_mut(folder.hierarchy.as_mut().unwrap()).complete = true;
+            }
             disk.mailbox.lock().unwrap().folder =
                 Some((disk.generation(), disk.navigation, folder));
+            if state != ScanState::Scanning {
+                disk.mailbox.lock().unwrap().outcome.push_back((
+                    disk.generation(),
+                    disk.navigation,
+                    state.clone(),
+                ));
+            }
             disk.consume_mailbox();
             let expected = match state {
                 ScanState::Scanning => "Scanning",

@@ -75,28 +75,14 @@ impl Disk {
     }
 
     pub(super) fn scan_shelf_status(&self) -> String {
-        let running = self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.activity == ScanActivity::Running);
-        let state = if running {
-            None
-        } else {
-            self.folder
+        let label = scan_shelf_label(
+            self.session.as_ref().map(|session| &session.activity),
+            self.session
                 .as_ref()
-                .map(|folder| &folder.state)
-                .or_else(|| {
-                    self.session
-                        .as_ref()
-                        .and_then(|session| session.outcome.as_ref())
-                })
-        };
-        let label = match state {
-            Some(ScanState::Complete) => "Complete",
-            Some(ScanState::Cancelled) => "Cancelled · partial sizes",
-            Some(ScanState::Failed(_)) => "Failed · partial sizes",
-            _ => "Scanning · partial sizes",
-        };
+                .and_then(|session| session.outcome.as_ref()),
+            self.folder.as_ref(),
+            self.map.previous_result,
+        );
         format!(
             "{} · {} observed · {} unreadable",
             label,
@@ -178,6 +164,37 @@ impl Disk {
             Command::Choose => self.map.controls.choose_requested = true,
         }
         self.map.controls.disclosure = None;
+    }
+}
+
+fn scan_shelf_label(
+    activity: Option<&ScanActivity>,
+    outcome: Option<&ScanState>,
+    folder: Option<&Folder>,
+    previous_result: bool,
+) -> &'static str {
+    if activity == Some(&ScanActivity::Running) {
+        return "Scanning · partial sizes";
+    }
+    let state = if activity == Some(&ScanActivity::Interrupted) {
+        folder.map(|folder| &folder.state).or(outcome)
+    } else {
+        outcome.or_else(|| folder.map(|folder| &folder.state))
+    };
+    match state {
+        Some(ScanState::Complete)
+            if !previous_result
+                && folder.is_some_and(|folder| {
+                    folder.errors > 0
+                        || folder.hierarchy.as_ref().is_some_and(|root| !root.complete)
+                }) =>
+        {
+            "Partial · partial sizes"
+        }
+        Some(ScanState::Complete) => "Complete",
+        Some(ScanState::Cancelled) => "Cancelled · partial sizes",
+        Some(ScanState::Failed(_)) => "Failed · partial sizes",
+        _ => "Scanning · partial sizes",
     }
 }
 

@@ -122,7 +122,7 @@ struct Mailbox {
     expired: Option<u64>,
     #[cfg(test)]
     scan_gate: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
-    outcome: Option<(u64, ScanState)>,
+    outcome: VecDeque<(u64, u64, ScanState)>,
     scan_bytes: Option<(u64, u64)>,
     resume: Option<u64>,
     folder: Option<(u64, u64, Folder)>,
@@ -321,14 +321,14 @@ impl Disk {
         self.status.clear();
         self.status_kind = StatusKind::Message;
     }
-    fn apply_outcome(&mut self, generation: u64, outcome: ScanState) {
+    fn apply_outcome(&mut self, generation: u64, navigation: u64, outcome: ScanState) {
+        if navigation != self.navigation {
+            return;
+        }
         let root =
             if let Some(session) = self.session.as_mut().filter(|s| s.generation == generation) {
                 session.outcome = Some(outcome.clone());
-                if outcome != ScanState::Scanning
-                    && session.activity == ScanActivity::Running
-                    && session.view.path == session.root
-                {
+                if outcome != ScanState::Scanning && session.activity == ScanActivity::Running {
                     session.activity = ScanActivity::Finished;
                 }
                 Some(session.root.clone())
@@ -386,15 +386,15 @@ impl Disk {
         let folder = mailbox.folder.take();
         let status = mailbox.status.take();
         let proposal = mailbox.proposal.take();
-        let outcome = mailbox.outcome.take();
+        let outcomes = std::mem::take(&mut mailbox.outcome);
         let scan_bytes = mailbox.scan_bytes.take();
         let resume = mailbox.resume.take();
         drop(mailbox);
         if let Some((_, bytes)) = scan_bytes.filter(|(g, _)| *g == self.generation()) {
             self.scan_bytes = Some(bytes);
         }
-        if let Some((generation, outcome)) = outcome {
-            self.apply_outcome(generation, outcome);
+        for (generation, navigation, outcome) in outcomes {
+            self.apply_outcome(generation, navigation, outcome);
         }
         if expired == Some(self.generation()) {
             self.apply_expiry(self.generation());
@@ -428,15 +428,6 @@ impl Disk {
                     .is_some_and(|old| old.state == ScanState::Complete)
             {
                 return false;
-            }
-            if folder.state != ScanState::Scanning {
-                if let Some(session) = self
-                    .session
-                    .as_mut()
-                    .filter(|s| s.activity != ScanActivity::Interrupted)
-                {
-                    session.activity = ScanActivity::Finished;
-                }
             }
             if folder.hierarchy.is_none()
                 && self
@@ -612,6 +603,7 @@ impl Disk {
         if let Some(session) = &mut self.session {
             session.view = ScanView { path, page };
             session.activity = ScanActivity::Running;
+            session.outcome = None;
         }
         self.selected = 0;
         self.cancel.store(true, Ordering::Relaxed);
@@ -686,15 +678,17 @@ impl Disk {
                 confirmation,
                 token.clone(),
                 self.generation(),
-                self.navigation,
+                self.navigation + 1,
                 self.folder.as_ref().unwrap().path.clone(),
                 self.folder.as_ref().unwrap().page,
             )) {
                 Ok(()) => {
+                    self.navigation += 1;
                     self.sending = true;
                     self.cancel = token;
                     if let Some(session) = &mut self.session {
                         session.activity = ScanActivity::Running;
+                        session.outcome = None;
                     }
                     self.set_status("Moving item to Trash…");
                 }
@@ -828,6 +822,12 @@ fn publish(
         }
     }
 }
+fn finish_command(output: &Mutex<Mailbox>, generation: u64, navigation: u64, state: ScanState) {
+    let mut mailbox = output.lock().unwrap();
+    mailbox.outcome.push_back((generation, navigation, state));
+    mailbox.notify();
+}
+
 fn publish_browse(
     output: &Mutex<Mailbox>,
     tree: &Tree,
@@ -835,7 +835,7 @@ fn publish_browse(
     page: usize,
     home: &Path,
     control: ScanControl<'_>,
-) -> bool {
+) -> ScanState {
     output.lock().unwrap().scan_bytes = Some((control.identity.0, tree.observed_bytes()));
     let ScanControl {
         token,
@@ -849,7 +849,7 @@ fn publish_browse(
         publish(
             output, tree, &tree.root, page, false, generation, navigation,
         );
-        return tree.state == ScanState::Complete && !token.load(Ordering::Relaxed);
+        return tree.state.clone();
     }
     let mut published_complete = false;
     priority.update();
@@ -881,7 +881,7 @@ fn publish_browse(
         mailbox.folder = Some((generation, navigation, folder));
         mailbox.notify();
     }
-    subtree.state == ScanState::Complete && !token.load(Ordering::Relaxed)
+    subtree.state
 }
 struct ScanControl<'a> {
     options: gtop_disk::scan::ScanOptions,
@@ -1037,9 +1037,7 @@ fn worker_with_trash(
                 if token.load(Ordering::Relaxed) {
                     active = None;
                     completed = None;
-                    let mut mailbox = output.lock().unwrap();
-                    mailbox.outcome = Some((generation, ScanState::Cancelled));
-                    mailbox.notify();
+                    finish_command(&output, generation, 0, ScanState::Cancelled);
                     continue;
                 }
                 if let Some(tree) = active.take().filter(|t| t.state == ScanState::Complete) {
@@ -1059,11 +1057,11 @@ fn worker_with_trash(
                                 })
                         })
                     }) {
-                        let complete = if browsing == tree.root {
+                        let outcome = if browsing == tree.root {
                             publish(
                                 &output, &tree, &browsing, page, true, generation, navigation,
                             );
-                            true
+                            tree.state.clone()
                         } else {
                             publish_browse(
                                 &output,
@@ -1085,10 +1083,10 @@ fn worker_with_trash(
                                 },
                             )
                         };
-                        let mut mailbox = output.lock().unwrap();
-                        mailbox.outcome = Some((generation, tree.state.clone()));
-                        mailbox.notify();
-                        completed = complete.then_some((generation, navigation));
+                        completed = (outcome == ScanState::Complete
+                            && !token.load(Ordering::Relaxed))
+                        .then_some((generation, navigation));
+                        finish_command(&output, generation, navigation, outcome);
                         active = Some(tree);
                         continue;
                     }
@@ -1122,7 +1120,7 @@ fn worker_with_trash(
                     options.clone(),
                 );
                 priority.restore();
-                completed = publish_browse(
+                let outcome = publish_browse(
                     &output,
                     &tree,
                     &browsing,
@@ -1139,39 +1137,44 @@ fn worker_with_trash(
                             )
                         },
                     },
-                )
-                .then_some((generation, navigation));
-                let outcome = tree.state.clone();
+                );
+                completed = (outcome == ScanState::Complete && !token.load(Ordering::Relaxed))
+                    .then_some((generation, navigation));
                 active = Some(tree);
-                let mut mailbox = output.lock().unwrap();
-                mailbox.outcome = Some((generation, outcome));
-                mailbox.notify();
+                finish_command(&output, generation, navigation, outcome);
             }
             Command::Browse(path, p, g, n, token) => {
-                if g == generation && !token.load(Ordering::Relaxed) {
-                    if let Some(tree) = &active {
-                        completed = publish_browse(
-                            &output,
-                            tree,
-                            &path,
-                            p,
-                            &home,
-                            ScanControl {
-                                options: scan_options.clone(),
-                                token: &token,
-                                priority: &mut priority,
-                                identity: (generation, n),
-                                service: &|| {
-                                    service_retention(
-                                        &receiver, &queue, &retention, &output, generation, &token,
-                                        false,
-                                    )
-                                },
-                            },
-                        )
-                        .then_some((generation, n));
-                    }
+                if g != generation {
+                    continue;
                 }
+                let outcome = if token.load(Ordering::Relaxed) {
+                    ScanState::Cancelled
+                } else if let Some(tree) = &active {
+                    publish_browse(
+                        &output,
+                        tree,
+                        &path,
+                        p,
+                        &home,
+                        ScanControl {
+                            options: scan_options.clone(),
+                            token: &token,
+                            priority: &mut priority,
+                            identity: (generation, n),
+                            service: &|| {
+                                service_retention(
+                                    &receiver, &queue, &retention, &output, generation, &token,
+                                    false,
+                                )
+                            },
+                        },
+                    )
+                } else {
+                    ScanState::Failed("Scan data is unavailable. Rescan the folder.".into())
+                };
+                completed = (outcome == ScanState::Complete && !token.load(Ordering::Relaxed))
+                    .then_some((generation, n));
+                finish_command(&output, generation, n, outcome);
             }
             Command::Prepare(path, size, identity, g, n, proposal) => {
                 let result = prepare_cleanup(completed, (g, n), &path, size, identity, &home);
@@ -1191,7 +1194,9 @@ fn worker_with_trash(
                 drop(mailbox);
                 cache.clear();
                 if g == generation {
-                    if let Some(tree) = active.take() {
+                    let outcome = if token.load(Ordering::Relaxed) {
+                        ScanState::Cancelled
+                    } else if let Some(tree) = active.take() {
                         let root = tree.root.clone();
                         let browsing = path;
                         let page = p;
@@ -1223,7 +1228,7 @@ fn worker_with_trash(
                             scan_options.clone(),
                         );
                         priority.restore();
-                        completed = publish_browse(
+                        let outcome = publish_browse(
                             &output,
                             &refreshed,
                             &browsing,
@@ -1241,13 +1246,18 @@ fn worker_with_trash(
                                     )
                                 },
                             },
-                        )
-                        .then_some((generation, navigation));
+                        );
                         active = Some(refreshed);
                         let mut mailbox = output.lock().unwrap();
                         mailbox.status = Some(final_status);
                         mailbox.notify();
-                    }
+                        outcome
+                    } else {
+                        ScanState::Failed("Scan data is unavailable. Rescan the folder.".into())
+                    };
+                    completed = (outcome == ScanState::Complete && !token.load(Ordering::Relaxed))
+                        .then_some((generation, n));
+                    finish_command(&output, generation, n, outcome);
                 }
             }
         }
@@ -1720,7 +1730,7 @@ mod tests {
         assert_eq!(disk.volume.as_ref().unwrap().space.unwrap().available, 30);
         let generation = disk.generation();
 
-        disk.apply_outcome(generation, ScanState::Complete);
+        disk.apply_outcome(generation, disk.navigation, ScanState::Complete);
         assert_eq!(disk.volume.as_ref().unwrap().root, root);
         assert_eq!(
             disk.volume.as_ref().unwrap().identity_label(),
@@ -1936,8 +1946,8 @@ mod tests {
                 identity: (7, 3),
                 service: &|| {},
             },
-        )
-        .then_some((7, 3));
+        );
+        let completed = (completed == ScanState::Complete).then_some((7, 3));
         let (_, _, folder) = output.lock().unwrap().folder.take().unwrap();
         assert_eq!(folder.state, ScanState::Complete);
         assert_eq!(folder.root, home);
@@ -1979,7 +1989,7 @@ mod tests {
                 service: &|| {},
             },
         );
-        assert!(!completed_root);
+        assert_ne!(completed_root, ScanState::Complete);
         let mut disk = Disk::with_home(home.clone());
         let _ = receive(&mut disk, ScanState::Complete);
         let mut incomplete = folder;
@@ -1988,6 +1998,138 @@ mod tests {
         disk.request_trash(&row);
         assert!(disk.status.contains("Finish the scan"));
         drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn controls_v2_fix3_worker_replies_once_per_accepted_command() {
+        for cancelled in [false, true] {
+            let home = scratch();
+            let child = home.join("child");
+            fs::create_dir(&child).unwrap();
+            fs::write(child.join("file"), [1; 4096]).unwrap();
+            let tree = disk_scan::scan(&home, &home, &AtomicBool::new(false), |_| {});
+            let row = tree.folder(&child, 0, false).rows[0].clone();
+            let confirmation =
+                Confirmation::new(&row.path, row.allocated, row.identity, &home).unwrap();
+            let (sender, receiver) = mpsc::sync_channel(8);
+            for generation in [1, 2] {
+                sender
+                    .send(Command::Scan(
+                        home.clone(),
+                        true,
+                        Arc::new(AtomicBool::new(cancelled)),
+                        generation,
+                        Default::default(),
+                        ScanView {
+                            path: home.clone(),
+                            page: 0,
+                        },
+                    ))
+                    .unwrap();
+            }
+            sender
+                .send(Command::Browse(
+                    child.clone(),
+                    0,
+                    2,
+                    1,
+                    Arc::new(AtomicBool::new(cancelled)),
+                ))
+                .unwrap();
+            sender
+                .send(Command::Trash(
+                    confirmation,
+                    Arc::new(AtomicBool::new(cancelled)),
+                    2,
+                    2,
+                    child,
+                    0,
+                ))
+                .unwrap();
+            drop(sender);
+            let output = Arc::new(Mutex::new(Mailbox::default()));
+            worker_with_trash(
+                receiver,
+                output.clone(),
+                home.clone(),
+                Arc::new(AtomicBool::new(false)),
+                |_, _| Err(std::io::Error::other("test keeps the file")),
+            );
+            let expected = if cancelled {
+                ScanState::Cancelled
+            } else {
+                ScanState::Complete
+            };
+            assert_eq!(
+                output.lock().unwrap().outcome,
+                VecDeque::from([
+                    (1, 0, expected.clone()),
+                    (2, 0, expected.clone()),
+                    (2, 1, expected.clone()),
+                    (2, 2, expected),
+                ]),
+            );
+            assert!(row.path.exists());
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn controls_v2_fix3_missing_tree_ends_browse_and_refresh() {
+        let home = scratch();
+        fs::write(home.join("file"), [1; 4096]).unwrap();
+        let tree = disk_scan::scan(&home, &home, &AtomicBool::new(false), |_| {});
+        let row = tree.folder(&home, 0, false).rows[0].clone();
+        let confirmation =
+            Confirmation::new(&row.path, row.allocated, row.identity, &home).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        sender
+            .send(Command::Scan(
+                home.clone(),
+                true,
+                Arc::new(AtomicBool::new(true)),
+                1,
+                Default::default(),
+                ScanView {
+                    path: home.clone(),
+                    page: 0,
+                },
+            ))
+            .unwrap();
+        sender
+            .send(Command::Browse(
+                home.clone(),
+                0,
+                1,
+                1,
+                Arc::new(AtomicBool::new(false)),
+            ))
+            .unwrap();
+        sender
+            .send(Command::Trash(
+                confirmation,
+                Arc::new(AtomicBool::new(false)),
+                1,
+                2,
+                home.clone(),
+                0,
+            ))
+            .unwrap();
+        drop(sender);
+        let output = Arc::new(Mutex::new(Mailbox::default()));
+        worker_with_trash(
+            receiver,
+            output.clone(),
+            home.clone(),
+            Arc::new(AtomicBool::new(false)),
+            |_, _| Err(std::io::Error::other("test keeps the file")),
+        );
+        let mailbox = output.lock().unwrap();
+        assert_eq!(mailbox.outcome.len(), 3);
+        assert!(matches!(&mailbox.outcome[1], (1, 1, ScanState::Failed(_))));
+        assert!(matches!(&mailbox.outcome[2], (1, 2, ScanState::Failed(_))));
+        assert!(row.path.exists());
         fs::remove_dir_all(home).unwrap();
     }
     #[test]
@@ -2199,7 +2341,11 @@ mod tests {
         let start = Instant::now();
         loop {
             let mailbox = mailbox.lock().unwrap();
-            if matches!(mailbox.outcome, Some((7, ScanState::Complete))) {
+            if mailbox
+                .outcome
+                .iter()
+                .any(|(g, n, state)| (*g, *n) == (7, 0) && *state == ScanState::Complete)
+            {
                 assert_ne!(mailbox.expired, Some(7));
                 assert_eq!(mailbox.folder.as_ref().unwrap().2.items, 1);
                 break;
@@ -2518,7 +2664,9 @@ mod tests {
         resume.send(()).unwrap();
         let start = Instant::now();
         let outcome = loop {
-            if let Some((reply_generation, outcome)) = disk.mailbox.lock().unwrap().outcome.take() {
+            if let Some((reply_generation, _, outcome)) =
+                disk.mailbox.lock().unwrap().outcome.pop_front()
+            {
                 if reply_generation == generation {
                     break outcome;
                 }
