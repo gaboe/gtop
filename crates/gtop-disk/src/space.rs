@@ -652,12 +652,18 @@ fn c_chars(field: &[std::ffi::c_char]) -> String {
 }
 
 /// Exact mount and device for a space query, without the Finder Data-volume alias.
-#[cfg(target_os = "macos")]
 pub fn scan_volume_identity(path: &Path) -> io::Result<String> {
-    let stat = rustix::fs::statfs(path)?;
-    let mount = c_chars(&stat.f_mntonname);
-    let device = c_chars(&stat.f_mntfromname);
-    volume_identity(&mount, &device)
+    #[cfg(target_os = "macos")]
+    {
+        let stat = rustix::fs::statfs(path)?;
+        let mount = c_chars(&stat.f_mntonname);
+        let device = c_chars(&stat.f_mntfromname);
+        volume_identity(&mount, &device)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        scan_volume_identity_non_macos(path)
+    }
 }
 
 fn volume_identity(mount: &str, device: &str) -> io::Result<String> {
@@ -665,11 +671,6 @@ fn volume_identity(mount: &str, device: &str) -> io::Result<String> {
         return Err(io::Error::other("Unknown volume"));
     }
     Ok(format!("{mount} · {device}"))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn scan_volume_identity(path: &Path) -> io::Result<String> {
-    scan_volume_identity_non_macos(path)
 }
 
 #[cfg(not(target_os = "macos"))]
