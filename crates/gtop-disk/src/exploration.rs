@@ -57,9 +57,9 @@ pub fn age_label(modified: i64, now: i64) -> &'static str {
     }
     match now.saturating_sub(modified) {
         ..=86400 => "Today",
-        ..=604800 => "This week",
-        ..=2592000 => "This month",
-        ..=31536000 => "This year",
+        86401..=604800 => "This week",
+        604801..=2592000 => "This month",
+        2592001..=31536000 => "This year",
         _ => "Over a year",
     }
 }

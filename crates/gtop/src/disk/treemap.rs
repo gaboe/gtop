@@ -98,6 +98,7 @@ struct Entry {
     depth: usize,
 }
 
+#[cfg(test)]
 fn entries(root: &Node) -> Vec<Entry> {
     entries_with(root, Metric::Bytes, 4)
 }
@@ -359,15 +360,25 @@ impl Disk {
         let previous = self.map_row();
         self.map.reset_navigation();
         if let (Some(row), Some(root)) = (previous, folder.hierarchy.as_ref()) {
-            self.map.selected = entries(root).into_iter().find_map(|entry| {
-                let TileKind::Node { crumbs } = &entry.kind else {
-                    return None;
+            let Ok(relative) = row.path.strip_prefix(&folder.path) else {
+                return;
+            };
+            let mut node = root.as_ref();
+            let mut crumbs = Vec::new();
+            for component in relative.components() {
+                let Some(index) = node
+                    .children
+                    .iter()
+                    .position(|child| child.filesystem_name() == component.as_os_str())
+                else {
+                    return;
                 };
-                let node = root.resolve(crumbs)?;
-                (node_path(root, &folder.path, crumbs).as_ref() == Some(&row.path)
-                    && node.identity() == Some((row.identity.device, row.identity.inode)))
-                .then_some(entry.kind)
-            });
+                crumbs.push(index);
+                node = &node.children[index];
+            }
+            if node.identity() == Some((row.identity.device, row.identity.inode)) {
+                self.map.selected = Some(TileKind::Node { crumbs });
+            }
         }
     }
     #[cfg(test)]
@@ -658,8 +669,18 @@ impl Monitor {
                                 } else if mode == Mode::Age {
                                     match age {
                                         Some("Today") => t.selection,
-                                        Some("This week") => t.rule_hi,
-                                        Some("This month") => t.rule,
+                                        Some("This week") => {
+                                            crate::palette::mix(t.base.led, t.well, 0.16)
+                                        }
+                                        Some("This month") => {
+                                            crate::palette::mix(t.base.led, t.well, 0.1)
+                                        }
+                                        Some("This year") => {
+                                            crate::palette::mix(t.base.hot, t.well, 0.1)
+                                        }
+                                        Some("Over a year") => {
+                                            crate::palette::mix(t.base.hot, t.well, 0.16)
+                                        }
                                         _ => t.base.plate,
                                     }
                                 } else {
@@ -816,6 +837,7 @@ impl Monitor {
                 crumbs = crumbs.child(
                     Button::new(("map-crumb", index))
                         .label(label)
+                        .max_w(px(180.))
                         .rack(&t)
                         .small()
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -825,40 +847,49 @@ impl Monitor {
                         })),
                 );
                 crumbs = crumbs.child(
-                    Button::new(("map-siblings", index))
-                        .label("▾")
-                        .rack(&t)
-                        .small()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let map = &mut this.disk.as_mut().unwrap().map;
-                            map.siblings = if map.siblings.as_ref() == Some(&sibling_path) {
-                                None
-                            } else {
-                                Some(sibling_path.clone())
-                            };
-                            window.focus(&this.focus, cx);
-                            cx.notify();
-                        })),
+                    div()
+                        .debug_selector(move || format!("map-siblings-{index}"))
+                        .child(
+                            Button::new(("map-siblings", index))
+                                .label("▾")
+                                .rack(&t)
+                                .small()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let map = &mut this.disk.as_mut().unwrap().map;
+                                    map.siblings = if map.siblings.as_ref() == Some(&sibling_path) {
+                                        None
+                                    } else {
+                                        Some(sibling_path.clone())
+                                    };
+                                    window.focus(&this.focus, cx);
+                                    cx.notify();
+                                })),
+                        ),
                 );
             }
         }
         if let Some(path) = &disk.map.siblings {
             for (index, path) in disk.map_siblings(path).into_iter().enumerate() {
                 crumbs = crumbs.child(
-                    Button::new(("map-sibling-entry", index))
-                        .label(
-                            path.file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .into_owned(),
-                        )
-                        .rack(&t)
-                        .small()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.disk.as_mut().unwrap().enter(path.clone());
-                            window.focus(&this.focus, cx);
-                            cx.notify();
-                        })),
+                    div()
+                        .debug_selector(move || format!("map-sibling-entry-{index}"))
+                        .child(
+                            Button::new(("map-sibling-entry", index))
+                                .label(
+                                    path.file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                )
+                                .max_w(px(180.))
+                                .rack(&t)
+                                .small()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.disk.as_mut().unwrap().enter(path.clone());
+                                    window.focus(&this.focus, cx);
+                                    cx.notify();
+                                })),
+                        ),
                 );
             }
         }
@@ -879,7 +910,7 @@ impl Monitor {
         for (index, mode) in [Mode::Size, Mode::Files, Mode::Age].into_iter().enumerate() {
             controls = controls.child(
                 div()
-                    .debug_selector(move || format!("map-mode-{index}").into())
+                    .debug_selector(move || format!("map-mode-{index}"))
                     .child(
                         Button::new(("map-mode", index))
                             .label(format!(
@@ -1580,6 +1611,23 @@ mod tests {
                 assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
             });
         }
+        for selector in [
+            "map-depth-less",
+            "map-depth-more",
+            "map-reset",
+            "map-filter",
+        ] {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let bounds = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(bounds.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+        }
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
         assert!(pending.try_recv().is_err(), "view controls must never scan");
         let center = visual.debug_bounds("disk-treemap").unwrap().center();
         let before = monitor.read_with(visual, |monitor, _| {
@@ -1735,6 +1783,87 @@ mod tests {
             assert_eq!(disk.session.as_ref().unwrap().root, chosen);
             assert_eq!(disk.generation(), chosen_generation);
         });
+        monitor.update(visual, |monitor, _| monitor.disk = None);
+    }
+
+    #[gpui::test]
+    async fn sibling_choices_and_history_use_observed_paths(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        let original = disk.folder.clone().unwrap();
+        disk.remember_map_root(&original);
+        disk.map_visit(original.path.clone());
+        let root = original.hierarchy.as_ref().unwrap();
+        let index = root
+            .children
+            .iter()
+            .position(|node| &*node.name == "projects")
+            .unwrap();
+        let child = root.children[index].clone();
+        disk.map_select(TileKind::Node {
+            crumbs: vec![index],
+        });
+        let (sender, pending) = mpsc::sync_channel(32);
+        disk.sender = sender;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1480.), px(930.)));
+        visual.simulate_keystrokes("enter");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        let Command::Browse(projects, _, generation, navigation, _) = pending.try_recv().unwrap()
+        else {
+            panic!("browse");
+        };
+        let mut folder = original;
+        folder.path = projects.clone();
+        folder.allocated = child.bytes;
+        folder.hierarchy = Some(Arc::new(child));
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            disk.mailbox.lock().unwrap().folder = Some((generation, navigation, folder));
+            assert!(disk.consume_mailbox());
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let arrow = visual.debug_bounds("map-siblings-1").unwrap();
+        visual.simulate_click(arrow.center(), Modifiers::default());
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let (target_index, target) = monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            disk.map_siblings(&projects)
+                .into_iter()
+                .enumerate()
+                .find(|(_, path)| path.file_name().is_some_and(|name| name == "tiny"))
+                .unwrap()
+        });
+        assert_eq!(target_index, 1);
+        let option = visual.debug_bounds("map-sibling-entry-1").unwrap();
+        visual.simulate_click(option.center(), Modifiers::default());
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        assert!(
+            matches!(pending.try_recv().unwrap(),Command::Browse(path,_,_,_,_) if path==target)
+        );
+        for (selector, expected) in [("map-back", projects), ("map-forward", target)] {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let bounds = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(bounds.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            assert!(
+                matches!(pending.try_recv().unwrap(),Command::Browse(path,_,_,_,_) if path==expected)
+            );
+        }
         monitor.update(visual, |monitor, _| monitor.disk = None);
     }
 
