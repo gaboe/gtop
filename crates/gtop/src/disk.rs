@@ -416,6 +416,7 @@ impl Disk {
         }
         if expired == Some(self.generation()) {
             self.apply_expiry(self.generation());
+            folder = None;
         } else if self.open && resume == Some(self.generation()) {
             self.start_over();
         }
@@ -995,6 +996,7 @@ fn worker_with_trash(
             completed = None;
             let mut mailbox = output.lock().unwrap();
             mailbox.folder = None;
+            mailbox.outcome.retain(|(g, _, _)| *g != generation);
             mailbox.proposal = None;
             mailbox.expired = Some(generation);
             mailbox.notify();
@@ -1589,12 +1591,11 @@ impl Monitor {
         let mut disk = Disk::with_home(home);
         let start = std::time::Instant::now();
         loop {
-            let value = disk.mailbox.lock().unwrap().folder.take();
-            if let Some((_, _, folder)) = value {
+            if disk.consume_mailbox() {
+                let folder = disk.folder.as_ref().unwrap();
                 if folder.state == ScanState::Complete {
                     assert_eq!(folder.rows.len(), 128);
                     assert_eq!(folder.smaller_items, 32);
-                    disk.folder = Some(folder);
                     break;
                 }
             }
@@ -1841,6 +1842,12 @@ mod tests {
         }
     }
     fn receive_cleanup_refresh(disk: &Disk) -> (String, Folder) {
+        let (status, ScanReply::Folder(folder)) = receive_cleanup_reply(disk) else {
+            panic!("expected cleanup refresh folder");
+        };
+        (status, folder)
+    }
+    fn receive_cleanup_reply(disk: &Disk) -> (String, ScanReply) {
         let start = Instant::now();
         loop {
             let mut mailbox = disk.mailbox.lock().unwrap();
@@ -1866,22 +1873,15 @@ mod tests {
             let reply = mailbox
                 .outcome
                 .iter()
-                .position(|(g, n, reply)| {
-                    (*g, *n) == (disk.generation(), disk.navigation)
-                        && matches!(reply, ScanReply::Folder(_))
-                })
+                .position(|(g, n, _)| (*g, *n) == (disk.generation(), disk.navigation))
                 .and_then(|index| mailbox.outcome.remove(index));
             drop(mailbox);
-            let (generation, navigation, ScanReply::Folder(folder)) =
-                reply.expect("cleanup refresh folder")
-            else {
-                panic!("expected folder");
-            };
+            let (generation, navigation, reply) = reply.expect("cleanup terminal reply");
             assert_eq!(
                 (generation, navigation),
                 (disk.generation(), disk.navigation)
             );
-            return (status, folder);
+            return (status, reply);
         }
     }
     fn receive_proposal(disk: &Disk) -> (u64, u64, Result<Confirmation, String>) {
@@ -2898,10 +2898,14 @@ mod tests {
         disk.close();
         let cancelled_at_close = token.load(Ordering::Relaxed);
         release.send(()).unwrap();
-        let (_, cancelled) = receive_cleanup_refresh(&disk);
+        let (_, cancelled) = receive_cleanup_reply(&disk);
         assert!(cancelled_at_close);
-        assert_eq!(cancelled.state, ScanState::Cancelled);
-        disk.mailbox.lock().unwrap().folder = Some((disk.generation(), disk.navigation, cancelled));
+        assert_eq!(*cancelled.state(), ScanState::Cancelled);
+        disk.mailbox.lock().unwrap().outcome.push_back((
+            disk.generation(),
+            disk.navigation,
+            cancelled,
+        ));
         disk.consume_mailbox();
         assert!(Arc::ptr_eq(
             retained.hierarchy.as_ref().unwrap(),
