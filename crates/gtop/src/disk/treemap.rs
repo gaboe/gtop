@@ -5082,6 +5082,128 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    async fn mode_buttons_leave_findings_navigation(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            window.focus(&monitor.focus, cx);
+            monitor.disk = Some(insights_snapshot_disk());
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        for (selector, mode) in [
+            ("map-mode-0", Mode::Size),
+            ("map-mode-1", Mode::Files),
+            ("map-mode-2", Mode::Age),
+        ] {
+            let (selected, selected_index, target_path, next_selection, sender, commands) = {
+                let mut disk = insights_snapshot_disk();
+                let folder = disk.folder.as_ref().unwrap();
+                let root = folder.hierarchy.as_ref().unwrap().clone();
+                let folder_path = folder.path.clone();
+                let experiments = root
+                    .children
+                    .iter()
+                    .position(|node| &*node.name == "experiments")
+                    .unwrap();
+                let fresh_editor = root.children[experiments]
+                    .children
+                    .iter()
+                    .position(|node| &*node.name == "fresh-editor")
+                    .unwrap();
+                let crumbs = vec![experiments, fresh_editor];
+                let selected = TileKind::Node {
+                    crumbs: crumbs.clone(),
+                };
+                let target_path = node_path(&root, &folder_path, &crumbs).unwrap();
+                let entries = disk.map.entries(&root);
+                let selected_index = entries
+                    .iter()
+                    .position(|entry| entry.kind == selected)
+                    .unwrap();
+                let next_selection = entries[selected_index + 1].kind.clone();
+                let (sender, commands) = mpsc::sync_channel(4);
+                disk.sender = sender.clone();
+                monitor.update(visual, |monitor, _| monitor.disk = Some(disk));
+                (
+                    selected,
+                    selected_index,
+                    target_path,
+                    next_selection,
+                    sender,
+                    commands,
+                )
+            };
+            let row_selector = Box::leak(format!("map-entry-{selected_index}").into_boxed_str());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+
+            let row = visual.debug_bounds(row_selector).unwrap();
+            visual.simulate_click(row.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            monitor.read_with(visual, |monitor, _| {
+                assert_eq!(
+                    monitor.disk.as_ref().unwrap().map.selected,
+                    Some(selected.clone())
+                )
+            });
+            visual.simulate_keystrokes("w");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            let bounds = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(bounds.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                assert_eq!(disk.map.mode, mode);
+            });
+            visual.simulate_keystrokes("enter");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            let enter_routed_to_folder = matches!(
+                commands.try_recv(),
+                Ok(Command::Browse(path, ..)) if path == target_path
+            );
+
+            let mut disk = insights_snapshot_disk();
+            disk.sender = sender;
+            monitor.update(visual, |monitor, _| monitor.disk = Some(disk));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let row = visual.debug_bounds(row_selector).unwrap();
+            visual.simulate_click(row.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            visual.simulate_keystrokes("w");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            let bounds = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(bounds.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            visual.simulate_keystrokes("down");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            let down_routed_to_list = monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                disk.map.finding_cursor.is_none() && disk.map.selected.as_ref() == Some(&next_selection)
+            });
+            assert!(enter_routed_to_folder, "{selector} Enter browses the selected folder");
+            assert!(down_routed_to_list, "{selector} Down moves the regular row selection");
+        }
+    }
+
     fn kinds_snapshot_disk() -> Disk {
         use gtop_disk::tree::{aggregate, NodeKind};
         fn dir(name: &str, bytes: u64) -> Node {
