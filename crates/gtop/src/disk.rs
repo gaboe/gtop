@@ -325,6 +325,12 @@ impl Disk {
         let root =
             if let Some(session) = self.session.as_mut().filter(|s| s.generation == generation) {
                 session.outcome = Some(outcome.clone());
+                if outcome != ScanState::Scanning
+                    && session.activity == ScanActivity::Running
+                    && session.view.path == session.root
+                {
+                    session.activity = ScanActivity::Finished;
+                }
                 Some(session.root.clone())
             } else {
                 None
@@ -574,6 +580,7 @@ impl Disk {
         self.invalidate_proposal();
         self.navigation = 0;
         self.map.reset_navigation();
+        self.map.previous_result = false;
         self.selected = 0;
         self.map.pending_selection = previous_selection;
         self.folder = None;

@@ -123,7 +123,6 @@ impl MapState {
         self.finding_cursor = None;
         self.selected = None;
         self.pending_selection = None;
-        self.previous_result = false;
         self.hovered = None;
         self.viewport = Viewport::default();
         self.siblings = None;
