@@ -253,12 +253,34 @@ impl Disk {
     fn apply_outcome(&mut self, generation: u64, outcome: ScanState) {
         let root =
             if let Some(session) = self.session.as_mut().filter(|s| s.generation == generation) {
-                session.outcome = Some(outcome);
+                session.outcome = Some(outcome.clone());
                 Some(session.root.clone())
             } else {
                 None
             };
         if let Some(root) = root {
+            if self.status.starts_with("Previous result") {
+                let message = match &outcome {
+                    ScanState::Failed(error) => {
+                        Some(format!("Previous result. Replacement failed: {error}"))
+                    }
+                    ScanState::Cancelled => Some("Previous result. Replacement cancelled.".into()),
+                    _ => None,
+                };
+                if let Some(message) = message {
+                    self.status = message;
+                    if let Some(folder) = &mut self.folder {
+                        folder.state = outcome.clone();
+                    }
+                }
+            }
+            if self.folder.is_none() {
+                match &outcome {
+                    ScanState::Cancelled => self.status = "Scan cancelled.".into(),
+                    ScanState::Failed(error) => self.status = format!("Scan failed: {error}"),
+                    _ => {}
+                }
+            }
             self.refresh_volume(&root);
         }
     }
@@ -320,11 +342,20 @@ impl Disk {
                     .folder
                     .as_ref()
                     .is_some_and(|old| old.hierarchy.is_some())
-                && self.status.starts_with("Previous result is stale.")
+                && self.status.starts_with("Previous result")
             {
+                if !matches!(folder.state, ScanState::Scanning) {
+                    self.status = match &folder.state {
+                        ScanState::Failed(error) => {
+                            format!("Previous result. Replacement failed: {error}")
+                        }
+                        _ => "Previous result. Replacement cancelled.".into(),
+                    };
+                    self.folder.as_mut().unwrap().state = folder.state;
+                }
                 return true;
             }
-            if folder.hierarchy.is_some() && self.status.starts_with("Previous result is stale.") {
+            if folder.hierarchy.is_some() && self.status.starts_with("Previous result") {
                 self.status.clear();
             }
             let same_hierarchy = self.folder.as_ref().is_some_and(|previous| {
@@ -398,6 +429,24 @@ impl Disk {
         )) {
             return;
         }
+        let replacement = self
+            .folder
+            .as_ref()
+            .is_some_and(|folder| folder.root == root);
+        let previous_selection = if replacement {
+            self.map_row()
+                .or_else(|| self.map.pending_selection.clone())
+        } else {
+            None
+        };
+        let previous_folder = if replacement {
+            self.folder.clone().map(|mut folder| {
+                folder.state = ScanState::Scanning;
+                folder
+            })
+        } else {
+            None
+        };
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = cancel;
         self.refresh_volume(&root);
@@ -412,7 +461,11 @@ impl Disk {
         self.navigation = 0;
         self.map.reset_navigation();
         self.selected = 0;
-        self.folder = None;
+        self.map.pending_selection = previous_selection;
+        self.folder = previous_folder;
+        if self.folder.is_some() {
+            self.status = "Previous result is stale. Scanning replacement…".into();
+        }
     }
     fn start_over(&mut self) {
         let root = self
@@ -1300,11 +1353,11 @@ impl Monitor {
                 );
             }
         } else {
-            body = body.child("Starting disk scan…");
+            body = body.child(self.disk.as_ref().unwrap().status.clone());
         }
         body =
             body.child(div().text_size(px(10.)).child(
-                "↑ ↓ select · Enter open · Backspace up · X trash · C cancel · R start over",
+                "arrows/HJKL move · Tab list · Enter open · Backspace up · X trash · C cancel · R start over",
             ));
         let mut panel = div()
             .relative()

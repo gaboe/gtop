@@ -2855,6 +2855,26 @@ impl Monitor {
                 .colors
                 .iter()
                 .any(|i| i.read(cx).focus_handle(cx).is_focused(window));
+        if self.disk.as_ref().is_some_and(|disk| disk.open)
+            && !self.settings_open
+            && self.moment.is_none()
+            && !self.focus.is_focused(window)
+        {
+            if k == "tab" {
+                if event.keystroke.modifiers.shift {
+                    window.focus_prev(cx);
+                } else {
+                    window.focus_next(cx);
+                }
+                window.prevent_default();
+                cx.stop_propagation();
+            } else if k == "escape" {
+                window.focus(&self.focus, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
         if k == "tab" {
             if let Some(disk) = self
                 .disk
@@ -2871,6 +2891,15 @@ impl Monitor {
                     cx.notify();
                     return;
                 }
+                if event.keystroke.modifiers.shift {
+                    window.focus_prev(cx);
+                } else {
+                    window.focus_next(cx);
+                }
+                window.prevent_default();
+                cx.stop_propagation();
+                cx.notify();
+                return;
             }
             self.switch_view_from_tab(event.keystroke.modifiers.shift, window, cx);
             window.prevent_default();

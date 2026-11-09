@@ -16,12 +16,27 @@ pub(super) struct MapState {
     viewport: Viewport,
     history: History,
     siblings: Option<PathBuf>,
+    sibling_index: usize,
+    sibling_scroll: UniformListScrollHandle,
     scan_root: Option<(PathBuf, Arc<Node>)>,
     selected: Option<TileKind>,
     hovered: Option<TileKind>,
     frame: Rc<RefCell<MapFrame>>,
     list_scroll: UniformListScrollHandle,
     listing: RefCell<Option<Listing>>,
+    matches: RefCell<Option<FilterCache>>,
+    pub(super) pending_selection: Option<disk_scan::Row>,
+    #[cfg(test)]
+    clock: Option<i64>,
+    #[cfg(test)]
+    filter_searches: std::cell::Cell<usize>,
+}
+
+struct FilterCache {
+    root: Arc<Node>,
+    query: String,
+    mode: Mode,
+    matches: Option<Rc<gtop_disk::filter::Matches>>,
 }
 
 struct Listing {
@@ -30,6 +45,7 @@ struct Listing {
     depth: u32,
     filter: String,
     entries: Rc<Vec<Entry>>,
+    applied: bool,
 }
 
 #[derive(Default)]
@@ -38,6 +54,8 @@ struct MapFrame {
     size: Size<Pixels>,
     root: Option<Arc<Node>>,
     tiles: Vec<Tile>,
+    #[cfg(test)]
+    painted: Vec<(TileKind, Rect, String, u32)>,
     mode: Mode,
     depth: u32,
     filter: String,
@@ -59,6 +77,27 @@ impl MapState {
         *self.frame.borrow_mut() = MapFrame::default();
         *self.listing.borrow_mut() = None;
     }
+    fn matches(&self, root: &Arc<Node>) -> Option<Rc<gtop_disk::filter::Matches>> {
+        let mut cache = self.matches.borrow_mut();
+        if let Some(cached) = cache.as_ref() {
+            if Arc::ptr_eq(&cached.root, root)
+                && cached.query == self.filter
+                && cached.mode == self.mode
+            {
+                return cached.matches.clone();
+            }
+        }
+        #[cfg(test)]
+        self.filter_searches.set(self.filter_searches.get() + 1);
+        let matches = gtop_disk::filter::filter(root, &[], &self.filter).map(Rc::new);
+        *cache = Some(FilterCache {
+            root: root.clone(),
+            query: self.filter.clone(),
+            mode: self.mode,
+            matches: matches.clone(),
+        });
+        matches
+    }
     fn entries(&self, root: &Arc<Node>) -> Rc<Vec<Entry>> {
         let mut listing = self.listing.borrow_mut();
         if let Some(cached) = &*listing {
@@ -66,20 +105,22 @@ impl MapState {
                 && cached.mode == self.mode
                 && cached.depth == self.draw_depth()
                 && cached.filter == self.filter
+                && cached.applied == self.applied
             {
                 return cached.entries.clone();
             }
         }
-        let mut rows = entries_with(root, self.mode.metric(), self.draw_depth());
-        if self.applied {
-            if let Some(matches) = gtop_disk::filter::filter(root, &[], &self.filter) {
-                rows.retain(|entry| match &entry.kind {
-                    TileKind::Node { crumbs } | TileKind::Others { crumbs, .. } => {
-                        matches.keep(crumbs).is_some()
-                    }
-                });
-            }
-        }
+        let matches = self.matches(root);
+        let rows = entries_filtered(
+            root,
+            self.mode.metric(),
+            self.draw_depth(),
+            if self.applied {
+                matches.as_deref()
+            } else {
+                None
+            },
+        );
         let entries = Rc::new(rows);
         *listing = Some(Listing {
             root: root.clone(),
@@ -87,6 +128,7 @@ impl MapState {
             depth: self.draw_depth(),
             filter: self.filter.clone(),
             entries: entries.clone(),
+            applied: self.applied,
         });
         entries
     }
@@ -102,21 +144,48 @@ struct Entry {
 fn entries(root: &Node) -> Vec<Entry> {
     entries_with(root, Metric::Bytes, 4)
 }
+#[cfg(test)]
 fn entries_with(root: &Node, metric: Metric, depth: u32) -> Vec<Entry> {
+    entries_filtered(root, metric, depth, None)
+}
+
+fn entries_filtered(
+    root: &Node,
+    metric: Metric,
+    depth: u32,
+    matches: Option<&gtop_disk::filter::Matches>,
+) -> Vec<Entry> {
     fn visit(
         node: &Node,
         crumbs: &mut Vec<usize>,
         out: &mut Vec<Entry>,
         metric: Metric,
         depth: u32,
+        matches: Option<&gtop_disk::filter::Matches>,
     ) {
         let mut children: Vec<_> = node
             .children
             .iter()
             .enumerate()
-            .filter(|(_, child)| child.value(metric) > 0)
+            .filter(|(index, child)| {
+                let mut path = crumbs.clone();
+                path.push(*index);
+                matches.map_or(child.value(metric), |found| {
+                    found.keep(&path).map_or(0, |keep| {
+                        gtop_disk::filter::Matches::value(keep, child, metric)
+                    })
+                }) > 0
+            })
             .collect();
-        children.sort_by_key(|(_, child)| std::cmp::Reverse(child.value(metric)));
+        children.sort_by_key(|(index, child)| {
+            let mut path = crumbs.clone();
+            path.push(*index);
+            std::cmp::Reverse(matches.map_or(child.value(metric), |found| {
+                found.keep(&path).map_or(0, |keep| {
+                    gtop_disk::filter::Matches::value(keep, child, metric)
+                })
+            }))
+        });
         let kept = children.len().min(LayoutOptions::default().max_children);
         for (rank, (index, child)) in children.iter().enumerate() {
             if rank == kept {
@@ -143,16 +212,15 @@ fn entries_with(root: &Node, metric: Metric, depth: u32) -> Vec<Entry> {
                 depth: crumbs.len() - 1,
             });
             if rank < kept && crumbs.len() < depth as usize {
-                visit(child, crumbs, out, metric, depth);
+                visit(child, crumbs, out, metric, depth, matches);
             }
             crumbs.pop();
         }
-        for (index, child) in node
-            .children
-            .iter()
-            .enumerate()
-            .filter(|(_, child)| child.value(metric) == 0)
-        {
+        for (index, child) in node.children.iter().enumerate().filter(|(index, child)| {
+            let mut path = crumbs.clone();
+            path.push(*index);
+            child.value(metric) == 0 && matches.is_none_or(|found| found.keep(&path).is_some())
+        }) {
             let mut path = crumbs.clone();
             path.push(index);
             out.push(Entry {
@@ -163,7 +231,7 @@ fn entries_with(root: &Node, metric: Metric, depth: u32) -> Vec<Entry> {
         }
     }
     let mut out = Vec::new();
-    visit(root, &mut Vec::new(), &mut out, metric, depth);
+    visit(root, &mut Vec::new(), &mut out, metric, depth, matches);
     out
 }
 
@@ -258,9 +326,37 @@ impl Disk {
             }
             return true;
         }
+        if let Some(path) = self.map.siblings.clone() {
+            let siblings = self.map_siblings(&path);
+            match key {
+                "escape" => self.map.siblings = None,
+                "down" | "j" | "tab" | "up" | "k" | "shift-tab" => {
+                    self.map.sibling_index = if matches!(key, "down" | "j" | "tab") {
+                        (self.map.sibling_index + 1).min(siblings.len().saturating_sub(1))
+                    } else {
+                        self.map.sibling_index.saturating_sub(1)
+                    };
+                    self.map
+                        .sibling_scroll
+                        .scroll_to_item(self.map.sibling_index, ScrollStrategy::Nearest);
+                }
+                "enter" => {
+                    if let Some(path) = siblings.get(self.map.sibling_index) {
+                        self.enter(path.clone());
+                    }
+                }
+                _ => return self.map_command(key),
+            }
+            return true;
+        }
+        self.map_command(key)
+    }
+
+    fn map_command(&mut self, key: &str) -> bool {
         match key {
             "/" => {
                 self.map.filtering = true;
+                self.map.applied = false;
             }
             "m" => self.set_map_mode(self.map.mode.next()),
             "[" | "]" => self.map.depth = draw_depth(self.map.draw_depth(), key == "]"),
@@ -315,6 +411,9 @@ impl Disk {
     }
 
     fn map_travel(&mut self, forward: bool) {
+        let previous = self.map.history.clone();
+        let generation = self.generation();
+        let navigation = self.navigation;
         if let Some(path) = self.map.history.travel(forward) {
             if self
                 .session
@@ -325,12 +424,14 @@ impl Disk {
             } else {
                 self.start(path, false);
             }
+            if self.generation() == generation && self.navigation == navigation {
+                self.map.history = previous;
+            }
         }
     }
 
     fn change_scan_option(&mut self, hidden: bool) {
         let previous = self.options.clone();
-        let folder = self.folder.clone();
         if hidden {
             self.options.include_hidden = !self.options.include_hidden;
         } else {
@@ -341,13 +442,12 @@ impl Disk {
         if self.generation() == generation {
             self.options = previous;
         } else {
-            self.folder = folder;
             self.status = "Previous result is stale. Scanning with new options…".into();
         }
     }
 
     pub(super) fn restore_map_selection(&mut self, folder: &Folder) {
-        let previous = self.map_row();
+        let previous = self.map.pending_selection.take().or_else(|| self.map_row());
         self.map.reset_navigation();
         if let (Some(row), Some(root)) = (previous, folder.hierarchy.as_ref()) {
             let Ok(relative) = row.path.strip_prefix(&folder.path) else {
@@ -434,6 +534,19 @@ impl Disk {
                     self.map.selected.as_ref().and_then(|selected| {
                         entries.iter().position(|entry| &entry.kind == selected)
                     });
+                let forward = matches!(key, "down" | "j" | "tab");
+                if matches!(key, "tab" | "shift-tab")
+                    && (entries.is_empty()
+                        || selected.is_some_and(|index| {
+                            if forward {
+                                index + 1 == entries.len()
+                            } else {
+                                index == 0
+                            }
+                        }))
+                {
+                    return false;
+                }
                 let next = match (selected, matches!(key, "down" | "j" | "tab")) {
                     (Some(index), true) => (index + 1).min(entries.len().saturating_sub(1)),
                     (Some(index), false) => index.saturating_sub(1),
@@ -499,12 +612,15 @@ impl Monitor {
         let depth = disk.map.draw_depth();
         let viewport = disk.map.viewport;
         let filter = disk.map.filter.clone();
-        let paint_filter = filter.clone();
+        let matches = hierarchy.as_ref().and_then(|root| disk.map.matches(root));
+        let paint_matches = matches.clone();
         let applied = disk.map.applied;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        #[cfg(test)]
+        let now = disk.map.clock.unwrap_or(now);
         let canvas = div()
             .id("disk-treemap")
             .debug_selector(|| "disk-treemap".into())
@@ -606,12 +722,7 @@ impl Monitor {
                                         max_depth: depth,
                                         ..Default::default()
                                     },
-                                    if applied {
-                                        gtop_disk::filter::filter(root, &[], &filter)
-                                    } else {
-                                        None
-                                    }
-                                    .as_ref(),
+                                    if applied { matches.as_deref() } else { None },
                                 )
                             });
                             frame.size = bounds.size;
@@ -630,7 +741,9 @@ impl Monitor {
                     },
                     move |bounds, (root, tiles), window, cx| {
                         let Some(root) = root else { return };
-                        let matches = gtop_disk::filter::filter(&root, &[], &paint_filter);
+                        let matches = &paint_matches;
+                        #[cfg(test)]
+                        paint_frame.borrow_mut().painted.clear();
                         for tile in tiles {
                             let dimmed = matches
                                 .as_ref()
@@ -649,33 +762,34 @@ impl Monitor {
                             } else {
                                 t.rule
                             };
+                            let fill = if selected.as_ref() == Some(&tile.kind) {
+                                t.selection
+                            } else if dimmed {
+                                t.well
+                            } else if mode == Mode::Age {
+                                match age {
+                                    Some("Today") => t.selection,
+                                    Some("This week") => {
+                                        crate::palette::mix(t.base.led, t.well, 0.16)
+                                    }
+                                    Some("This month") => {
+                                        crate::palette::mix(t.base.led, t.well, 0.1)
+                                    }
+                                    Some("This year") => {
+                                        crate::palette::mix(t.base.hot, t.well, 0.1)
+                                    }
+                                    Some("Over a year") => {
+                                        crate::palette::mix(t.base.hot, t.well, 0.16)
+                                    }
+                                    _ => t.base.plate,
+                                }
+                            } else {
+                                t.base.plate
+                            };
                             window.paint_quad(quad(
                                 rect,
                                 Corners::default(),
-                                rgb(if selected.as_ref() == Some(&tile.kind) {
-                                    t.selection
-                                } else if dimmed {
-                                    t.well
-                                } else if mode == Mode::Age {
-                                    match age {
-                                        Some("Today") => t.selection,
-                                        Some("This week") => {
-                                            crate::palette::mix(t.base.led, t.well, 0.16)
-                                        }
-                                        Some("This month") => {
-                                            crate::palette::mix(t.base.led, t.well, 0.1)
-                                        }
-                                        Some("This year") => {
-                                            crate::palette::mix(t.base.hot, t.well, 0.1)
-                                        }
-                                        Some("Over a year") => {
-                                            crate::palette::mix(t.base.hot, t.well, 0.16)
-                                        }
-                                        _ => t.base.plate,
-                                    }
-                                } else {
-                                    t.base.plate
-                                }),
+                                rgb(fill),
                                 Edges::all(px(1.)),
                                 rgb(edge),
                                 BorderStyle::Solid,
@@ -704,6 +818,13 @@ impl Monitor {
                                     (format!("Other · {count} items"), String::new())
                                 }
                             };
+                            #[cfg(test)]
+                            paint_frame.borrow_mut().painted.push((
+                                tile.kind.clone(),
+                                tile.rect,
+                                size_text.clone(),
+                                fill,
+                            ));
                             let band = tile.header.unwrap_or(tile.rect);
                             let mask = Bounds::new(
                                 bounds.origin + point(px(band.x), px(band.y)),
@@ -805,7 +926,7 @@ impl Monitor {
                 .size_full(),
             );
         let path = disk.folder.as_ref().map_or_else(
-            || "Starting disk scan…".into(),
+            || self.disk.as_ref().unwrap().status.clone(),
             |folder| folder.path.display().to_string(),
         );
         let mut crumbs = div().flex().flex_wrap().gap(px(4.));
@@ -846,6 +967,7 @@ impl Monitor {
                                 .small()
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     let map = &mut this.disk.as_mut().unwrap().map;
+                                    map.sibling_index = 0;
                                     map.siblings = if map.siblings.as_ref() == Some(&sibling_path) {
                                         None
                                     } else {
@@ -858,31 +980,58 @@ impl Monitor {
                 );
             }
         }
-        if let Some(path) = &disk.map.siblings {
-            for (index, path) in disk.map_siblings(path).into_iter().enumerate() {
-                crumbs = crumbs.child(
-                    div()
-                        .debug_selector(move || format!("map-sibling-entry-{index}"))
-                        .child(
-                            Button::new(("map-sibling-entry", index))
-                                .label(
-                                    path.file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .into_owned(),
-                                )
-                                .max_w(px(180.))
-                                .rack(&t)
-                                .small()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.disk.as_mut().unwrap().enter(path.clone());
-                                    window.focus(&this.focus, cx);
-                                    cx.notify();
-                                })),
-                        ),
-                );
-            }
-        }
+        let siblings = disk.map.siblings.as_ref().map(|path| {
+            let paths = disk.map_siblings(path);
+            let selected = disk.map.sibling_index;
+            div()
+                .id("map-sibling-menu")
+                .debug_selector(|| "map-sibling-menu".into())
+                .h(px(160.))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .child(
+                    uniform_list(
+                        "map-sibling-rows",
+                        paths.len(),
+                        cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+                            range
+                                .map(|index| {
+                                    let path = paths[index].clone();
+                                    div()
+                                        .debug_selector(move || {
+                                            format!("map-sibling-entry-{index}")
+                                        })
+                                        .h(px(28.))
+                                        .w_full()
+                                        .bg(rgb(if selected == index {
+                                            t.selection
+                                        } else {
+                                            t.base.plate
+                                        }))
+                                        .cursor_pointer()
+                                        .child(
+                                            path.file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.disk.as_mut().unwrap().enter(path.clone());
+                                                window.focus(&this.focus, cx);
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }),
+                                        )
+                                })
+                                .collect()
+                        }),
+                    )
+                    .track_scroll(&disk.map.sibling_scroll)
+                    .size_full(),
+                )
+        });
         let hover = disk
             .map
             .hovered
@@ -937,7 +1086,7 @@ impl Monitor {
                         .rack(&t)
                         .small()
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.disk.as_mut().unwrap().map_controls_key(key);
+                            this.disk.as_mut().unwrap().map_command(key);
                             window.focus(&this.focus, cx);
                             cx.notify();
                         })),
@@ -1016,7 +1165,7 @@ impl Monitor {
             .folder
             .as_ref()
             .and_then(|folder| folder.hierarchy.as_ref())
-            .and_then(|root| gtop_disk::filter::filter(root, &[], &disk.map.filter))
+            .and_then(|root| disk.map.matches(root))
             .map(|found| {
                 format!(
                     "{} matched bytes · {} scan bytes{}",
@@ -1034,11 +1183,11 @@ impl Monitor {
             .child(div().flex().flex_col().flex_1().min_w_0().min_h_0().gap(px(8.))
                 .child(div().bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule_hi)).p(px(12.))
                     .child(crate::rack::label(if disk.options.apparent_size { "TREEMAP · APPARENT SIZE" } else { "TREEMAP · ALLOCATED BLOCKS" }, &t))
-                    .child(current_path(path)).child(crumbs).child(controls).child(div().text_size(px(10.)).child(matched)))
+                    .child(current_path(path)).child(crumbs).children(siblings).child(controls).child(div().text_size(px(10.)).child(matched)))
                 .child(canvas)
                 .child(div().h(px(20.)).overflow_hidden().text_size(px(10.)).child(hover))
                 .child(div().bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule)).p(px(8.))
-                    .child("D Top · arrows/HJKL move · Tab list · Enter open · Backspace up · X Trash")
+                    .child("D Top · arrows/HJKL move · Tab list/controls · Esc canvas · Enter open · Backspace up · X Trash")
                     .child("M mode · / filter · [ ] depth · + − zoom · 0 reset · B/F history")
                     .child(div().text_size(px(10.)).child("Observed sizes. Unknown space has no tile area. Hover informs; click selects."))))
             .child(self.resizable_disk_inspector(window, cx))
@@ -1474,6 +1623,429 @@ mod tests {
     fn init(cx: &mut App) {
         gpui_component::init(cx);
         crate::theme::init(cx);
+    }
+
+    #[gpui::test]
+    async fn fix1_filter_cache_age_and_painted_zoom(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = age_snapshot_disk();
+        disk.map.mode = Mode::Age;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        monitor.read_with(visual, |monitor, _| {
+            let t = monitor.settings.base().tokens();
+            let disk = monitor.disk.as_ref().unwrap();
+            let frame = disk.map.frame.borrow();
+            let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+            for (index, label, fill) in [
+                (0, "Today", t.selection),
+                (
+                    1,
+                    "This week",
+                    crate::palette::mix(t.base.led, t.well, 0.16),
+                ),
+                (
+                    2,
+                    "This month",
+                    crate::palette::mix(t.base.led, t.well, 0.1),
+                ),
+                (3, "Unknown age", t.base.plate),
+            ] {
+                let kind = TileKind::Node {
+                    crumbs: vec![index],
+                };
+                let painted = frame.painted.iter().find(|tile| tile.0 == kind).unwrap();
+                assert!(
+                    painted.2.contains(label),
+                    "{}: {}",
+                    root.children[index].name,
+                    painted.2
+                );
+                assert_eq!(painted.3, fill, "age fill {label}");
+            }
+        });
+        for key in ["/", "n", "o", "m", "a", "t", "c", "h"] {
+            visual.simulate_keystrokes(key);
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+        }
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let searches = monitor.read_with(visual, |monitor, _| {
+            monitor.disk.as_ref().unwrap().map.filter_searches.get()
+        });
+        for _ in 0..5 {
+            monitor.update(visual, |_, cx| cx.notify());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        monitor.read_with(visual, |monitor, _| {
+            assert_eq!(
+                monitor.disk.as_ref().unwrap().map.filter_searches.get(),
+                searches,
+                "unchanged redraw searches"
+            )
+        });
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let (origin, extent) = monitor.read_with(visual, |monitor, _| {
+            let frame = monitor.disk.as_ref().unwrap().map.frame.borrow();
+            (frame.origin, frame.size)
+        });
+        let pointer = origin + point(extent.width * 0.23, extent.height * 0.31);
+        for (shift, delta) in [
+            (false, point(px(0.), px(220.))),
+            (true, point(px(37.), px(-11.))),
+        ] {
+            visual.update(|window, cx| {
+                window.dispatch_event(
+                    ScrollWheelEvent {
+                        position: pointer,
+                        delta: ScrollDelta::Pixels(delta),
+                        modifiers: Modifiers {
+                            shift,
+                            ..Default::default()
+                        },
+                        touch_phase: TouchPhase::Moved,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+            });
+        }
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let points = monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            let frame = disk.map.frame.borrow();
+            let scale = (220f32 * 0.002).exp();
+            assert!((disk.map.viewport.scale - scale).abs() < 0.0001);
+            let anchor_x = extent.width.as_f32() * 0.23;
+            let anchor_y = extent.height.as_f32() * 0.31;
+            assert!((disk.map.viewport.x - (anchor_x * (1. - scale) + 37.)).abs() < 0.001);
+            assert!((disk.map.viewport.y - (anchor_y * (1. - scale) - 11.)).abs() < 0.001);
+            for (kind, rect, _, _) in &frame.painted {
+                let old = frame
+                    .tiles
+                    .iter()
+                    .find(|tile| &tile.kind == kind)
+                    .unwrap()
+                    .rect;
+                assert!((rect.x - (old.x * scale + anchor_x * (1. - scale) + 37.)).abs() < 0.001);
+                assert!((rect.w - old.w * scale).abs() < 0.001);
+            }
+            let mut points = Vec::new();
+            for y in (5..extent.height.as_f32() as usize).step_by(13) {
+                for x in (5..extent.width.as_f32() as usize).step_by(13) {
+                    let expected = frame
+                        .painted
+                        .iter()
+                        .rev()
+                        .find(|tile| tile.1.contains(x as f32, y as f32));
+                    if let Some(expected) = expected {
+                        let old = treemap::hit(&frame.tiles, x as f32, y as f32);
+                        if old.is_none_or(|old| old.kind != expected.0) {
+                            points.push((
+                                origin + point(px(x as f32), px(y as f32)),
+                                expected.0.clone(),
+                            ));
+                            if points.len() == 3 {
+                                return points;
+                            }
+                        }
+                    }
+                }
+            }
+            points
+        });
+        assert_eq!(points.len(), 3, "clicks must cross old paint boundaries");
+        for (point, expected) in points {
+            visual.simulate_click(point, Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            monitor.read_with(visual, |monitor, _| {
+                assert_eq!(monitor.disk.as_ref().unwrap().map.selected, Some(expected))
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn fix1_list_boundaries_leave_focus_and_escape_returns(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+        disk.map.selected = disk
+            .map
+            .entries(root)
+            .last()
+            .map(|entry| entry.kind.clone());
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.simulate_keystrokes("tab");
+        visual.update(|window, cx| {
+            assert_ne!(
+                window.focused(cx),
+                Some(monitor.read(cx).focus.clone()),
+                "Tab leaves final row"
+            )
+        });
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+            disk.map.selected = disk
+                .map
+                .entries(root)
+                .first()
+                .map(|entry| entry.kind.clone());
+        });
+        visual.simulate_keystrokes("shift-tab");
+        visual.update(|window, cx| {
+            assert_ne!(
+                window.focused(cx),
+                Some(monitor.read(cx).focus.clone()),
+                "Shift-Tab leaves first row"
+            )
+        });
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+    }
+
+    #[gpui::test]
+    async fn fix1_hundreds_of_siblings_scroll_by_key_and_pointer(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        let (sender, pending) = mpsc::sync_channel(4);
+        disk.sender = sender;
+        let mut parent = Node::directory("root");
+        parent.children = (0..400)
+            .map(|index| {
+                let mut node = Node::directory(format!("sibling-{index:03}-long-directory-name"));
+                node.children
+                    .push(Node::entry("file", gtop_disk::tree::NodeKind::File, 4096));
+                gtop_disk::tree::aggregate(&mut node, Metric::Bytes);
+                node
+            })
+            .collect();
+        gtop_disk::tree::aggregate(&mut parent, Metric::Bytes);
+        disk.map.scan_root = Some(("/Users/demo".into(), Arc::new(parent.clone())));
+        disk.map.siblings =
+            Some(Path::new("/Users/demo").join(parent.children[0].filesystem_name()));
+        let last = Path::new("/Users/demo").join(parent.children[399].filesystem_name());
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let menu = visual.debug_bounds("map-sibling-menu").unwrap();
+        assert!(menu.size.height <= px(160.));
+        let canvas = visual.debug_bounds("disk-treemap").unwrap();
+        assert!(canvas.size.height > px(100.));
+        for _ in 0..399 {
+            visual.simulate_keystrokes("down");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+        }
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let last_bounds = visual.debug_bounds("map-sibling-entry-399").unwrap();
+        assert!(last_bounds.top() >= menu.top() && last_bounds.bottom() <= menu.bottom());
+        visual.simulate_keystrokes("enter");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        let Command::Browse(path, ..) = pending.recv().unwrap() else {
+            panic!("browse")
+        };
+        assert_eq!(path, last);
+        monitor.update(visual, |monitor, cx| {
+            let disk = monitor.disk.as_mut().unwrap();
+            disk.map.siblings = Some("/Users/demo/sibling-000-long-directory-name".into());
+            disk.map.sibling_index = 399;
+            disk.map
+                .sibling_scroll
+                .scroll_to_item(399, ScrollStrategy::Nearest);
+            cx.notify();
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let last_bounds = visual.debug_bounds("map-sibling-entry-399").unwrap();
+        visual.simulate_click(last_bounds.center(), Modifiers::default());
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        let Command::Browse(path, ..) = pending.recv().unwrap() else {
+            panic!("browse")
+        };
+        assert_eq!(path, last);
+    }
+
+    #[test]
+    fn fix1_reopening_filter_keeps_preview_geometry() {
+        let mut disk = snapshot_disk();
+        disk.map_controls_key("/");
+        disk.map_controls_key("t");
+        disk.map_controls_key("enter");
+        disk.map_controls_key("/");
+        disk.map_controls_key("z");
+        assert!(disk.map.filtering);
+        assert!(!disk.map.applied, "editing must only highlight matches");
+    }
+
+    #[test]
+    fn fix1_filtered_list_has_no_obsolete_other() {
+        let mut disk = snapshot_disk();
+        disk.map.filter = "file-159".into();
+        disk.map.applied = true;
+        let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+        let rows = disk.map.entries(root);
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row.kind, TileKind::Others { .. })));
+        assert!(rows.iter().any(|row| row.label.contains("file-159")));
+    }
+
+    #[test]
+    fn fix1_rejected_history_preserves_next_destination() {
+        let mut disk = snapshot_disk();
+        let (sender, pending) = mpsc::sync_channel(1);
+        disk.sender = sender;
+        for path in ["/Users/demo/a", "/Users/demo/b", "/Users/demo/c"] {
+            disk.map_visit(path.into());
+        }
+        disk.sender
+            .try_send(Command::Browse(
+                "/busy".into(),
+                0,
+                1,
+                1,
+                disk.cancel.clone(),
+            ))
+            .unwrap();
+        disk.map_travel(false);
+        pending.recv().unwrap();
+        disk.map_travel(false);
+        let Command::Browse(path, ..) = pending.recv().unwrap() else {
+            panic!("browse")
+        };
+        assert_eq!(path, Path::new("/Users/demo/b"));
+    }
+
+    #[test]
+    fn fix1_terminal_replacement_reports_failure_and_cancel() {
+        for state in [
+            ScanState::Failed("root missing".into()),
+            ScanState::Cancelled,
+        ] {
+            let mut disk = snapshot_disk();
+            let (sender, _pending) = mpsc::sync_channel(4);
+            disk.sender = sender;
+            disk.change_scan_option(true);
+            let generation = disk.generation();
+            disk.mailbox.lock().unwrap().outcome = Some((generation, state.clone()));
+            disk.consume_mailbox();
+            assert!(!disk.status.contains("Scanning"), "{}", disk.status);
+            assert!(disk.status.contains("Previous result"), "{}", disk.status);
+            assert!(
+                disk.status
+                    .contains(if matches!(state, ScanState::Cancelled) {
+                        "cancelled"
+                    } else {
+                        "root missing"
+                    }),
+                "{}",
+                disk.status
+            );
+        }
+    }
+
+    #[test]
+    fn fix1_replacement_scan_restores_selection() {
+        for option in [false, true] {
+            let mut disk = snapshot_disk();
+            let root = Arc::make_mut(disk.folder.as_mut().unwrap().hierarchy.as_mut().unwrap());
+            root.children[0].inode = Some((42, std::num::NonZeroU64::new(99).unwrap()));
+            disk.map_select(TileKind::Node { crumbs: vec![0] });
+            let selected = disk.map_row().unwrap();
+            let mut replacement = disk.folder.clone().unwrap();
+            Arc::make_mut(replacement.hierarchy.as_mut().unwrap())
+                .children
+                .reverse();
+            let (sender, _pending) = mpsc::sync_channel(4);
+            disk.sender = sender;
+            if option {
+                disk.change_scan_option(true);
+            } else {
+                disk.start_over();
+            }
+            disk.mailbox.lock().unwrap().folder = Some((disk.generation(), 0, replacement));
+            assert!(disk.consume_mailbox());
+            let restored = disk
+                .map_row()
+                .expect("selection restored after production start");
+            assert_eq!(restored.path, selected.path);
+            assert_eq!(restored.identity, selected.identity);
+        }
+    }
+
+    #[gpui::test]
+    async fn fix1_visible_controls_do_not_type(cx: &mut TestAppContext) {
+        cx.update(init);
+        let disk = snapshot_disk();
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.simulate_keystrokes("+ / t");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        for selector in [
+            "map-reset",
+            "map-depth-more",
+            "map-depth-less",
+            "map-filter",
+        ] {
+            let bounds = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(bounds.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                assert_eq!(disk.map.filter, "t");
+                if selector == "map-reset" {
+                    assert_eq!(disk.map.viewport, Viewport::default());
+                }
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+        }
     }
 
     #[test]
@@ -2622,8 +3194,16 @@ mod tests {
                 .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
                 .unwrap();
         }
-        for (width, height) in [(1480., 930.), (1200., 720.)] {
-            let mut disk = snapshot_disk();
+        for (width, height, ages) in [
+            (1480., 930., false),
+            (1200., 720., false),
+            (1200., 720., true),
+        ] {
+            let mut disk = if ages {
+                age_snapshot_disk()
+            } else {
+                snapshot_disk()
+            };
             disk.map.mode = Mode::Age;
             let index = disk
                 .folder
@@ -2656,9 +3236,33 @@ mod tests {
             .unwrap();
             cx.capture_screenshot(handle.into())
                 .unwrap()
-                .save(output.join(format!("modes-{width:.0}x{height:.0}.png")))
+                .save(output.join(format!(
+                    "modes-{}{width:.0}x{height:.0}.png",
+                    if ages { "age-" } else { "" }
+                )))
                 .unwrap();
         }
+    }
+
+    const AGE_NOW: i64 = 1_800_000_000;
+    fn age_snapshot_disk() -> Disk {
+        let mut disk = snapshot_disk();
+        disk.map.clock = Some(AGE_NOW);
+        let root = Arc::make_mut(disk.folder.as_mut().unwrap().hierarchy.as_mut().unwrap());
+        fn set_age(node: &mut Node, modified: i64) {
+            node.modified = modified;
+            for child in &mut node.children {
+                set_age(child, modified);
+            }
+        }
+        for (node, ago) in root
+            .children
+            .iter_mut()
+            .zip([3600, 3 * 86400, 20 * 86400, AGE_NOW])
+        {
+            set_age(node, AGE_NOW - ago);
+        }
+        disk
     }
 
     fn snapshot_disk() -> Disk {

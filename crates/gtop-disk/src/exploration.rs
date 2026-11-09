@@ -142,7 +142,7 @@ impl Viewport {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct History {
     paths: Vec<PathBuf>,
     cursor: usize,
