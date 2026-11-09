@@ -342,6 +342,8 @@ fn coverage_tag(node: &Node) -> Option<&'static str> {
         Some("VOL")
     } else if !node.complete || node.read_error || node.unreadable > 0 {
         Some("PART")
+    } else if node.shared {
+        Some("SHARED")
     } else {
         None
     }
@@ -1845,6 +1847,17 @@ mod tests {
             fs::write(path.join("unknown/observed"), vec![1; 32 << 10]).unwrap();
             Self(path.canonicalize().unwrap())
         }
+        fn shared_pair() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "gtop-treemap-shared-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("a"), [1; 4096]).unwrap();
+            fs::hard_link(path.join("a"), path.join("b")).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
         fn disk(&self) -> Disk {
             let mut disk = Disk::with_home(self.0.clone());
             wait_folder(&mut disk, &self.0);
@@ -1925,6 +1938,46 @@ mod tests {
             });
         }
         monitor.update(visual, |monitor, _| monitor.disk = None);
+    }
+
+    #[gpui::test]
+    async fn shared_hardlink_tile_shows_counted_elsewhere_in_files_mode(cx: &mut TestAppContext) {
+        cx.update(init);
+        let fixture = Fixture::shared_pair();
+        let mut disk = Disk::with_home(fixture.0.clone());
+        wait_folder(&mut disk, &fixture.0);
+        disk.map.mode = Mode::Files;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            let frame = disk.map.frame.borrow();
+            let root = frame.root.as_ref().unwrap();
+            let (index, shared) = root
+                .children
+                .iter()
+                .enumerate()
+                .find(|(_, node)| node.shared)
+                .unwrap();
+            assert_eq!(shared.bytes, 0);
+            assert_eq!(shared.files, 1);
+            let kind = TileKind::Node {
+                crumbs: vec![index],
+            };
+            let (_, label, _) = frame
+                .coverage_labels
+                .iter()
+                .find(|(tile, _, _)| *tile == kind)
+                .unwrap();
+            assert!(label.starts_with("SHARED · 1 files"), "{label}");
+        });
+        monitor.update(visual, |monitor, _| monitor.disk = None);
+        drop(fixture);
     }
 
     #[gpui::test]
