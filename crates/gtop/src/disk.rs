@@ -406,11 +406,19 @@ impl Disk {
                     .session
                     .as_ref()
                     .is_some_and(|session| session.activity == ScanActivity::Interrupted)
+                && self
+                    .folder
+                    .as_ref()
+                    .is_some_and(|old| old.state == ScanState::Complete)
             {
                 return false;
             }
             if folder.state != ScanState::Scanning {
-                if let Some(session) = &mut self.session {
+                if let Some(session) = self
+                    .session
+                    .as_mut()
+                    .filter(|s| s.activity != ScanActivity::Interrupted)
+                {
                     session.activity = ScanActivity::Finished;
                 }
             }
@@ -2817,11 +2825,8 @@ mod tests {
 
         let mut restarted = Vec::new();
         while let Ok(command) = receiver.try_recv() {
-            match command {
-                Command::Scan(root, force, _, _, options, _) => {
-                    restarted.push((root, force, options));
-                }
-                _ => {}
+            if let Command::Scan(root, force, _, _, options, _) = command {
+                restarted.push((root, force, options));
             }
         }
         let status = disk.status.clone();

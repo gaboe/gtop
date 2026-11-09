@@ -582,7 +582,12 @@ impl Disk {
     pub(super) fn restore_map_selection(&mut self, folder: &Folder) {
         let previous = self.map.pending_selection.take().or_else(|| self.map_row());
         self.map.reset_navigation();
-        if folder.state == ScanState::Scanning {
+        if folder.state == ScanState::Scanning
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.activity == super::ScanActivity::Interrupted)
+        {
             self.map.pending_selection = previous.clone();
         }
         if let (Some(row), Some(root)) = (previous, folder.hierarchy.as_ref()) {
@@ -3079,10 +3084,16 @@ mod tests {
 
     #[test]
     fn fix1_closed_cancel_reply_preserves_restart_selection() {
+        use std::os::unix::ffi::OsStringExt;
         let mut disk = snapshot_disk();
         let root = Arc::make_mut(disk.folder.as_mut().unwrap().hierarchy.as_mut().unwrap());
-        root.children[0].inode = Some((42, std::num::NonZeroU64::new(99).unwrap()));
-        disk.map_select(TileKind::Node { crumbs: vec![0] });
+        let node = &mut root.children[0].children[0].children[0].children[0];
+        node.inode = Some((42, std::num::NonZeroU64::new(99).unwrap()));
+        node.raw_name =
+            Some(std::ffi::OsString::from_vec(b"binary-\xff".to_vec()).into_boxed_os_str());
+        disk.map_select(TileKind::Node {
+            crumbs: vec![0, 0, 0, 0],
+        });
         let selected = disk.map_row().unwrap();
         let complete = disk.folder.clone().unwrap();
         let (sender, _pending) = mpsc::sync_channel(8);
