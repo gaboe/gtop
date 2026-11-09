@@ -431,9 +431,9 @@ impl Disk {
             return;
         }
         let replacement = self
-            .folder
+            .session
             .as_ref()
-            .is_some_and(|folder| folder.root == root);
+            .is_some_and(|session| session.root == root);
         let previous_selection = if replacement {
             self.map_row()
                 .or_else(|| self.map.pending_selection.clone())

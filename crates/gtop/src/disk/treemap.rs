@@ -401,6 +401,7 @@ impl Disk {
                 Escape::Viewport => self.map.viewport = Viewport::default(),
                 Escape::Selection => {
                     self.map.selected = None;
+                    self.map.pending_selection = None;
                     self.invalidate_proposal();
                 }
                 Escape::Close => return false,
@@ -483,6 +484,9 @@ impl Disk {
     pub(super) fn restore_map_selection(&mut self, folder: &Folder) {
         let previous = self.map.pending_selection.take().or_else(|| self.map_row());
         self.map.reset_navigation();
+        if folder.state == ScanState::Scanning {
+            self.map.pending_selection = previous.clone();
+        }
         if let (Some(row), Some(root)) = (previous, folder.hierarchy.as_ref()) {
             let Ok(relative) = row.path.strip_prefix(&folder.path) else {
                 return;
@@ -525,6 +529,7 @@ impl Disk {
     fn map_select(&mut self, kind: TileKind) {
         self.invalidate_proposal();
         self.map.selected = Some(kind);
+        self.map.pending_selection = None;
     }
 
     pub(super) fn map_row(&self) -> Option<disk_scan::Row> {
@@ -2175,7 +2180,21 @@ mod tests {
                 disk.change_scan_option(true);
             } else {
                 disk.start_over();
+                disk.start_over();
             }
+            let mut starting = replacement.clone();
+            starting.state = ScanState::Scanning;
+            starting.hierarchy = None;
+            disk.mailbox.lock().unwrap().folder = Some((disk.generation(), 0, starting));
+            assert!(disk.consume_mailbox());
+            let mut partial = replacement.clone();
+            Arc::make_mut(partial.hierarchy.as_mut().unwrap())
+                .children
+                .clear();
+            partial.state = ScanState::Scanning;
+            disk.mailbox.lock().unwrap().folder = Some((disk.generation(), 0, partial));
+            assert!(disk.consume_mailbox());
+            assert!(disk.map.selected.is_none());
             disk.mailbox.lock().unwrap().folder = Some((disk.generation(), 0, replacement));
             assert!(disk.consume_mailbox());
             let restored = disk
