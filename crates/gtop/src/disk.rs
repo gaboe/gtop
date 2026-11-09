@@ -2420,7 +2420,47 @@ mod tests {
     }
 
     #[test]
-    fn running_scan_survives_close_and_reopen_without_restarting() {
+    fn close_keeps_completed_tree_without_queuing_a_scan() {
+        let home = scratch();
+        fs::write(home.join("one"), [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        let folder = receive(&mut disk, ScanState::Complete);
+        let (sender, receiver) = mpsc::sync_channel(4);
+        disk.sender = sender;
+
+        disk.close();
+        disk.reopen(Instant::now(), false);
+
+        assert_eq!(disk.folder.as_ref().unwrap().root, folder.root);
+        assert_eq!(disk.folder.as_ref().unwrap().state, ScanState::Complete);
+        assert!(matches!(receiver.recv().unwrap(), Command::Close(_)));
+        assert!(matches!(receiver.recv().unwrap(), Command::Reopen(_)));
+        assert!(receiver.try_recv().is_err());
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn completed_tree_expires_before_reopen_and_scans_fresh_data() {
+        let home = scratch();
+        fs::write(home.join("one"), [1; 4096]).unwrap();
+        let mut disk = Disk::with_home(home.clone());
+        let original = receive(&mut disk, ScanState::Complete);
+        disk.close();
+        fs::write(home.join("two"), [2; 4096]).unwrap();
+
+        disk.reopen(Instant::now() + SESSION_RETENTION, false);
+        let fresh = receive(&mut disk, ScanState::Complete);
+
+        assert_eq!(original.items, 1);
+        assert_eq!(fresh.items, 2);
+        assert!(!fresh.cached);
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn close_cancels_a_pending_scan_immediately() {
         let home = scratch();
         fs::write(home.join("one"), [1; 4096]).unwrap();
         let mut disk = Disk::with_home(home.clone());
@@ -2430,17 +2470,102 @@ mod tests {
         disk.mailbox.lock().unwrap().scan_gate = Some((started, suspended));
         disk.start(home.clone(), true);
         ready.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(disk.session.as_ref().unwrap().outcome.is_none());
         let generation = disk.generation();
+        let token = disk.cancel.clone();
         disk.close();
-        assert!(!disk.cancel.load(Ordering::Relaxed));
-        assert!(!disk.foreground.load(Ordering::Acquire));
-        disk.reopen(Instant::now(), false);
-        assert_eq!(disk.generation(), generation);
+        let cancelled_at_close = token.load(Ordering::Relaxed);
         resume.send(()).unwrap();
-        assert_eq!(receive(&mut disk, ScanState::Complete).items, 1);
+        let start = Instant::now();
+        let outcome = loop {
+            if let Some((reply_generation, outcome)) = disk.mailbox.lock().unwrap().outcome.take() {
+                if reply_generation == generation {
+                    break outcome;
+                }
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "worker timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        };
         drop(disk);
         fs::remove_dir_all(home).unwrap();
+        assert!(cancelled_at_close, "close must signal the running scan at once");
+        assert_eq!(outcome, ScanState::Cancelled);
+    }
+
+    #[test]
+    fn reopening_restarts_a_closed_scan_with_its_root_and_options() {
+        let home = scratch();
+        let mut disk = Disk::with_home(home.clone());
+        let _ = receive(&mut disk, ScanState::Complete);
+        disk.options.apparent_size = true;
+        disk.options.include_hidden = false;
+        let (sender, receiver) = mpsc::sync_channel(4);
+        disk.sender = sender;
+
+        let root = home.join("scan-root");
+        disk.start(root.clone(), true);
+        let (first_root, first_force, first_token, first_options) =
+            match receiver.recv().unwrap() {
+                Command::Scan(root, force, token, _, options) => (root, force, token, options),
+                _ => panic!("expected the initial scan command"),
+            };
+        disk.close();
+        let cancelled_at_close = first_token.load(Ordering::Relaxed);
+        disk.reopen(Instant::now(), false);
+
+        let mut reopened = false;
+        let mut restarted = None;
+        while let Ok(command) = receiver.try_recv() {
+            match command {
+                Command::Reopen(_) => reopened = true,
+                Command::Scan(root, force, _, _, options) => {
+                    restarted = Some((root, force, options));
+                }
+                _ => {}
+            }
+        }
+        let status = disk.status.clone();
+        drop(disk);
+        fs::remove_dir_all(home).unwrap();
+
+        assert!(cancelled_at_close, "close must signal the running scan at once");
+        assert!(reopened, "reopen must reach the scan worker");
+        let (restarted_root, restarted_force, restarted_options) =
+            restarted.expect("reopen must send a replacement scan command");
+        assert_eq!(first_root, root);
+        assert!(first_force);
+        assert_eq!(restarted_root, first_root);
+        assert_eq!(restarted_force, first_force);
+        assert_eq!(restarted_options.apparent_size, first_options.apparent_size);
+        assert_eq!(restarted_options.follow_links, first_options.follow_links);
+        assert_eq!(restarted_options.include_hidden, first_options.include_hidden);
+        assert_eq!(restarted_options.one_filesystem, first_options.one_filesystem);
+        assert_eq!(restarted_options.max_depth, first_options.max_depth);
+        assert_eq!(restarted_options.dedup_hardlinks, first_options.dedup_hardlinks);
+        assert_eq!(restarted_options.metric, first_options.metric);
+        assert_eq!(
+            restarted_options.threads.max_threads,
+            first_options.threads.max_threads
+        );
+        assert_eq!(
+            restarted_options.threads.adaptive,
+            first_options.threads.adaptive
+        );
+        assert_eq!(
+            restarted_options.threads.retained_throughput.to_bits(),
+            first_options.threads.retained_throughput.to_bits()
+        );
+        assert_eq!(
+            restarted_options
+                .threads
+                .system_cpu_limit
+                .map(f64::to_bits),
+            first_options.threads.system_cpu_limit.map(f64::to_bits)
+        );
+        assert_eq!(
+            restarted_options.max_retained_bytes,
+            first_options.max_retained_bytes
+        );
+        assert_eq!(status, "Scanning…");
     }
 
     #[test]
