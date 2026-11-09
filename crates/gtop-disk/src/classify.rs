@@ -43,6 +43,18 @@ pub enum Category {
 
 impl Category {
     /// The categories the legend lists, in its order.
+    pub const ALL: [Self; 9] = [
+        Self::Code,
+        Self::AgentScratch,
+        Self::Toolchain,
+        Self::Synced,
+        Self::Git,
+        Self::Media,
+        Self::Documents,
+        Self::Cache,
+        Self::Other,
+    ];
+
     pub const LEGEND: [Self; 8] = [
         Self::Code,
         Self::AgentScratch,
@@ -64,7 +76,7 @@ impl Category {
             Self::Media => "Media",
             Self::Documents => "Documents",
             Self::Cache => "Cache",
-            Self::Other => "Other",
+            Self::Other => "Unknown kind",
         }
     }
 }
@@ -169,7 +181,7 @@ pub fn category_of_name(name: &str) -> Option<Category> {
         "documents" | "desktop" | "downloads" | "books" | "notes"
         | "obsidian" | "public" | "templates" => Category::Documents,
         ".cache" | "cache" | "caches" | ".ccache" | ".sccache" | "_cacache"
-        | "__pycache__" | "node_modules" | "trash" | ".trash" | "tmp"
+        | "__pycache__" | "node_modules" | ".venv" | "venv" | "pods" | "trash" | ".trash" | "tmp"
         | ".tmp" | "deriveddata" | "ios devicesupport"
         | "watchos devicesupport"
         // Windows: see `reclaim_of`.
@@ -200,7 +212,7 @@ pub fn reclaim_of(
         // next time that device is plugged in.
         | "ios devicesupport" | "watchos devicesupport" => Reclaim::Regenerable,
         ".stversions" => Reclaim::SyncHistory,
-        ".pnpm-store" | "pnpm" => Reclaim::PackageStore,
+        ".pnpm-store" | "pnpm" | ".npm" => Reclaim::PackageStore,
         "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache"
         | ".next" | ".turbo" | ".parcel-cache"
         // Xcode's build products and indexes, rebuilt on the next build.
@@ -209,7 +221,7 @@ pub fn reclaim_of(
         "logs" if has_sibling("Application Support") => Reclaim::Temporary,
         // Too common to trust alone: only a build directory beside a manifest.
         "target" if has_sibling("Cargo.toml") => Reclaim::BuildOutput,
-        "node_modules" if has_sibling("package.json") => Reclaim::Reinstallable,
+        "node_modules" | ".venv" | "venv" | "pods" => Reclaim::Reinstallable,
         // Layers and snapshots are only disposable inside sandbox state.
         "layers" if parent == Category::AgentScratch => Reclaim::SandboxLayers,
         "snapshots" if parent == Category::AgentScratch => Reclaim::Snapshots,
@@ -227,23 +239,47 @@ pub fn reclaim_of(
 /// Top-down: a node's own name wins, otherwise it inherits. Reclaimable
 /// space is inherited too, so everything under a cache is hatched.
 pub fn classify(root: &mut Node) {
-    root.category = Category::Other;
-    root.reclaim = None;
+    root.category = category_of_name(&root.name).unwrap_or(Category::Other);
+    root.reclaim = root
+        .is_dir()
+        .then(|| reclaim_of(&root.name, root.category, |_| false))
+        .flatten();
     for index in 0..root.children.len() {
         let siblings = &root.children;
-        let has_sibling = |wanted: &str| siblings.iter().any(|name| &*name.name == wanted);
+        let has_sibling = |wanted: &str| {
+            siblings.iter().any(|node| {
+                &*node.name == wanted
+                    && (wanted != "Cargo.toml" || node.kind == crate::tree::NodeKind::File)
+            })
+        };
         let child = &siblings[index];
         // A top-level directory with an unknown name takes the kind of its
         // largest recognisable child: `~/world` is mostly `.git`.
         let category = category_of_name(&child.name)
             .or_else(|| is_git_store(child).then_some(Category::Git))
             .or_else(|| dominant_child_category(child))
-            .unwrap_or(Category::Other);
+            .unwrap_or(root.category);
         let reclaim = child
             .is_dir()
-            .then(|| reclaim_of(&child.name, Category::Other, has_sibling))
-            .flatten();
+            .then(|| reclaim_of(&child.name, root.category, has_sibling))
+            .flatten()
+            .or(root.reclaim);
         classify_below(&mut root.children[index], category, reclaim, 1);
+    }
+}
+
+/// A description of observed kind, never authority to remove an entry.
+pub fn description(node: &Node) -> String {
+    if node.in_cloud {
+        return "Cloud entry · content not read".into();
+    }
+    match node.reclaim {
+        Some(reason) => format!(
+            "{} · {} · inspect before cleanup",
+            node.category.label(),
+            reason.label()
+        ),
+        None => node.category.label().into(),
     }
 }
 
@@ -292,7 +328,12 @@ fn kind_of(
     if !child.is_dir() {
         return (category, reclaim);
     }
-    let has_sibling = |wanted: &str| siblings.iter().any(|name| &*name.name == wanted);
+    let has_sibling = |wanted: &str| {
+        siblings.iter().any(|node| {
+            &*node.name == wanted
+                && (wanted != "Cargo.toml" || node.kind == crate::tree::NodeKind::File)
+        })
+    };
     let child_category = category_of_name(&child.name)
         .or_else(|| is_git_store(child).then_some(Category::Git))
         .unwrap_or(category);
@@ -332,6 +373,80 @@ pub fn is_git_store(node: &Node) -> bool {
 mod tests {
     use super::*;
     use crate::tree::{Metric, NodeKind, aggregate};
+
+    #[test]
+    fn kinds_cover_manifests_dependencies_cloud_unknown_and_supported_caches() {
+        let mut root = dir(
+            "Home",
+            vec![
+                dir(
+                    "project",
+                    vec![
+                        file("Cargo.toml", 1),
+                        dir("target", vec![file("binary", 100)]),
+                    ],
+                ),
+                dir("unrelated", vec![dir("target", vec![file("notes", 10)])]),
+                dir(
+                    "false-manifest",
+                    vec![
+                        dir("Cargo.toml", vec![]),
+                        dir("target", vec![file("notes", 10)]),
+                    ],
+                ),
+                dir(
+                    "dependencies",
+                    vec![
+                        dir("node_modules", vec![]),
+                        dir(".venv", vec![]),
+                        dir("Pods", vec![]),
+                    ],
+                ),
+                dir("mystery", vec![file("notes", 10)]),
+                dir(".npm", vec![file("archive", 10)]),
+                dir(
+                    "Library",
+                    vec![
+                        dir("Caches", vec![]),
+                        dir("pnpm", vec![dir("store", vec![])]),
+                    ],
+                ),
+            ],
+        );
+        classify(&mut root);
+        assert_eq!(
+            named(&root, &["project", "target"]).reclaim,
+            Some(Reclaim::BuildOutput)
+        );
+        for parent in ["unrelated", "false-manifest"] {
+            assert_eq!(named(&root, &[parent, "target"]).reclaim, None);
+        }
+        for name in ["node_modules", ".venv", "Pods"] {
+            let node = named(&root, &["dependencies", name]);
+            assert_eq!(node.category, Category::Cache);
+            assert_eq!(node.reclaim, Some(Reclaim::Reinstallable));
+            assert!(description(node).contains("reinstallable"));
+        }
+        assert_eq!(description(named(&root, &["mystery"])), "Unknown kind");
+        assert_eq!(named(&root, &[".npm"]).reclaim, Some(Reclaim::PackageStore));
+        assert_eq!(
+            named(&root, &["Library", "Caches"]).reclaim,
+            Some(Reclaim::Regenerable)
+        );
+        assert_eq!(
+            named(&root, &["Library", "pnpm", "store"]).reclaim,
+            Some(Reclaim::PackageStore)
+        );
+        let mut cloud = dir("Caches", vec![]);
+        cloud.in_cloud = true;
+        classify(&mut cloud);
+        assert_eq!(description(&cloud), "Cloud entry · content not read");
+        for category in Category::ALL {
+            let mut node = dir("entry", vec![]);
+            node.category = category;
+            assert_eq!(description(&node), category.label());
+        }
+    }
 
     fn file(name: &str, bytes: u64) -> Node {
         Node::entry(name, NodeKind::File, bytes)

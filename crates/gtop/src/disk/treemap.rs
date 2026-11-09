@@ -59,6 +59,10 @@ struct MapFrame {
     tiles: Vec<Tile>,
     #[cfg(test)]
     painted: Vec<(TileKind, Rect, String, u32)>,
+    #[cfg(test)]
+    paint_count: usize,
+    #[cfg(test)]
+    hatched: Vec<(TileKind, Rect)>,
     mode: Mode,
     depth: u32,
     filter: String,
@@ -271,7 +275,13 @@ fn entries_filtered(
                 kind: TileKind::Node {
                     crumbs: crumbs.clone(),
                 },
-                label: format!("{} · {}{}", child.name, bytes(child.bytes), coverage(child)),
+                label: format!(
+                    "{} · {}{} · {}",
+                    child.name,
+                    bytes(child.bytes),
+                    coverage(child),
+                    gtop_disk::classify::description(child)
+                ),
                 depth: crumbs.len() - 1,
             });
             if (weight == 0 || positive_rank < kept) && crumbs.len() < depth as usize {
@@ -291,7 +301,13 @@ fn entries_filtered(
             path.push(index);
             out.push(Entry {
                 kind: TileKind::Node { crumbs: path },
-                label: format!("{} · {}{}", child.name, bytes(child.bytes), coverage(child)),
+                label: format!(
+                    "{} · {}{} · {}",
+                    child.name,
+                    bytes(child.bytes),
+                    coverage(child),
+                    gtop_disk::classify::description(child)
+                ),
                 depth: crumbs.len(),
             });
         }
@@ -834,7 +850,12 @@ impl Monitor {
                         let Some(root) = root else { return };
                         let matches = &paint_matches;
                         #[cfg(test)]
-                        paint_frame.borrow_mut().painted.clear();
+                        {
+                            let mut frame = paint_frame.borrow_mut();
+                            frame.painted.clear();
+                            frame.hatched.clear();
+                            frame.paint_count += 1;
+                        }
                         for tile in tiles {
                             let dimmed = matches
                                 .as_ref()
@@ -853,6 +874,12 @@ impl Monitor {
                             } else {
                                 t.rule
                             };
+                            let node = root.resolve(tile.crumbs());
+                            let style = crate::palette::kind_style(
+                                &t,
+                                node.map_or(Default::default(), |node| node.category),
+                                tile.depth as usize,
+                            );
                             let fill = if selected.as_ref() == Some(&tile.kind) {
                                 t.selection
                             } else if dimmed {
@@ -875,7 +902,7 @@ impl Monitor {
                                     _ => t.base.plate,
                                 }
                             } else {
-                                t.base.plate
+                                style.fill
                             };
                             window.paint_quad(quad(
                                 rect,
@@ -885,6 +912,61 @@ impl Monitor {
                                 rgb(edge),
                                 BorderStyle::Solid,
                             ));
+                            if !dimmed
+                                && node.is_some_and(|node| node.reclaim.is_some() && !node.in_cloud)
+                            {
+                                let hatch_rect = tile.rect.inset(1.);
+                                #[cfg(test)]
+                                paint_frame
+                                    .borrow_mut()
+                                    .hatched
+                                    .push((tile.kind.clone(), hatch_rect));
+                                let clip = Bounds::new(
+                                    bounds.origin + point(px(hatch_rect.x), px(hatch_rect.y)),
+                                    size(px(hatch_rect.w), px(hatch_rect.h)),
+                                );
+                                window.with_content_mask(
+                                    Some(ContentMask { bounds: clip }),
+                                    |window| {
+                                        let mut path = PathBuilder::stroke(px(1.));
+                                        for [(x1, y1), (x2, y2)] in
+                                            treemap::hatch_segments(hatch_rect)
+                                        {
+                                            path.move_to(bounds.origin + point(px(x1), px(y1)));
+                                            path.line_to(bounds.origin + point(px(x2), px(y2)));
+                                        }
+                                        if let Ok(path) = path.build() {
+                                            let hatch = if fill == style.fill {
+                                                style.hatch
+                                            } else {
+                                                crate::palette::mix(
+                                                    crate::palette::readable_text(
+                                                        fill,
+                                                        t.base.silk,
+                                                    ),
+                                                    fill,
+                                                    0.10,
+                                                )
+                                            };
+                                            window.paint_path(path, rgb(hatch));
+                                        }
+                                    },
+                                );
+                            }
+                            if let Some(header) = tile.header {
+                                window.paint_quad(gpui::fill(
+                                    Bounds::new(
+                                        bounds.origin + point(px(header.x + 1.), px(header.y + 1.)),
+                                        size(px(3.), px((header.h - 2.).max(0.))),
+                                    ),
+                                    rgb(style.strip),
+                                ));
+                            }
+                            let text = if fill == style.fill {
+                                style.text
+                            } else {
+                                crate::palette::readable_text(fill, t.base.silk)
+                            };
                             let (name, size_text) = match &tile.kind {
                                 TileKind::Node { crumbs } => root.resolve(crumbs).map_or(
                                     (String::new(), String::new()),
@@ -932,7 +1014,7 @@ impl Monitor {
                                     &[TextRun {
                                         len: size_text.len(),
                                         font: font("JetBrains Mono"),
-                                        color: rgb(t.base.silk).into(),
+                                        color: rgb(text).into(),
                                         ..Default::default()
                                     }],
                                     None,
@@ -949,7 +1031,7 @@ impl Monitor {
                                 &[TextRun {
                                     len: label.len(),
                                     font: font("JetBrains Mono"),
-                                    color: rgb(t.base.silk).into(),
+                                    color: rgb(text).into(),
                                     ..Default::default()
                                 }],
                                 None,
@@ -963,7 +1045,7 @@ impl Monitor {
                                 Some(ContentMask { bounds: name_mask }),
                                 |window| {
                                     let _ = line.paint(
-                                        mask.origin + point(px(4.), px(1.)),
+                                        mask.origin + point(px(6.), px(1.)),
                                         px(17.),
                                         TextAlign::Left,
                                         None,
@@ -1280,11 +1362,30 @@ impl Monitor {
                 )
             })
             .unwrap_or_default();
+        let mut legend = div()
+            .debug_selector(|| "map-kind-legend".into())
+            .flex()
+            .flex_wrap()
+            .gap(px(6.))
+            .text_size(px(10.));
+        for kind in gtop_disk::classify::Category::ALL {
+            let style = crate::palette::kind_style(&t, kind, 0);
+            legend = legend.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(3.))
+                    .child(div().w(px(8.)).h(px(8.)).bg(rgb(style.strip)))
+                    .child(kind.label()),
+            );
+        }
+        legend = legend.child("//// Rebuildable or reclaimable · inspect before cleanup");
         div().flex().size_full().gap(px(8.)).min_w_0()
             .child(div().flex().flex_col().flex_1().min_w_0().min_h_0().gap(px(8.))
                 .child(div().bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule_hi)).p(px(12.))
                     .child(crate::rack::label(if disk.options.apparent_size { "TREEMAP · APPARENT SIZE" } else { "TREEMAP · ALLOCATED BLOCKS" }, &t))
                     .child(current_path(path)).child(crumbs).children(siblings).child(controls).child(div().text_size(px(10.)).child(matched)))
+                .child(legend)
                 .child(canvas)
                 .child(div().h(px(20.)).overflow_hidden().text_size(px(10.)).child(hover))
                 .child(div().bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule)).p(px(8.))
@@ -1633,7 +1734,7 @@ impl Disk {
             ),
             format!("{} files · {} directories", node.files, node.dirs),
             format!("Newest subtree write · {last_write}"),
-            "Kind · Pending classification".into(),
+            format!("Kind · {}", gtop_disk::classify::description(node)),
             coverage.join(" · "),
         ]
     }
@@ -1724,6 +1825,130 @@ mod tests {
     fn init(cx: &mut App) {
         gpui_component::init(cx);
         crate::theme::init(cx);
+    }
+
+    #[gpui::test]
+    async fn kinds_palette_changes_repaint_without_rescan_and_keep_focus_then_settle(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(init);
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(kinds_snapshot_disk());
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("map-kind-legend").is_some());
+        let original = monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            (
+                disk.folder
+                    .as_ref()
+                    .unwrap()
+                    .hierarchy
+                    .as_ref()
+                    .unwrap()
+                    .clone(),
+                disk.generation(),
+                disk.map.frame.borrow().painted.clone(),
+            )
+        });
+        let click = monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            let frame = disk.map.frame.borrow();
+            let tile = frame
+                .tiles
+                .iter()
+                .find(|tile| {
+                    tile.crumbs().len() > 1
+                        && original
+                            .0
+                            .resolve(tile.crumbs())
+                            .is_some_and(|node| &*node.name == "target")
+                })
+                .unwrap();
+            let band = tile.header.unwrap_or(tile.rect);
+            frame.origin + point(px(band.x + band.w / 2.), px(band.y + band.h / 2.))
+        });
+        visual.simulate_click(click, Modifiers::default());
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        monitor.update(visual, |monitor, cx| {
+            monitor.settings.active = 4;
+            cx.notify();
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert!(Arc::ptr_eq(
+                &original.0,
+                disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap()
+            ));
+            assert_eq!(original.1, disk.generation());
+            assert_ne!(original.2, disk.map.frame.borrow().painted);
+            assert!(disk.selection_details()[4].contains("build output"));
+            let frame = disk.map.frame.borrow();
+            assert!(!frame.hatched.is_empty());
+            for (kind, clip) in &frame.hatched {
+                let tile = frame.painted.iter().find(|tile| &tile.0 == kind).unwrap();
+                assert_eq!(*clip, tile.1.inset(1.));
+                let layout_tile = frame.tiles.iter().find(|tile| &tile.kind == kind).unwrap();
+                let node = original.0.resolve(layout_tile.crumbs()).unwrap();
+                assert!(!node.in_cloud);
+                assert!(node.reclaim.is_some());
+            }
+            for name in ["target", "CloudStorage"] {
+                let index = original
+                    .0
+                    .children
+                    .iter()
+                    .position(|node| &*node.name == name)
+                    .unwrap();
+                assert!(!frame.hatched.iter().any(|(kind, _)| *kind
+                    == TileKind::Node {
+                        crumbs: vec![index]
+                    }));
+            }
+            let entries = disk.map.entries(&original.0);
+            for entry in entries.iter() {
+                if let TileKind::Node { crumbs } = &entry.kind {
+                    assert!(entry.label.contains(&gtop_disk::classify::description(
+                        original.0.resolve(crumbs).unwrap()
+                    )));
+                }
+            }
+        });
+        visual.run_until_parked();
+        let before = monitor.read_with(visual, |monitor, _| {
+            monitor
+                .disk
+                .as_ref()
+                .unwrap()
+                .map
+                .frame
+                .borrow()
+                .paint_count
+        });
+        for _ in 0..120 {
+            visual.update(|window, cx| assert_eq!(window.simulate_next_frame(cx), 0));
+            visual.executor().advance_clock(Duration::from_millis(16));
+            visual.run_until_parked();
+        }
+        assert_eq!(
+            before,
+            monitor.read_with(visual, |monitor, _| monitor
+                .disk
+                .as_ref()
+                .unwrap()
+                .map
+                .frame
+                .borrow()
+                .paint_count)
+        );
+        monitor.update(visual, |monitor, _| monitor.disk = None);
     }
 
     #[gpui::test]
@@ -3607,7 +3832,7 @@ mod tests {
         );
         assert_eq!(lines[2], format!("{files} files · {dirs} directories"));
         assert_eq!(lines[3], "Newest subtree write · 2023-11-14 22:13 UTC");
-        assert_eq!(lines[4], "Kind · Pending classification");
+        assert_eq!(lines[4], "Kind · Cloud entry · content not read");
         assert!(lines[5].contains("Cloud content was not read"));
         assert!(lines[5].contains("Incomplete"));
         assert!(lines[5].contains("3 unreadable entries"));
@@ -3855,6 +4080,53 @@ mod tests {
                 .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
                 .unwrap();
         }
+        for (palette_index, width, height) in [
+            (0, 1480., 930.),
+            (0, 1200., 720.),
+            (4, 1200., 720.),
+            (1, 1200., 720.),
+            (2, 1200., 720.),
+            (3, 1200., 720.),
+        ] {
+            let mut disk = kinds_snapshot_disk();
+            let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+            let project = root
+                .children
+                .iter()
+                .position(|node| &*node.name == "projects")
+                .unwrap();
+            let target = root.children[project].children[0]
+                .children
+                .iter()
+                .position(|node| &*node.name == "target")
+                .unwrap();
+            disk.map_select(TileKind::Node {
+                crumbs: vec![project, 0, target],
+            });
+            let handle = cx
+                .open_window(size(px(width), px(height)), |window, cx| {
+                    let monitor = cx.new(|cx| {
+                        let mut monitor = crate::draw_benchmark::fixture(window, cx);
+                        monitor.settings.active = palette_index;
+                        monitor.disk = Some(disk);
+                        monitor
+                    });
+                    cx.new(|cx| gpui_component::Root::new(monitor, window, cx))
+                })
+                .unwrap();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            cx.capture_screenshot(handle.into())
+                .unwrap()
+                .save(output.join(format!(
+                    "kinds-{}-{width:.0}x{height:.0}.png",
+                    crate::palette::presets()[palette_index].name.to_lowercase()
+                )))
+                .unwrap();
+        }
         for (width, height, ages) in [
             (1480., 930., false),
             (1200., 720., false),
@@ -3921,6 +4193,51 @@ mod tests {
     }
 
     const AGE_NOW: i64 = 1_800_000_000;
+    fn kinds_snapshot_disk() -> Disk {
+        use gtop_disk::tree::{aggregate, NodeKind};
+        fn dir(name: &str, bytes: u64) -> Node {
+            let mut node = Node::directory(name);
+            node.children
+                .push(Node::entry("content", NodeKind::File, bytes));
+            node
+        }
+        let mut disk = snapshot_disk();
+        let folder = disk.folder.as_mut().unwrap();
+        let root = Arc::make_mut(folder.hierarchy.as_mut().unwrap());
+        let project = root
+            .children
+            .iter_mut()
+            .find(|node| &*node.name == "projects")
+            .unwrap();
+        project.children[0]
+            .children
+            .push(Node::entry("Cargo.toml", NodeKind::File, 500));
+        project.children[0].children.extend([
+            dir("node_modules", 900 << 10),
+            dir(".venv", 700 << 10),
+            dir("Pods", 600 << 10),
+        ]);
+        let mut cloud = Node::directory("CloudStorage");
+        cloud.directory_bytes = 650 << 10;
+        cloud.in_cloud = true;
+        cloud.complete = false;
+        root.children.extend([
+            dir("worktrees", 2 << 20),
+            dir(".cargo", 2 << 20),
+            cloud,
+            dir(".git", 1 << 20),
+            dir("Movies", 2 << 20),
+            dir("Documents", 1 << 20),
+            dir("Caches", 2 << 20),
+            dir("target", 800 << 10),
+        ]);
+        aggregate(root, Metric::Bytes);
+        gtop_disk::classify::classify(root);
+        folder.allocated = root.bytes;
+        folder.items = root.files + u64::from(root.dirs) - 1;
+        disk.scan_bytes = Some(root.bytes);
+        disk
+    }
     fn age_snapshot_disk() -> Disk {
         let mut disk = snapshot_disk();
         disk.map.clock = Some(AGE_NOW);

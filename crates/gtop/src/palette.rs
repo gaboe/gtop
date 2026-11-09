@@ -238,6 +238,111 @@ pub fn mix(a: u32, b: u32, p: f64) -> u32 {
     let b = lab(b);
     from_lab(std::array::from_fn(|i| a[i] * p + b[i] * (1. - p)))
 }
+
+#[derive(Clone, Copy, Debug)]
+pub struct KindStyle {
+    pub fill: u32,
+    pub text: u32,
+    pub strip: u32,
+    pub hatch: u32,
+}
+
+pub fn readable_text(fill: u32, preferred: u32) -> u32 {
+    if contrast(fill, preferred) >= 4.5 {
+        preferred
+    } else if contrast(fill, 0) > contrast(fill, 0xffffff) {
+        0
+    } else {
+        0xffffff
+    }
+}
+
+pub fn kind_style(t: &Tokens, category: gtop_disk::classify::Category, depth: usize) -> KindStyle {
+    use gtop_disk::classify::Category;
+    let hue: f64 = match category {
+        Category::Code => 255.,
+        Category::AgentScratch => 55.,
+        Category::Toolchain => 145.,
+        Category::Synced => 205.,
+        Category::Git => 10.,
+        Category::Media => 305.,
+        Category::Documents | Category::Other => 0.,
+        Category::Cache => 90.,
+    };
+    let accent = lab(t.base.led);
+    let chroma = if matches!(category, Category::Documents | Category::Other) {
+        0.
+    } else {
+        accent[1].hypot(accent[2]).clamp(0.12, 0.2)
+    };
+    let pigment = from_lab([
+        accent[0].clamp(0.5, 0.8),
+        chroma * hue.to_radians().cos(),
+        chroma * hue.to_radians().sin(),
+    ]);
+    let surface = mix(t.well, t.base.plate, 0.85);
+    let fill = mix(pigment, surface, 0.18 + depth.min(6) as f64 * 0.012);
+    KindStyle {
+        fill,
+        text: readable_text(fill, t.base.silk),
+        strip: mix(pigment, t.well, 0.5),
+        hatch: mix(readable_text(fill, t.base.silk), fill, 0.10),
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+    #[test]
+    fn kinds_have_readable_text_and_keep_action_colours_separate_on_all_presets() {
+        for palette in presets() {
+            let t = palette.base.tokens();
+            let mut ratios = vec![];
+            for category in gtop_disk::classify::Category::ALL {
+                let mut minimum = f64::INFINITY;
+                for depth in 0..=10 {
+                    let style = kind_style(&t, category, depth);
+                    let ratio = contrast(style.fill, style.text);
+                    assert!(
+                        ratio >= 4.5,
+                        "{} {} depth {depth}: {ratio}",
+                        palette.name,
+                        category.label()
+                    );
+                    assert!(contrast(style.hatch, style.text) >= 4.5);
+                    assert_ne!(style.fill, t.selection);
+                    assert_ne!(style.fill, t.base.led);
+                    assert_ne!(style.fill, t.base.hot);
+                    assert!(contrast(style.fill, t.base.led) >= 3.);
+                    assert!(contrast(style.fill, t.base.hot) >= 3.);
+                    minimum = minimum.min(ratio);
+                }
+                ratios.push(format!("{} {minimum:.2}", category.label()));
+            }
+            assert_ne!(t.base.led, t.base.hot);
+            assert_ne!(t.selection, mix(t.base.hot, t.well, 0.18));
+            println!("KIND_CONTRAST {} | {}", palette.name, ratios.join(" | "));
+        }
+    }
+
+    #[test]
+    fn kinds_follow_user_palette_edits_without_classifying_again() {
+        let original = presets()[0].base;
+        for field in ColorField::ALL {
+            let mut changed = original;
+            field.set(&mut changed, 0x4a65a3);
+            let before = kind_style(&original.tokens(), gtop_disk::classify::Category::Code, 0);
+            let after = kind_style(&changed.tokens(), gtop_disk::classify::Category::Code, 0);
+            if matches!(
+                field,
+                ColorField::Ground | ColorField::Led | ColorField::Plate
+            ) {
+                assert_ne!(before.fill, after.fill, "{}", field.name());
+            }
+            assert!(contrast(after.fill, after.text) >= 4.5);
+        }
+    }
+}
 impl Base {
     pub fn tokens(self) -> Tokens {
         let b = self;

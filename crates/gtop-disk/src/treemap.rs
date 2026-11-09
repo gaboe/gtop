@@ -22,6 +22,58 @@ pub struct Rect {
     pub h: f32,
 }
 
+/// Diagonal centre lines bounded by the tile. The painter also clips stroke width.
+pub fn hatch_segments(rect: Rect) -> Vec<[(f32, f32); 2]> {
+    if ![rect.x, rect.y, rect.w, rect.h]
+        .iter()
+        .all(|v| v.is_finite())
+        || rect.w <= 0.
+        || rect.h <= 0.
+    {
+        return vec![];
+    }
+    (1..=((rect.w + rect.h) / 9.).ceil() as usize)
+        .map(|i| i as f32 * 9.)
+        .take_while(|k| *k < rect.w + rect.h)
+        .map(|k| {
+            [
+                (rect.x + (k - rect.h).max(0.), rect.y + k.min(rect.h)),
+                (rect.x + k.min(rect.w), rect.y + (k - rect.w).max(0.)),
+            ]
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod hatch_tests {
+    use super::*;
+    #[test]
+    fn hatch_endpoints_stay_inside_offset_thin_and_zoomed_tiles() {
+        for rect in [
+            Rect::new(0., 0., 100., 70.),
+            Rect::new(-234., 517., 830., 2.),
+            Rect::new(19., -8., 0.5, 90.),
+        ] {
+            let segments = hatch_segments(rect);
+            assert!(!segments.is_empty());
+            for [(x1, y1), (x2, y2)] in segments {
+                for (x, y) in [(x1, y1), (x2, y2)] {
+                    assert!(x >= rect.x && x <= rect.right());
+                    assert!(y >= rect.y && y <= rect.bottom());
+                }
+                assert!((x1 + y1 - x2 - y2).abs() < 0.001);
+            }
+        }
+        for rect in [
+            Rect::default(),
+            Rect::new(0., 0., -1., 5.),
+            Rect::new(f32::NAN, 0., 5., 5.),
+        ] {
+            assert!(hatch_segments(rect).is_empty());
+        }
+    }
+}
+
 impl Rect {
     pub const fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
         Self { x, y, w, h }
