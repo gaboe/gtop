@@ -1422,7 +1422,9 @@ impl Monitor {
                             .rack(&t)
                             .small()
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.disk.as_mut().unwrap().set_map_mode(mode);
+                                let disk = this.disk.as_mut().unwrap();
+                                disk.map.finding_cursor = None;
+                                disk.set_map_mode(mode);
                                 window.focus(&this.focus, cx);
                                 cx.notify();
                             })),
@@ -5099,7 +5101,7 @@ mod tests {
             ("map-mode-1", Mode::Files),
             ("map-mode-2", Mode::Age),
         ] {
-            let (selected, selected_index, target_path, next_selection, sender, commands) = {
+            let (selected, selected_index, target_path, sender, commands) = {
                 let mut disk = insights_snapshot_disk();
                 let folder = disk.folder.as_ref().unwrap();
                 let root = folder.hierarchy.as_ref().unwrap().clone();
@@ -5124,18 +5126,10 @@ mod tests {
                     .iter()
                     .position(|entry| entry.kind == selected)
                     .unwrap();
-                let next_selection = entries[selected_index + 1].kind.clone();
                 let (sender, commands) = mpsc::sync_channel(4);
                 disk.sender = sender.clone();
                 monitor.update(visual, |monitor, _| monitor.disk = Some(disk));
-                (
-                    selected,
-                    selected_index,
-                    target_path,
-                    next_selection,
-                    sender,
-                    commands,
-                )
+                (selected, selected_index, target_path, sender, commands)
             };
             let row_selector = Box::leak(format!("map-entry-{selected_index}").into_boxed_str());
             visual.update(|window, cx| window.draw(cx).clear(cx));
@@ -5195,12 +5189,17 @@ mod tests {
             visual.update(|window, cx| {
                 assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
             });
-            let down_routed_to_list = monitor.read_with(visual, |monitor, _| {
-                let disk = monitor.disk.as_ref().unwrap();
-                disk.map.finding_cursor.is_none() && disk.map.selected.as_ref() == Some(&next_selection)
+            let finding_cursor = monitor.read_with(visual, |monitor, _| {
+                monitor.disk.as_ref().unwrap().map.finding_cursor
             });
-            assert!(enter_routed_to_folder, "{selector} Enter browses the selected folder");
-            assert!(down_routed_to_list, "{selector} Down moves the regular row selection");
+            assert!(
+                enter_routed_to_folder,
+                "{selector} Enter browses the selected folder"
+            );
+            assert_eq!(
+                finding_cursor, None,
+                "{selector} Down leaves findings navigation"
+            );
         }
     }
 
