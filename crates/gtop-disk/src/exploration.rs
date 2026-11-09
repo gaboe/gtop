@@ -2,6 +2,42 @@
 use crate::{tree::Metric, treemap::Rect};
 use std::path::PathBuf;
 
+#[derive(Clone, Copy)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+pub fn spatial_neighbor(
+    tiles: &[crate::treemap::Tile],
+    selected: Option<&crate::treemap::TileKind>,
+    direction: Direction,
+) -> Option<crate::treemap::TileKind> {
+    let Some(selected) = tiles.iter().find(|tile| Some(&tile.kind) == selected) else {
+        return tiles.first().map(|tile| tile.kind.clone());
+    };
+    let center = |rect: Rect| (rect.x + rect.w / 2., rect.y + rect.h / 2.);
+    let (x, y) = center(selected.rect);
+    tiles
+        .iter()
+        .filter(|tile| tile.depth == selected.depth && tile.kind != selected.kind)
+        .filter_map(|tile| {
+            let (tx, ty) = center(tile.rect);
+            let dx = tx - x;
+            let dy = ty - y;
+            let eligible = match direction {
+                Direction::Left => dx < 0.,
+                Direction::Right => dx > 0.,
+                Direction::Up => dy < 0.,
+                Direction::Down => dy > 0.,
+            };
+            eligible.then_some((dx * dx + dy * dy, tile.kind.clone()))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, kind)| kind)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Escape {
     Filter,
@@ -139,6 +175,53 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn arrow_neighbors_follow_rectangle_positions() {
+        use crate::treemap::{Tile, TileKind};
+        let kind = |index| TileKind::Node {
+            crumbs: vec![index],
+        };
+        let tiles = vec![
+            Tile {
+                kind: kind(0),
+                rect: Rect::new(0., 0., 40., 40.),
+                depth: 0,
+                header: None,
+            },
+            Tile {
+                kind: kind(1),
+                rect: Rect::new(50., 0., 40., 40.),
+                depth: 0,
+                header: None,
+            },
+            Tile {
+                kind: kind(2),
+                rect: Rect::new(0., 50., 40., 40.),
+                depth: 0,
+                header: None,
+            },
+        ];
+        assert_eq!(
+            spatial_neighbor(&tiles, Some(&kind(0)), Direction::Right),
+            Some(kind(1))
+        );
+        assert_eq!(
+            spatial_neighbor(&tiles, Some(&kind(0)), Direction::Down),
+            Some(kind(2))
+        );
+        assert_eq!(
+            spatial_neighbor(&tiles, Some(&kind(2)), Direction::Up),
+            Some(kind(0))
+        );
+        assert_eq!(
+            spatial_neighbor(&tiles, Some(&kind(1)), Direction::Left),
+            Some(kind(0))
+        );
+        assert_eq!(
+            spatial_neighbor(&tiles, Some(&kind(0)), Direction::Left),
+            None
+        );
+    }
     #[test]
     fn mode_weights_and_unknown_age_are_explicit() {
         assert_eq!(Mode::Age.metric(), Metric::Bytes);

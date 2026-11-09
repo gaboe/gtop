@@ -289,31 +289,21 @@ impl Disk {
                 }
                 Escape::Close => return false,
             },
-            "h" | "left" | "l" | "right" => {
-                let frame = self.map.frame.borrow();
-                let selected = frame
-                    .tiles
-                    .iter()
-                    .find(|tile| Some(&tile.kind) == self.map.selected.as_ref());
-                let target = selected.and_then(|selected| {
-                    let center = |rect: Rect| (rect.x + rect.w / 2., rect.y + rect.h / 2.);
-                    let (x, y) = center(selected.rect);
-                    let right = matches!(key, "l" | "right");
-                    frame
-                        .tiles
-                        .iter()
-                        .filter(|tile| tile.depth == selected.depth && tile.kind != selected.kind)
-                        .filter_map(|tile| {
-                            let (tx, ty) = center(tile.rect);
-                            let dx = tx - x;
-                            let dy = ty - y;
-                            ((right && dx > 0.) || (!right && dx < 0.))
-                                .then_some((dx * dx + dy * dy, tile.kind.clone()))
-                        })
-                        .min_by(|a, b| a.0.total_cmp(&b.0))
-                        .map(|(_, kind)| kind)
-                });
-                drop(frame);
+            "h" | "left" | "l" | "right" | "up" | "k" | "down" | "j"
+                if !self.map.frame.borrow().tiles.is_empty() =>
+            {
+                use gtop_disk::exploration::{spatial_neighbor, Direction};
+                let direction = match key {
+                    "h" | "left" => Direction::Left,
+                    "l" | "right" => Direction::Right,
+                    "up" | "k" => Direction::Up,
+                    _ => Direction::Down,
+                };
+                let target = spatial_neighbor(
+                    &self.map.frame.borrow().tiles,
+                    self.map.selected.as_ref(),
+                    direction,
+                );
                 if let Some(kind) = target {
                     self.map_select(kind);
                 }
@@ -1048,7 +1038,7 @@ impl Monitor {
                 .child(canvas)
                 .child(div().h(px(20.)).overflow_hidden().text_size(px(10.)).child(hover))
                 .child(div().bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule)).p(px(8.))
-                    .child("D Top · arrows/HJKL move · Enter open · Backspace up · X Trash")
+                    .child("D Top · arrows/HJKL move · Tab list · Enter open · Backspace up · X Trash")
                     .child("M mode · / filter · [ ] depth · + − zoom · 0 reset · B/F history")
                     .child(div().text_size(px(10.)).child("Observed sizes. Unknown space has no tile area. Hover informs; click selects."))))
             .child(self.resizable_disk_inspector(window, cx))
@@ -1986,7 +1976,7 @@ mod tests {
                 .unwrap()
         });
         for _ in 0..=other_index {
-            visual.simulate_keystrokes("down");
+            visual.simulate_keystrokes("tab");
         }
         visual.update(|window, cx| {
             assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
@@ -2466,7 +2456,7 @@ mod tests {
             });
             visual.simulate_resize(size(px(1200.), px(720.)));
             for _ in 0..97 {
-                visual.simulate_keystrokes("down");
+                visual.simulate_keystrokes("tab");
                 visual.update(|window, cx| {
                     assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
                 });
@@ -2486,7 +2476,7 @@ mod tests {
             });
             for (index, expected) in omitted.iter().enumerate() {
                 if index > 0 {
-                    visual.simulate_keystrokes("down");
+                    visual.simulate_keystrokes("tab");
                     visual.update(|window, cx| {
                         assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
                     });
@@ -2518,7 +2508,7 @@ mod tests {
                 .position(|item| item == &path.join("omitted-dir"))
                 .unwrap();
             for _ in 0..directory_index {
-                visual.simulate_keystrokes("down");
+                visual.simulate_keystrokes("tab");
             }
             visual.simulate_keystrokes("enter");
             visual.update(|window, cx| {
@@ -2536,7 +2526,7 @@ mod tests {
             });
             if count > 97 {
                 for _ in 0..97 {
-                    visual.simulate_keystrokes("down");
+                    visual.simulate_keystrokes("tab");
                 }
                 visual.simulate_keystrokes("enter");
                 visual.update(|window, cx| {
@@ -2552,7 +2542,7 @@ mod tests {
                     })
                     .unwrap();
                 for _ in 0..file_index {
-                    visual.simulate_keystrokes("down");
+                    visual.simulate_keystrokes("tab");
                 }
                 visual.simulate_keystrokes("x");
                 visual.update(|window, cx| {

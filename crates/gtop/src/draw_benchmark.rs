@@ -1193,7 +1193,7 @@ fn disk_keyboard_scroll_reveals_selected_row_after_summary() {
         w.draw(cx).clear(cx);
     })
     .unwrap();
-    cx.simulate_keystrokes(handle.into(), "down");
+    cx.simulate_keystrokes(handle.into(), "tab");
     cx.update_window(handle.into(), |_, w, cx| {
         w.refresh();
         w.draw(cx).clear(cx);
