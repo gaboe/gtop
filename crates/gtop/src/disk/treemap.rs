@@ -62,7 +62,9 @@ struct MapFrame {
     #[cfg(test)]
     paint_count: usize,
     #[cfg(test)]
-    hatched: Vec<(TileKind, Rect)>,
+    hatched: Vec<(TileKind, Bounds<Pixels>)>,
+    #[cfg(test)]
+    coverage_labels: Vec<(TileKind, String, Bounds<Pixels>)>,
     mode: Mode,
     depth: u32,
     filter: String,
@@ -161,6 +163,7 @@ impl MapState {
 struct Entry {
     kind: TileKind,
     label: String,
+    visible_label: Option<String>,
     depth: usize,
 }
 
@@ -266,6 +269,7 @@ fn entries_filtered(
                                 .sum()
                         )
                     ),
+                    visible_label: None,
                     depth: crumbs.len(),
                 });
             }
@@ -282,6 +286,13 @@ fn entries_filtered(
                     coverage(child),
                     gtop_disk::classify::description(child)
                 ),
+                visible_label: Some(format!(
+                    "{} · {} · {}{}",
+                    child.category.label(),
+                    child.name,
+                    bytes(child.bytes),
+                    coverage(child)
+                )),
                 depth: crumbs.len() - 1,
             });
             if (weight == 0 || positive_rank < kept) && crumbs.len() < depth as usize {
@@ -308,6 +319,13 @@ fn entries_filtered(
                     coverage(child),
                     gtop_disk::classify::description(child)
                 ),
+                visible_label: Some(format!(
+                    "{} · {} · {}{}",
+                    child.category.label(),
+                    child.name,
+                    bytes(child.bytes),
+                    coverage(child)
+                )),
                 depth: crumbs.len(),
             });
         }
@@ -315,6 +333,18 @@ fn entries_filtered(
     let mut out = Vec::new();
     visit(root, &mut Vec::new(), &mut out, metric, depth, matches);
     out
+}
+
+fn coverage_tag(node: &Node) -> Option<&'static str> {
+    if node.in_cloud {
+        Some("CLOUD")
+    } else if node.skipped_volume {
+        Some("VOL")
+    } else if !node.complete || node.read_error || node.unreadable > 0 {
+        Some("PART")
+    } else {
+        None
+    }
 }
 
 fn coverage(node: &Node) -> &'static str {
@@ -854,6 +884,7 @@ impl Monitor {
                             let mut frame = paint_frame.borrow_mut();
                             frame.painted.clear();
                             frame.hatched.clear();
+                            frame.coverage_labels.clear();
                             frame.paint_count += 1;
                         }
                         for tile in tiles {
@@ -916,11 +947,6 @@ impl Monitor {
                                 && node.is_some_and(|node| node.reclaim.is_some() && !node.in_cloud)
                             {
                                 let hatch_rect = tile.rect.inset(1.);
-                                #[cfg(test)]
-                                paint_frame
-                                    .borrow_mut()
-                                    .hatched
-                                    .push((tile.kind.clone(), hatch_rect));
                                 let clip = Bounds::new(
                                     bounds.origin + point(px(hatch_rect.x), px(hatch_rect.y)),
                                     size(px(hatch_rect.w), px(hatch_rect.h)),
@@ -928,6 +954,11 @@ impl Monitor {
                                 window.with_content_mask(
                                     Some(ContentMask { bounds: clip }),
                                     |window| {
+                                        #[cfg(test)]
+                                        paint_frame.borrow_mut().hatched.push((
+                                            tile.kind.clone(),
+                                            window.content_mask().bounds,
+                                        ));
                                         let mut path = PathBuilder::stroke(px(1.));
                                         for [(x1, y1), (x2, y2)] in
                                             treemap::hatch_segments(hatch_rect)
@@ -971,9 +1002,8 @@ impl Monitor {
                                 TileKind::Node { crumbs } => root.resolve(crumbs).map_or(
                                     (String::new(), String::new()),
                                     |node| {
-                                        (
-                                            format!("{}{}", node.name, coverage(node)),
-                                            if mode == Mode::Age {
+                                        (node.name.to_string(), {
+                                            let value = if mode == Mode::Age {
                                                 format!(
                                                     "{} · {}",
                                                     bytes(node.bytes),
@@ -983,8 +1013,13 @@ impl Monitor {
                                                 format!("{} files", node.files)
                                             } else {
                                                 bytes(node.bytes)
-                                            },
-                                        )
+                                            };
+                                            if let Some(tag) = coverage_tag(node) {
+                                                format!("{tag} · {value}")
+                                            } else {
+                                                value
+                                            }
+                                        })
                                     },
                                 ),
                                 TileKind::Others { count, .. } => {
@@ -1007,7 +1042,9 @@ impl Monitor {
                             if mask.size.width < px(44.) || mask.size.height < px(minimum_height) {
                                 continue;
                             }
-                            let size_line = tile.header.map(|_| {
+                            let size_line = (tile.header.is_some()
+                                || node.is_some_and(|node| !coverage(node).is_empty()))
+                            .then(|| {
                                 window.text_system().shape_line(
                                     size_text.clone().into(),
                                     px(11.),
@@ -1020,7 +1057,25 @@ impl Monitor {
                                     None,
                                 )
                             });
-                            let label = if tile.header.is_some() {
+                            let size_line = size_line.map(|line| {
+                                if line.width > mask.size.width - px(8.) {
+                                    if let Some(tag) = node.and_then(coverage_tag) {
+                                        return window.text_system().shape_line(
+                                            tag.into(),
+                                            px(11.),
+                                            &[TextRun {
+                                                len: tag.len(),
+                                                font: font("JetBrains Mono"),
+                                                color: rgb(text).into(),
+                                                ..Default::default()
+                                            }],
+                                            None,
+                                        );
+                                    }
+                                }
+                                line
+                            });
+                            let label = if size_line.is_some() {
                                 name
                             } else {
                                 format!("{name} {size_text}")
@@ -1055,6 +1110,16 @@ impl Monitor {
                                 },
                             );
                             if let Some(line) = size_line {
+                                #[cfg(test)]
+                                if let Some(tag) = node.and_then(coverage_tag) {
+                                    assert!(line.width <= mask.size.width - px(8.));
+                                    assert!(line.text.starts_with(tag));
+                                    paint_frame.borrow_mut().coverage_labels.push((
+                                        tile.kind.clone(),
+                                        line.text.to_string(),
+                                        mask,
+                                    ));
+                                }
                                 window.with_content_mask(
                                     Some(ContentMask { bounds: mask }),
                                     |window| {
@@ -1552,7 +1617,7 @@ impl Monitor {
                             .whitespace_nowrap()
                             .text_size(px(11.))
                             .bg(rgb(if active { t.selection } else { t.base.plate }))
-                            .child(entry.label.clone())
+                            .child(entry.visible_label.as_ref().unwrap_or(&entry.label).clone())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, window, cx| {
@@ -1828,6 +1893,41 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn kinds_narrow_cloud_tile_keeps_coverage_outside_filename(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(kinds_snapshot_disk());
+            monitor
+        });
+        for (width, height) in [(1200., 720.), (1480., 930.)] {
+            visual.simulate_resize(size(px(width), px(height)));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                let frame = disk.map.frame.borrow();
+                let root = frame.root.as_ref().unwrap();
+                let cloud = frame
+                    .tiles
+                    .iter()
+                    .find(|tile| {
+                        root.resolve(tile.crumbs())
+                            .is_some_and(|node| &*node.name == "CloudStorage")
+                    })
+                    .unwrap();
+                let (_, tag, mask) = frame
+                    .coverage_labels
+                    .iter()
+                    .find(|(kind, _, _)| *kind == cloud.kind)
+                    .unwrap();
+                assert!(tag.starts_with("CLOUD"));
+                assert!(mask.size.width >= px(44.));
+            });
+        }
+        monitor.update(visual, |monitor, _| monitor.disk = None);
+    }
+
+    #[gpui::test]
     async fn kinds_palette_changes_repaint_without_rescan_and_keep_focus_then_settle(
         cx: &mut TestAppContext,
     ) {
@@ -1852,7 +1952,6 @@ mod tests {
                     .unwrap()
                     .clone(),
                 disk.generation(),
-                disk.map.frame.borrow().painted.clone(),
             )
         });
         let click = monitor.read_with(visual, |monitor, _| {
@@ -1876,6 +1975,27 @@ mod tests {
         visual.update(|window, cx| {
             assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
         });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let stable = monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            disk.map
+                .frame
+                .borrow()
+                .painted
+                .iter()
+                .find(|tile| {
+                    Some(&tile.0) != disk.map.selected.as_ref()
+                        && original
+                            .0
+                            .resolve(match &tile.0 {
+                                TileKind::Node { crumbs } => crumbs,
+                                _ => return false,
+                            })
+                            .is_some()
+                })
+                .unwrap()
+                .clone()
+        });
         monitor.update(visual, |monitor, cx| {
             monitor.settings.active = 4;
             cx.notify();
@@ -1888,13 +2008,50 @@ mod tests {
                 disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap()
             ));
             assert_eq!(original.1, disk.generation());
-            assert_ne!(original.2, disk.map.frame.borrow().painted);
+            let frame = disk.map.frame.borrow();
+            let witness = frame
+                .painted
+                .iter()
+                .find(|tile| tile.0 == stable.0)
+                .unwrap();
+            let layout = frame
+                .tiles
+                .iter()
+                .find(|tile| tile.kind == stable.0)
+                .unwrap();
+            let node = original.0.resolve(layout.crumbs()).unwrap();
+            let expected = crate::palette::kind_style(
+                &crate::palette::presets()[4].base.tokens(),
+                node.category,
+                layout.depth as usize,
+            )
+            .fill;
+            assert_eq!(
+                witness.3, expected,
+                "unselected tile must use the new palette"
+            );
+            assert_ne!(stable.3, witness.3);
             assert!(disk.selection_details()[4].contains("build output"));
             let frame = disk.map.frame.borrow();
             assert!(!frame.hatched.is_empty());
             for (kind, clip) in &frame.hatched {
                 let tile = frame.painted.iter().find(|tile| &tile.0 == kind).unwrap();
-                assert_eq!(*clip, tile.1.inset(1.));
+                let inset = tile.1.inset(1.);
+                let expected = Bounds::new(
+                    frame.origin + point(px(inset.x), px(inset.y)),
+                    size(px(inset.w), px(inset.h)),
+                );
+                for (actual, expected) in [
+                    (clip.left(), expected.left()),
+                    (clip.top(), expected.top()),
+                    (clip.right(), expected.right()),
+                    (clip.bottom(), expected.bottom()),
+                ] {
+                    assert!(
+                        (f32::from(actual) - f32::from(expected)).abs() < 0.0001,
+                        "applied hatch mask differs: {clip:?} vs {expected:?}"
+                    );
+                }
                 let layout_tile = frame.tiles.iter().find(|tile| &tile.kind == kind).unwrap();
                 let node = original.0.resolve(layout_tile.crumbs()).unwrap();
                 assert!(!node.in_cloud);
@@ -1915,6 +2072,11 @@ mod tests {
             let entries = disk.map.entries(&original.0);
             for entry in entries.iter() {
                 if let TileKind::Node { crumbs } = &entry.kind {
+                    assert!(!entry
+                        .visible_label
+                        .as_ref()
+                        .unwrap()
+                        .contains("inspect before cleanup"));
                     assert!(entry.label.contains(&gtop_disk::classify::description(
                         original.0.resolve(crumbs).unwrap()
                     )));
@@ -1922,6 +2084,13 @@ mod tests {
             }
         });
         visual.run_until_parked();
+        // Public key dispatch draws dirty windows before it delivers the unhandled key.
+        for _ in 0..3 {
+            visual.simulate_event(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse("f24").unwrap(),
+            });
+            visual.run_until_parked();
+        }
         let before = monitor.read_with(visual, |monitor, _| {
             monitor
                 .disk
@@ -1935,6 +2104,10 @@ mod tests {
         for _ in 0..120 {
             visual.update(|window, cx| assert_eq!(window.simulate_next_frame(cx), 0));
             visual.executor().advance_clock(Duration::from_millis(16));
+            visual.run_until_parked();
+            visual.simulate_event(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse("f24").unwrap(),
+            });
             visual.run_until_parked();
         }
         assert_eq!(

@@ -294,6 +294,19 @@ pub fn kind_style(t: &Tokens, category: gtop_disk::classify::Category, depth: us
 mod kind_tests {
     use super::*;
     #[test]
+    fn kinds_contrast_matches_independent_srgb_reference_ratios() {
+        for (a, b, expected) in [
+            (0x000000, 0xffffff, 21.0),
+            (0x789abc, 0x789abc, 1.0),
+            (0x777777, 0xffffff, 4.478089453577214),
+            (0x336699, 0xcccccc, 3.7347781032329115),
+        ] {
+            assert!((contrast(a, b) - expected).abs() < 0.000001);
+            assert!((contrast(b, a) - expected).abs() < 0.000001);
+        }
+    }
+
+    #[test]
     fn kinds_have_readable_text_and_keep_action_colours_separate_on_all_presets() {
         for palette in presets() {
             let t = palette.base.tokens();
