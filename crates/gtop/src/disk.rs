@@ -812,6 +812,13 @@ fn publish(
     generation: u64,
     navigation: u64,
 ) {
+    let folder = tree.folder(path, page, cached);
+    {
+        let mut mailbox = output.lock().unwrap();
+        mailbox.scan_bytes = Some((generation, tree.observed_bytes()));
+        mailbox.folder = Some((generation, navigation, folder));
+        mailbox.notify();
+    }
     #[cfg(test)]
     if tree.state == ScanState::Scanning {
         let gate = output.lock().unwrap().scan_gate.take();
@@ -820,11 +827,6 @@ fn publish(
             resume.recv().unwrap();
         }
     }
-    let folder = tree.folder(path, page, cached);
-    let mut mailbox = output.lock().unwrap();
-    mailbox.scan_bytes = Some((generation, tree.observed_bytes()));
-    mailbox.folder = Some((generation, navigation, folder));
-    mailbox.notify();
 }
 fn publish_browse(
     output: &Mutex<Mailbox>,

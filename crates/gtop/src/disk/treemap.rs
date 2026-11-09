@@ -4777,6 +4777,87 @@ mod tests {
         });
     }
 
+    fn wait_fix3_cancelled(visual: &mut VisualTestContext, monitor: &Entity<Monitor>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let cancelled = monitor.update(visual, |monitor, cx| {
+                let disk = monitor.disk.as_mut().unwrap();
+                disk.consume_mailbox();
+                cx.notify();
+                disk.scan_shelf_status().starts_with("Cancelled")
+            });
+            if cancelled {
+                break;
+            }
+            assert!(Instant::now() < deadline, "shelf did not end at Cancelled");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("map-cancel").is_none());
+    }
+
+    #[gpui::test]
+    async fn controls_v2_fix3_queued_option_with_retained_progress(cx: &mut TestAppContext) {
+        cx.update(init);
+        let fixture = Fixture::new();
+        let mut disk = Disk::with_home(fixture.0.clone());
+        wait_folder(&mut disk, &fixture.0);
+        let (started, ready) = mpsc::sync_channel(1);
+        let (resume, suspended) = mpsc::sync_channel(1);
+        disk.mailbox.lock().unwrap().scan_gate = Some((started, suspended));
+        disk.start(fixture.0.clone(), true);
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        disk.consume_mailbox();
+        let progress = disk.folder.as_ref().expect("published progress");
+        assert_eq!(progress.state, ScanState::Scanning);
+        assert!(progress.hierarchy.is_none());
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        click_controls_fix1(visual, &monitor, "controls-view");
+        click_controls_fix1(visual, &monitor, "map-apparent");
+        key_controls_fix1(visual, &monitor, "c");
+        resume.send(()).unwrap();
+        wait_fix3_cancelled(visual, &monitor);
+    }
+
+    #[gpui::test]
+    async fn controls_v2_fix3_queued_child_browse(cx: &mut TestAppContext) {
+        cx.update(init);
+        let fixture = Fixture::new();
+        let mut disk = Disk::with_home(fixture.0.clone());
+        wait_folder(&mut disk, &fixture.0);
+        let (started, ready) = mpsc::sync_channel(1);
+        let (resume, suspended) = mpsc::sync_channel(1);
+        disk.mailbox.lock().unwrap().scan_gate = Some((started, suspended));
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        click_controls_fix1(visual, &monitor, "controls-view");
+        click_controls_fix1(visual, &monitor, "map-apparent");
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        click_controls_fix1(visual, &monitor, "map-entry-1");
+        key_controls_fix1(visual, &monitor, "enter");
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            let session = disk.session.as_ref().unwrap();
+            assert_ne!(session.view.path, session.root);
+            assert!(disk.map.previous_result);
+            assert!(disk.scan_shelf_status().starts_with("Scanning"));
+        });
+        key_controls_fix1(visual, &monitor, "c");
+        resume.send(()).unwrap();
+        wait_fix3_cancelled(visual, &monitor);
+    }
+
     #[gpui::test]
     async fn controls_v2_fix1_owner_transitions_and_escape(cx: &mut TestAppContext) {
         cx.update(init);
