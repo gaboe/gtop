@@ -236,16 +236,29 @@ fn entries_filtered(
                         bytes(
                             children
                                 .iter()
-                                .filter_map(|(index, node)| {
+                                .map(|(index, node)| {
                                     let mut path = crumbs.clone();
                                     path.push(*index);
-                                    let value = matches.map_or(node.value(metric), |found| {
-                                        found.keep(&path).map_or(0, |keep| {
+                                    let keep = matches.and_then(|found| found.keep(&path));
+                                    let weight = matches.map_or(node.value(metric), |_| {
+                                        keep.map_or(0, |keep| {
                                             gtop_disk::filter::Matches::value(keep, node, metric)
                                         })
                                     });
-                                    (value > 0).then_some(node.bytes)
+                                    let bytes = matches.map_or(node.bytes, |_| {
+                                        keep.map_or(0, |keep| {
+                                            gtop_disk::filter::Matches::value(
+                                                keep,
+                                                node,
+                                                Metric::Bytes,
+                                            )
+                                        })
+                                    });
+                                    (weight, bytes)
                                 })
+                                .filter(|(weight, _)| *weight > 0)
+                                .skip(kept)
+                                .map(|(_, bytes)| bytes)
                                 .sum()
                         )
                     ),
@@ -507,12 +520,14 @@ impl Disk {
                 .folder
                 .as_ref()
                 .is_some_and(|folder| folder.hierarchy.is_some());
-            self.status = if self.map.previous_result {
-                "Previous result is stale. Scanning with new options…"
-            } else {
-                "Scanning with new options…"
-            }
-            .into();
+            self.set_scan_status(
+                self.generation(),
+                if self.map.previous_result {
+                    "Previous result is stale. Scanning with new options…"
+                } else {
+                    "Scanning with new options…"
+                },
+            );
         }
     }
 
@@ -2149,6 +2164,61 @@ mod tests {
         assert!(rows.iter().any(|row| row.label.contains("file-159")));
     }
 
+    #[test]
+    fn fix3_other_reports_only_tail_bytes_in_each_mode() {
+        let mut disk = snapshot_disk();
+        for mode in [Mode::Size, Mode::Files, Mode::Age] {
+            for filter in ["", "file-"] {
+                disk.map.mode = mode;
+                disk.map.filter = filter.into();
+                disk.map.committed_filter = filter.into();
+                disk.map.applied = !filter.is_empty();
+                disk.map.listing.borrow_mut().take();
+                let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+                let rows = disk.map.entries(root);
+                let other = rows
+                    .iter()
+                    .find(|row| matches!(row.kind, TileKind::Others { .. }))
+                    .expect("tiny folder has an Other row");
+                assert_eq!(
+                    other.label, "Other · 64 items · 262.1 KB",
+                    "mode {mode:?}, filter {filter:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fix3_partial_other_reports_only_matched_tail_bytes() {
+        use gtop_disk::tree::{aggregate, NodeKind};
+
+        let mut root = Node::directory("Home");
+        for index in 0..97 {
+            let mut directory = Node::directory(format!("directory-{index:02}"));
+            directory.children = vec![
+                Node::entry("matching-file", NodeKind::File, 4096),
+                Node::entry("unmatched-file", NodeKind::File, 1 << 20),
+            ];
+            aggregate(&mut directory, Metric::Bytes);
+            root.children.push(directory);
+        }
+        aggregate(&mut root, Metric::Bytes);
+        let root = Arc::new(root);
+        let mut disk = snapshot_disk();
+        disk.map.mode = Mode::Size;
+        disk.map.filter = "matching-file".into();
+        disk.map.committed_filter = disk.map.filter.clone();
+        disk.map.applied = true;
+        disk.map.listing.borrow_mut().take();
+
+        let rows = disk.map.entries(&root);
+        let other = rows
+            .iter()
+            .find(|row| matches!(row.kind, TileKind::Others { .. }))
+            .expect("the 97th matching directory is in Other");
+        assert_eq!(other.label, "Other · 1 items · 4.1 KB");
+    }
+
     #[gpui::test]
     async fn fix2_filtered_zero_byte_match_stays_keyboard_reachable(cx: &mut TestAppContext) {
         cx.update(init);
@@ -2247,6 +2317,48 @@ mod tests {
                 assert!(disk.folder.as_ref().unwrap().path == root);
             });
         }
+    }
+
+    #[gpui::test]
+    async fn fix3_option_rescan_without_previous_hierarchy_clears_status(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        let mut completed_folder = disk.folder.take().unwrap();
+        completed_folder.state = ScanState::Complete;
+        disk.session.as_mut().unwrap().outcome = None;
+        let (sender, _pending) = mpsc::sync_channel(4);
+        disk.sender = sender;
+        disk.status = "Scanning…".into();
+
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let hidden_button = visual.debug_bounds("map-hidden").unwrap();
+        visual.simulate_click(hidden_button.center(), Modifiers::default());
+        let generation = monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert!(!disk.map.previous_result);
+            assert!(disk.status.contains("Scanning with new options"));
+            disk.generation()
+        });
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            let mut mailbox = disk.mailbox.lock().unwrap();
+            mailbox.folder = Some((generation, 0, completed_folder));
+            mailbox.outcome = Some((generation, ScanState::Complete));
+            drop(mailbox);
+            assert!(disk.consume_mailbox());
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("disk-status").is_some());
+        monitor.read_with(visual, |monitor, _| {
+            assert!(monitor.disk.as_ref().unwrap().status.is_empty());
+        });
     }
 
     #[test]
@@ -3707,6 +3819,7 @@ mod tests {
             scroll: ScrollHandle::new(),
             row_children: Default::default(),
             status: "Complete · observed sizes".into(),
+            status_kind: StatusKind::Message,
         }
     }
 }

@@ -131,6 +131,13 @@ struct ScanSession {
     outcome: Option<ScanState>,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum StatusKind {
+    #[default]
+    Message,
+    Scan(u64),
+}
+
 pub(super) struct Disk {
     inspector_resize: inspector_model::InspectorResize,
     volume: Option<gtop_disk::inspector::VolumeReadout>,
@@ -155,6 +162,7 @@ pub(super) struct Disk {
     scroll: ScrollHandle,
     row_children: std::cell::RefCell<Vec<(PathBuf, usize)>>,
     status: String,
+    status_kind: StatusKind,
 }
 impl Drop for Disk {
     fn drop(&mut self) {
@@ -209,6 +217,7 @@ impl Disk {
             scroll: ScrollHandle::new(),
             row_children: Default::default(),
             status: String::new(),
+            status_kind: StatusKind::Message,
         };
         disk.start(home, false);
         disk
@@ -250,6 +259,18 @@ impl Disk {
             .as_ref()
             .map_or(0, |session| session.generation)
     }
+    fn set_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+        self.status_kind = StatusKind::Message;
+    }
+    fn set_scan_status(&mut self, generation: u64, status: impl Into<String>) {
+        self.status = status.into();
+        self.status_kind = StatusKind::Scan(generation);
+    }
+    fn clear_status(&mut self) {
+        self.status.clear();
+        self.status_kind = StatusKind::Message;
+    }
     fn apply_outcome(&mut self, generation: u64, outcome: ScanState) {
         let root =
             if let Some(session) = self.session.as_mut().filter(|s| s.generation == generation) {
@@ -268,7 +289,7 @@ impl Disk {
                     _ => None,
                 };
                 if let Some(message) = message {
-                    self.status = message;
+                    self.set_status(message);
                     if let Some(folder) = &mut self.folder {
                         folder.state = outcome.clone();
                     }
@@ -276,13 +297,13 @@ impl Disk {
             }
             if self.folder.is_none() {
                 match &outcome {
-                    ScanState::Cancelled => self.status = "Scan cancelled.".into(),
-                    ScanState::Failed(error) => self.status = format!("Scan failed: {error}"),
+                    ScanState::Cancelled => self.set_status("Scan cancelled."),
+                    ScanState::Failed(error) => self.set_status(format!("Scan failed: {error}")),
                     _ => {}
                 }
             }
-            if outcome == ScanState::Complete && self.status == "Scanning…" {
-                self.status.clear();
+            if outcome == ScanState::Complete && self.status_kind == StatusKind::Scan(generation) {
+                self.clear_status();
             }
             self.refresh_volume(&root);
         }
@@ -334,7 +355,7 @@ impl Disk {
                     self.refresh_volume(&root);
                 }
             }
-            self.status = status;
+            self.set_status(status);
             self.sending = false;
         }
         if let Some((_, _, folder)) =
@@ -348,18 +369,18 @@ impl Disk {
                 && self.map.previous_result
             {
                 if !matches!(folder.state, ScanState::Scanning) {
-                    self.status = match &folder.state {
+                    self.set_status(match &folder.state {
                         ScanState::Failed(error) => {
                             format!("Previous result. Replacement failed: {error}")
                         }
                         _ => "Previous result. Replacement cancelled.".into(),
-                    };
+                    });
                     self.folder.as_mut().unwrap().state = folder.state;
                 }
                 return true;
             }
             if folder.hierarchy.is_some() && self.map.previous_result {
-                self.status.clear();
+                self.clear_status();
                 self.map.previous_result = false;
             }
             let same_hierarchy = self.folder.as_ref().is_some_and(|previous| {
@@ -381,7 +402,7 @@ impl Disk {
     }
     fn invalidate_proposal(&mut self) {
         if self.status == "Checking cleanup path…" {
-            self.status.clear();
+            self.clear_status();
         }
         self.confirmation = None;
         self.proposal_id += 1;
@@ -402,9 +423,9 @@ impl Disk {
         match result {
             Ok(proposal) => {
                 self.confirmation = Some(proposal);
-                self.status.clear();
+                self.clear_status();
             }
-            Err(error) => self.status = error,
+            Err(error) => self.set_status(error),
         }
         true
     }
@@ -412,11 +433,11 @@ impl Disk {
         match self.sender.try_send(command) {
             Ok(()) => true,
             Err(mpsc::TrySendError::Full(_)) => {
-                self.status = "Disk worker busy. Try again.".into();
+                self.set_status("Disk worker busy. Try again.");
                 false
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
-                self.status = "Disk worker unavailable. Reopen the application.".into();
+                self.set_status("Disk worker unavailable. Reopen the application.");
                 false
             }
         }
@@ -459,7 +480,7 @@ impl Disk {
         self.selected = 0;
         self.map.pending_selection = previous_selection;
         self.folder = None;
-        self.status = "Scanning…".into();
+        self.set_scan_status(generation, "Scanning…");
     }
     fn start_over(&mut self) {
         let root = self
@@ -516,7 +537,7 @@ impl Disk {
     }
     fn request_trash(&mut self, row: &disk_scan::Row) {
         if row.in_cloud {
-            self.status = "Cloud items cannot be prepared for cleanup".into();
+            self.set_status("Cloud items cannot be prepared for cleanup");
             return;
         }
         if self.sending {
@@ -527,7 +548,7 @@ impl Disk {
             .as_ref()
             .is_some_and(|f| f.state == ScanState::Complete)
         {
-            self.status = "Finish the scan before cleanup".into();
+            self.set_status("Finish the scan before cleanup");
             return;
         }
         let proposal = self.proposal_id + 1;
@@ -543,7 +564,7 @@ impl Disk {
         }
         self.proposal_id = proposal;
         self.confirmation = None;
-        self.status = "Checking cleanup path…".into();
+        self.set_status("Checking cleanup path…");
     }
 
     fn confirm(&mut self, rendered_proposal: u64) {
@@ -563,16 +584,15 @@ impl Disk {
                 Ok(()) => {
                     self.sending = true;
                     self.cancel = token;
-                    self.status = "Moving item to Trash…".into();
+                    self.set_status("Moving item to Trash…");
                 }
                 Err(error) => {
-                    self.status = match &error {
+                    self.set_status(match &error {
                         mpsc::TrySendError::Full(_) => "Disk worker busy. Try again.",
                         mpsc::TrySendError::Disconnected(_) => {
                             "Disk worker unavailable. Reopen the application."
                         }
-                    }
-                    .into();
+                    });
                     let (mpsc::TrySendError::Full(Command::Trash(confirmation, ..))
                     | mpsc::TrySendError::Disconnected(Command::Trash(confirmation, ..))) = error
                     else {
@@ -1647,6 +1667,7 @@ mod tests {
             scroll: ScrollHandle::new(),
             row_children: Default::default(),
             status: String::new(),
+            status_kind: StatusKind::Message,
         };
 
         disk.start(root.clone(), true);
