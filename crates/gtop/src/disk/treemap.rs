@@ -5,9 +5,12 @@ use gtop_disk::{
     treemap::{self, LayoutOptions, Rect, Tile, TileKind},
 };
 use std::rc::Rc;
+#[path = "controls.rs"]
+mod controls;
 
 #[derive(Default)]
 pub(super) struct MapState {
+    controls: controls::Controls,
     mode: Mode,
     depth: u32,
     filter: String,
@@ -481,6 +484,10 @@ impl Disk {
         self.map.history.visit(path);
     }
     pub(super) fn map_controls_key(&mut self, key: &str) -> bool {
+        if (self.map.controls.disclosure.is_some() || !self.map.filtering) && self.controls_key(key)
+        {
+            return true;
+        }
         if !self.map.filtering
             && self.map.finding_cursor.is_some()
             && matches!(
@@ -1281,20 +1288,6 @@ impl Monitor {
                 )
                 .size_full(),
             );
-        let path = disk.folder.as_ref().map_or_else(
-            || self.disk.as_ref().unwrap().status.clone(),
-            |folder| {
-                format!(
-                    "{}{}",
-                    folder.path.display(),
-                    if disk.map.previous_result {
-                        " · Previous result"
-                    } else {
-                        ""
-                    }
-                )
-            },
-        );
         let mut crumbs = div().flex().flex_wrap().gap(px(4.));
         if let Some(folder) = &disk.folder {
             let mut ancestors: Vec<_> = folder
@@ -1411,124 +1404,6 @@ impl Monitor {
                     .map(|path| path.display().to_string())
             })
             .unwrap_or_default();
-        let mut controls = div().flex().flex_wrap().gap(px(4.));
-        for (index, mode) in [Mode::Size, Mode::Files, Mode::Age].into_iter().enumerate() {
-            controls = controls.child(
-                div()
-                    .debug_selector(move || format!("map-mode-{index}"))
-                    .child(
-                        Button::new(("map-mode", index))
-                            .label(format!(
-                                "{}{:?}",
-                                if disk.map.mode == mode { "● " } else { "" },
-                                mode
-                            ))
-                            .rack(&t)
-                            .small()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                let disk = this.disk.as_mut().unwrap();
-                                disk.set_map_mode(mode);
-                                window.focus(&this.focus, cx);
-                                cx.notify();
-                            })),
-                    ),
-            );
-        }
-        for (id, label, key) in [
-            ("map-depth-less", "Depth −".to_string(), "["),
-            (
-                "map-depth-more",
-                format!("{} +", disk.map.draw_depth()),
-                "]",
-            ),
-            ("map-filter", format!("/ Filter {}", disk.map.filter), "/"),
-            ("map-back", "Back".into(), "b"),
-            ("map-forward", "Forward".into(), "f"),
-            ("map-reset", "Reset 0".into(), "0"),
-        ] {
-            controls = controls.child(
-                div().debug_selector(move || id.into()).child(
-                    Button::new(id)
-                        .label(label)
-                        .rack(&t)
-                        .small()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let disk = this.disk.as_mut().unwrap();
-                            disk.map_command(key);
-                            window.focus(&this.focus, cx);
-                            cx.notify();
-                        })),
-                ),
-            );
-        }
-        for (id, label, hidden) in [
-            (
-                "map-hidden",
-                format!(
-                    "Hidden {}",
-                    if disk.options.include_hidden {
-                        "on"
-                    } else {
-                        "off"
-                    }
-                ),
-                true,
-            ),
-            (
-                "map-apparent",
-                format!(
-                    "Apparent {}",
-                    if disk.options.apparent_size {
-                        "on"
-                    } else {
-                        "off"
-                    }
-                ),
-                false,
-            ),
-        ] {
-            controls = controls.child(
-                div().debug_selector(move || id.into()).child(
-                    Button::new(id)
-                        .label(label)
-                        .rack(&t)
-                        .small()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.disk.as_mut().unwrap().change_scan_option(hidden);
-                            window.focus(&this.focus, cx);
-                            cx.notify();
-                        })),
-                ),
-            );
-        }
-        controls = controls.child(
-            div().debug_selector(|| "map-choose-folder".into()).child(
-                Button::new("map-choose-folder")
-                    .label("Choose folder")
-                    .rack(&t)
-                    .small()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        window.focus(&this.focus, cx);
-                        let request = cx.prompt_for_paths(PathPromptOptions {
-                            files: false,
-                            directories: true,
-                            multiple: false,
-                            prompt: Some("Scan folder".into()),
-                        });
-                        cx.spawn(async move |entity, cx| {
-                            if let Ok(Ok(Some(paths))) = request.await {
-                                if let Some(path) = paths.into_iter().next() {
-                                    let _ = entity.update(cx, |this, cx| {
-                                        this.disk.as_mut().unwrap().start(path, false);
-                                        cx.notify();
-                                    });
-                                }
-                            }
-                        })
-                        .detach();
-                    })),
-            ),
-        );
         let matched = disk
             .folder
             .as_ref()
@@ -1565,22 +1440,10 @@ impl Monitor {
             );
         }
         legend = legend.child("//// Rebuildable or reclaimable · inspect before cleanup");
-        div().capture_any_mouse_down(cx.listener(|this, _, _, cx| {
-            this.disk.as_mut().unwrap().map.leave_findings_navigation();
-            cx.notify();
-        })).flex().size_full().gap(px(8.)).min_w_0()
-            .child(div().flex().flex_col().flex_1().min_w_0().min_h_0().gap(px(8.))
-                .child(div().bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule_hi)).p(px(12.))
-                    .child(crate::rack::label(if disk.options.apparent_size { "TREEMAP · APPARENT SIZE" } else { "TREEMAP · ALLOCATED BLOCKS" }, &t))
-                    .child(current_path(path)).child(crumbs).children(siblings).child(controls).child(div().text_size(px(10.)).child(matched)))
-                .child(legend)
-                .child(canvas)
-                .child(div().h(px(20.)).overflow_hidden().text_size(px(10.)).child(hover))
-                .child(div().bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule)).p(px(8.))
-                    .child("D Top · arrows/HJKL move · Tab list/controls · Esc canvas · Enter open · Backspace up · X Trash")
-                    .child("M mode · / filter · [ ] depth · + − zoom · 0 reset · B/F history")
-                    .child(div().text_size(px(10.)).child("Observed sizes. Unknown space has no tile area. Hover informs; click selects."))))
-            .child(self.resizable_disk_inspector(window, cx))
+        let legend = legend
+            .child(div().text_size(px(10.)).child(matched))
+            .child(div().text_size(px(10.)).child(hover));
+        self.controls_workspace(canvas, crumbs, siblings, legend, window, cx)
     }
 
     fn resizable_disk_inspector(&self, window: &Window, cx: &mut Context<Self>) -> Div {
@@ -1884,14 +1747,6 @@ impl Monitor {
             .px(px(12.))
             .gap(px(6.))
             .child(selection)
-            .child(crate::rack::label(
-                format!("{:?} · {} observed", folder.state, bytes(folder.allocated)),
-                &t,
-            ))
-            .child(div().text_size(px(10.)).child(format!(
-                "{} unreadable entries · incomplete sizes can contain more",
-                folder.errors
-            )))
             .child(crate::rack::label("WORTH A LOOK · W", &t))
             .when(has_findings, |this| {
                 this.child(
@@ -1913,13 +1768,6 @@ impl Monitor {
                         .child("No large inspection suggestions."),
                 )
             })
-            .when(has_findings, |this| {
-                this.child(
-                    div()
-                        .text_size(px(10.))
-                        .child("W findings · ↑↓ choose · Enter inspect · Esc return"),
-                )
-            })
             .child(crate::rack::label("FOLDERS AND FILES", &t))
             .child(
                 div()
@@ -1929,7 +1777,7 @@ impl Monitor {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_h(px(26.))
+                    .min_h(px(52.))
                     .child(list),
             )
             .child(self.disk_volume_readout())
@@ -2172,6 +2020,22 @@ mod tests {
     fn init(cx: &mut App) {
         gpui_component::init(cx);
         crate::theme::init(cx);
+    }
+
+    fn open_control(visual: &mut VisualTestContext, monitor: &Entity<Monitor>, selector: &str) {
+        let trigger = match selector {
+            "map-depth-less" | "map-depth-more" | "map-reset" | "map-hidden" | "map-apparent" => {
+                "controls-view"
+            }
+            "map-choose-folder" => "controls-source",
+            _ => return,
+        };
+        let bounds = visual.debug_bounds(trigger).unwrap();
+        visual.simulate_click(bounds.center(), Modifiers::default());
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
     }
 
     #[gpui::test]
@@ -3058,6 +2922,8 @@ mod tests {
         });
         visual.simulate_resize(size(px(1200.), px(720.)));
         visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.simulate_keystrokes("v");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         let hidden_button = visual.debug_bounds("map-hidden").unwrap();
         visual.simulate_click(hidden_button.center(), Modifiers::default());
         let generation = monitor.read_with(visual, |monitor, _| {
@@ -3173,6 +3039,8 @@ mod tests {
             assert!(disk.folder.as_ref().unwrap().hierarchy.is_none());
             assert!(!disk.map.previous_result);
         });
+        visual.simulate_keystrokes("v");
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         let hidden = visual.debug_bounds("map-hidden").unwrap();
         visual.simulate_click(hidden.center(), Modifiers::default());
         let generation = monitor.read_with(visual, |monitor, _| {
@@ -3452,6 +3320,7 @@ mod tests {
             "map-depth-less",
             "map-filter",
         ] {
+            open_control(visual, &monitor, selector);
             let bounds = visual.debug_bounds(selector).unwrap();
             visual.simulate_click(bounds.center(), Modifiers::default());
             visual.update(|window, cx| {
@@ -3559,6 +3428,7 @@ mod tests {
             ("map-mode-1", Mode::Files),
             ("map-mode-0", Mode::Size),
         ] {
+            open_control(visual, &monitor, selector);
             let bounds = visual.debug_bounds(selector).unwrap();
             visual.simulate_click(bounds.center(), Modifiers::default());
             visual.update(|window, cx| {
@@ -3600,6 +3470,7 @@ mod tests {
             "map-filter",
         ] {
             visual.update(|window, cx| window.draw(cx).clear(cx));
+            open_control(visual, &monitor, selector);
             let bounds = visual.debug_bounds(selector).unwrap();
             visual.simulate_click(bounds.center(), Modifiers::default());
             visual.update(|window, cx| {
@@ -3715,6 +3586,7 @@ mod tests {
         });
         for selector in ["map-hidden", "map-apparent"] {
             visual.update(|window, cx| window.draw(cx).clear(cx));
+            open_control(visual, &monitor, selector);
             let bounds = visual.debug_bounds(selector).unwrap();
             visual.simulate_click(bounds.center(), Modifiers::default());
             visual.update(|window, cx| {
@@ -3742,6 +3614,8 @@ mod tests {
             assert_eq!(disk.generation(), generation);
             assert!(disk.map.selected.is_none());
         });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.simulate_keystrokes("s");
         visual.update(|window, cx| window.draw(cx).clear(cx));
         let choose = visual.debug_bounds("map-choose-folder").unwrap();
         visual.simulate_click(choose.center(), Modifiers::default());
@@ -3838,6 +3712,7 @@ mod tests {
         );
         for (selector, expected) in [("map-back", projects), ("map-forward", target)] {
             visual.update(|window, cx| window.draw(cx).clear(cx));
+            open_control(visual, &monitor, selector);
             let bounds = visual.debug_bounds(selector).unwrap();
             visual.simulate_click(bounds.center(), Modifiers::default());
             visual.update(|window, cx| {
@@ -4615,8 +4490,29 @@ mod tests {
                 .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
                 .unwrap();
         }
-        for (width, height) in [(1480., 930.), (1200., 720.)] {
+        for (width, height, state) in [
+            (1480., 930., "final"),
+            (1200., 720., "final"),
+            (1200., 720., "keys"),
+            (1200., 720., "source"),
+            (1200., 720., "view"),
+            (1200., 720., "scanning"),
+        ] {
             let mut disk = insights_snapshot_disk();
+            if state == "keys" {
+                disk.controls_key("?");
+            }
+            if state == "source" {
+                disk.controls_key("s");
+            }
+            if state == "view" {
+                disk.controls_key("v");
+            }
+            if state == "scanning" {
+                disk.session.as_mut().unwrap().activity = ScanActivity::Running;
+                disk.session.as_mut().unwrap().outcome = None;
+                disk.folder.as_mut().unwrap().state = ScanState::Scanning;
+            }
             let folder = disk.folder.as_ref().unwrap();
             let findings = disk
                 .map
@@ -4643,7 +4539,7 @@ mod tests {
             .unwrap();
             cx.capture_screenshot(handle.into())
                 .unwrap()
-                .save(output.join(format!("insights-{width:.0}x{height:.0}.png")))
+                .save(output.join(format!("controls-v2-{state}-{width:.0}x{height:.0}.png")))
                 .unwrap();
         }
         for (palette_index, width, height) in [
@@ -4759,6 +4655,244 @@ mod tests {
     }
 
     const AGE_NOW: i64 = 1_800_000_000;
+
+    #[gpui::test]
+    async fn controls_v2_reachability_and_immediate_focus(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = insights_snapshot_disk();
+        let (sender, pending) = mpsc::sync_channel(32);
+        disk.sender = sender;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        macro_rules! focus {
+            () => {
+                visual.update(|window, cx| {
+                    assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                })
+            };
+        }
+        macro_rules! key {
+            ($key:expr) => {{
+                visual.simulate_keystrokes($key);
+                focus!();
+            }};
+        }
+        macro_rules! click {
+            ($selector:expr) => {{
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+                let bounds = visual.debug_bounds($selector).expect($selector);
+                visual.simulate_click(bounds.center(), Modifiers::default());
+                focus!();
+            }};
+        }
+        for (width, height) in [(1200., 720.), (1480., 930.)] {
+            visual.simulate_resize(size(px(width), px(height)));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let shelf = visual.debug_bounds("controls-scan-shelf").unwrap();
+            let navigation = visual.debug_bounds("controls-navigation").unwrap();
+            let findings = visual.debug_bounds("disk-findings").unwrap();
+            let list = visual.debug_bounds("map-folder-list").unwrap();
+            assert!(shelf.bottom() <= navigation.top());
+            assert!(findings.size.height >= px(76.));
+            assert!(list.size.height >= px(52.), "two file rows fit: {list:?}");
+            assert!(list.bottom() <= px(height));
+        }
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        for (selector, mode) in [
+            ("map-mode-1", Mode::Files),
+            ("map-mode-2", Mode::Age),
+            ("map-mode-0", Mode::Size),
+        ] {
+            key!("w");
+            click!(selector);
+            monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                assert_eq!(disk.map.mode, mode);
+                assert_eq!(disk.map.finding_cursor, None);
+            });
+        }
+        key!("m");
+        monitor.read_with(visual, |monitor, _| {
+            assert_eq!(monitor.disk.as_ref().unwrap().map.mode, Mode::Files)
+        });
+        for trigger in ["controls-source", "controls-view", "controls-help"] {
+            key!("w");
+            click!(trigger);
+            monitor.read_with(visual, |monitor, _| {
+                assert!(monitor.disk.as_ref().unwrap().map.finding_cursor.is_none())
+            });
+            key!("escape");
+            monitor.read_with(visual, |monitor, _| {
+                assert!(monitor.disk.as_ref().unwrap().open)
+            });
+        }
+        for (selector, key_value) in [
+            ("map-depth-less", "["),
+            ("map-depth-more", "]"),
+            ("map-zoom-in", "+"),
+            ("map-zoom-out", "-"),
+            ("map-reset", "0"),
+        ] {
+            let before = monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                (disk.map.draw_depth(), disk.map.viewport)
+            });
+            let expected = monitor.update(visual, |monitor, _| {
+                let disk = monitor.disk.as_mut().unwrap();
+                disk.map_command(key_value);
+                let expected = (disk.map.draw_depth(), disk.map.viewport);
+                disk.map.depth = before.0;
+                disk.map.viewport = before.1;
+                expected
+            });
+            key!("v");
+            click!(selector);
+            monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                assert_eq!((disk.map.draw_depth(), disk.map.viewport), expected);
+                assert!(disk.map.controls.disclosure.is_none());
+            });
+        }
+        key!("v");
+        key!("down");
+        key!("enter");
+        key!("?");
+        key!("?");
+        monitor.read_with(visual, |monitor, _| {
+            assert!(monitor
+                .disk
+                .as_ref()
+                .unwrap()
+                .map
+                .controls
+                .disclosure
+                .is_none())
+        });
+        click!("map-filter");
+        for text in ["s", "v", "?"] {
+            key!(text);
+        }
+        monitor.read_with(visual, |monitor, _| {
+            assert_eq!(monitor.disk.as_ref().unwrap().map.filter, "sv?")
+        });
+        click!("controls-view");
+        key!("escape");
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert!(disk.map.filtering);
+            assert_eq!(disk.map.filter, "sv?");
+        });
+        key!("escape");
+        key!("w");
+        key!("down");
+        key!("enter");
+        monitor.read_with(visual, |monitor, _| {
+            assert!(monitor.disk.as_ref().unwrap().map_row().is_some())
+        });
+        for selector in ["map-hidden", "map-apparent"] {
+            key!("v");
+            click!(selector);
+            assert!(matches!(
+                pending.try_recv().unwrap(),
+                Command::Scan(_, true, _, _, _, _)
+            ));
+        }
+        for index in 0..7 {
+            key!("v");
+            for _ in 0..index {
+                key!("down");
+            }
+            key!("enter");
+            monitor.read_with(visual, |monitor, _| {
+                assert!(monitor
+                    .disk
+                    .as_ref()
+                    .unwrap()
+                    .map
+                    .controls
+                    .disclosure
+                    .is_none())
+            });
+            if index >= 5 {
+                assert!(matches!(
+                    pending.try_recv().unwrap(),
+                    Command::Scan(_, true, _, _, _, _)
+                ));
+            }
+        }
+        key!("r");
+        assert!(matches!(
+            pending.try_recv().unwrap(),
+            Command::Scan(_, true, _, _, _, _)
+        ));
+        click!("disk-rescan");
+        assert!(matches!(
+            pending.try_recv().unwrap(),
+            Command::Scan(_, true, _, _, _, _)
+        ));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let shelf = visual.debug_bounds("controls-scan-shelf").unwrap();
+        for selector in ["disk-cancel", "disk-rescan"] {
+            let bounds = visual.debug_bounds(selector).unwrap();
+            assert!(bounds.right() <= shelf.right());
+            assert!(bounds.top() >= shelf.top() && bounds.bottom() <= shelf.bottom());
+        }
+        click!("disk-cancel");
+        monitor.read_with(visual, |monitor, _| {
+            assert!(monitor
+                .disk
+                .as_ref()
+                .unwrap()
+                .cancel
+                .load(Ordering::Relaxed))
+        });
+        for keyboard in [false, true] {
+            for (index, selector) in ["disk-home", "disk-system", "map-choose-folder"]
+                .into_iter()
+                .enumerate()
+            {
+                if keyboard {
+                    key!("s");
+                    for _ in 0..index {
+                        key!("down");
+                    }
+                    key!("enter");
+                } else {
+                    click!("controls-source");
+                    click!(selector);
+                }
+                if index == 2 {
+                    assert!(visual.did_prompt_for_paths());
+                    visual.simulate_path_prompt_response(|options| {
+                        assert!(!options.files && options.directories && !options.multiple);
+                        Some(vec![PathBuf::from("/Volumes/External/controls-v2")])
+                    });
+                    visual.run_until_parked();
+                }
+                let Command::Scan(path, false, _, _, _, _) = pending.try_recv().unwrap() else {
+                    panic!("source starts a scan");
+                };
+                let expected = match index {
+                    0 => monitor.read_with(visual, |monitor, _| {
+                        monitor.disk.as_ref().unwrap().home.clone()
+                    }),
+                    1 => disk_scan::system_root(),
+                    _ => PathBuf::from("/Volumes/External/controls-v2"),
+                };
+                assert_eq!(path, expected);
+            }
+        }
+        click!("controls-top");
+        monitor.read_with(visual, |monitor, _| {
+            assert!(!monitor.disk.as_ref().unwrap().open)
+        });
+    }
+
     fn insights_snapshot_disk() -> Disk {
         use gtop_disk::tree::{aggregate, NodeKind};
         fn dir(name: &str, children: Vec<Node>) -> Node {
@@ -5154,6 +5288,7 @@ mod tests {
             visual.update(|window, cx| {
                 assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
             });
+            open_control(visual, &monitor, selector);
             let bounds = visual.debug_bounds(selector).unwrap();
             visual.simulate_click(bounds.center(), Modifiers::default());
             visual.update(|window, cx| {
@@ -5185,6 +5320,7 @@ mod tests {
             visual.update(|window, cx| {
                 assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
             });
+            open_control(visual, &monitor, selector);
             let bounds = visual.debug_bounds(selector).unwrap();
             visual.simulate_click(bounds.center(), Modifiers::default());
             visual.update(|window, cx| {
@@ -5308,6 +5444,9 @@ mod tests {
             monitor.disk.as_ref().unwrap().folder.clone().unwrap()
         });
         for selector in [
+            "controls-source",
+            "controls-view",
+            "controls-help",
             "map-depth-less",
             "map-depth-more",
             "map-reset",
@@ -5327,6 +5466,9 @@ mod tests {
             let mut disk = insights_snapshot_disk();
             disk.remember_map_root(&original);
             disk.folder = Some(child_folder.clone());
+            if selector == "disk-cancel" {
+                disk.session.as_mut().unwrap().activity = ScanActivity::Running;
+            }
             let (sender, _pending) = mpsc::sync_channel(32);
             disk.sender = sender;
             monitor.update(visual, |monitor, _| monitor.disk = Some(disk));
@@ -5343,6 +5485,7 @@ mod tests {
                 )
             });
             visual.update(|window, cx| window.draw(cx).clear(cx));
+            open_control(visual, &monitor, selector);
             let bounds = visual.debug_bounds(selector).unwrap();
             visual.simulate_click(bounds.center(), Modifiers::default());
             visual.update(|window, cx| {

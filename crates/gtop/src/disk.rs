@@ -1464,15 +1464,6 @@ impl Monitor {
         } else {
             body = body.child(self.disk.as_ref().unwrap().status.clone());
         }
-        if !disk
-            .folder
-            .as_ref()
-            .is_some_and(|folder| folder.hierarchy.is_some())
-        {
-            body = body.child(div().text_size(px(10.)).child(
-                "arrows/HJKL move · Tab list · Enter open · Backspace up · X trash · C cancel · R start over",
-            ));
-        }
         let mut panel = div()
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
                 this.disk.as_mut().unwrap().map.leave_findings_navigation();
@@ -1489,73 +1480,6 @@ impl Monitor {
             .bg(rgb(t.base.plate))
             .border_1()
             .border_color(rgb(t.rule_hi))
-            .child(
-                div()
-                    .px(px(12.))
-                    .py(px(10.))
-                    .border_b_1()
-                    .border_color(rgb(t.rule))
-                    .child(crate::rack::label("DISK SPACE", &t))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap(px(5.))
-                            .child(
-                                Button::new("disk-home")
-                                    .label("Home")
-                                    .rack(&t)
-                                    .small()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let d = this.disk.as_mut().unwrap();
-                                        d.start(d.home.clone(), false);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("disk-system")
-                                    .label("Data volume")
-                                    .rack(&t)
-                                    .small()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.disk
-                                            .as_mut()
-                                            .unwrap()
-                                            .start(disk_scan::system_root(), false);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div().debug_selector(|| "disk-cancel".into()).child(
-                                    Button::new("disk-cancel")
-                                        .label("Cancel")
-                                        .rack(&t)
-                                        .small()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.disk
-                                                .as_ref()
-                                                .unwrap()
-                                                .cancel
-                                                .store(true, Ordering::Relaxed);
-                                            cx.notify();
-                                        })),
-                                ),
-                            )
-                            .child(
-                                div().debug_selector(|| "disk-rescan".into()).child(
-                                    Button::new("disk-rescan")
-                                        .label("Start over")
-                                        .rack(&t)
-                                        .small()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            let d = this.disk.as_mut().unwrap();
-                                            d.start_over();
-                                            cx.notify();
-                                        })),
-                                ),
-                            ),
-                    ),
-            )
             .child(
                 body.id("disk-body")
                     .debug_selector(|| "disk-body".into())
@@ -1577,28 +1501,16 @@ impl Monitor {
                 .child(Button::new("disk-confirm").label("Move to Trash · Y").rack(&t).danger().small().on_click(cx.listener(move |this,_,_,cx| { this.disk.as_mut().unwrap().confirm(rendered_proposal); cx.notify(); })))
                 .child(Button::new("disk-keep").label("Keep · N").rack(&t).small().on_click(cx.listener(|this,_,_,cx| { this.disk.as_mut().unwrap().confirmation=None; cx.notify(); }))));
         }
-        panel = panel
-            .child(
-                div()
-                    .id("disk-status")
-                    .debug_selector(|| "disk-status".into())
-                    .role(Role::Status)
-                    .px(px(12.))
-                    .py(px(10.))
-                    .text_size(px(10.))
-                    .child(disk.status.clone()),
-            )
-            .child(
-                Button::new("disk-close")
-                    .label("Close · Esc")
-                    .rack(&t)
-                    .small()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.disk.as_mut().unwrap().close();
-                        this.panel_resize.finish();
-                        cx.notify();
-                    })),
-            );
+        panel = panel.child(
+            div()
+                .id("disk-status")
+                .debug_selector(|| "disk-status".into())
+                .role(Role::Status)
+                .px(px(12.))
+                .py(px(10.))
+                .text_size(px(10.))
+                .child(disk.status.clone()),
+        );
         Some(panel)
     }
 }

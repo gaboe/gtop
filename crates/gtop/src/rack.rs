@@ -2948,6 +2948,9 @@ impl Monitor {
             .filter(|d| d.open && !self.settings_open && self.moment.is_none())
         {
             if disk.key(k) {
+                if disk.take_choose_folder() {
+                    self.controls_choose_folder(window, cx);
+                }
                 cx.stop_propagation();
                 cx.notify();
                 return;
