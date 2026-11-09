@@ -1811,11 +1811,6 @@ impl Monitor {
                 .hover(|style| style.bg(rgb(t.well)).border_color(rgb(t.rule_hi)))
                 .on_click(cx.listener(|this, _, window, cx| this.open_disk(window, cx)))
                 .child(label("SSD GB", t))
-                .child(
-                    label("Disk · D", t)
-                        .debug_selector(|| "disk-open-hint".into())
-                        .text_color(rgb(t.base.silk)),
-                )
                 .child(lit(
                     if stats.disk_total_bytes > 0 {
                         format!(
@@ -1835,7 +1830,11 @@ impl Monitor {
                     40,
                     t,
                 ))
-                .children(purgeable_label(stats.disk_purgeable_bytes).map(|text| label(text, t))),
+                .children(purgeable_label(stats.disk_purgeable_bytes).map(|text| label(text, t)))
+                .child(
+                    label("CLICK OR PRESS D FOR DISK", t)
+                        .debug_selector(|| "disk-open-hint".into()),
+                ),
         );
         let gpu = stats.gpus.first();
         let util = gpu.and_then(|g| g.utilization);
