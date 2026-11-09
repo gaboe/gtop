@@ -74,7 +74,7 @@ impl Disk {
         std::mem::take(&mut self.map.controls.choose_requested)
     }
 
-    fn scan_shelf_status(&self) -> String {
+    pub(super) fn scan_shelf_status(&self) -> String {
         let state = self
             .session
             .as_ref()

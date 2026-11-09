@@ -1555,6 +1555,7 @@ impl Monitor {
                 )
                 .child(
                     Button::new("map-trash")
+                        .debug_selector(|| "map-trash".into())
                         .label("Review cleanup · X")
                         .rack(&t)
                         .small()
@@ -4655,6 +4656,241 @@ mod tests {
     }
 
     const AGE_NOW: i64 = 1_800_000_000;
+
+    fn click_controls_fix1(visual: &mut VisualTestContext, monitor: &Entity<Monitor>, selector: &'static str) {
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = visual.debug_bounds(selector).expect(selector);
+        visual.simulate_click(bounds.center(), Modifiers::default());
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+    }
+
+    #[gpui::test]
+    async fn controls_v2_fix1_menu_enter_never_confirms_trash(cx: &mut TestAppContext) {
+        cx.update(init);
+        let fixture = Fixture::shared_pair();
+        let mut disk = Disk::with_home(fixture.0.clone());
+        wait_folder(&mut disk, &fixture.0);
+        disk.map_select(TileKind::Node { crumbs: vec![0] });
+        let (sender, commands) = mpsc::sync_channel(32);
+        disk.sender = sender.clone();
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        for trigger in ["controls-source", "controls-view", "controls-help"] {
+            let mut disk = Disk::with_home(fixture.0.clone());
+            wait_folder(&mut disk, &fixture.0);
+            disk.map_select(TileKind::Node { crumbs: vec![0] });
+            disk.sender = sender.clone();
+            monitor.update(visual, |monitor, cx| {
+                monitor.disk = Some(disk);
+                cx.notify();
+            });
+            click_controls_fix1(visual, &monitor, "map-trash");
+            let Command::Prepare(path, allocated, identity, generation, _, proposal) =
+                commands.try_recv().unwrap()
+            else {
+                panic!("Review cleanup prepares one item")
+            };
+            monitor.update(visual, |monitor, cx| {
+                let disk = monitor.disk.as_mut().unwrap();
+                assert!(disk.apply_proposal(
+                    generation,
+                    proposal,
+                    Confirmation::new(&path, allocated, identity, &fixture.0).map_err(|e| e.to_string()),
+                ));
+                assert!(disk.confirmation.is_some());
+                cx.notify();
+            });
+            click_controls_fix1(visual, &monitor, trigger);
+            visual.simulate_keystrokes("enter");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            while let Ok(command) = commands.try_recv() {
+                assert!(!matches!(command, Command::Trash(..)), "menu Enter must never confirm Trash");
+            }
+            monitor.update(visual, |monitor, cx| {
+                let disk = monitor.disk.as_mut().unwrap();
+                assert!(disk.confirmation.is_none());
+                assert!(!disk.apply_proposal(
+                    generation,
+                    proposal,
+                    Confirmation::new(&path, allocated, identity, &fixture.0).map_err(|e| e.to_string()),
+                ), "opening a menu also rejects a late Prepare reply");
+                disk.map.controls.disclosure = None;
+                cx.notify();
+            });
+        }
+        assert_eq!(fs::read(fixture.0.join("a")).unwrap(), vec![1; 4096]);
+    }
+
+    #[gpui::test]
+    async fn controls_v2_fix1_siblings_take_each_disclosure(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (sender, commands) = mpsc::sync_channel(32);
+        let mut disk = insights_snapshot_disk();
+        disk.sender = sender;
+        let home = disk.folder.as_ref().unwrap().path.clone();
+        let child = home.join("worktrees");
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        for trigger in ["controls-source", "controls-view", "controls-help"] {
+            monitor.update(visual, |monitor, cx| {
+                monitor.disk.as_mut().unwrap().folder.as_mut().unwrap().path = child.clone();
+                cx.notify();
+            });
+            click_controls_fix1(visual, &monitor, trigger);
+            click_controls_fix1(visual, &monitor, "map-siblings-1");
+            visual.simulate_keystrokes("down");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                assert_eq!(disk.map.sibling_index, 1, "siblings take keys from {trigger}");
+                assert!(disk.map.controls.disclosure.is_none());
+            });
+            visual.simulate_keystrokes("enter");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            assert!(matches!(commands.try_recv().unwrap(), Command::Browse(..)));
+        }
+    }
+
+    #[gpui::test]
+    async fn controls_v2_fix1_filter_keeps_text_and_enter(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(insights_snapshot_disk());
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        for trigger in ["controls-source", "controls-view", "controls-help"] {
+            for key in ["/", "a", "b"] {
+                visual.simulate_keystrokes(key);
+                visual.update(|window, cx| {
+                    assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                });
+            }
+            click_controls_fix1(visual, &monitor, trigger);
+            for key in ["c", "down", "enter"] {
+                visual.simulate_keystrokes(key);
+                visual.update(|window, cx| {
+                    assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                });
+            }
+            monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                assert_eq!(disk.map.filter, "abc", "filter keeps text with {trigger}");
+                assert_eq!(disk.map.committed_filter, "abc");
+                assert!(!disk.map.filtering);
+                assert!(disk.map.controls.disclosure.is_none());
+                assert_eq!(disk.map.draw_depth(), 4);
+            });
+            visual.simulate_keystrokes("escape");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+        }
+    }
+
+    #[test]
+    fn controls_v2_fix1_shelf_tracks_browse_and_retained_result() {
+        let mut disk = insights_snapshot_disk();
+        let (sender, commands) = mpsc::sync_channel(32);
+        disk.sender = sender;
+        let path = disk.folder.as_ref().unwrap().path.join("worktrees");
+        disk.enter(path.clone());
+        assert!(matches!(commands.try_recv().unwrap(), Command::Browse(..)));
+        assert!(disk.scan_shelf_status().starts_with("Scanning"));
+        for state in [ScanState::Scanning, ScanState::Cancelled, ScanState::Failed("denied".into()), ScanState::Complete] {
+            let mut folder = disk.folder.as_ref().unwrap().clone();
+            folder.path = path.clone();
+            folder.state = state.clone();
+            disk.mailbox.lock().unwrap().folder = Some((disk.generation(), disk.navigation, folder));
+            disk.consume_mailbox();
+            let expected = match state {
+                ScanState::Scanning => "Scanning",
+                ScanState::Cancelled => "Cancelled",
+                ScanState::Failed(_) => "Failed",
+                _ => "Complete",
+            };
+            assert!(disk.scan_shelf_status().starts_with(expected), "{}", disk.scan_shelf_status());
+        }
+    }
+
+    #[gpui::test]
+    async fn controls_v2_fix1_previous_result_survives_action_status(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = insights_snapshot_disk();
+        let (sender, commands) = mpsc::sync_channel(32);
+        disk.sender = sender;
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        click_controls_fix1(visual, &monitor, "controls-view");
+        click_controls_fix1(visual, &monitor, "map-apparent");
+        assert!(matches!(commands.try_recv().unwrap(), Command::Scan(..)));
+        monitor.update(visual, |monitor, cx| {
+            let disk = monitor.disk.as_mut().unwrap();
+            let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+            let index = root.children.iter().position(|node| &*node.name == "worktrees").unwrap();
+            disk.map_select(TileKind::Node { crumbs: vec![index] });
+            cx.notify();
+        });
+        visual.simulate_keystrokes("x");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert_eq!(disk.status, "Finish the scan before cleanup");
+            assert!(disk.map.previous_result);
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(visual.debug_bounds("controls-previous-result").is_some(), "retained data has a warning independent of action status");
+    }
+
+    #[gpui::test]
+    async fn controls_v2_fix1_findings_end_on_row_boundaries(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = insights_snapshot_disk();
+        let folder = disk.folder.as_ref().unwrap();
+        let findings = disk.map.findings(folder.hierarchy.as_ref().unwrap(), folder.observed);
+        let stale = findings.iter().find(|finding| !finding.children.is_empty()).unwrap();
+        disk.inspect_finding(stale.locations()[0].clone());
+        let (_, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            monitor
+        });
+        for (width, height) in [(1200., 720.), (1480., 930.)] {
+            visual.simulate_resize(size(px(width), px(height)));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let area = visual.debug_bounds("disk-findings").unwrap();
+            let row = visual.debug_bounds("disk-finding-0").unwrap();
+            let rows = area.size.height.as_f32() / row.size.height.as_f32();
+            assert!((rows - rows.round()).abs() < 0.01, "findings viewport ends on a whole row at {width}x{height}: {rows}");
+        }
+    }
 
     #[gpui::test]
     async fn controls_v2_reachability_and_immediate_focus(cx: &mut TestAppContext) {
