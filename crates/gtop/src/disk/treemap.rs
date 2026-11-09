@@ -157,7 +157,7 @@ fn entries_with(root: &Node, metric: Metric, depth: u32) -> Vec<Entry> {
             path.push(index);
             out.push(Entry {
                 kind: TileKind::Node { crumbs: path },
-                label: format!("{} · 0 B{}", child.name, coverage(child)),
+                label: format!("{} · {}{}", child.name, bytes(child.bytes), coverage(child)),
                 depth: crumbs.len(),
             });
         }
