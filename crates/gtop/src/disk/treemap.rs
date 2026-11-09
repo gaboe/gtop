@@ -4571,7 +4571,10 @@ mod tests {
             session: Some(ScanSession {
                 root: path.clone(),
                 generation: 1,
+                force: false,
+                options: Default::default(),
                 outcome: Some(ScanState::Complete),
+                closed_while_scanning: false,
             }),
             navigation: 0,
             home: path,

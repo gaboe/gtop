@@ -128,7 +128,10 @@ impl Mailbox {
 struct ScanSession {
     root: PathBuf,
     generation: u64,
+    force: bool,
+    options: gtop_disk::scan::ScanOptions,
     outcome: Option<ScanState>,
+    closed_while_scanning: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -234,6 +237,14 @@ impl Disk {
             return;
         }
         self.open = false;
+        if let Some(session) = self
+            .session
+            .as_mut()
+            .filter(|session| session.outcome.is_none())
+        {
+            session.closed_while_scanning = true;
+            self.cancel.store(true, Ordering::Relaxed);
+        }
         self.inspector_resize.finish();
         self.set_visible(false);
         self.invalidate_proposal();
@@ -245,7 +256,14 @@ impl Disk {
         self.open = true;
         self.inspector_resize.finish();
         self.set_visible(visible);
-        if self.folder.is_none()
+        let interrupted = self.session.as_ref().and_then(|session| {
+            session
+                .closed_while_scanning
+                .then(|| (session.root.clone(), session.force, session.options.clone()))
+        });
+        if let Some((root, force, options)) = interrupted {
+            self.start_with_options(root, force, options);
+        } else if self.folder.is_none()
             && !self
                 .session
                 .as_ref()
@@ -275,6 +293,9 @@ impl Disk {
         let root =
             if let Some(session) = self.session.as_mut().filter(|s| s.generation == generation) {
                 session.outcome = Some(outcome.clone());
+                if outcome != ScanState::Cancelled {
+                    session.closed_while_scanning = false;
+                }
                 Some(session.root.clone())
             } else {
                 None
@@ -443,6 +464,14 @@ impl Disk {
         }
     }
     fn start(&mut self, root: PathBuf, force: bool) {
+        self.start_with_options(root, force, self.options.clone());
+    }
+    fn start_with_options(
+        &mut self,
+        root: PathBuf,
+        force: bool,
+        options: gtop_disk::scan::ScanOptions,
+    ) {
         let cancel = Arc::new(AtomicBool::new(false));
         let generation = self.generation() + 1;
         if !self.accepted(Command::Scan(
@@ -450,7 +479,7 @@ impl Disk {
             force,
             cancel.clone(),
             generation,
-            self.options.clone(),
+            options.clone(),
         )) {
             return;
         }
@@ -472,7 +501,10 @@ impl Disk {
         self.session = Some(ScanSession {
             root,
             generation,
+            force,
+            options,
             outcome: None,
+            closed_while_scanning: false,
         });
         self.invalidate_proposal();
         self.navigation = 0;
@@ -2482,12 +2514,18 @@ mod tests {
                     break outcome;
                 }
             }
-            assert!(start.elapsed() < Duration::from_secs(10), "worker timed out");
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "worker timed out"
+            );
             std::thread::sleep(Duration::from_millis(5));
         };
         drop(disk);
         fs::remove_dir_all(home).unwrap();
-        assert!(cancelled_at_close, "close must signal the running scan at once");
+        assert!(
+            cancelled_at_close,
+            "close must signal the running scan at once"
+        );
         assert_eq!(outcome, ScanState::Cancelled);
     }
 
@@ -2503,11 +2541,10 @@ mod tests {
 
         let root = home.join("scan-root");
         disk.start(root.clone(), true);
-        let (first_root, first_force, first_token, first_options) =
-            match receiver.recv().unwrap() {
-                Command::Scan(root, force, token, _, options) => (root, force, token, options),
-                _ => panic!("expected the initial scan command"),
-            };
+        let (first_root, first_force, first_token, first_options) = match receiver.recv().unwrap() {
+            Command::Scan(root, force, token, _, options) => (root, force, token, options),
+            _ => panic!("expected the initial scan command"),
+        };
         disk.close();
         let cancelled_at_close = first_token.load(Ordering::Relaxed);
         disk.reopen(Instant::now(), false);
@@ -2527,7 +2564,10 @@ mod tests {
         drop(disk);
         fs::remove_dir_all(home).unwrap();
 
-        assert!(cancelled_at_close, "close must signal the running scan at once");
+        assert!(
+            cancelled_at_close,
+            "close must signal the running scan at once"
+        );
         assert!(reopened, "reopen must reach the scan worker");
         let (restarted_root, restarted_force, restarted_options) =
             restarted.expect("reopen must send a replacement scan command");
@@ -2537,10 +2577,19 @@ mod tests {
         assert_eq!(restarted_force, first_force);
         assert_eq!(restarted_options.apparent_size, first_options.apparent_size);
         assert_eq!(restarted_options.follow_links, first_options.follow_links);
-        assert_eq!(restarted_options.include_hidden, first_options.include_hidden);
-        assert_eq!(restarted_options.one_filesystem, first_options.one_filesystem);
+        assert_eq!(
+            restarted_options.include_hidden,
+            first_options.include_hidden
+        );
+        assert_eq!(
+            restarted_options.one_filesystem,
+            first_options.one_filesystem
+        );
         assert_eq!(restarted_options.max_depth, first_options.max_depth);
-        assert_eq!(restarted_options.dedup_hardlinks, first_options.dedup_hardlinks);
+        assert_eq!(
+            restarted_options.dedup_hardlinks,
+            first_options.dedup_hardlinks
+        );
         assert_eq!(restarted_options.metric, first_options.metric);
         assert_eq!(
             restarted_options.threads.max_threads,
@@ -2555,10 +2604,7 @@ mod tests {
             first_options.threads.retained_throughput.to_bits()
         );
         assert_eq!(
-            restarted_options
-                .threads
-                .system_cpu_limit
-                .map(f64::to_bits),
+            restarted_options.threads.system_cpu_limit.map(f64::to_bits),
             first_options.threads.system_cpu_limit.map(f64::to_bits)
         );
         assert_eq!(
@@ -2569,7 +2615,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_scan_completes_in_background_and_expiry_releases_cache() {
+    fn closed_scan_cancels_and_reopen_starts_fresh_scan() {
         let home = scratch();
         fs::write(home.join("one"), [1; 4096]).unwrap();
         let mut disk = Disk::with_home(home.clone());
@@ -2579,12 +2625,17 @@ mod tests {
         disk.mailbox.lock().unwrap().scan_gate = Some((started, suspended));
         disk.start(home.clone(), true);
         ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        let token = disk.cancel.clone();
         disk.close();
+        let cancelled_at_close = token.load(Ordering::Relaxed);
         resume.send(()).unwrap();
-        disk.folder = Some(receive(&mut disk, ScanState::Complete));
+        let cancelled = receive(&mut disk, ScanState::Cancelled);
+        assert_eq!(cancelled.state, ScanState::Cancelled);
         fs::write(home.join("two"), [2; 4096]).unwrap();
-        disk.reopen(Instant::now() + SESSION_RETENTION, false);
+        disk.reopen(Instant::now(), false);
+        assert_eq!(disk.status, "Scanning…");
         let fresh = receive(&mut disk, ScanState::Complete);
+        assert!(cancelled_at_close);
         assert_eq!(fresh.items, 2);
         assert!(!fresh.cached);
         drop(disk);
