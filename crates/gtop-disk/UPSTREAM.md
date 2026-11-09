@@ -34,6 +34,10 @@ Windows administrator checks and privilege restart functions are removed.
 
 ## Local changes
 
+- Worth a look findings carry exact matching-child locations for stale
+  experiment subtotals. A subtotal never targets its mixed parent. Unknown
+  or incomplete subtree times do not establish staleness. Findings remain
+  inspection suggestions and have no removal executor.
 - The package is `gtop-disk`, version 1.2.0, with Rust 1.99.1.
   Edition 2024 is retained because upstream uses let chains. Gtop's other
   crates use edition 2021. The workspace has no shared lint configuration.

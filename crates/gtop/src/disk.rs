@@ -1461,51 +1461,18 @@ impl Monitor {
                             })),
                     ),
             );
-            body = body.child(crate::rack::label(
-                "CLEANABLE · LARGEST 24 · REVIEW FIRST",
-                &t,
-            ));
-            if folder.cleanable.is_empty() {
-                body = body.child("No known caches found yet");
-            }
-            for (i, row) in folder.cleanable.iter().enumerate() {
-                let row = row.clone();
-                body = body.child(
-                    div()
-                        .border_t_1()
-                        .border_color(rgb(t.rule))
-                        .py(px(6.))
-                        .child(div().text_size(px(11.)).child(format!(
-                            "{} · {}",
-                            bytes(row.allocated),
-                            row.path.display()
-                        )))
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(rgb(t.silk_dim))
-                                .child(row.cleanable.unwrap()),
-                        )
-                        .child(
-                            Button::new(("disk-clean", i))
-                                .label("Review cleanup")
-                                .rack(&t)
-                                .small()
-                                .disabled(row.path.starts_with(disk.home.join(".Trash")))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.disk.as_mut().unwrap().request_trash(&row);
-                                    cx.notify();
-                                })),
-                        ),
-                );
-            }
         } else {
             body = body.child(self.disk.as_ref().unwrap().status.clone());
         }
-        body =
-            body.child(div().text_size(px(10.)).child(
+        if !disk
+            .folder
+            .as_ref()
+            .is_some_and(|folder| folder.hierarchy.is_some())
+        {
+            body = body.child(div().text_size(px(10.)).child(
                 "arrows/HJKL move · Tab list · Enter open · Backspace up · X trash · C cancel · R start over",
             ));
+        }
         let mut panel = div()
             .relative()
             .child(crate::rack::screws(&t, "disk"))
@@ -1971,7 +1938,7 @@ mod tests {
         let (status, folder) = receive_cleanup_refresh(&disk);
         let destination = home.join(".Trash/node_modules");
         assert_eq!(status, format!("Moved to {}.", destination.display()));
-        assert!(!folder.cleanable.iter().any(|item| item.path == row.path));
+        assert!(!folder.rows.iter().any(|item| item.path == row.path));
         assert!(!row.path.exists());
         let moved = fs::metadata(&destination).unwrap();
         assert_eq!((moved.dev(), moved.ino()), (expected.dev(), expected.ino()));

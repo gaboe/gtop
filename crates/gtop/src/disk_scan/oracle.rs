@@ -187,13 +187,6 @@ impl<F: FnMut(&Tree)> Walker<'_, F> {
                     .then_some("Cargo build products")
             })
         };
-        if row.cleanable.is_some() {
-            self.tree.candidates.push(row.clone());
-            self.tree
-                .candidates
-                .sort_unstable_by_key(|r| std::cmp::Reverse(r.allocated));
-            self.tree.candidates.truncate(24);
-        }
         total.0 = total.0.saturating_add(row.allocated);
         total.1 += row.descendants + 1;
         total.2 += row.unreadable;

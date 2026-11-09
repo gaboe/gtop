@@ -29,8 +29,17 @@ fn production_scanner_matches_serial_oracle_allocation_counts_and_identity() {
     assert_eq!(actual.nodes[0].descendants, expected.nodes[0].descendants);
     assert_eq!(actual.nodes[0].identity, expected.nodes[0].identity);
     assert_eq!(actual.nodes[0].unreadable, expected.nodes[0].unreadable);
-    assert_eq!(actual.candidates.len(), 1);
-    assert_eq!(actual.candidates[0].path, home.0.join("project/target"));
+    let root = actual.hierarchy.as_ref().unwrap();
+    let target = root
+        .child_named("project")
+        .unwrap()
+        .child_named("target")
+        .unwrap();
+    assert_eq!(
+        target.reclaim,
+        Some(gtop_disk::classify::Reclaim::BuildOutput)
+    );
+    assert!(target.identity().is_some());
     assert!(actual.coverage_complete);
 }
 
@@ -72,7 +81,10 @@ fn production_cleanup_uses_observed_parent_manifest_and_bounds_candidates() {
         let project = home.0.join(format!("project-{index}"));
         fs::create_dir_all(project.join("target")).unwrap();
         fs::write(project.join("Cargo.toml"), b"manifest").unwrap();
-        fs::write(project.join("target/data"), [1; 4096]).unwrap();
+        fs::File::create(project.join("target/data"))
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
     }
     fs::create_dir_all(home.0.join("unrelated/target")).unwrap();
     symlink(
@@ -80,14 +92,36 @@ fn production_cleanup_uses_observed_parent_manifest_and_bounds_candidates() {
         home.0.join("unrelated/Cargo.toml"),
     )
     .unwrap();
-    let tree = scan(&home.0, &home.0, &AtomicBool::new(false), |_| {});
+    let tree = scan_with_options(
+        &home.0,
+        &home.0,
+        &AtomicBool::new(false),
+        |_| {},
+        || ScanUrgency::Background,
+        gtop_disk::scan::ScanOptions {
+            apparent_size: true,
+            ..Default::default()
+        },
+    );
     assert_eq!(tree.state, ScanState::Complete);
-    assert_eq!(tree.candidates.len(), 24);
-    assert!(tree
-        .candidates
+    let root = tree.hierarchy.as_ref().unwrap();
+    let findings = gtop_disk::insights::worth_a_look(root, 1_800_000_000, 24);
+    assert_eq!(findings.len(), 24);
+    assert!(findings
         .iter()
-        .all(|row| row.path != home.0.join("unrelated/target")));
-    assert!(tree.candidates.iter().all(|row| row.identity.inode != 0));
+        .flat_map(|finding| finding.locations())
+        .all(|crumbs| {
+            let node = root.resolve(&crumbs).unwrap();
+            assert!(node.identity().is_some());
+            gtop_disk::tree::path_of(&home.0, root, &crumbs) != home.0.join("unrelated/target")
+        }));
+    assert!(root
+        .child_named("unrelated")
+        .unwrap()
+        .child_named("target")
+        .unwrap()
+        .reclaim
+        .is_none());
 }
 
 #[test]

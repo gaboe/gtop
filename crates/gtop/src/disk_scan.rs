@@ -55,7 +55,6 @@ pub struct Tree {
     pub root: PathBuf,
     pub state: ScanState,
     pub observed: SystemTime,
-    candidates: Vec<Row>,
     cloud_items: u64,
     coverage_complete: bool,
     #[cfg(test)]
@@ -84,7 +83,6 @@ pub struct Folder {
     pub items: u64,
     pub errors: u64,
     pub rows: Vec<Row>,
-    pub cleanable: Vec<Row>,
     pub page: usize,
     pub pages: usize,
     pub cached: bool,
@@ -121,7 +119,6 @@ impl Tree {
             root: root.into(),
             state: ScanState::Scanning,
             observed: SystemTime::now(),
-            candidates: vec![],
             cloud_items: 0,
             coverage_complete: false,
             #[cfg(test)]
@@ -241,7 +238,6 @@ impl Tree {
             .take(PAGE_SIZE)
             .map(|id| self.row(id))
             .collect();
-        let cleanable = self.candidates.clone();
         let shown_items: u64 = node
             .children
             .iter()
@@ -261,7 +257,6 @@ impl Tree {
             items: node.descendants,
             errors: self.nodes[0].unreadable,
             rows,
-            cleanable,
             page,
             pages,
             cached,
@@ -1068,7 +1063,7 @@ fn headless_output(root: &Path, tree: &Tree, wall_seconds: f64) -> String {
         tree.nodes[0].unreadable,
         wall_seconds,
         tree.cloud_items,
-        tree.nodes.len().saturating_sub(1) + tree.candidates.len(),
+        tree.nodes.len().saturating_sub(1),
         if tree.state == ScanState::Complete && tree.coverage_complete { "full" } else { "incomplete" }
     )
 }
@@ -1666,13 +1661,27 @@ mod cleanup_regressions {
         .unwrap();
         fs::write(home.0.join("project/target"), "personal scratch notes").unwrap();
         let tree = scan(&home.0, &home.0, &AtomicBool::new(false), |_| {});
-        println!("ordinary_files candidates={:?}", tree.candidates);
-        assert!(tree.candidates.is_empty());
+        let root = tree.hierarchy.as_ref().unwrap();
+        assert!(root.child_named("node_modules").unwrap().reclaim.is_none());
+        assert!(root
+            .child_named("project")
+            .unwrap()
+            .child_named("target")
+            .unwrap()
+            .reclaim
+            .is_none());
         fs::remove_file(home.0.join("project/target")).unwrap();
         fs::create_dir(home.0.join("project/target")).unwrap();
         let tree = scan(&home.0, &home.0, &AtomicBool::new(false), |_| {});
-        assert_eq!(tree.candidates.len(), 1);
-        assert_eq!(tree.candidates[0].cleanable, Some("Cargo build products"));
+        let root = tree.hierarchy.as_ref().unwrap();
+        assert_eq!(
+            root.child_named("project")
+                .unwrap()
+                .child_named("target")
+                .unwrap()
+                .reclaim,
+            Some(gtop_disk::classify::Reclaim::BuildOutput)
+        );
     }
 }
 

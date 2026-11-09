@@ -227,16 +227,8 @@ fn project(root: &Path, home: &Path, source: &DiskNode) -> Tree {
         tree.cloud_items += u64::from(source.in_cloud);
         for child in &source.children {
             let child_path = path.join(child.filesystem_name());
-            let row = node_row(&child_path, child, home, Some(source));
-            if row.cleanable.is_some() {
-                tree.candidates.push(row.clone());
-                tree.candidates.sort_unstable_by(|a, b| {
-                    b.allocated.cmp(&a.allocated).then(a.path.cmp(&b.path))
-                });
-                tree.candidates.truncate(24);
-            }
             if path == tree.root {
-                retain_row(tree, row);
+                retain_row(tree, node_row(&child_path, child, home, Some(source)));
             }
             visit(tree, &child_path, child, home);
         }

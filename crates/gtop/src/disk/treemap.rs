@@ -27,12 +27,21 @@ pub(super) struct MapState {
     listing: RefCell<Option<Listing>>,
     matches: RefCell<Option<FilterCache>>,
     committed_matches: RefCell<Option<FilterCache>>,
+    insights: RefCell<Option<InsightCache>>,
+    finding_cursor: Option<usize>,
+    finding_scroll: UniformListScrollHandle,
     pub(super) previous_result: bool,
     pub(super) pending_selection: Option<disk_scan::Row>,
     #[cfg(test)]
     clock: Option<i64>,
     #[cfg(test)]
     filter_searches: std::cell::Cell<usize>,
+}
+
+struct InsightCache {
+    root: Arc<Node>,
+    now: i64,
+    findings: Rc<Vec<gtop_disk::insights::Candidate>>,
 }
 
 struct FilterCache {
@@ -71,6 +80,31 @@ struct MapFrame {
 }
 
 impl MapState {
+    fn findings(
+        &self,
+        root: &Arc<Node>,
+        observed: std::time::SystemTime,
+    ) -> Rc<Vec<gtop_disk::insights::Candidate>> {
+        let now = observed
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        #[cfg(test)]
+        let now = self.clock.unwrap_or(now);
+        let mut cache = self.insights.borrow_mut();
+        if let Some(cached) = cache.as_ref() {
+            if Arc::ptr_eq(&cached.root, root) && cached.now == now {
+                return cached.findings.clone();
+            }
+        }
+        let findings = Rc::new(gtop_disk::insights::worth_a_look(root, now, 24));
+        *cache = Some(InsightCache {
+            root: root.clone(),
+            now,
+            findings: findings.clone(),
+        });
+        findings
+    }
     fn draw_depth(&self) -> u32 {
         if self.depth == 0 {
             4
@@ -79,6 +113,7 @@ impl MapState {
         }
     }
     pub(super) fn reset_navigation(&mut self) {
+        self.finding_cursor = None;
         self.selected = None;
         self.pending_selection = None;
         self.previous_result = false;
@@ -165,6 +200,20 @@ struct Entry {
     label: String,
     visible_label: Option<String>,
     depth: usize,
+}
+
+fn finding_locations(
+    findings: &[gtop_disk::insights::Candidate],
+) -> Vec<(usize, Vec<usize>, bool)> {
+    let mut rows = Vec::new();
+    for (index, finding) in findings.iter().enumerate() {
+        let locations = finding.locations();
+        rows.push((index, locations[0].clone(), false));
+        if !finding.children.is_empty() {
+            rows.extend(locations.into_iter().map(|crumbs| (index, crumbs, true)));
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -374,6 +423,15 @@ fn node_path(root: &Node, base: &Path, crumbs: &[usize]) -> Option<PathBuf> {
 }
 
 impl Disk {
+    fn inspect_finding(&mut self, crumbs: Vec<usize>) {
+        self.map.filter.clear();
+        self.map.committed_filter.clear();
+        self.map.applied = false;
+        self.map.filtering = false;
+        self.map.viewport = Viewport::default();
+        self.map.depth = self.map.draw_depth().max(crumbs.len() as u32 + 1);
+        self.map_select(TileKind::Node { crumbs });
+    }
     pub(super) fn map_filtering(&self) -> bool {
         self.map.filtering
     }
@@ -419,6 +477,15 @@ impl Disk {
         self.map.history.visit(path);
     }
     pub(super) fn map_controls_key(&mut self, key: &str) -> bool {
+        if self.map.finding_cursor.is_some()
+            && matches!(
+                key,
+                "up" | "k" | "down" | "j" | "tab" | "shift-tab" | "enter" | "escape"
+            )
+        {
+            return self.map_key(key);
+        }
+        self.map.finding_cursor = None;
         if self.map.filtering {
             match key {
                 "escape" => {
@@ -630,6 +697,7 @@ impl Disk {
     }
 
     fn map_select(&mut self, kind: TileKind) {
+        self.map.finding_cursor = None;
         self.invalidate_proposal();
         self.map.selected = Some(kind);
         self.map.pending_selection = None;
@@ -669,6 +737,44 @@ impl Disk {
         else {
             return false;
         };
+        let findings = self
+            .map
+            .findings(&root, self.folder.as_ref().unwrap().observed);
+        let locations = finding_locations(&findings);
+        if key == "w" && !locations.is_empty() {
+            self.map.finding_cursor = Some(0);
+            self.map
+                .finding_scroll
+                .scroll_to_item(0, ScrollStrategy::Top);
+            return true;
+        }
+        if let Some(index) = self.map.finding_cursor {
+            match key {
+                "up" | "k" | "shift-tab" | "down" | "j" | "tab" => {
+                    let next = if matches!(key, "down" | "j" | "tab") {
+                        (index + 1).min(locations.len().saturating_sub(1))
+                    } else {
+                        index.saturating_sub(1)
+                    };
+                    self.map.finding_cursor = Some(next);
+                    self.map
+                        .finding_scroll
+                        .scroll_to_item(next, ScrollStrategy::Nearest);
+                    return true;
+                }
+                "enter" => {
+                    if let Some((_, crumbs, _)) = locations.get(index) {
+                        self.inspect_finding(crumbs.clone());
+                    }
+                    return true;
+                }
+                "escape" => {
+                    self.map.finding_cursor = None;
+                    return true;
+                }
+                _ => self.map.finding_cursor = None,
+            }
+        }
         match key {
             "down" | "j" | "up" | "k" | "tab" | "shift-tab" => {
                 let entries = self.map.entries(&root);
@@ -1593,6 +1699,126 @@ impl Monitor {
             selection = selection.child("Click a tile or choose a folder below.");
         }
         let entries = disk.map.entries(root);
+        let findings = disk.map.findings(root, folder.observed);
+        let finding_rows = finding_locations(&findings);
+        let has_findings = !finding_rows.is_empty();
+        let finding_root = root.clone();
+        let finding_base = folder.path.clone();
+        let finding_cursor = disk.map.finding_cursor;
+        let finding_scan_bytes = root.bytes;
+        let finding_list = uniform_list(
+            "disk-findings-rows",
+            finding_rows.len(),
+            cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+                range
+                    .map(|index| {
+                        let (finding_index, crumbs, child) = &finding_rows[index];
+                        let finding = &findings[*finding_index];
+                        let node = finding_root.resolve(crumbs).unwrap();
+                        let display = if *child {
+                            crumbs.as_slice()
+                        } else {
+                            finding.crumbs.as_slice()
+                        };
+                        let path = node_path(&finding_root, &finding_base, display).unwrap();
+                        let shown_bytes = if *child { node.bytes } else { finding.bytes };
+                        let reason = if *child {
+                            "Matching old experiment · inspect before cleanup".to_string()
+                        } else {
+                            finding.reason()
+                        };
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        let title = if !*child && !finding.children.is_empty() {
+                            format!("{name} · old subtotal")
+                        } else {
+                            name.into_owned()
+                        };
+                        let colour = crate::palette::kind_style(&t, node.category, 0).strip;
+                        let label = format!(
+                            "{} · {} · {} · {}",
+                            path.display(),
+                            bytes(shown_bytes),
+                            reason,
+                            gtop_disk::classify::description(node)
+                        );
+                        let target = crumbs.clone();
+                        div()
+                            .id(("disk-finding", index))
+                            .debug_selector(move || format!("disk-finding-{index}"))
+                            .role(Role::ListItem)
+                            .aria_label(label)
+                            .aria_selected(finding_cursor == Some(index))
+                            .h(px(76.))
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(rgb(if finding_cursor == Some(index) {
+                                t.base.led
+                            } else {
+                                t.rule
+                            }))
+                            .bg(rgb(if finding_cursor == Some(index) {
+                                t.selection
+                            } else {
+                                t.base.plate
+                            }))
+                            .px(px(if *child { 10. } else { 4. }))
+                            .py(px(3.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(4.))
+                                    .justify_between()
+                                    .child(
+                                        div().min_w_0().truncate().text_size(px(11.)).child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(11.))
+                                            .child(bytes(shown_bytes)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(t.silk_dim))
+                                    .child(reason),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.))
+                                    .truncate()
+                                    .child(path.display().to_string()),
+                            )
+                            .child(
+                                div().h(px(3.)).w_full().bg(rgb(t.well)).child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(if finding_scan_bytes == 0 {
+                                            0.
+                                        } else {
+                                            (shown_bytes as f32 / finding_scan_bytes as f32)
+                                                .clamp(0., 1.)
+                                        }))
+                                        .bg(rgb(colour)),
+                                ),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.disk.as_mut().unwrap().inspect_finding(target.clone());
+                                    window.focus(&this.focus, cx);
+                                    cx.notify();
+                                }),
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(&disk.map.finding_scroll)
+        .flex_1()
+        .min_h_0();
         let selected = disk.map.selected.clone();
         let list = uniform_list(
             "map-folder-rows",
@@ -1656,6 +1882,34 @@ impl Monitor {
                 "{} unreadable entries · incomplete sizes can contain more",
                 folder.errors
             )))
+            .child(crate::rack::label("WORTH A LOOK · W", &t))
+            .when(has_findings, |this| {
+                this.child(
+                    div()
+                        .id("disk-findings")
+                        .debug_selector(|| "disk-findings".into())
+                        .role(Role::List)
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(76.))
+                        .child(finding_list),
+                )
+            })
+            .when(!has_findings, |this| {
+                this.child(
+                    div()
+                        .text_size(px(10.))
+                        .child("No large inspection suggestions."),
+                )
+            })
+            .when(has_findings, |this| {
+                this.child(
+                    div()
+                        .text_size(px(10.))
+                        .child("W findings · ↑↓ choose · Enter inspect · Esc return"),
+                )
+            })
             .child(crate::rack::label("FOLDERS AND FILES", &t))
             .child(
                 div()
@@ -1665,7 +1919,7 @@ impl Monitor {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_h_0()
+                    .min_h(px(26.))
                     .child(list),
             )
             .child(self.disk_volume_readout())
@@ -4351,6 +4605,37 @@ mod tests {
                 .add_fonts(vec![std::borrow::Cow::Borrowed(bytes)])
                 .unwrap();
         }
+        for (width, height) in [(1480., 930.), (1200., 720.)] {
+            let mut disk = insights_snapshot_disk();
+            let folder = disk.folder.as_ref().unwrap();
+            let findings = disk
+                .map
+                .findings(folder.hierarchy.as_ref().unwrap(), folder.observed);
+            let stale = findings
+                .iter()
+                .find(|finding| !finding.children.is_empty())
+                .unwrap();
+            disk.inspect_finding(stale.locations()[0].clone());
+            let handle = cx
+                .open_window(size(px(width), px(height)), |window, cx| {
+                    let monitor = cx.new(|cx| {
+                        let mut monitor = crate::draw_benchmark::fixture(window, cx);
+                        monitor.disk = Some(disk);
+                        monitor
+                    });
+                    cx.new(|cx| gpui_component::Root::new(monitor, window, cx))
+                })
+                .unwrap();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            cx.capture_screenshot(handle.into())
+                .unwrap()
+                .save(output.join(format!("insights-{width:.0}x{height:.0}.png")))
+                .unwrap();
+        }
         for (palette_index, width, height) in [
             (0, 1480., 930.),
             (0, 1200., 720.),
@@ -4464,6 +4749,216 @@ mod tests {
     }
 
     const AGE_NOW: i64 = 1_800_000_000;
+    fn insights_snapshot_disk() -> Disk {
+        use gtop_disk::tree::{aggregate, NodeKind};
+        fn dir(name: &str, children: Vec<Node>) -> Node {
+            let mut node = Node::directory(name);
+            node.children = children;
+            node
+        }
+        fn file(name: &str, mib: u64, days: i64) -> Node {
+            let mut node = Node::entry(name, NodeKind::File, mib << 20);
+            node.modified = AGE_NOW - days * 86_400;
+            node
+        }
+        let mut disk = kinds_snapshot_disk();
+        disk.map.clock = Some(AGE_NOW);
+        let folder = disk.folder.as_mut().unwrap();
+        let root = Arc::make_mut(folder.hierarchy.as_mut().unwrap());
+        let mut unknown = file("unknown-write", 128, 60);
+        unknown.modified = 0;
+        root.children.retain(|node| &*node.name != "worktrees");
+        root.children.extend([
+            dir(
+                ".cache",
+                vec![dir("nested-cache", vec![file("cache-data", 900, 1)])],
+            ),
+            dir(
+                "worktrees",
+                vec![
+                    dir("feature-a", vec![file("source", 700, 45)]),
+                    dir("feature-b", vec![file("source", 400, 2)]),
+                ],
+            ),
+            dir(
+                "experiments",
+                vec![
+                    dir(
+                        "old-parser",
+                        vec![
+                            file("Cargo.toml", 1, 70),
+                            dir("target", vec![file("build", 500, 60)]),
+                        ],
+                    ),
+                    dir("old-layout", vec![file("sketch", 300, 50)]),
+                    dir(
+                        "fresh-editor",
+                        vec![
+                            file("source", 400, 1),
+                            dir("node_modules", vec![file("dependency", 200, 1)]),
+                        ],
+                    ),
+                    dir("unknown-time", vec![file("old-known", 200, 70), unknown]),
+                ],
+            ),
+        ]);
+        aggregate(root, Metric::Bytes);
+        gtop_disk::classify::classify(root);
+        folder.allocated = root.bytes;
+        folder.items = root.files + u64::from(root.dirs) - 1;
+        disk.scan_bytes = Some(root.bytes);
+        disk
+    }
+
+    #[gpui::test]
+    async fn insights_pointer_and_keyboard_inspect_every_location_without_cleanup(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(init);
+        let scratch = Fixture::shared_pair();
+        let sentinel = fs::read(scratch.0.join("a")).unwrap();
+        let mut disk = insights_snapshot_disk();
+        disk.home = scratch.0.clone();
+        disk.folder.as_mut().unwrap().path = scratch.0.clone();
+        disk.folder.as_mut().unwrap().root = scratch.0.clone();
+        let (sender, commands) = mpsc::sync_channel(1);
+        disk.sender = sender;
+        let folder = disk.folder.as_ref().unwrap();
+        let root = folder.hierarchy.as_ref().unwrap().clone();
+        let findings = disk.map.findings(&root, folder.observed);
+        let rows = finding_locations(&findings);
+        let selectors = [
+            "disk-finding-0",
+            "disk-finding-1",
+            "disk-finding-2",
+            "disk-finding-3",
+            "disk-finding-4",
+            "disk-finding-5",
+        ];
+        assert_eq!(rows.len(), selectors.len());
+        let subtotal = findings
+            .iter()
+            .position(|finding| !finding.children.is_empty())
+            .unwrap();
+        let matching: Vec<_> = rows
+            .iter()
+            .filter(|(index, _, child)| *index == subtotal && *child)
+            .collect();
+        assert_eq!(matching.len(), 2);
+        assert!(matching.iter().all(|(_, crumbs, _)| root
+            .resolve(crumbs)
+            .unwrap()
+            .name
+            .starts_with("old-")));
+        disk.inspect_finding(rows[0].1.clone());
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        for (width, height) in [(1480., 930.), (1200., 720.)] {
+            visual.simulate_resize(size(px(width), px(height)));
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let selection = visual.debug_bounds("disk-selection").unwrap();
+            let volume = visual.debug_bounds("disk-volume").unwrap();
+            let area = visual.debug_bounds("disk-findings").unwrap();
+            assert!(area.size.height >= px(76.));
+            assert!(area.top() >= selection.bottom() && area.bottom() <= volume.top());
+            for (index, (_, target, _)) in rows.iter().enumerate() {
+                visual.simulate_keystrokes("w");
+                visual.update(|window, cx| {
+                    assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                });
+                for _ in 0..index {
+                    visual.simulate_keystrokes("down");
+                    visual.update(|window, cx| {
+                        assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                    });
+                }
+                monitor.read_with(visual, |monitor, _| {
+                    assert_eq!(
+                        monitor.disk.as_ref().unwrap().map.finding_cursor,
+                        Some(index)
+                    )
+                });
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+                let area = visual.debug_bounds("disk-findings").unwrap();
+                let row = visual.debug_bounds(selectors[index]).unwrap();
+                assert!(
+                    row.top() >= area.top() - px(0.1) && row.bottom() <= area.bottom() + px(0.1),
+                    "keyboard scroll reaches finding {index}"
+                );
+                visual.simulate_keystrokes("enter");
+                visual.update(|window, cx| {
+                    assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                });
+                monitor.read_with(visual, |monitor, _| {
+                    let disk = monitor.disk.as_ref().unwrap();
+                    assert_eq!(
+                        disk.map.selected,
+                        Some(TileKind::Node {
+                            crumbs: target.clone()
+                        })
+                    );
+                    assert!(disk.confirmation.is_none());
+                    assert_eq!(disk.folder.as_ref().unwrap().path, scratch.0);
+                    assert!(Arc::ptr_eq(
+                        disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap(),
+                        &root
+                    ));
+                });
+                assert!(matches!(
+                    commands.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                monitor.update(visual, |monitor, cx| {
+                    let other = if *target == rows[0].1 {
+                        &rows.last().unwrap().1
+                    } else {
+                        &rows[0].1
+                    };
+                    monitor
+                        .disk
+                        .as_mut()
+                        .unwrap()
+                        .inspect_finding(other.clone());
+                    cx.notify();
+                });
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+                let area = visual.debug_bounds("disk-findings").unwrap();
+                let row = visual.debug_bounds(selectors[index]).unwrap();
+                let click = point(
+                    row.center().x,
+                    row.center()
+                        .y
+                        .clamp(area.top() + px(1.), area.bottom() - px(1.)),
+                );
+                visual.simulate_click(click, Modifiers::default());
+                visual.update(|window, cx| {
+                    assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+                });
+                monitor.read_with(visual, |monitor, _| {
+                    let disk = monitor.disk.as_ref().unwrap();
+                    assert_eq!(
+                        disk.map.selected,
+                        Some(TileKind::Node {
+                            crumbs: target.clone()
+                        })
+                    );
+                    assert!(disk.confirmation.is_none());
+                });
+                assert!(matches!(
+                    commands.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                assert_eq!(fs::read(scratch.0.join("a")).unwrap(), sentinel);
+                assert_eq!(fs::read(scratch.0.join("b")).unwrap(), sentinel);
+                assert!(!scratch.0.join(".Trash").exists());
+            }
+        }
+    }
+
     fn kinds_snapshot_disk() -> Disk {
         use gtop_disk::tree::{aggregate, NodeKind};
         fn dir(name: &str, bytes: u64) -> Node {
@@ -4584,7 +5079,6 @@ mod tests {
             items: root.files + u64::from(root.dirs) - 1,
             errors: 1,
             rows: vec![],
-            cleanable: vec![],
             page: 0,
             pages: 1,
             cached: false,

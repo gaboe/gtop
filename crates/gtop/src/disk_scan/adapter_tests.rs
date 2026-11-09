@@ -60,7 +60,7 @@ fn projection_preserves_cloud_volume_errors_directory_bytes_and_coverage() {
             .unwrap()
             .skipped_volume
     );
-    assert!(folder.cleanable.is_empty());
+    assert!(folder.rows.iter().all(|row| row.cleanable.is_none()));
     assert!(folder.rows.iter().all(|row| row.identity.inode > 0));
 }
 
@@ -244,7 +244,7 @@ fn unavailable_named_leaf_projects_as_one_unreadable_item() {
     assert_eq!(folder.rows[0].path, root.join("x"));
     assert_eq!(folder.rows[0].allocated, 0);
     assert_eq!(folder.rows[0].unreadable, 1);
-    assert!(folder.cleanable.is_empty());
+    assert!(gtop_disk::insights::worth_a_look(&source, 1_800_000_000, 24).is_empty());
     assert!(!tree.coverage_complete);
 }
 
