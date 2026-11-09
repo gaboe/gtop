@@ -92,7 +92,13 @@ fn service_retention(
 }
 
 enum Command {
-    Scan(PathBuf, bool, Arc<AtomicBool>, u64),
+    Scan(
+        PathBuf,
+        bool,
+        Arc<AtomicBool>,
+        u64,
+        gtop_disk::scan::ScanOptions,
+    ),
     Close(Instant),
     Reopen(Instant),
     Browse(PathBuf, usize, u64, u64, Arc<AtomicBool>),
@@ -130,6 +136,7 @@ pub(super) struct Disk {
     volume: Option<gtop_disk::inspector::VolumeReadout>,
     volume_query: Arc<dyn Fn(&Path) -> gtop_disk::inspector::VolumeReadout + Send + Sync>,
     scan_bytes: Option<u64>,
+    options: gtop_disk::scan::ScanOptions,
     map: treemap::MapState,
     pub open: bool,
     session: Option<ScanSession>,
@@ -183,6 +190,7 @@ impl Disk {
             volume: None,
             volume_query: Arc::new(gtop_disk::inspector::VolumeReadout::query),
             scan_bytes: None,
+            options: Default::default(),
             map: Default::default(),
             open: true,
             session: None,
@@ -307,6 +315,18 @@ impl Disk {
         if let Some((_, _, folder)) =
             folder.filter(|(g, n, _)| *g == self.generation() && *n == self.navigation)
         {
+            if folder.hierarchy.is_none()
+                && self
+                    .folder
+                    .as_ref()
+                    .is_some_and(|old| old.hierarchy.is_some())
+                && self.status.starts_with("Previous result is stale.")
+            {
+                return true;
+            }
+            if folder.hierarchy.is_some() && self.status.starts_with("Previous result is stale.") {
+                self.status.clear();
+            }
             let same_hierarchy = self.folder.as_ref().is_some_and(|previous| {
                 match (&previous.hierarchy, &folder.hierarchy) {
                     (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -315,9 +335,10 @@ impl Disk {
                 }
             });
             if !same_hierarchy {
-                self.map = Default::default();
+                self.restore_map_selection(&folder);
             }
             self.selected = self.selected.min(folder.rows.len().saturating_sub(1));
+            self.remember_map_root(&folder);
             self.folder = Some(folder);
             return true;
         }
@@ -373,6 +394,7 @@ impl Disk {
             force,
             cancel.clone(),
             generation,
+            self.options.clone(),
         )) {
             return;
         }
@@ -380,6 +402,7 @@ impl Disk {
         self.cancel = cancel;
         self.refresh_volume(&root);
         self.scan_bytes = None;
+        self.map_visit(root.clone());
         self.session = Some(ScanSession {
             root,
             generation,
@@ -387,7 +410,7 @@ impl Disk {
         });
         self.invalidate_proposal();
         self.navigation = 0;
-        self.map = Default::default();
+        self.map.reset_navigation();
         self.selected = 0;
         self.folder = None;
     }
@@ -403,7 +426,7 @@ impl Disk {
         let navigation = self.navigation + 1;
         let token = Arc::new(AtomicBool::new(false));
         if !self.accepted(Command::Browse(
-            path,
+            path.clone(),
             page,
             self.generation(),
             navigation,
@@ -412,7 +435,8 @@ impl Disk {
             return;
         }
         self.invalidate_proposal();
-        self.map = Default::default();
+        self.map.reset_navigation();
+        self.map_visit(path);
         self.selected = 0;
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = token;
@@ -516,7 +540,7 @@ impl Disk {
         if !self.open {
             return false;
         }
-        if key == "d" {
+        if key == "d" && !self.map_filtering() {
             self.close();
             return true;
         }
@@ -526,6 +550,13 @@ impl Disk {
                 "n" | "escape" => self.confirmation = None,
                 _ => {}
             }
+            return true;
+        }
+        if self.map_controls_key(key) {
+            return true;
+        }
+        if key == "d" {
+            self.close();
             return true;
         }
         if self.map_key(key) {
@@ -629,6 +660,7 @@ fn publish_browse(
         priority,
         identity,
         service,
+        options,
     } = control;
     let (generation, navigation) = identity;
     if path == tree.root || !path.starts_with(&tree.root) {
@@ -639,7 +671,7 @@ fn publish_browse(
     }
     let mut published_complete = false;
     priority.update();
-    let subtree = disk_scan::scan_beneath(
+    let subtree = disk_scan::scan_beneath_with_options(
         &tree.root,
         path,
         home,
@@ -657,6 +689,7 @@ fn publish_browse(
             service();
             priority.update()
         },
+        options,
     );
     priority.restore();
     if !published_complete {
@@ -669,6 +702,7 @@ fn publish_browse(
     subtree.state == ScanState::Complete && !token.load(Ordering::Relaxed)
 }
 struct ScanControl<'a> {
+    options: gtop_disk::scan::ScanOptions,
     token: &'a AtomicBool,
     priority: &'a mut ScanPriority,
     identity: (u64, u64),
@@ -743,6 +777,7 @@ fn worker_with_trash(
     let mut priority = ScanPriority::new(foreground);
     let mut cache: HashMap<PathBuf, Tree> = HashMap::new();
     let mut active: Option<Tree> = None;
+    let mut scan_options = gtop_disk::scan::ScanOptions::default();
     let mut generation = 0;
     let mut completed = None;
     let retention = RefCell::new(Retention::default());
@@ -802,7 +837,14 @@ fn worker_with_trash(
                     mailbox.notify();
                 }
             }
-            Command::Scan(root, force, token, scan_generation) => {
+            Command::Scan(root, force, token, scan_generation, options) => {
+                if scan_options.include_hidden != options.include_hidden
+                    || scan_options.apparent_size != options.apparent_size
+                {
+                    cache.clear();
+                    active = None;
+                }
+                scan_options = options.clone();
                 let expired = retention.borrow_mut().expire(Instant::now());
                 if expired {
                     active = None;
@@ -852,7 +894,7 @@ fn worker_with_trash(
                     cache.remove(&key);
                 }
                 priority.update();
-                let tree = disk_scan::scan_with_hook(
+                let tree = disk_scan::scan_with_options(
                     &root,
                     &home,
                     &token,
@@ -870,6 +912,7 @@ fn worker_with_trash(
                         );
                         priority.update()
                     },
+                    options,
                 );
                 priority.restore();
                 publish(
@@ -893,6 +936,7 @@ fn worker_with_trash(
                             p,
                             &home,
                             ScanControl {
+                                options: scan_options.clone(),
                                 token: &token,
                                 priority: &mut priority,
                                 identity: (generation, n),
@@ -932,7 +976,7 @@ fn worker_with_trash(
                         let page = p;
                         let navigation = n;
                         priority.update();
-                        let refreshed = disk_scan::scan_with_hook(
+                        let refreshed = disk_scan::scan_with_options(
                             &root,
                             &home,
                             &token,
@@ -955,6 +999,7 @@ fn worker_with_trash(
                                 );
                                 priority.update()
                             },
+                            scan_options.clone(),
                         );
                         priority.restore();
                         completed = publish_browse(
@@ -964,6 +1009,7 @@ fn worker_with_trash(
                             page,
                             &home,
                             ScanControl {
+                                options: scan_options.clone(),
                                 token: &token,
                                 priority: &mut priority,
                                 identity: (generation, navigation),
@@ -1534,6 +1580,7 @@ mod tests {
                 }
             }),
             scan_bytes: None,
+            options: Default::default(),
             map: Default::default(),
             open: true,
             session: None,
@@ -1773,6 +1820,7 @@ mod tests {
             0,
             &home,
             ScanControl {
+                options: Default::default(),
                 token: &browse_token,
                 priority: &mut priority,
                 identity: (7, 3),
@@ -1814,6 +1862,7 @@ mod tests {
             0,
             &home,
             ScanControl {
+                options: Default::default(),
                 token: &browse_token,
                 priority: &mut priority,
                 identity: (7, 4),
@@ -1890,7 +1939,7 @@ mod tests {
         assert_ne!(identity.0, disk.generation());
         assert!(matches!(
             receiver.try_recv(),
-            Ok(Command::Scan(_, true, _, _))
+            Ok(Command::Scan(_, true, _, _, _))
         ));
         drop(disk);
         fs::remove_dir_all(home).unwrap();
@@ -1920,7 +1969,7 @@ mod tests {
         disk.key("r");
         assert!(matches!(
             receiver.recv().unwrap(),
-            Command::Scan(_, true, _, _)
+            Command::Scan(_, true, _, _, _)
         ));
         drop(disk);
         fs::remove_dir_all(home).unwrap();
@@ -1970,10 +2019,10 @@ mod tests {
         assert!(disk.key("r"));
         assert!(disk.generation() > first);
         assert!(
-            matches!(receiver.recv().unwrap(), Command::Scan(root, true, _, _) if root == data)
+            matches!(receiver.recv().unwrap(), Command::Scan(root, true, _, _, _) if root == data)
         );
         assert!(
-            matches!(receiver.recv().unwrap(), Command::Scan(root, true, _, _) if root == data)
+            matches!(receiver.recv().unwrap(), Command::Scan(root, true, _, _, _) if root == data)
         );
         drop(disk);
         fs::remove_dir_all(home).unwrap();
@@ -2014,7 +2063,13 @@ mod tests {
         let token = Arc::new(AtomicBool::new(false));
         sender.send(Command::Close(Instant::now())).unwrap();
         sender
-            .send(Command::Scan(home.clone(), true, token.clone(), 7))
+            .send(Command::Scan(
+                home.clone(),
+                true,
+                token.clone(),
+                7,
+                Default::default(),
+            ))
             .unwrap();
         let worker = std::thread::spawn(move || {
             worker(

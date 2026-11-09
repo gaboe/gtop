@@ -13,26 +13,7 @@ pub(crate) enum Urgency {
 
 const REPORT_INTERVAL: Duration = Duration::from_millis(100);
 
-pub(super) fn run(
-    root: &Path,
-    home: &Path,
-    directory: OwnedFd,
-    cancel: &AtomicBool,
-    progress: &mut dyn FnMut(&Tree),
-    on_tick: &mut dyn FnMut() -> Urgency,
-) -> Tree {
-    run_with_options(
-        root,
-        home,
-        directory,
-        cancel,
-        progress,
-        on_tick,
-        ScanOptions::default(),
-    )
-}
-
-fn run_with_options(
+pub(super) fn run_with_options(
     root: &Path,
     home: &Path,
     directory: OwnedFd,

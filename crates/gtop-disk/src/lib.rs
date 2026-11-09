@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod classify;
+pub mod exploration;
 pub mod filter;
 pub mod identity;
 pub mod insights;

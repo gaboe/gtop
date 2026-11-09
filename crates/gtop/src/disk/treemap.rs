@@ -1,4 +1,5 @@
 use super::*;
+use gtop_disk::exploration::{age_label, draw_depth, escape, Escape, History, Mode, Viewport};
 use gtop_disk::{
     tree::{Metric, Node},
     treemap::{self, LayoutOptions, Rect, Tile, TileKind},
@@ -7,6 +8,15 @@ use std::rc::Rc;
 
 #[derive(Default)]
 pub(super) struct MapState {
+    mode: Mode,
+    depth: u32,
+    filter: String,
+    filtering: bool,
+    applied: bool,
+    viewport: Viewport,
+    history: History,
+    siblings: Option<PathBuf>,
+    scan_root: Option<(PathBuf, Arc<Node>)>,
     selected: Option<TileKind>,
     hovered: Option<TileKind>,
     frame: Rc<RefCell<MapFrame>>,
@@ -16,6 +26,9 @@ pub(super) struct MapState {
 
 struct Listing {
     root: Arc<Node>,
+    mode: Mode,
+    depth: u32,
+    filter: String,
     entries: Rc<Vec<Entry>>,
 }
 
@@ -25,19 +38,54 @@ struct MapFrame {
     size: Size<Pixels>,
     root: Option<Arc<Node>>,
     tiles: Vec<Tile>,
+    mode: Mode,
+    depth: u32,
+    filter: String,
 }
 
 impl MapState {
+    fn draw_depth(&self) -> u32 {
+        if self.depth == 0 {
+            4
+        } else {
+            self.depth
+        }
+    }
+    pub(super) fn reset_navigation(&mut self) {
+        self.selected = None;
+        self.hovered = None;
+        self.viewport = Viewport::default();
+        self.siblings = None;
+        *self.frame.borrow_mut() = MapFrame::default();
+        *self.listing.borrow_mut() = None;
+    }
     fn entries(&self, root: &Arc<Node>) -> Rc<Vec<Entry>> {
         let mut listing = self.listing.borrow_mut();
         if let Some(cached) = &*listing {
-            if Arc::ptr_eq(&cached.root, root) {
+            if Arc::ptr_eq(&cached.root, root)
+                && cached.mode == self.mode
+                && cached.depth == self.draw_depth()
+                && cached.filter == self.filter
+            {
                 return cached.entries.clone();
             }
         }
-        let entries = Rc::new(entries(root));
+        let mut rows = entries_with(root, self.mode.metric(), self.draw_depth());
+        if self.applied {
+            if let Some(matches) = gtop_disk::filter::filter(root, &[], &self.filter) {
+                rows.retain(|entry| match &entry.kind {
+                    TileKind::Node { crumbs } | TileKind::Others { crumbs, .. } => {
+                        matches.keep(crumbs).is_some()
+                    }
+                });
+            }
+        }
+        let entries = Rc::new(rows);
         *listing = Some(Listing {
             root: root.clone(),
+            mode: self.mode,
+            depth: self.draw_depth(),
+            filter: self.filter.clone(),
             entries: entries.clone(),
         });
         entries
@@ -51,14 +99,23 @@ struct Entry {
 }
 
 fn entries(root: &Node) -> Vec<Entry> {
-    fn visit(node: &Node, crumbs: &mut Vec<usize>, out: &mut Vec<Entry>) {
+    entries_with(root, Metric::Bytes, 4)
+}
+fn entries_with(root: &Node, metric: Metric, depth: u32) -> Vec<Entry> {
+    fn visit(
+        node: &Node,
+        crumbs: &mut Vec<usize>,
+        out: &mut Vec<Entry>,
+        metric: Metric,
+        depth: u32,
+    ) {
         let mut children: Vec<_> = node
             .children
             .iter()
             .enumerate()
-            .filter(|(_, child)| child.bytes > 0)
+            .filter(|(_, child)| child.value(metric) > 0)
             .collect();
-        children.sort_by_key(|(_, child)| std::cmp::Reverse(child.bytes));
+        children.sort_by_key(|(_, child)| std::cmp::Reverse(child.value(metric)));
         let kept = children.len().min(LayoutOptions::default().max_children);
         for (rank, (index, child)) in children.iter().enumerate() {
             if rank == kept {
@@ -84,8 +141,8 @@ fn entries(root: &Node) -> Vec<Entry> {
                 label: format!("{} · {}{}", child.name, bytes(child.bytes), coverage(child)),
                 depth: crumbs.len() - 1,
             });
-            if rank < kept && crumbs.len() < LayoutOptions::default().max_depth as usize {
-                visit(child, crumbs, out);
+            if rank < kept && crumbs.len() < depth as usize {
+                visit(child, crumbs, out, metric, depth);
             }
             crumbs.pop();
         }
@@ -93,7 +150,7 @@ fn entries(root: &Node) -> Vec<Entry> {
             .children
             .iter()
             .enumerate()
-            .filter(|(_, child)| child.bytes == 0)
+            .filter(|(_, child)| child.value(metric) == 0)
         {
             let mut path = crumbs.clone();
             path.push(index);
@@ -105,7 +162,7 @@ fn entries(root: &Node) -> Vec<Entry> {
         }
     }
     let mut out = Vec::new();
-    visit(root, &mut Vec::new(), &mut out);
+    visit(root, &mut Vec::new(), &mut out, metric, depth);
     out
 }
 
@@ -134,6 +191,185 @@ fn node_path(root: &Node, base: &Path, crumbs: &[usize]) -> Option<PathBuf> {
 }
 
 impl Disk {
+    pub(super) fn map_filtering(&self) -> bool {
+        self.map.filtering
+    }
+    fn set_map_mode(&mut self, mode: Mode) {
+        self.invalidate_proposal();
+        self.map.mode = mode;
+    }
+    pub(super) fn remember_map_root(&mut self, folder: &Folder) {
+        if folder.path == folder.root {
+            if let Some(root) = &folder.hierarchy {
+                self.map.scan_root = Some((folder.root.clone(), root.clone()));
+            }
+        }
+    }
+    fn map_siblings(&self, path: &Path) -> Vec<PathBuf> {
+        let Some((base, root)) = &self.map.scan_root else {
+            return Vec::new();
+        };
+        let Some(parent) = path.parent().filter(|parent| parent.starts_with(base)) else {
+            return Vec::new();
+        };
+        let Ok(relative) = parent.strip_prefix(base) else {
+            return Vec::new();
+        };
+        let mut node = root.as_ref();
+        for part in relative.components() {
+            let Some(child) = node
+                .children
+                .iter()
+                .find(|child| child.filesystem_name() == part.as_os_str())
+            else {
+                return Vec::new();
+            };
+            node = child;
+        }
+        node.children
+            .iter()
+            .filter(|child| child.is_dir() && !child.in_cloud && !child.skipped_volume)
+            .map(|child| parent.join(child.filesystem_name()))
+            .collect()
+    }
+    pub(super) fn map_visit(&mut self, path: PathBuf) {
+        self.map.history.visit(path);
+    }
+    pub(super) fn map_controls_key(&mut self, key: &str) -> bool {
+        if self.map.filtering {
+            match key {
+                "escape" => {
+                    self.map.filter.clear();
+                    self.map.filtering = false;
+                    self.map.applied = false;
+                }
+                "enter" => {
+                    self.map.filtering = false;
+                    self.map.applied = true;
+                    *self.map.listing.borrow_mut() = None;
+                }
+                "backspace" => {
+                    self.map.filter.pop();
+                }
+                "space" => self.map.filter.push(' '),
+                key if key.chars().count() == 1 => self.map.filter.push_str(key),
+                _ => {}
+            }
+            return true;
+        }
+        match key {
+            "/" => {
+                self.map.filtering = true;
+            }
+            "m" => self.set_map_mode(self.map.mode.next()),
+            "[" | "]" => self.map.depth = draw_depth(self.map.draw_depth(), key == "]"),
+            "0" => self.map.viewport = Viewport::default(),
+            "+" | "=" | "-" => {
+                let size = self.map.frame.borrow().size;
+                self.map.viewport.zoom(
+                    if key == "-" { 0.8 } else { 1.25 },
+                    size.width.as_f32() / 2.,
+                    size.height.as_f32() / 2.,
+                );
+            }
+            "escape" => match escape(
+                !self.map.filter.is_empty(),
+                self.map.viewport,
+                self.map.selected.is_some(),
+            ) {
+                Escape::Filter => {
+                    self.map.filter.clear();
+                    self.map.applied = false;
+                }
+                Escape::Viewport => self.map.viewport = Viewport::default(),
+                Escape::Selection => {
+                    self.map.selected = None;
+                    self.invalidate_proposal();
+                }
+                Escape::Close => return false,
+            },
+            "h" | "left" | "l" | "right" => {
+                let frame = self.map.frame.borrow();
+                let selected = frame
+                    .tiles
+                    .iter()
+                    .find(|tile| Some(&tile.kind) == self.map.selected.as_ref());
+                let target = selected.and_then(|selected| {
+                    let center = |rect: Rect| (rect.x + rect.w / 2., rect.y + rect.h / 2.);
+                    let (x, y) = center(selected.rect);
+                    let right = matches!(key, "l" | "right");
+                    frame
+                        .tiles
+                        .iter()
+                        .filter(|tile| tile.depth == selected.depth && tile.kind != selected.kind)
+                        .filter_map(|tile| {
+                            let (tx, ty) = center(tile.rect);
+                            let dx = tx - x;
+                            let dy = ty - y;
+                            ((right && dx > 0.) || (!right && dx < 0.))
+                                .then_some((dx * dx + dy * dy, tile.kind.clone()))
+                        })
+                        .min_by(|a, b| a.0.total_cmp(&b.0))
+                        .map(|(_, kind)| kind)
+                });
+                drop(frame);
+                if let Some(kind) = target {
+                    self.map_select(kind);
+                }
+            }
+            "b" | "f" => self.map_travel(key == "f"),
+            _ => return false,
+        }
+        true
+    }
+
+    fn map_travel(&mut self, forward: bool) {
+        if let Some(path) = self.map.history.travel(forward) {
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|session| path.starts_with(&session.root))
+            {
+                self.browse(path, 0);
+            } else {
+                self.start(path, false);
+            }
+        }
+    }
+
+    fn change_scan_option(&mut self, hidden: bool) {
+        let previous = self.options.clone();
+        let folder = self.folder.clone();
+        if hidden {
+            self.options.include_hidden = !self.options.include_hidden;
+        } else {
+            self.options.apparent_size = !self.options.apparent_size;
+        }
+        let generation = self.generation();
+        self.start_over();
+        if self.generation() == generation {
+            self.options = previous;
+        } else {
+            self.folder = folder;
+            self.status = "Previous result is stale. Scanning with new options…".into();
+        }
+    }
+
+    pub(super) fn restore_map_selection(&mut self, folder: &Folder) {
+        let previous = self.map_row();
+        self.map.reset_navigation();
+        if let (Some(row), Some(root)) = (previous, folder.hierarchy.as_ref()) {
+            self.map.selected = entries(root).into_iter().find_map(|entry| {
+                let TileKind::Node { crumbs } = &entry.kind else {
+                    return None;
+                };
+                let node = root.resolve(crumbs)?;
+                (node_path(root, &folder.path, crumbs).as_ref() == Some(&row.path)
+                    && node.identity() == Some((row.identity.device, row.identity.inode)))
+                .then_some(entry.kind)
+            });
+        }
+    }
     #[cfg(test)]
     pub(super) fn select_map_entry_for_test(&mut self, index: usize) {
         let root = self.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
@@ -191,13 +427,13 @@ impl Disk {
             return false;
         };
         match key {
-            "down" | "j" | "up" | "k" => {
+            "down" | "j" | "up" | "k" | "tab" => {
                 let entries = self.map.entries(&root);
                 let selected =
                     self.map.selected.as_ref().and_then(|selected| {
                         entries.iter().position(|entry| &entry.kind == selected)
                     });
-                let next = match (selected, matches!(key, "down" | "j")) {
+                let next = match (selected, matches!(key, "down" | "j" | "tab")) {
                     (Some(index), true) => (index + 1).min(entries.len().saturating_sub(1)),
                     (Some(index), false) => index.saturating_sub(1),
                     (None, _) => 0,
@@ -209,7 +445,7 @@ impl Disk {
                         .scroll_to_item(next, ScrollStrategy::Nearest);
                 }
             }
-            "enter" | "right" => {
+            "enter" | "right" | "l" => {
                 if let Some(selected @ TileKind::Others { .. }) = &self.map.selected {
                     let entries = self.map.entries(&root);
                     if let Some(next) = entries
@@ -258,6 +494,16 @@ impl Monitor {
         let hovered = disk.map.hovered.clone();
         let measured = disk.map.frame.clone();
         let paint_frame = measured.clone();
+        let mode = disk.map.mode;
+        let depth = disk.map.draw_depth();
+        let viewport = disk.map.viewport;
+        let filter = disk.map.filter.clone();
+        let paint_filter = filter.clone();
+        let applied = disk.map.applied;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
         let canvas = div()
             .id("disk-treemap")
             .debug_selector(|| "disk-treemap".into())
@@ -275,30 +521,48 @@ impl Monitor {
                     let disk = this.disk.as_mut().unwrap();
                     let hit = {
                         let frame = disk.map.frame.borrow();
-                        treemap::hit(
-                            &frame.tiles,
+                        let (x, y) = disk.map.viewport.inverse(
                             (event.position.x - frame.origin.x).as_f32(),
                             (event.position.y - frame.origin.y).as_f32(),
-                        )
-                        .map(|tile| tile.kind.clone())
+                        );
+                        treemap::hit(&frame.tiles, x, y).map(|tile| tile.kind.clone())
                     };
                     if let Some(kind) = hit {
                         disk.map_select(kind);
+                        if event.click_count == 2 {
+                            disk.map_key("enter");
+                        }
                     }
                     window.focus(&this.focus, cx);
                     cx.notify();
                 }),
             )
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                let disk = this.disk.as_mut().unwrap();
+                let delta = event.delta.pixel_delta(px(20.));
+                let origin = disk.map.frame.borrow().origin;
+                if event.modifiers.shift {
+                    disk.map.viewport.pan(delta.x.as_f32(), delta.y.as_f32());
+                } else {
+                    disk.map.viewport.zoom(
+                        (delta.y.as_f32() * 0.002).exp(),
+                        (event.position.x - origin.x).as_f32(),
+                        (event.position.y - origin.y).as_f32(),
+                    );
+                }
+                window.focus(&this.focus, cx);
+                cx.stop_propagation();
+                cx.notify();
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 let disk = this.disk.as_mut().unwrap();
                 let hit = {
                     let frame = disk.map.frame.borrow();
-                    treemap::hit(
-                        &frame.tiles,
+                    let (x, y) = disk.map.viewport.inverse(
                         (event.position.x - frame.origin.x).as_f32(),
                         (event.position.y - frame.origin.y).as_f32(),
-                    )
-                    .map(|tile| tile.kind.clone())
+                    );
+                    treemap::hit(&frame.tiles, x, y).map(|tile| tile.kind.clone())
                 };
                 if disk.map.hovered != hit {
                     disk.map.hovered = hit;
@@ -320,9 +584,14 @@ impl Monitor {
                             (None, None) => true,
                             _ => false,
                         };
-                        if !same_root || frame.size != bounds.size {
+                        if !same_root
+                            || frame.size != bounds.size
+                            || frame.mode != mode
+                            || frame.depth != depth
+                            || frame.filter != format!("{applied}:{filter}")
+                        {
                             frame.tiles = hierarchy.as_ref().map_or_else(Vec::new, |root| {
-                                treemap::layout(
+                                treemap::layout_filtered(
                                     root,
                                     &[],
                                     Rect::new(
@@ -331,19 +600,43 @@ impl Monitor {
                                         bounds.size.width.as_f32(),
                                         bounds.size.height.as_f32(),
                                     ),
-                                    Metric::Bytes,
-                                    &LayoutOptions::default(),
+                                    mode.metric(),
+                                    &LayoutOptions {
+                                        max_depth: depth,
+                                        ..Default::default()
+                                    },
+                                    if applied {
+                                        gtop_disk::filter::filter(root, &[], &filter)
+                                    } else {
+                                        None
+                                    }
+                                    .as_ref(),
                                 )
                             });
                             frame.size = bounds.size;
                             frame.root = hierarchy.clone();
+                            frame.mode = mode;
+                            frame.depth = depth;
+                            frame.filter = format!("{applied}:{filter}");
                         }
                         frame.origin = bounds.origin;
-                        (hierarchy.clone(), frame.tiles.clone())
+                        let mut tiles = frame.tiles.clone();
+                        for tile in &mut tiles {
+                            tile.rect = viewport.rect(tile.rect);
+                            tile.header = tile.header.map(|band| viewport.rect(band));
+                        }
+                        (hierarchy.clone(), tiles)
                     },
                     move |bounds, (root, tiles), window, cx| {
                         let Some(root) = root else { return };
+                        let matches = gtop_disk::filter::filter(&root, &[], &paint_filter);
                         for tile in tiles {
+                            let dimmed = matches
+                                .as_ref()
+                                .is_some_and(|found| found.keep(tile.crumbs()).is_none());
+                            let age = root
+                                .resolve(tile.crumbs())
+                                .map(|node| age_label(node.modified, now));
                             let rect = Bounds::new(
                                 bounds.origin + point(px(tile.rect.x), px(tile.rect.y)),
                                 size(px(tile.rect.w), px(tile.rect.h)),
@@ -360,6 +653,15 @@ impl Monitor {
                                 Corners::default(),
                                 rgb(if selected.as_ref() == Some(&tile.kind) {
                                     t.selection
+                                } else if dimmed {
+                                    t.well
+                                } else if mode == Mode::Age {
+                                    match age {
+                                        Some("Today") => t.selection,
+                                        Some("This week") => t.rule_hi,
+                                        Some("This month") => t.rule,
+                                        _ => t.base.plate,
+                                    }
                                 } else {
                                     t.base.plate
                                 }),
@@ -373,7 +675,17 @@ impl Monitor {
                                     |node| {
                                         (
                                             format!("{}{}", node.name, coverage(node)),
-                                            bytes(node.bytes),
+                                            if mode == Mode::Age {
+                                                format!(
+                                                    "{} · {}",
+                                                    bytes(node.bytes),
+                                                    age_label(node.modified, now)
+                                                )
+                                            } else if mode == Mode::Files {
+                                                format!("{} files", node.files)
+                                            } else {
+                                                bytes(node.bytes)
+                                            },
                                         )
                                     },
                                 ),
@@ -463,9 +775,10 @@ impl Monitor {
                             .iter()
                             .find(|tile| selected.as_ref() == Some(&tile.kind))
                         {
+                            let transformed = viewport.rect(tile.rect);
                             let rect = Bounds::new(
-                                bounds.origin + point(px(tile.rect.x), px(tile.rect.y)),
-                                size(px(tile.rect.w), px(tile.rect.h)),
+                                bounds.origin + point(px(transformed.x), px(transformed.y)),
+                                size(px(transformed.w), px(transformed.h)),
                             );
                             window.paint_quad(quad(
                                 rect,
@@ -494,6 +807,7 @@ impl Monitor {
             ancestors.reverse();
             for (index, path) in ancestors.into_iter().enumerate() {
                 let path = path.to_path_buf();
+                let sibling_path = path.clone();
                 let label = path
                     .file_name()
                     .unwrap_or(path.as_os_str())
@@ -502,6 +816,42 @@ impl Monitor {
                 crumbs = crumbs.child(
                     Button::new(("map-crumb", index))
                         .label(label)
+                        .rack(&t)
+                        .small()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.disk.as_mut().unwrap().enter(path.clone());
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        })),
+                );
+                crumbs = crumbs.child(
+                    Button::new(("map-siblings", index))
+                        .label("▾")
+                        .rack(&t)
+                        .small()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let map = &mut this.disk.as_mut().unwrap().map;
+                            map.siblings = if map.siblings.as_ref() == Some(&sibling_path) {
+                                None
+                            } else {
+                                Some(sibling_path.clone())
+                            };
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        if let Some(path) = &disk.map.siblings {
+            for (index, path) in disk.map_siblings(path).into_iter().enumerate() {
+                crumbs = crumbs.child(
+                    Button::new(("map-sibling-entry", index))
+                        .label(
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
                         .rack(&t)
                         .small()
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -525,15 +875,150 @@ impl Monitor {
                     .map(|path| path.display().to_string())
             })
             .unwrap_or_default();
+        let mut controls = div().flex().flex_wrap().gap(px(4.));
+        for (index, mode) in [Mode::Size, Mode::Files, Mode::Age].into_iter().enumerate() {
+            controls = controls.child(
+                div()
+                    .debug_selector(move || format!("map-mode-{index}").into())
+                    .child(
+                        Button::new(("map-mode", index))
+                            .label(format!(
+                                "{}{:?}",
+                                if disk.map.mode == mode { "● " } else { "" },
+                                mode
+                            ))
+                            .rack(&t)
+                            .small()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.disk.as_mut().unwrap().set_map_mode(mode);
+                                window.focus(&this.focus, cx);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        for (id, label, key) in [
+            ("map-depth-less", "Depth −".to_string(), "["),
+            (
+                "map-depth-more",
+                format!("{} +", disk.map.draw_depth()),
+                "]",
+            ),
+            ("map-filter", format!("/ Filter {}", disk.map.filter), "/"),
+            ("map-back", "Back".into(), "b"),
+            ("map-forward", "Forward".into(), "f"),
+            ("map-reset", "Reset 0".into(), "0"),
+        ] {
+            controls = controls.child(
+                div().debug_selector(move || id.into()).child(
+                    Button::new(id)
+                        .label(label)
+                        .rack(&t)
+                        .small()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.disk.as_mut().unwrap().map_controls_key(key);
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        })),
+                ),
+            );
+        }
+        for (id, label, hidden) in [
+            (
+                "map-hidden",
+                format!(
+                    "Hidden {}",
+                    if disk.options.include_hidden {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ),
+                true,
+            ),
+            (
+                "map-apparent",
+                format!(
+                    "Apparent {}",
+                    if disk.options.apparent_size {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ),
+                false,
+            ),
+        ] {
+            controls = controls.child(
+                div().debug_selector(move || id.into()).child(
+                    Button::new(id)
+                        .label(label)
+                        .rack(&t)
+                        .small()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.disk.as_mut().unwrap().change_scan_option(hidden);
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        })),
+                ),
+            );
+        }
+        controls = controls.child(
+            div().debug_selector(|| "map-choose-folder".into()).child(
+                Button::new("map-choose-folder")
+                    .label("Choose folder")
+                    .rack(&t)
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.focus, cx);
+                        let request = cx.prompt_for_paths(PathPromptOptions {
+                            files: false,
+                            directories: true,
+                            multiple: false,
+                            prompt: Some("Scan folder".into()),
+                        });
+                        cx.spawn(async move |entity, cx| {
+                            if let Ok(Ok(Some(paths))) = request.await {
+                                if let Some(path) = paths.into_iter().next() {
+                                    let _ = entity.update(cx, |this, cx| {
+                                        this.disk.as_mut().unwrap().start(path, false);
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                        })
+                        .detach();
+                    })),
+            ),
+        );
+        let matched = disk
+            .folder
+            .as_ref()
+            .and_then(|folder| folder.hierarchy.as_ref())
+            .and_then(|root| gtop_disk::filter::filter(root, &[], &disk.map.filter))
+            .map(|found| {
+                format!(
+                    "{} matched bytes · {} scan bytes{}",
+                    found.bytes,
+                    disk.scan_bytes.unwrap_or(0),
+                    if disk.map.filtering {
+                        " · Enter applies"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .unwrap_or_default();
         div().flex().size_full().gap(px(8.)).min_w_0()
             .child(div().flex().flex_col().flex_1().min_w_0().min_h_0().gap(px(8.))
                 .child(div().bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule_hi)).p(px(12.))
-                    .child(crate::rack::label("TREEMAP · ALLOCATED BLOCKS · DEPTH 4", &t))
-                    .child(current_path(path)).child(crumbs))
+                    .child(crate::rack::label(if disk.options.apparent_size { "TREEMAP · APPARENT SIZE" } else { "TREEMAP · ALLOCATED BLOCKS" }, &t))
+                    .child(current_path(path)).child(crumbs).child(controls).child(div().text_size(px(10.)).child(matched)))
                 .child(canvas)
                 .child(div().h(px(20.)).overflow_hidden().text_size(px(10.)).child(hover))
                 .child(div().bg(rgb(t.base.plate)).border_1().border_color(rgb(t.rule)).p(px(8.))
-                    .child("D Top · ↑ ↓ select · Enter open · Backspace up · X Trash")
+                    .child("D Top · arrows/HJKL move · Enter open · Backspace up · X Trash")
+                    .child("M mode · / filter · [ ] depth · + − zoom · 0 reset · B/F history")
                     .child(div().text_size(px(10.)).child("Observed sizes. Unknown space has no tile area. Hover informs; click selects."))))
             .child(self.resizable_disk_inspector(window, cx))
     }
@@ -971,6 +1456,32 @@ mod tests {
     }
 
     #[test]
+    fn resort_restores_raw_path_and_identity_and_rejects_replacement() {
+        let mut disk = snapshot_disk();
+        let root = Arc::make_mut(disk.folder.as_mut().unwrap().hierarchy.as_mut().unwrap());
+        root.children[0].inode = Some((42, std::num::NonZeroU64::new(99).unwrap()));
+        disk.map_select(TileKind::Node { crumbs: vec![0] });
+        let selected = disk.map_row().unwrap();
+        let mut replacement = disk.folder.clone().unwrap();
+        Arc::make_mut(replacement.hierarchy.as_mut().unwrap())
+            .children
+            .reverse();
+        disk.restore_map_selection(&replacement);
+        disk.folder = Some(replacement.clone());
+        let restored = disk.map_row().unwrap();
+        assert_eq!(restored.path, selected.path);
+        assert_eq!(restored.identity, selected.identity);
+        let TileKind::Node { crumbs } = disk.map.selected.as_ref().unwrap() else {
+            panic!("node");
+        };
+        let index = crumbs[0];
+        Arc::make_mut(replacement.hierarchy.as_mut().unwrap()).children[index].inode =
+            Some((42, std::num::NonZeroU64::new(100).unwrap()));
+        disk.restore_map_selection(&replacement);
+        assert!(disk.map.selected.is_none());
+    }
+
+    #[test]
     fn map_selection_uses_raw_names_and_observed_identity() {
         use std::os::unix::ffi::OsStringExt;
         let mut disk = snapshot_disk();
@@ -1000,6 +1511,231 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[gpui::test]
+    async fn modes_filter_depth_zoom_and_pending_scan_options(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        let (sender, pending) = mpsc::sync_channel(32);
+        disk.sender = sender;
+        disk.remember_map_root(&disk.folder.clone().unwrap());
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1480.), px(930.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let rectangles = monitor.read_with(visual, |monitor, _| {
+            monitor
+                .disk
+                .as_ref()
+                .unwrap()
+                .map
+                .frame
+                .borrow()
+                .tiles
+                .iter()
+                .map(|tile| (tile.kind.clone(), tile.rect))
+                .collect::<Vec<_>>()
+        });
+        for (selector, mode) in [
+            ("map-mode-2", Mode::Age),
+            ("map-mode-1", Mode::Files),
+            ("map-mode-0", Mode::Size),
+        ] {
+            let bounds = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(bounds.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                assert_eq!(disk.map.mode, mode);
+                let current = disk
+                    .map
+                    .frame
+                    .borrow()
+                    .tiles
+                    .iter()
+                    .map(|tile| (tile.kind.clone(), tile.rect))
+                    .collect::<Vec<_>>();
+                if mode == Mode::Age {
+                    assert_eq!(current, rectangles);
+                }
+                if mode == Mode::Files {
+                    assert_ne!(current, rectangles);
+                }
+            });
+        }
+        for key in [
+            "]", "[", "m", "m", "m", "down", "j", "up", "k", "left", "h", "right", "l", "tab", "+",
+            "-", "0",
+        ] {
+            visual.simulate_keystrokes(key);
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+        }
+        assert!(pending.try_recv().is_err(), "view controls must never scan");
+        let center = visual.debug_bounds("disk-treemap").unwrap().center();
+        let before = monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            let frame = disk.map.frame.borrow();
+            disk.map.viewport.inverse(
+                (center.x - frame.origin.x).as_f32(),
+                (center.y - frame.origin.y).as_f32(),
+            )
+        });
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position: center,
+                    delta: ScrollDelta::Pixels(point(px(0.), px(250.))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Moved,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        });
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            let frame = disk.map.frame.borrow();
+            let after = disk.map.viewport.inverse(
+                (center.x - frame.origin.x).as_f32(),
+                (center.y - frame.origin.y).as_f32(),
+            );
+            assert!((before.0 - after.0).abs() < 0.001 && (before.1 - after.1).abs() < 0.001);
+        });
+        let expected = monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            let frame = disk.map.frame.borrow();
+            let (x, y) = disk.map.viewport.inverse(
+                (center.x - frame.origin.x).as_f32(),
+                (center.y - frame.origin.y).as_f32(),
+            );
+            treemap::hit(&frame.tiles, x, y).unwrap().kind.clone()
+        });
+        visual.simulate_click(center, Modifiers::default());
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        monitor.read_with(visual, |monitor, _| {
+            assert_eq!(monitor.disk.as_ref().unwrap().map.selected, Some(expected))
+        });
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position: center,
+                    delta: ScrollDelta::Pixels(point(px(10.), px(-15.))),
+                    modifiers: Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                    touch_phase: TouchPhase::Moved,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()));
+        });
+        visual.simulate_keystrokes("/");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        for key in ["t", "a", "r", "g", "e", "t", "enter"] {
+            visual.simulate_keystrokes(key);
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+        }
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert!(disk.map.filter.is_empty());
+            assert_ne!(disk.map.viewport, Viewport::default());
+            assert!(disk.map.selected.is_some());
+        });
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            assert_eq!(disk.map.viewport, Viewport::default());
+            assert!(disk.map.selected.is_some());
+        });
+        visual.simulate_keystrokes("escape");
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        monitor.read_with(visual, |monitor, _| {
+            assert!(monitor.disk.as_ref().unwrap().map.selected.is_none())
+        });
+        let stale = monitor.read_with(visual, |monitor, _| {
+            monitor.disk.as_ref().unwrap().folder.clone().unwrap()
+        });
+        for selector in ["map-hidden", "map-apparent"] {
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            let bounds = visual.debug_bounds(selector).unwrap();
+            visual.simulate_click(bounds.center(), Modifiers::default());
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+        }
+        let Command::Scan(_, true, first_token, first_generation, first_options) =
+            pending.try_recv().unwrap()
+        else {
+            panic!("first scan");
+        };
+        let Command::Scan(root, true, _, generation, options) = pending.try_recv().unwrap() else {
+            panic!("second scan while first pending");
+        };
+        assert!(first_token.load(Ordering::Relaxed));
+        assert!(!first_options.include_hidden && !first_options.apparent_size);
+        assert!(!options.include_hidden && options.apparent_size);
+        assert!(generation > first_generation);
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            disk.mailbox.lock().unwrap().folder = Some((first_generation, 0, stale.clone()));
+            assert!(!disk.consume_mailbox());
+            assert_eq!(disk.session.as_ref().unwrap().root, root);
+            assert_eq!(disk.generation(), generation);
+            assert!(disk.map.selected.is_none());
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let choose = visual.debug_bounds("map-choose-folder").unwrap();
+        visual.simulate_click(choose.center(), Modifiers::default());
+        visual.update(|window, cx| {
+            assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+        });
+        assert!(visual.did_prompt_for_paths());
+        visual.simulate_path_prompt_response(|options| {
+            assert!(!options.files && options.directories && !options.multiple);
+            Some(vec![PathBuf::from("/Volumes/External/chosen")])
+        });
+        visual.run_until_parked();
+        let Command::Scan(chosen, false, _, chosen_generation, _) = pending.try_recv().unwrap()
+        else {
+            panic!("chosen root scan");
+        };
+        assert_eq!(chosen, Path::new("/Volumes/External/chosen"));
+        monitor.update(visual, |monitor, _| {
+            let disk = monitor.disk.as_mut().unwrap();
+            disk.mailbox.lock().unwrap().folder = Some((generation, 0, stale));
+            assert!(!disk.consume_mailbox());
+            assert_eq!(disk.session.as_ref().unwrap().root, chosen);
+            assert_eq!(disk.generation(), chosen_generation);
+        });
+        monitor.update(visual, |monitor, _| monitor.disk = None);
     }
 
     #[gpui::test]
@@ -1747,6 +2483,7 @@ mod tests {
         }
         for (width, height) in [(1480., 930.), (1200., 720.)] {
             let mut disk = snapshot_disk();
+            disk.map.mode = Mode::Age;
             let index = disk
                 .folder
                 .as_ref()
@@ -1778,7 +2515,7 @@ mod tests {
             .unwrap();
             cx.capture_screenshot(handle.into())
                 .unwrap()
-                .save(output.join(format!("inspector-{width:.0}x{height:.0}.png")))
+                .save(output.join(format!("modes-{width:.0}x{height:.0}.png")))
                 .unwrap();
         }
     }
@@ -1864,6 +2601,7 @@ mod tests {
             )),
             volume_query: Arc::new(gtop_disk::inspector::VolumeReadout::query),
             scan_bytes: Some(root.bytes),
+            options: Default::default(),
             map: Default::default(),
             open: true,
             session: Some(ScanSession {

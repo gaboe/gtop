@@ -518,8 +518,26 @@ pub(super) fn scan_with_hook(
     root: &Path,
     home: &Path,
     cancel: &AtomicBool,
+    progress: impl FnMut(&Tree),
+    on_tick: impl FnMut() -> ScanUrgency,
+) -> Tree {
+    scan_with_options(
+        root,
+        home,
+        cancel,
+        progress,
+        on_tick,
+        gtop_disk::scan::ScanOptions::default(),
+    )
+}
+
+pub(super) fn scan_with_options(
+    root: &Path,
+    home: &Path,
+    cancel: &AtomicBool,
     mut progress: impl FnMut(&Tree),
     mut on_tick: impl FnMut() -> ScanUrgency,
+    options: gtop_disk::scan::ScanOptions,
 ) -> Tree {
     #[cfg(target_os = "macos")]
     if let Ok(metadata) = fs::symlink_metadata(root) {
@@ -538,7 +556,9 @@ pub(super) fn scan_with_hook(
         }
     }
     match open_root(root) {
-        Ok(fd) => queue::run(root, home, fd, cancel, &mut progress, &mut on_tick),
+        Ok(fd) => {
+            queue::run_with_options(root, home, fd, cancel, &mut progress, &mut on_tick, options)
+        }
         Err(error) => {
             let mut tree = Tree::new(root);
             tree.state = ScanState::Failed(error.to_string());
@@ -562,13 +582,34 @@ fn cloud_root_tree(root: &Path, identity: FileId, blocks: u64, cancelled: bool) 
     tree
 }
 
+#[cfg(test)]
 pub(super) fn scan_beneath(
+    scope: &Path,
+    root: &Path,
+    home: &Path,
+    cancel: &AtomicBool,
+    progress: impl FnMut(&Tree),
+    on_tick: impl FnMut() -> ScanUrgency,
+) -> Tree {
+    scan_beneath_with_options(
+        scope,
+        root,
+        home,
+        cancel,
+        progress,
+        on_tick,
+        Default::default(),
+    )
+}
+
+pub(super) fn scan_beneath_with_options(
     scope: &Path,
     root: &Path,
     home: &Path,
     cancel: &AtomicBool,
     mut progress: impl FnMut(&Tree),
     mut on_tick: impl FnMut() -> ScanUrgency,
+    options: gtop_disk::scan::ScanOptions,
 ) -> Tree {
     let mut last_tick = Instant::now() - Duration::from_secs(1);
     let opened = (|| {
@@ -611,7 +652,9 @@ pub(super) fn scan_beneath(
         Ok(fd)
     })();
     match opened {
-        Ok(fd) => queue::run(root, home, fd, cancel, &mut progress, &mut on_tick),
+        Ok(fd) => {
+            queue::run_with_options(root, home, fd, cancel, &mut progress, &mut on_tick, options)
+        }
         Err(error) => {
             let mut tree = Tree::new(root);
             tree.state = if cancel.load(Ordering::Relaxed) {
@@ -1060,6 +1103,52 @@ mod tests {
             inode: m.ino(),
         }
     }
+    #[test]
+    fn scan_options_measure_apparent_and_exclude_hidden_without_limiting_depth() {
+        let scratch = Scratch::new();
+        fs::create_dir(scratch.0.join("nested")).unwrap();
+        fs::write(scratch.0.join(".hidden"), b"hidden").unwrap();
+        let path = scratch.0.join("nested/sparse");
+        fs::File::create(&path).unwrap().set_len(2 << 20).unwrap();
+        let options = gtop_disk::scan::ScanOptions {
+            include_hidden: false,
+            apparent_size: true,
+            ..Default::default()
+        };
+        let tree = scan_with_options(
+            &scratch.0,
+            &scratch.0,
+            &AtomicBool::new(false),
+            |_| {},
+            || ScanUrgency::Background,
+            options,
+        );
+        assert_eq!(tree.state, ScanState::Complete);
+        let hierarchy = tree.hierarchy.unwrap();
+        assert!(!hierarchy
+            .children
+            .iter()
+            .any(|node| node.filesystem_name() == ".hidden"));
+        let nested = hierarchy
+            .children
+            .iter()
+            .find(|node| node.filesystem_name() == "nested")
+            .unwrap();
+        assert_eq!(nested.children[0].bytes, 2 << 20);
+        let tree = scan(&scratch.0, &scratch.0, &AtomicBool::new(false), |_| {});
+        let hierarchy = tree.hierarchy.unwrap();
+        assert!(hierarchy
+            .children
+            .iter()
+            .any(|node| node.filesystem_name() == ".hidden"));
+        let nested = hierarchy
+            .children
+            .iter()
+            .find(|node| node.filesystem_name() == "nested")
+            .unwrap();
+        assert!(nested.children[0].bytes < 2 << 20);
+    }
+
     #[test]
     fn bulk_matches_stat_allocated_blocks_with_hardlinks_symlinks_sparse_files_and_directories() {
         let temp = Scratch::new();
