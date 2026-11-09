@@ -77,6 +77,8 @@ exclude_re = [
   "native_processes\\.rs.*replace == with != in Collector::read_bsd_info",
   # Equivalent: a larger first buffer lists the same PIDs, only with more slack.
   "native_processes\\.rs.*replace \\+ with \\* in list_pids",
+  # The non-macOS variant is not compiled on macOS.
+  'space\.rs.*replace scan_volume_identity_non_macos -> io::Result<String> with',
 ]
 
 # The gtop test binary links GPUI. A cold build in a fresh copy takes minutes.

@@ -657,6 +657,10 @@ pub fn scan_volume_identity(path: &Path) -> io::Result<String> {
     let stat = rustix::fs::statfs(path)?;
     let mount = c_chars(&stat.f_mntonname);
     let device = c_chars(&stat.f_mntfromname);
+    volume_identity(&mount, &device)
+}
+
+fn volume_identity(mount: &str, device: &str) -> io::Result<String> {
     if mount.is_empty() || device.is_empty() {
         return Err(io::Error::other("Unknown volume"));
     }
@@ -665,9 +669,15 @@ pub fn scan_volume_identity(path: &Path) -> io::Result<String> {
 
 #[cfg(not(target_os = "macos"))]
 pub fn scan_volume_identity(path: &Path) -> io::Result<String> {
+    scan_volume_identity_non_macos(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn scan_volume_identity_non_macos(path: &Path) -> io::Result<String> {
     let device = device_for(path).ok_or_else(|| io::Error::other("Unknown volume"))?;
     let mount = volume_root_for(path).ok_or_else(|| io::Error::other("Unknown mount"))?;
-    Ok(format!("{} · {device}", mount.display()))
+    let mount = mount.display().to_string();
+    volume_identity(&mount, &device)
 }
 
 /// A mounted volume the picker can switch the scan to: where it is mounted
@@ -871,6 +881,24 @@ portal /run/user/1000/doc fuse.portal rw 0 0
         let mut paths = repeated_mounts(&parse_mountinfo(table), Path::new(root));
         paths.sort();
         paths
+    }
+
+    #[test]
+    fn volume_identity_rejects_an_empty_mount() {
+        assert!(volume_identity("", "/dev/disk3s5").is_err());
+    }
+
+    #[test]
+    fn volume_identity_rejects_an_empty_device() {
+        assert!(volume_identity("/", "").is_err());
+    }
+
+    #[test]
+    fn volume_identity_formats_mount_and_device() {
+        assert_eq!(
+            volume_identity("/Volumes/Work", "/dev/disk3s5").unwrap(),
+            "/Volumes/Work · /dev/disk3s5"
+        );
     }
 
     #[test]
