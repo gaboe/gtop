@@ -281,6 +281,9 @@ impl Disk {
                     _ => {}
                 }
             }
+            if outcome == ScanState::Complete && self.status == "Scanning…" {
+                self.status.clear();
+            }
             self.refresh_volume(&root);
         }
     }
@@ -1450,6 +1453,7 @@ impl Monitor {
             .child(
                 div()
                     .id("disk-status")
+                    .debug_selector(|| "disk-status".into())
                     .role(Role::Status)
                     .px(px(12.))
                     .py(px(10.))

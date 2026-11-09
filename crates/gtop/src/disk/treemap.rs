@@ -190,11 +190,7 @@ fn entries_filtered(
             .filter(|(index, child)| {
                 let mut path = crumbs.clone();
                 path.push(*index);
-                matches.map_or(child.value(metric), |found| {
-                    found.keep(&path).map_or(0, |keep| {
-                        gtop_disk::filter::Matches::value(keep, child, metric)
-                    })
-                }) > 0
+                matches.map_or(child.value(metric) > 0, |found| found.keep(&path).is_some())
             })
             .collect();
         children.sort_by_key(|(index, child)| {
@@ -206,32 +202,49 @@ fn entries_filtered(
                 })
             }))
         });
-        let kept = children.len().min(LayoutOptions::default().max_children);
-        for (rank, (index, child)) in children.iter().enumerate() {
-            if rank == kept {
+        let positive_count = children
+            .iter()
+            .filter(|(index, child)| {
+                let mut path = crumbs.clone();
+                path.push(*index);
+                matches.map_or(child.value(metric), |found| {
+                    found.keep(&path).map_or(0, |keep| {
+                        gtop_disk::filter::Matches::value(keep, child, metric)
+                    })
+                }) > 0
+            })
+            .count();
+        let kept = positive_count.min(LayoutOptions::default().max_children);
+        let mut positive_rank = 0;
+        for (index, child) in &children {
+            let mut path = crumbs.clone();
+            path.push(*index);
+            let weight = matches.map_or(child.value(metric), |found| {
+                found.keep(&path).map_or(0, |keep| {
+                    gtop_disk::filter::Matches::value(keep, child, metric)
+                })
+            });
+            if weight > 0 && positive_rank == kept && positive_count > kept {
                 out.push(Entry {
                     kind: TileKind::Others {
                         crumbs: crumbs.clone(),
-                        count: children.len() - kept,
+                        count: positive_count - kept,
                     },
                     label: format!(
                         "Other · {} items · {}",
-                        children.len() - kept,
+                        positive_count - kept,
                         bytes(
-                            children[kept..]
+                            children
                                 .iter()
-                                .map(|(index, node)| {
+                                .filter_map(|(index, node)| {
                                     let mut path = crumbs.clone();
                                     path.push(*index);
-                                    matches.map_or(node.bytes, |found| {
+                                    let value = matches.map_or(node.value(metric), |found| {
                                         found.keep(&path).map_or(0, |keep| {
-                                            gtop_disk::filter::Matches::value(
-                                                keep,
-                                                node,
-                                                Metric::Bytes,
-                                            )
+                                            gtop_disk::filter::Matches::value(keep, node, metric)
                                         })
-                                    })
+                                    });
+                                    (value > 0).then_some(node.bytes)
                                 })
                                 .sum()
                         )
@@ -248,15 +261,18 @@ fn entries_filtered(
                 label: format!("{} · {}{}", child.name, bytes(child.bytes), coverage(child)),
                 depth: crumbs.len() - 1,
             });
-            if rank < kept && crumbs.len() < depth as usize {
+            if (weight == 0 || positive_rank < kept) && crumbs.len() < depth as usize {
                 visit(child, crumbs, out, metric, depth, matches);
             }
             crumbs.pop();
+            if weight > 0 {
+                positive_rank += 1;
+            }
         }
         for (index, child) in node.children.iter().enumerate().filter(|(index, child)| {
             let mut path = crumbs.clone();
             path.push(*index);
-            child.value(metric) == 0 && matches.is_none_or(|found| found.keep(&path).is_some())
+            matches.is_none() && child.value(metric) == 0
         }) {
             let mut path = crumbs.clone();
             path.push(index);
@@ -2131,6 +2147,106 @@ mod tests {
             .iter()
             .any(|row| matches!(row.kind, TileKind::Others { .. })));
         assert!(rows.iter().any(|row| row.label.contains("file-159")));
+    }
+
+    #[gpui::test]
+    async fn fix2_filtered_zero_byte_match_stays_keyboard_reachable(cx: &mut TestAppContext) {
+        cx.update(init);
+        let mut disk = snapshot_disk();
+        let target = vec![0, 0, 3];
+        for mode in [Mode::Size, Mode::Files, Mode::Age] {
+            disk.map.mode = mode;
+            disk.map.filter = "zero".into();
+            disk.map.committed_filter = "zero".into();
+            disk.map.applied = true;
+            let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+            let rows = disk.map.entries(root);
+            assert!(
+                rows.iter().any(|row| {
+                    matches!(&row.kind, TileKind::Node { crumbs } if crumbs == &target)
+                }),
+                "zero-byte match missing in {mode:?}"
+            );
+        }
+        disk.map.mode = Mode::Size;
+        disk.map.listing.borrow_mut().take();
+        let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+        let expected = disk.map.entries(root).len();
+        let (monitor, visual) = cx.add_window_view(|window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(disk);
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        for _ in 0..expected {
+            visual.simulate_keystrokes("tab");
+            visual.update(|window, cx| {
+                assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
+            });
+        }
+        monitor.read_with(visual, |monitor, _| {
+            let disk = monitor.disk.as_ref().unwrap();
+            let root = disk.folder.as_ref().unwrap().hierarchy.as_ref().unwrap();
+            let selected = disk.map.selected.as_ref().unwrap();
+            assert!(matches!(selected, TileKind::Node { crumbs } if crumbs == &target));
+            assert!(disk.map.entries(root).iter().any(|row| {
+                matches!(&row.kind, TileKind::Node { crumbs } if crumbs == &target)
+            }));
+        });
+    }
+
+    #[gpui::test]
+    async fn fix2_successful_scans_clear_rendered_scanning_status(cx: &mut TestAppContext) {
+        cx.update(init);
+        let fixture = Fixture::new();
+        let root = fixture.0.clone();
+        let disk_root = root.clone();
+        let (monitor, visual) = cx.add_window_view(move |window, cx| {
+            let mut monitor = crate::draw_benchmark::fixture(window, cx);
+            monitor.disk = Some(Disk::with_home(disk_root));
+            monitor.disk.as_mut().unwrap().open = true;
+            window.focus(&monitor.focus, cx);
+            monitor
+        });
+        visual.simulate_resize(size(px(1200.), px(720.)));
+        for scan in 0..2 {
+            if scan == 1 {
+                monitor.update(visual, |monitor, _| {
+                    let disk = monitor.disk.as_mut().unwrap();
+                    disk.change_scan_option(true);
+                    assert!(disk.map.previous_result);
+                    assert!(disk.status.starts_with("Previous result"));
+                    assert!(disk.status.contains("Scanning"));
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let complete = monitor.update(visual, |monitor, _| {
+                    let disk = monitor.disk.as_mut().unwrap();
+                    disk.consume_mailbox();
+                    disk.session
+                        .as_ref()
+                        .is_some_and(|session| session.outcome == Some(ScanState::Complete))
+                        && disk.folder.as_ref().is_some_and(|folder| {
+                            folder.path == root && folder.state == ScanState::Complete
+                        })
+                });
+                visual.update(|window, cx| window.draw(cx).clear(cx));
+                if complete {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "scan did not complete");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(visual.debug_bounds("disk-status").is_some());
+            monitor.read_with(visual, |monitor, _| {
+                let disk = monitor.disk.as_ref().unwrap();
+                assert!(disk.status.is_empty(), "rendered status: {}", disk.status);
+                assert!(disk.folder.as_ref().unwrap().path == root);
+            });
+        }
     }
 
     #[test]
