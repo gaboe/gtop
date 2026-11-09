@@ -2765,7 +2765,7 @@ mod tests {
         disk.mailbox.lock().unwrap().outcome.push_back((
             disk.generation(),
             0,
-            ScanState::Cancelled,
+            ScanReply::Outcome(ScanState::Cancelled),
         ));
         disk.consume_mailbox();
         assert_eq!(disk.status, "Scan cancelled.");
@@ -2990,7 +2990,7 @@ mod tests {
             mailbox.folder = Some((generation, 0, completed_folder));
             mailbox
                 .outcome
-                .push_back((generation, 0, ScanState::Complete));
+                .push_back((generation, 0, ScanReply::Outcome(ScanState::Complete)));
             drop(mailbox);
             assert!(disk.consume_mailbox());
         });
@@ -3051,7 +3051,7 @@ mod tests {
             mailbox.folder = Some((generation, 0, terminal));
             mailbox
                 .outcome
-                .push_back((generation, 0, ScanState::Cancelled));
+                .push_back((generation, 0, ScanReply::Outcome(ScanState::Cancelled)));
             drop(mailbox);
             assert!(disk.consume_mailbox());
         });
@@ -3124,7 +3124,7 @@ mod tests {
             mailbox.folder = Some((generation, 0, terminal));
             mailbox
                 .outcome
-                .push_back((generation, 0, ScanState::Cancelled));
+                .push_back((generation, 0, ScanReply::Outcome(ScanState::Cancelled)));
             drop(mailbox);
             assert!(disk.consume_mailbox());
         });
@@ -3176,9 +3176,11 @@ mod tests {
             terminal.state = ScanState::Failed(error.into());
             let mut mailbox = disk.mailbox.lock().unwrap();
             mailbox.folder = Some((generation, 0, terminal));
-            mailbox
-                .outcome
-                .push_back((generation, 0, ScanState::Failed(error.into())));
+            mailbox.outcome.push_back((
+                generation,
+                0,
+                ScanReply::Outcome(ScanState::Failed(error.into())),
+            ));
             drop(mailbox);
             assert!(disk.consume_mailbox());
         });
@@ -3257,11 +3259,11 @@ mod tests {
             disk.sender = sender;
             disk.change_scan_option(true);
             let generation = disk.generation();
-            disk.mailbox
-                .lock()
-                .unwrap()
-                .outcome
-                .push_back((generation, 0, state.clone()));
+            disk.mailbox.lock().unwrap().outcome.push_back((
+                generation,
+                0,
+                ScanReply::Outcome(state.clone()),
+            ));
             disk.consume_mailbox();
             assert!(!disk.status.contains("Scanning"), "{}", disk.status);
             assert!(disk.status.contains("Previous result"), "{}", disk.status);
@@ -3304,9 +3306,11 @@ mod tests {
         {
             let mut mailbox = disk.mailbox.lock().unwrap();
             mailbox.folder = Some((disk.generation(), 0, cancelled));
-            mailbox
-                .outcome
-                .push_back((disk.generation(), 0, ScanState::Cancelled));
+            mailbox.outcome.push_back((
+                disk.generation(),
+                0,
+                ScanReply::Outcome(ScanState::Cancelled),
+            ));
         }
         disk.consume_mailbox();
         disk.reopen(std::time::Instant::now(), false);
@@ -4897,18 +4901,19 @@ mod tests {
                             "{command}/{end}/{retained}/{previous} while running",
                         );
                         let generation = disk.generation();
-                        if matches!(end, "Complete" | "Partial") {
-                            let mut current = insights_snapshot_disk().folder.unwrap();
+                        let reply = if matches!(end, "Complete" | "Partial") {
+                            let mut current = insights_snapshot_disk().folder.take().unwrap();
                             current.state = ScanState::Complete;
                             current.errors = u64::from(end == "Partial");
                             Arc::make_mut(current.hierarchy.as_mut().unwrap()).complete = true;
-                            disk.mailbox.lock().unwrap().folder =
-                                Some((generation, disk.navigation, current));
-                        }
+                            ScanReply::Folder(current)
+                        } else {
+                            ScanReply::Outcome(state.clone())
+                        };
                         disk.mailbox.lock().unwrap().outcome.push_back((
                             generation,
                             disk.navigation,
-                            state.clone(),
+                            reply,
                         ));
                         disk.consume_mailbox();
                         assert!(disk.session.as_ref().unwrap().activity == ScanActivity::Finished);
@@ -5247,11 +5252,11 @@ mod tests {
         disk.enter(path.clone());
         assert!(matches!(commands.try_recv().unwrap(), Command::Browse(..)));
         assert!(disk.scan_shelf_status().starts_with("Scanning"));
-        disk.mailbox
-            .lock()
-            .unwrap()
-            .outcome
-            .push_back((disk.generation(), 0, ScanState::Complete));
+        disk.mailbox.lock().unwrap().outcome.push_back((
+            disk.generation(),
+            0,
+            ScanReply::Outcome(ScanState::Complete),
+        ));
         disk.consume_mailbox();
         assert!(
             disk.scan_shelf_status().starts_with("Scanning"),
@@ -5276,7 +5281,7 @@ mod tests {
                 disk.mailbox.lock().unwrap().outcome.push_back((
                     disk.generation(),
                     disk.navigation,
-                    state.clone(),
+                    ScanReply::Outcome(state.clone()),
                 ));
             }
             disk.consume_mailbox();
