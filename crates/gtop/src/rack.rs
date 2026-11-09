@@ -2856,6 +2856,22 @@ impl Monitor {
                 .iter()
                 .any(|i| i.read(cx).focus_handle(cx).is_focused(window));
         if k == "tab" {
+            if let Some(disk) = self
+                .disk
+                .as_mut()
+                .filter(|disk| disk.open && !self.settings_open && self.moment.is_none())
+            {
+                if disk.key(if event.keystroke.modifiers.shift {
+                    "shift-tab"
+                } else {
+                    "tab"
+                }) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+            }
             self.switch_view_from_tab(event.keystroke.modifiers.shift, window, cx);
             window.prevent_default();
             return;

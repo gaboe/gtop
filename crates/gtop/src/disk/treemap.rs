@@ -428,7 +428,7 @@ impl Disk {
             return false;
         };
         match key {
-            "down" | "j" | "up" | "k" | "tab" => {
+            "down" | "j" | "up" | "k" | "tab" | "shift-tab" => {
                 let entries = self.map.entries(&root);
                 let selected =
                     self.map.selected.as_ref().and_then(|selected| {
@@ -1983,7 +1983,18 @@ mod tests {
         });
         visual.update(|window, cx| window.draw(cx).clear(cx));
         let list = visual.debug_bounds("map-folder-list").unwrap();
-        let other = visual.debug_bounds("map-entry-other").unwrap();
+        let other = visual.debug_bounds("map-entry-other").unwrap_or_else(|| {
+            panic!(
+                "selected {:?}",
+                monitor.read_with(visual, |monitor, _| monitor
+                    .disk
+                    .as_ref()
+                    .unwrap()
+                    .map
+                    .selected
+                    .clone())
+            )
+        });
         assert!(other.top() >= list.top() && other.bottom() <= list.bottom());
         visual.simulate_click(other.center(), Modifiers::default());
         visual.update(|window, cx| {
@@ -2465,7 +2476,18 @@ mod tests {
                 assert!(monitor.disk.as_ref().unwrap().map_row().is_none())
             });
             visual.update(|window, cx| window.draw(cx).clear(cx));
-            let other = visual.debug_bounds("map-entry-other").unwrap();
+            let other = visual.debug_bounds("map-entry-other").unwrap_or_else(|| {
+                panic!(
+                    "selected {:?}",
+                    monitor.read_with(visual, |monitor, _| monitor
+                        .disk
+                        .as_ref()
+                        .unwrap()
+                        .map
+                        .selected
+                        .clone())
+                )
+            });
             visual.simulate_click(other.center(), Modifiers::default());
             visual.update(|window, cx| {
                 assert_eq!(window.focused(cx), Some(monitor.read(cx).focus.clone()))
@@ -2501,7 +2523,7 @@ mod tests {
                 .unwrap();
             assert!(last.top() >= list.top() && last.bottom() <= list.bottom());
             for _ in 1..omitted.len() {
-                visual.simulate_keystrokes("up");
+                visual.simulate_keystrokes("shift-tab");
             }
             let directory_index = omitted
                 .iter()
