@@ -1,6 +1,8 @@
 # cargo-mutants scope for gtop. Run `sh scripts/mutants-diff.sh` for changed code.
 # Only domain logic is mutated: collectors' pure parsing, state, history, disk scan,
 # search, sorting, and number formatting. GPUI views, FFI shells, and test code are out.
+# Disk view state (disk.rs, disk/*.rs) is in: its scan, navigation and reply logic had
+# the bugs that later fix commits repaired; drawing glue there goes to exclude_re.
 
 exclude_globs = [
   "crates/gtop-disk/src/macos.rs", # getattrlistbulk FFI shell; needs the real filesystem.
@@ -34,7 +36,8 @@ examine_globs = [
   "crates/gtop/src/history.rs",
   "crates/gtop/src/history/store.rs",
   "crates/gtop/src/disk_scan.rs",
-  "crates/gtop/src/disk/inspector_model.rs",
+  "crates/gtop/src/disk.rs",
+  "crates/gtop/src/disk/*.rs",
   "crates/gtop/src/disk_scan/queue.rs",
   "crates/gtop/src/perf.rs",
 ]
@@ -42,6 +45,8 @@ examine_globs = [
 exclude_re = [
   # GPUI element builders are drawing glue; width calculations and event behavior remain in scope.
   'column_widths.rs:.*(replace | in )(cell|handle|handle_left|pin_to_edge)( ->| with |$)',
+  # Disk GPUI view builders (impl Monitor) are drawing glue; Disk state and key logic stay in scope.
+  'gtop/src/disk(\.rs|/[a-z_]+\.rs):.*(replace | in )Monitor::',
   # Sends real signals; a mutant could reach pid <= 1. Never mutate the kill path.
   '(replace | in )signal_target_is_safe( ->| with |$)',
   '(replace | in )ProcessMonitor::kill_process( ->| with |$)',
