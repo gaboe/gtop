@@ -84,6 +84,8 @@ pub struct Temperature {
 /// Speed of one cooling fan
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct Fan {
+    /// Fan number from 0, as the platform numbers it
+    pub index: u8,
     /// Current speed in revolutions per minute; 0 when the fan is stopped
     pub rpm: f32,
     /// Top speed in revolutions per minute, when the platform reports it

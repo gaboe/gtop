@@ -123,8 +123,9 @@ fn snapshot() -> Snapshot {
             }
         }),
     );
-    s.fans = [2380., 2410.]
-        .map(|rpm| gtop_core::monitoring::Fan {
+    s.fans = [(0, 2380.), (1, 2410.)]
+        .map(|(index, rpm)| gtop_core::monitoring::Fan {
+            index,
             rpm,
             max_rpm: Some(5900.),
         })

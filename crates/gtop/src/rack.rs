@@ -1869,43 +1869,44 @@ impl Monitor {
                 )
                 .child(segments(util.unwrap_or(0.), 40, t)),
         );
-        tower = tower.child(
-            win(t)
-                .child(label("TEMPERATURE °C", t))
-                .child(div().flex().gap(px(8.)).children(
-                    [("CPU", 90.), ("GPU", 90.), ("SSD", 70.), ("Battery", 45.)].map(
-                        |(name, limit)| {
-                            let value = stats
-                                .temperatures
-                                .iter()
-                                .find(|v| v.name == name)
-                                .map(|v| v.celsius);
-                            div()
-                                .flex_1()
-                                .child(
-                                    value
-                                        .map(|value| {
-                                            lit(format!("{value:2.0}"), 22., value > limit, t)
-                                        })
-                                        .unwrap_or_else(|| lit("N/A".into(), 22., false, t)),
-                                )
-                                .child(label(if name == "Battery" { "BAT" } else { name }, t))
-                        },
-                    ),
-                ))
-                .when(!stats.fans.is_empty(), |w| {
-                    w.child(label("FAN RPM", t))
-                        .child(div().flex().gap(px(8.)).children(
-                            stats.fans.iter().enumerate().map(|(index, fan)| {
-                                let (text, hot) = fan_readout(fan);
+        tower =
+            tower.child(
+                win(t)
+                    .child(label("TEMPERATURE °C", t))
+                    .child(div().flex().gap(px(8.)).children(
+                        [("CPU", 90.), ("GPU", 90.), ("SSD", 70.), ("Battery", 45.)].map(
+                            |(name, limit)| {
+                                let value = stats
+                                    .temperatures
+                                    .iter()
+                                    .find(|v| v.name == name)
+                                    .map(|v| v.celsius);
                                 div()
                                     .flex_1()
-                                    .child(lit(text, 22., hot, t))
-                                    .child(label(format!("FAN {}", index + 1), t))
-                            }),
-                        ))
-                }),
-        );
+                                    .child(
+                                        value
+                                            .map(|value| {
+                                                lit(format!("{value:2.0}"), 22., value > limit, t)
+                                            })
+                                            .unwrap_or_else(|| lit("N/A".into(), 22., false, t)),
+                                    )
+                                    .child(label(if name == "Battery" { "BAT" } else { name }, t))
+                            },
+                        ),
+                    ))
+                    .when(!stats.fans.is_empty(), |w| {
+                        w.child(label("FAN RPM", t))
+                            .child(div().flex().gap(px(8.)).children(stats.fans.iter().map(
+                                |fan| {
+                                    let (text, hot) = fan_readout(fan);
+                                    div().flex_1().child(lit(text, 22., hot, t)).child(label(
+                                        format!("FAN {}", u16::from(fan.index) + 1),
+                                        t,
+                                    ))
+                                },
+                            )))
+                    }),
+            );
         if let Some(power) = stats.power.as_ref() {
             let [state, system_watts, battery_watts] = battery_readouts(power);
             tower = tower.child(
@@ -3540,6 +3541,22 @@ mod tests {
         assert_eq!(memory_share(8, 32), 0.25);
         assert!(toggles_memory_breakdown("b"));
         assert!(!toggles_memory_breakdown("m"));
+    }
+
+    #[test]
+    fn fan_readout_shows_off_speed_and_hot_above_ninety_percent() {
+        let fan = |rpm, max_rpm| gtop_core::monitoring::Fan {
+            index: 0,
+            rpm,
+            max_rpm,
+        };
+        let read = |rpm, max| crate::rack::fan_readout(&fan(rpm, max));
+        assert_eq!(read(0., Some(6000.)), ("OFF".into(), false));
+        assert_eq!(read(0.5, Some(6000.)), ("OFF".into(), false));
+        assert_eq!(read(2400.4, Some(6000.)), ("2400".into(), false));
+        assert_eq!(read(5400., Some(6000.)), ("5400".into(), false));
+        assert_eq!(read(5401., Some(6000.)), ("5401".into(), true));
+        assert_eq!(read(7900., None), ("7900".into(), false));
     }
 
     #[test]

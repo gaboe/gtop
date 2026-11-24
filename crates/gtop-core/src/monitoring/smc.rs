@@ -54,6 +54,7 @@ type SmcKey = (u32, KeyInfo);
 /// SMC keys of one fan: its current speed and, when the SMC has it, its top speed
 #[derive(Debug)]
 struct FanKeys {
+    index: u8,
     actual: SmcKey,
     max: Option<SmcKey>,
 }
@@ -136,10 +137,11 @@ impl GpuTemperature {
                 }
             }
         }
-        sensor.fans = fans
-            .into_iter()
-            .filter_map(|(actual, max)| {
+        sensor.fans = (0u8..)
+            .zip(fans)
+            .filter_map(|(index, (actual, max))| {
                 Some(FanKeys {
+                    index,
                     actual: actual?,
                     max,
                 })
@@ -155,6 +157,7 @@ impl GpuTemperature {
             .filter_map(|fan| {
                 let (key, info) = fan.actual;
                 Some(super::Fan {
+                    index: fan.index,
                     rpm: decode_rpm(info, &self.read(key, info)?.bytes)?,
                     max_rpm: fan.max.and_then(|(key, info)| {
                         decode_rpm(info, &self.read(key, info)?.bytes).filter(|&rpm| rpm > 0.)
