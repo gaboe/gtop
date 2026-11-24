@@ -68,6 +68,7 @@ pub fn snapshot() -> Snapshot {
                 name: "CPU".into(),
                 celsius: 80.,
             }],
+            fans: vec![],
             power: Some(gtop_core::monitoring::Power {
                 percent: 80,
                 state: gtop_core::monitoring::BatteryState::Charging {

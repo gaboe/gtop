@@ -170,6 +170,7 @@ impl SystemMonitor {
             disk_purgeable_bytes: disk_stats.purgeable_bytes,
             gpus: self.gpu_monitor.collect(),
             temperatures: self.temperature_monitor.collect(),
+            fans: self.temperature_monitor.fans(),
             #[cfg(target_os = "macos")]
             power: super::iokit::read_battery(_power_source_time_read)
                 .as_ref()

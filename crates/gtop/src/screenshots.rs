@@ -123,6 +123,12 @@ fn snapshot() -> Snapshot {
             }
         }),
     );
+    s.fans = [2380., 2410.]
+        .map(|rpm| gtop_core::monitoring::Fan {
+            rpm,
+            max_rpm: Some(5900.),
+        })
+        .into();
     s.gpus = vec![gtop_core::monitoring::GpuInfo {
         name: "Apple M2 Pro".into(),
         vendor: "Apple".into(),

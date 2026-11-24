@@ -1139,6 +1139,15 @@ fn core_banks(usage: &[f32], topology: &CpuTopology, scale: palette::CpuScale, t
     }
     banks
 }
+/// Fan speed text, and whether the fan runs above 90 % of its top speed
+fn fan_readout(fan: &gtop_core::monitoring::Fan) -> (String, bool) {
+    if fan.rpm < 1. {
+        return ("OFF".into(), false);
+    }
+    let hot = fan.max_rpm.is_some_and(|max| fan.rpm > max * 0.9);
+    (format!("{:.0}", fan.rpm), hot)
+}
+
 fn readout(name: &str, value: String, t: &Tokens) -> Div {
     let display = if let Some(number) = value.strip_suffix('%') {
         lit_unit(number.to_string(), '%', 22., false, t)
@@ -1860,27 +1869,43 @@ impl Monitor {
                 )
                 .child(segments(util.unwrap_or(0.), 40, t)),
         );
-        tower = tower.child(win(t).child(label("TEMPERATURE °C", t)).child(
-            div().flex().gap(px(8.)).children(
-                [("CPU", 90.), ("GPU", 90.), ("SSD", 70.), ("Battery", 45.)].map(
-                    |(name, limit)| {
-                        let value = stats
-                            .temperatures
-                            .iter()
-                            .find(|v| v.name == name)
-                            .map(|v| v.celsius);
-                        div()
-                            .flex_1()
-                            .child(
-                                value
-                                    .map(|value| lit(format!("{value:2.0}"), 22., value > limit, t))
-                                    .unwrap_or_else(|| lit("N/A".into(), 22., false, t)),
-                            )
-                            .child(label(if name == "Battery" { "BAT" } else { name }, t))
-                    },
-                ),
-            ),
-        ));
+        tower = tower.child(
+            win(t)
+                .child(label("TEMPERATURE °C", t))
+                .child(div().flex().gap(px(8.)).children(
+                    [("CPU", 90.), ("GPU", 90.), ("SSD", 70.), ("Battery", 45.)].map(
+                        |(name, limit)| {
+                            let value = stats
+                                .temperatures
+                                .iter()
+                                .find(|v| v.name == name)
+                                .map(|v| v.celsius);
+                            div()
+                                .flex_1()
+                                .child(
+                                    value
+                                        .map(|value| {
+                                            lit(format!("{value:2.0}"), 22., value > limit, t)
+                                        })
+                                        .unwrap_or_else(|| lit("N/A".into(), 22., false, t)),
+                                )
+                                .child(label(if name == "Battery" { "BAT" } else { name }, t))
+                        },
+                    ),
+                ))
+                .when(!stats.fans.is_empty(), |w| {
+                    w.child(label("FAN RPM", t))
+                        .child(div().flex().gap(px(8.)).children(
+                            stats.fans.iter().enumerate().map(|(index, fan)| {
+                                let (text, hot) = fan_readout(fan);
+                                div()
+                                    .flex_1()
+                                    .child(lit(text, 22., hot, t))
+                                    .child(label(format!("FAN {}", index + 1), t))
+                            }),
+                        ))
+                }),
+        );
         if let Some(power) = stats.power.as_ref() {
             let [state, system_watts, battery_watts] = battery_readouts(power);
             tower = tower.child(

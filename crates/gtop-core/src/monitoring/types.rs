@@ -81,6 +81,15 @@ pub struct Temperature {
     pub celsius: f32,
 }
 
+/// Speed of one cooling fan
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Fan {
+    /// Current speed in revolutions per minute; 0 when the fan is stopped
+    pub rpm: f32,
+    /// Top speed in revolutions per minute, when the platform reports it
+    pub max_rpm: Option<f32>,
+}
+
 /// Battery charge and power readings exposed by the platform.
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct Power {
@@ -147,6 +156,8 @@ pub struct SystemStats {
     pub gpus: Vec<GpuInfo>,
     /// Hottest reading per component group; empty when no sensor is readable
     pub temperatures: Vec<Temperature>,
+    /// Fan speeds in fan order; empty on fanless machines and outside macOS
+    pub fans: Vec<Fan>,
     /// Battery and power readings, or `None` when no battery is available.
     pub power: Option<Power>,
 }

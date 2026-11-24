@@ -1,4 +1,5 @@
-//! Read-only AppleSMC GPU temperature discovery. Key names vary by chip.
+//! Read-only AppleSMC GPU temperature and fan speed discovery. Key names vary
+//! by chip.
 
 use objc2_core_foundation::{CFDictionary, CFRetained};
 use objc2_io_kit::{
@@ -47,10 +48,21 @@ impl Message {
     }
 }
 
+/// An SMC key and its type and size
+type SmcKey = (u32, KeyInfo);
+
+/// SMC keys of one fan: its current speed and, when the SMC has it, its top speed
+#[derive(Debug)]
+struct FanKeys {
+    actual: SmcKey,
+    max: Option<SmcKey>,
+}
+
 #[derive(Debug)]
 pub(super) struct GpuTemperature {
     connection: u32,
     keys: Vec<(u32, KeyInfo)>,
+    fans: Vec<FanKeys>,
 }
 
 impl Drop for GpuTemperature {
@@ -90,7 +102,9 @@ impl GpuTemperature {
         let mut sensor = Self {
             connection,
             keys: Vec::new(),
+            fans: Vec::new(),
         };
+        let mut fans: [(Option<SmcKey>, Option<SmcKey>); 10] = [(None, None); 10];
         let count_key = u32::from_be_bytes(*b"#KEY");
         let info = sensor.info(count_key)?;
         let count = u32::from_be_bytes(sensor.read(count_key, info)?.bytes[..4].try_into().ok()?);
@@ -103,7 +117,16 @@ impl GpuTemperature {
                 continue;
             };
             let key = entry.key;
-            if gpu_key(key) {
+            if let Some((index, is_max)) = fan_key(key) {
+                if let Some(info) = sensor.info(key).filter(|&info| rpm_format(info)) {
+                    let slot = &mut fans[index];
+                    if is_max {
+                        slot.1 = Some((key, info));
+                    } else {
+                        slot.0 = Some((key, info));
+                    }
+                }
+            } else if gpu_key(key) {
                 if let Some(info) = sensor.info(key) {
                     if matches!((info.kind.to_be_bytes(), info.size), (kind, 4) if kind == *b"flt ")
                         || (info.kind == u32::from_be_bytes(*b"sp78") && info.size == 2)
@@ -113,7 +136,32 @@ impl GpuTemperature {
                 }
             }
         }
+        sensor.fans = fans
+            .into_iter()
+            .filter_map(|(actual, max)| {
+                Some(FanKeys {
+                    actual: actual?,
+                    max,
+                })
+            })
+            .collect();
         Some(sensor)
+    }
+
+    /// Current speed of every fan, in fan index order; empty on fanless Macs
+    pub(super) fn fans(&self) -> Vec<super::Fan> {
+        self.fans
+            .iter()
+            .filter_map(|fan| {
+                let (key, info) = fan.actual;
+                Some(super::Fan {
+                    rpm: decode_rpm(info, &self.read(key, info)?.bytes)?,
+                    max_rpm: fan.max.and_then(|(key, info)| {
+                        decode_rpm(info, &self.read(key, info)?.bytes).filter(|&rpm| rpm > 0.)
+                    }),
+                })
+            })
+            .collect()
     }
 
     pub(super) fn hottest(&self) -> Option<f32> {
@@ -156,6 +204,38 @@ impl GpuTemperature {
 fn gpu_key(key: u32) -> bool {
     let bytes = key.to_be_bytes();
     bytes.starts_with(b"Tg") || bytes.starts_with(b"TG")
+}
+
+/// Fan keys are `F<digit>Ac` for the current speed and `F<digit>Mx` for the
+/// top speed. Returns the fan index and whether the key is the top speed.
+fn fan_key(key: u32) -> Option<(usize, bool)> {
+    let [f, digit, a, b] = key.to_be_bytes();
+    if f != b'F' || !digit.is_ascii_digit() {
+        return None;
+    }
+    let index = usize::from(digit - b'0');
+    match [a, b] {
+        [b'A', b'c'] => Some((index, false)),
+        [b'M', b'x'] => Some((index, true)),
+        _ => None,
+    }
+}
+
+/// Apple silicon stores fan speeds as `flt `, Intel Macs as `fpe2`
+fn rpm_format(info: KeyInfo) -> bool {
+    matches!(
+        (&info.kind.to_be_bytes(), info.size),
+        (b"flt ", 4) | (b"fpe2", 2)
+    )
+}
+
+fn decode_rpm(info: KeyInfo, bytes: &[u8; 32]) -> Option<f32> {
+    let value = match (&info.kind.to_be_bytes(), info.size) {
+        (b"flt ", 4) => f32::from_le_bytes(bytes[..4].try_into().ok()?),
+        (b"fpe2", 2) => f32::from(u16::from_be_bytes(bytes[..2].try_into().ok()?)) / 4.,
+        _ => return None,
+    };
+    (value.is_finite() && (0.0..20_000.0).contains(&value)).then_some(value)
 }
 
 fn decode(info: KeyInfo, bytes: &[u8; 32]) -> Option<f32> {
@@ -215,6 +295,40 @@ mod tests {
         assert!(gpu_key(u32::from_be_bytes(*b"Tg0f")));
         assert!(gpu_key(u32::from_be_bytes(*b"TG0D")));
         assert!(!gpu_key(u32::from_be_bytes(*b"Tp01")));
+    }
+
+    #[test]
+    fn finds_fan_keys_and_decodes_fan_speeds() {
+        let key = |name: &[u8; 4]| u32::from_be_bytes(*name);
+        assert_eq!(fan_key(key(b"F0Ac")), Some((0, false)));
+        assert_eq!(fan_key(key(b"F1Mx")), Some((1, true)));
+        for other in [b"F0Mn", b"FNum", b"Tg0f", b"FxAc"] {
+            assert_eq!(fan_key(key(other)), None);
+        }
+        let float = KeyInfo {
+            size: 4,
+            kind: key(b"flt "),
+            attributes: 0,
+        };
+        let fixed = KeyInfo {
+            size: 2,
+            kind: key(b"fpe2"),
+            attributes: 0,
+        };
+        assert!(rpm_format(float) && rpm_format(fixed));
+        assert!(!rpm_format(KeyInfo { size: 2, ..float }));
+        let mut bytes = [0; 32];
+        bytes[..4].copy_from_slice(&2400f32.to_le_bytes());
+        assert_eq!(decode_rpm(float, &bytes), Some(2400.));
+        bytes[..4].copy_from_slice(&0f32.to_le_bytes());
+        assert_eq!(decode_rpm(float, &bytes), Some(0.));
+        for value in [f32::NAN, -1., 20_000.] {
+            bytes[..4].copy_from_slice(&value.to_le_bytes());
+            assert_eq!(decode_rpm(float, &bytes), None);
+        }
+        bytes[..2].copy_from_slice(&(1800u16 * 4).to_be_bytes());
+        assert_eq!(decode_rpm(fixed, &bytes), Some(1800.));
+        assert_eq!(decode_rpm(KeyInfo { size: 4, ..fixed }, &bytes), None);
     }
 
     #[test]

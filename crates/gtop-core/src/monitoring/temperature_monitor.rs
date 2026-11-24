@@ -5,7 +5,7 @@
 //! is sorted into a component group by its label, and the panel shows the
 //! hottest sensor of every group.
 
-use super::Temperature;
+use super::{Fan, Temperature};
 use std::time::{Duration, Instant};
 use sysinfo::Components;
 
@@ -30,6 +30,7 @@ pub struct TemperatureMonitor {
     groups: Vec<Option<usize>>,
     refreshed_at: Option<Instant>,
     readings: Vec<Temperature>,
+    fans: Vec<Fan>,
     #[cfg(target_os = "macos")]
     gpu: Option<super::smc::GpuTemperature>,
 }
@@ -53,6 +54,7 @@ impl TemperatureMonitor {
             groups,
             refreshed_at: None,
             readings: Vec::new(),
+            fans: Vec::new(),
             #[cfg(target_os = "macos")]
             gpu: super::smc::GpuTemperature::new(),
         }
@@ -77,6 +79,11 @@ impl TemperatureMonitor {
         }
 
         #[cfg(target_os = "macos")]
+        {
+            self.fans = self.gpu.as_ref().map(|smc| smc.fans()).unwrap_or_default();
+        }
+
+        #[cfg(target_os = "macos")]
         if let Some(celsius) = self.gpu.as_ref().and_then(|gpu| gpu.hottest()) {
             hottest[1] = Some(hottest[1].map_or(celsius, |h| h.max(celsius)));
         }
@@ -93,6 +100,11 @@ impl TemperatureMonitor {
             .collect();
         self.refreshed_at = Some(Instant::now());
         self.readings.clone()
+    }
+
+    /// Fan speeds from the last `collect`; empty when the machine reports no fan
+    pub fn fans(&self) -> Vec<Fan> {
+        self.fans.clone()
     }
 }
 
@@ -116,6 +128,19 @@ mod tests {
         assert_eq!(name("NAND CH0 temp"), Some("SSD"));
         assert_eq!(name("gas gauge battery"), Some("Battery"));
         assert_eq!(name("PMU tdev1"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fan_speeds_are_plausible() {
+        let mut monitor = TemperatureMonitor::new();
+        monitor.collect();
+        for fan in monitor.fans() {
+            assert!((0.0..20_000.0).contains(&fan.rpm), "fan reads {}", fan.rpm);
+            if let Some(max) = fan.max_rpm {
+                assert!(max > 0., "top speed {max}");
+            }
+        }
     }
 
     #[test]
